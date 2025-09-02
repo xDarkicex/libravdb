@@ -1,0 +1,161 @@
+# Go Project .gitignore - Best Practices
+# This file specifies intentionally untracked files that Git should ignore
+
+# =============================================================================
+# Go Build Artifacts & Binaries
+# =============================================================================
+# Compiled binaries (platform-specific)
+*.exe          # Windows executables
+*.exe~         # Windows backup executables
+*.dll          # Windows dynamic libraries
+*.so           # Linux/Unix shared objects
+*.dylib        # macOS dynamic libraries
+
+# Static libraries and object files
+*.a            # Archive files (static libraries)
+*.o            # Object files
+*.obj          # Object files (Windows)
+
+# Go build cache and module cache (usually handled globally, but can be project-specific)
+# Uncomment if you want to ignore these locally
+# .cache/
+# pkg/mod/
+
+# =============================================================================
+# Project-Specific Executables
+# =============================================================================
+# Your project's main executables
+libraVDB       # Unix/Linux/macOS binary
+libraVDB.exe   # Windows binary
+
+# =============================================================================
+# Go Testing & Development
+# =============================================================================
+# Test binaries and coverage files
+*.test         # Test binaries
+_test          # Test artifacts directory
+.test          # Hidden test files
+
+# Test data and outputs
+testdata/.out          # Test output directory
+testdata/*.json        # Generated JSON test files
+testdata/golden/       # Golden files (expected test outputs)
+
+# Coverage reports
+*.out          # Coverage profile files
+coverage.html  # HTML coverage reports
+coverage.txt   # Text coverage reports
+
+# Benchmark results
+*.bench        # Benchmark output files
+
+# =============================================================================
+# Development Tools & IDEs
+# =============================================================================
+# JetBrains IDEs (GoLand, IntelliJ IDEA)
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# =============================================================================
+# Operating System Files
+# =============================================================================
+# macOS
+.DS_Store        # macOS folder metadata
+.DS_Store?       # Alternative macOS metadata
+._*              # macOS resource forks
+.Spotlight-V100  # macOS Spotlight
+.Trashes         # macOS Trash
+ehthumbs.db      # macOS thumbnail cache
+
+# Windows
+Thumbs.db        # Windows thumbnail cache
+Thumbs.db:encryptable
+ehthumbs_vista.db
+Desktop.ini      # Windows folder settings
+$RECYCLE.BIN/    # Windows Recycle Bin
+
+# Linux
+.fuse_hidden*    # FUSE hidden files
+
+# =============================================================================
+# Project Documentation & Temporary Files
+# =============================================================================
+# Text files (if not part of documentation)
+*.txt            # Generic text files
+*.tmp            # Temporary files
+*.temp           # Temporary files
+
+# Log files
+*.log            # Application logs
+*.log.*          # Rotated logs
+logs/            # Logs directory
+
+# =============================================================================
+# Development & Build Tools
+# =============================================================================
+# Air (live reloading tool)
+tmp/
+.air.toml
+
+# Wire (dependency injection)
+wire_gen.go
+
+# Vendor directory (if using vendor mode)
+vendor/
+
+# =============================================================================
+# Custom Project Files
+# =============================================================================
+# Project-specific ignore patterns
+.gitingest       # ignore gitingest 
+.gitingestignore # ignore gitingest ignore file
+
+# Environment and configuration files
+.env             # Environment variables
+.env.local       # Local environment overrides
+.env.*.local     # Environment-specific locals
+config.local.*   # Local configuration files
+
+# Database files
+*.db             # SQLite databases
+*.sqlite         # SQLite databases
+*.sqlite3        # SQLite databases
+
+# Keys and certificates (NEVER commit these!)
+*.key            # Private keys
+*.pem            # Certificate files
+*.crt            # Certificate files
+*.p12            # PKCS#12 files
+secrets/         # Secrets directory
+
+# =============================================================================
+# Deployment & Distribution
+# =============================================================================
+# Docker
+.dockerignore    # ignore dockerignore
+Dockerfile.local # Local Dockerfile variants
+
+# Build directories
+build/           # Build output
+dist/            # Distribution files
+release/         # Release artifacts
