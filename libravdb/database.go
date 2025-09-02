@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/xDarkicex/libraVDB/internal/obs"
-	"github.com/xDarkicex/libraVDB/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/storage"
 )
 
 // Database represents the main vector database instance

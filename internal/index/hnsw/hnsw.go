@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"sync"
 
-	"github.com/yourorg/libraVDB/internal/util"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search

@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xDarkice/libraVDB/internal/index"
-	"github.com/xDarkicex/libraVDB/internal/obs"
-	"github.com/xDarkicex/libraVDB/internal/storage"
+	"github.com/xDarkice/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/storage"
 )
 
 // Collection represents a named collection of vectors with a specific schema
