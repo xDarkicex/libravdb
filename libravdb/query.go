@@ -102,7 +102,7 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	if err != nil {
 		return nil, err
 	}
-	// TODO: fix this result.Results undefined type *SearchResult has no field or method Results
+
 	return &SearchResults{
 		Results: result.Results,
 		Took:    result.Took,

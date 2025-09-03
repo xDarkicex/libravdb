@@ -54,3 +54,14 @@ type CheckResult struct {
 	Healthy bool   `json:"healthy"`
 	Message string `json:"message"`
 }
+
+func (it IndexType) String() string {
+	switch it {
+	case HNSW:
+		return "HNSW"
+	case IVFPQ:
+		return "IVF-PQ"
+	default:
+		return "Unknown"
+	}
+}
