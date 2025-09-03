@@ -153,7 +153,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 }
 
 // Search performs a vector similarity search
-func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResult, error) {
+func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -193,9 +193,10 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		c.metrics.SearchQueries.Inc()
 	}
 
-	return &SearchResult{
+	return &SearchResults{
 		Results: results,
 		Took:    time.Since(start),
+		Total:   len(results),
 	}, nil
 }
 
