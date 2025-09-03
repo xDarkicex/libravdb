@@ -5,16 +5,22 @@
 # Go Build Artifacts & Binaries
 # =============================================================================
 # Compiled binaries (platform-specific)
-*.exe          # Windows executables
-*.exe~         # Windows backup executables
-*.dll          # Windows dynamic libraries
-*.so           # Linux/Unix shared objects
-*.dylib        # macOS dynamic libraries
+# Windows executables
+*.exe
+*.exe~
+# Windows dynamic libraries
+*.dll
+# Linux/Unix shared objects
+*.so
+# macOS dynamic libraries
+*.dylib
 
 # Static libraries and object files
-*.a            # Archive files (static libraries)
-*.o            # Object files
-*.obj          # Object files (Windows)
+# Archive files (static libraries)
+*.a
+# Object files
+*.o
+*.obj
 
 # Go build cache and module cache (usually handled globally, but can be project-specific)
 # Uncomment if you want to ignore these locally
@@ -25,29 +31,41 @@
 # Project-Specific Executables
 # =============================================================================
 # Your project's main executables
-libraVDB       # Unix/Linux/macOS binary
-libraVDB.exe   # Windows binary
+# Unix/Linux/macOS binary
+libraVDB
+# Windows binary
+libraVDB.exe
 
 # =============================================================================
 # Go Testing & Development
 # =============================================================================
 # Test binaries and coverage files
-*.test         # Test binaries
-_test          # Test artifacts directory
-.test          # Hidden test files
+# Test binaries
+*.test
+# Test artifacts directory
+_test
+# Hidden test files
+.test
 
 # Test data and outputs
-testdata/.out          # Test output directory
-testdata/*.json        # Generated JSON test files
-testdata/golden/       # Golden files (expected test outputs)
+# Test output directory
+testdata/.out
+# Generated JSON test files
+testdata/*.json
+# Golden files (expected test outputs)
+testdata/golden/
 
 # Coverage reports
-*.out          # Coverage profile files
-coverage.html  # HTML coverage reports
-coverage.txt   # Text coverage reports
+# Coverage profile files
+*.out
+# HTML coverage reports
+coverage.html
+# Text coverage reports
+coverage.txt
 
 # Benchmark results
-*.bench        # Benchmark output files
+# Benchmark output files
+*.bench
 
 # =============================================================================
 # Development Tools & IDEs
@@ -80,35 +98,49 @@ coverage.txt   # Text coverage reports
 # Operating System Files
 # =============================================================================
 # macOS
-.DS_Store        # macOS folder metadata
-.DS_Store?       # Alternative macOS metadata
-._*              # macOS resource forks
-.Spotlight-V100  # macOS Spotlight
-.Trashes         # macOS Trash
-ehthumbs.db      # macOS thumbnail cache
+# macOS folder metadata
+.DS_Store
+# Alternative macOS metadata
+.DS_Store?
+# macOS resource forks
+._*
+# macOS Spotlight
+.Spotlight-V100
+# macOS Trash
+.Trashes
+# macOS thumbnail cache
+ehthumbs.db
 
 # Windows
-Thumbs.db        # Windows thumbnail cache
+# Windows thumbnail cache
+Thumbs.db
 Thumbs.db:encryptable
 ehthumbs_vista.db
-Desktop.ini      # Windows folder settings
-$RECYCLE.BIN/    # Windows Recycle Bin
+# Windows folder settings
+Desktop.ini
+# Windows Recycle Bin
+$RECYCLE.BIN/
 
 # Linux
-.fuse_hidden*    # FUSE hidden files
+# FUSE hidden files
+.fuse_hidden*
 
 # =============================================================================
 # Project Documentation & Temporary Files
 # =============================================================================
-# Text files (if not part of documentation)
-*.txt            # Generic text files
-*.tmp            # Temporary files
-*.temp           # Temporary files
+# Generic text files (if not part of documentation)
+*.txt
+# Temporary files
+*.tmp
+*.temp
 
 # Log files
-*.log            # Application logs
-*.log.*          # Rotated logs
-logs/            # Logs directory
+# Application logs
+*.log
+# Rotated logs
+*.log.*
+# Logs directory
+logs/
 
 # =============================================================================
 # Development & Build Tools
@@ -127,35 +159,48 @@ vendor/
 # Custom Project Files
 # =============================================================================
 # Project-specific ignore patterns
-.gitingest       # ignore gitingest 
-.gitingestignore # ignore gitingest ignore file
+.gitingestignore
 
 # Environment and configuration files
-.env             # Environment variables
-.env.local       # Local environment overrides
-.env.*.local     # Environment-specific locals
-config.local.*   # Local configuration files
+# Environment variables
+.env
+# Local environment overrides
+.env.local
+# Environment-specific locals
+.env.*.local
+# Local configuration files
+config.local.*
 
 # Database files
-*.db             # SQLite databases
-*.sqlite         # SQLite databases
-*.sqlite3        # SQLite databases
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
 
 # Keys and certificates (NEVER commit these!)
-*.key            # Private keys
-*.pem            # Certificate files
-*.crt            # Certificate files
-*.p12            # PKCS#12 files
-secrets/         # Secrets directory
+# Private keys
+*.key
+# Certificate files
+*.pem
+*.crt
+# PKCS#12 files
+*.p12
+# Secrets directory
+secrets/
 
 # =============================================================================
 # Deployment & Distribution
 # =============================================================================
 # Docker
-.dockerignore    # ignore dockerignore
-Dockerfile.local # Local Dockerfile variants
+# If you want to ignore dockerignore itself
+.dockerignore
+# Local Dockerfile variants
+Dockerfile.local
 
 # Build directories
-build/           # Build output
-dist/            # Distribution files
-release/         # Release artifacts
+# Build output
+build/
+# Distribution files
+dist/
+# Release artifacts
+release/
