@@ -10,7 +10,6 @@ import (
 )
 
 // VectorEntry represents a vector entry for HNSW indexing
-// This matches the interface definition in internal/index/interfaces.go
 type VectorEntry struct {
 	ID       string
 	Vector   []float32
@@ -18,7 +17,6 @@ type VectorEntry struct {
 }
 
 // SearchResult represents a search result from HNSW
-// This matches the interface definition in internal/index/interfaces.go
 type SearchResult struct {
 	ID       string
 	Score    float32
@@ -233,7 +231,7 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 }
 
 // searchLevel performs search at a specific level
-func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int) []*Candidate {
+func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int) []*util.Candidate {
 	visited := make(map[uint32]bool)
 	candidates := util.NewMaxHeap(ef)
 	dynamic := util.NewMinHeap(ef)
@@ -241,13 +239,13 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 	// Start with entry point
 	entryID := h.findNodeID(entryPoint)
 	if entryID == ^uint32(0) {
-		return []*Candidate{}
+		return []*util.Candidate{}
 	}
 
 	distance := h.distance(query, entryPoint.Vector)
-	candidate := &Candidate{ID: entryID, Distance: distance}
+	candidate := &util.Candidate{ID: entryID, Distance: distance}
 
-	candidates.Push(candidate)
+	candidates.PushCandidate(candidate)
 	dynamic.PushCandidate(candidate)
 	visited[entryID] = true
 
@@ -267,14 +265,14 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 					visited[neighborID] = true
 
 					neighborDistance := h.distance(query, h.nodes[neighborID].Vector)
-					neighborCandidate := &Candidate{ID: neighborID, Distance: neighborDistance}
+					neighborCandidate := &util.Candidate{ID: neighborID, Distance: neighborDistance}
 
 					if candidates.Len() < ef || neighborDistance < candidates.Top().Distance {
-						candidates.Push(neighborCandidate)
+						candidates.PushCandidate(neighborCandidate)
 						dynamic.PushCandidate(neighborCandidate)
 
 						if candidates.Len() > ef {
-							candidates.Pop()
+							candidates.PopCandidate()
 						}
 					}
 				}
@@ -283,9 +281,10 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 	}
 
 	// Convert to sorted slice (best first)
-	result := make([]*Candidate, 0, candidates.Len())
+	result := make([]*util.Candidate, 0, candidates.Len())
 	for candidates.Len() > 0 {
-		result = append([]*Candidate{candidates.Pop()}, result...)
+		popped := candidates.PopCandidate()
+		result = append([]*util.Candidate{popped}, result...)
 	}
 
 	return result
@@ -321,17 +320,7 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// Helper functions for min/max (Go 1.21+ has these built-in)
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+func (h *Index) Delete(ctx context.Context, id string) error {
+	// TODO: Implement vector deletion
+	return fmt.Errorf("delete operation not yet implemented")
 }

@@ -44,12 +44,12 @@ func (h *MinHeap) Pop() interface{} {
 	return item
 }
 
-// Push adds a candidate to the heap
+// PushCandidate adds a candidate to the heap
 func (h *MinHeap) PushCandidate(c *Candidate) {
 	heap.Push(h, c)
 }
 
-// Pop removes and returns the minimum candidate
+// PopCandidate removes and returns the minimum candidate
 func (h *MinHeap) PopCandidate() *Candidate {
 	if h.Len() == 0 {
 		return nil
@@ -93,13 +93,13 @@ func (h *MaxHeap) Pop() interface{} {
 	return item
 }
 
-// Push adds a candidate to the heap
-func (h *MaxHeap) Push(c *Candidate) {
+// PushCandidate adds a candidate to the heap
+func (h *MaxHeap) PushCandidate(c *Candidate) {
 	heap.Push(h, c)
 }
 
-// Pop removes and returns the maximum candidate
-func (h *MaxHeap) Pop() *Candidate {
+// PopCandidate removes and returns the maximum candidate
+func (h *MaxHeap) PopCandidate() *Candidate {
 	if h.Len() == 0 {
 		return nil
 	}

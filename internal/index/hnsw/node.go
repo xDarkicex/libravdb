@@ -8,9 +8,3 @@ type Node struct {
 	Links    [][]uint32             // Adjacency lists for each level
 	Metadata map[string]interface{} // User metadata
 }
-
-// Candidate represents a search candidate with distance
-type Candidate struct {
-	ID       uint32  // Node ID in the index
-	Distance float32 // Distance to query
-}

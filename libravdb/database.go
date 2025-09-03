@@ -127,7 +127,7 @@ func (db *Database) ListCollections() []string {
 }
 
 // Health returns the current health status
-func (db *Database) Health(ctx context.Context) (*HealthStatus, error) {
+func (db *Database) Health(ctx context.Context) (*obs.HealthStatus, error) {
 	return db.health.Check(ctx)
 }
 

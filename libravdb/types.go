@@ -43,18 +43,6 @@ type CollectionStats struct {
 	MemoryUsage int64  `json:"memory_usage"`
 }
 
-// HealthStatus represents the health status of the database
-type HealthStatus struct {
-	Status string                  `json:"status"`
-	Checks map[string]*CheckResult `json:"checks"`
-}
-
-// CheckResult represents the result of a single health check
-type CheckResult struct {
-	Healthy bool   `json:"healthy"`
-	Message string `json:"message"`
-}
-
 func (it IndexType) String() string {
 	switch it {
 	case HNSW:

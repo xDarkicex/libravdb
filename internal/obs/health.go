@@ -2,9 +2,19 @@ package obs
 
 import (
 	"context"
-
-	"github.com/xDarkicex/libravdb/libravdb"
 )
+
+// HealthStatus represents the health status of the database
+type HealthStatus struct {
+	Status string                  `json:"status"`
+	Checks map[string]*CheckResult `json:"checks"`
+}
+
+// CheckResult represents the result of a single health check
+type CheckResult struct {
+	Healthy bool   `json:"healthy"`
+	Message string `json:"message"`
+}
 
 // HealthChecker performs health checks
 type HealthChecker struct {
@@ -17,10 +27,10 @@ func NewHealthChecker(db interface{}) *HealthChecker {
 }
 
 // Check performs health check
-func (hc *HealthChecker) Check(ctx context.Context) (*libravdb.HealthStatus, error) {
-	return &libravdb.HealthStatus{
+func (hc *HealthChecker) Check(ctx context.Context) (*HealthStatus, error) {
+	return &HealthStatus{
 		Status: "healthy",
-		Checks: map[string]*libravdb.CheckResult{
+		Checks: map[string]*CheckResult{
 			"basic": {
 				Healthy: true,
 				Message: "System operational",

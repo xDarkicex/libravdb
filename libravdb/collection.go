@@ -10,6 +10,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 // Collection represents a named collection of vectors with a specific schema
@@ -92,7 +93,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 			EfConstruction: config.EfConstruction,
 			EfSearch:       config.EfSearch,
 			ML:             config.ML,
-			Metric:         config.Metric,
+			Metric:         util.DistanceMetric(config.Metric),
 		})
 	default:
 		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
@@ -127,7 +128,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	}
 
 	// Create vector entry for storage (avoiding circular imports)
-	storageEntry := &storage.VectorEntry{
+	storageEntry := &index.VectorEntry{
 		ID:       id,
 		Vector:   vector,
 		Metadata: metadata,
