@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xDarkice/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
@@ -126,20 +126,20 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 			len(vector), c.config.Dimension)
 	}
 
-	// Create vector entry
-	entry := &VectorEntry{
+	// Create vector entry for storage (avoiding circular imports)
+	storageEntry := &storage.VectorEntry{
 		ID:       id,
 		Vector:   vector,
 		Metadata: metadata,
 	}
 
-	// Insert into index
-	if err := c.index.Insert(ctx, entry); err != nil {
+	// Insert into index (convert to index VectorEntry if needed)
+	if err := c.index.Insert(ctx, storageEntry); err != nil {
 		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
 	// Write to storage (WAL)
-	if err := c.storage.Insert(ctx, entry); err != nil {
+	if err := c.storage.Insert(ctx, storageEntry); err != nil {
 		// TODO: Rollback index insertion
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
@@ -180,12 +180,23 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 	}()
 
 	// Search index
-	results, err := c.index.Search(ctx, vector, k)
+	indexResults, err := c.index.Search(ctx, vector, k)
 	if err != nil {
 		if c.metrics != nil {
 			c.metrics.SearchErrors.Inc()
 		}
 		return nil, fmt.Errorf("index search failed: %w", err)
+	}
+
+	// Convert from index.SearchResult to libravdb.SearchResult
+	results := make([]*SearchResult, len(indexResults))
+	for i, r := range indexResults {
+		results[i] = &SearchResult{
+			ID:       r.ID,
+			Score:    r.Score,
+			Vector:   r.Vector,
+			Metadata: r.Metadata,
+		}
 	}
 
 	// Update metrics

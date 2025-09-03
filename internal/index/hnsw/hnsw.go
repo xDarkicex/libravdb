@@ -9,6 +9,23 @@ import (
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
+// VectorEntry represents a vector entry for HNSW indexing
+// This matches the interface definition in internal/index/interfaces.go
+type VectorEntry struct {
+	ID       string
+	Vector   []float32
+	Metadata map[string]interface{}
+}
+
+// SearchResult represents a search result from HNSW
+// This matches the interface definition in internal/index/interfaces.go
+type SearchResult struct {
+	ID       string
+	Score    float32
+	Vector   []float32
+	Metadata map[string]interface{}
+}
+
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
 	mu             sync.RWMutex
@@ -120,7 +137,10 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	// Phase 1: Search from top level to level 1
 	ep := h.entryPoint
 	for level := h.maxLevel; level > 0; level-- {
-		ep = h.searchLevel(query, ep, 1, level)[0]
+		candidates := h.searchLevel(query, ep, 1, level)
+		if len(candidates) > 0 {
+			ep = h.nodes[candidates[0].ID]
+		}
 	}
 
 	// Phase 2: Search level 0 with ef
@@ -228,11 +248,11 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 	candidate := &Candidate{ID: entryID, Distance: distance}
 
 	candidates.Push(candidate)
-	dynamic.Push(candidate)
+	dynamic.PushCandidate(candidate)
 	visited[entryID] = true
 
 	for dynamic.Len() > 0 {
-		current := dynamic.Pop()
+		current := dynamic.PopCandidate()
 
 		// Stop if current distance is worse than the ef-th best candidate
 		if candidates.Len() >= ef && current.Distance > candidates.Top().Distance {
@@ -251,7 +271,7 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 
 					if candidates.Len() < ef || neighborDistance < candidates.Top().Distance {
 						candidates.Push(neighborCandidate)
-						dynamic.Push(neighborCandidate)
+						dynamic.PushCandidate(neighborCandidate)
 
 						if candidates.Len() > ef {
 							candidates.Pop()
@@ -299,4 +319,19 @@ func (c *Config) validate() error {
 		return fmt.Errorf("ML must be positive")
 	}
 	return nil
+}
+
+// Helper functions for min/max (Go 1.21+ has these built-in)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
