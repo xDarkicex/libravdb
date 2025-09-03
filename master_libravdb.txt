@@ -1,0 +1,1455 @@
+Directory structure:
+└── libraVDB/
+    ├── README.md
+    ├── go.mod
+    ├── .gitingestignore
+    ├── .golangci.yml
+    ├── docs/
+    │   ├── design/
+    │   │   ├── api.md
+    │   │   ├── architecture.md
+    │   │   ├── hnsw.md
+    │   │   └── storage.md
+    │   ├── examples/
+    │   │   └── basic_usage.md
+    │   └── schema/
+    │       └── segment_v1.md
+    ├── internal/
+    │   ├── index/
+    │   │   ├── interfaces.go
+    │   │   ├── registry.go
+    │   │   └── hnsw/
+    │   │       ├── delete.go
+    │   │       ├── hnsw.go
+    │   │       ├── hnsw_test.go
+    │   │       ├── insert.go
+    │   │       ├── neighbors.go
+    │   │       ├── node.go
+    │   │       ├── params.go
+    │   │       └── search.go
+    │   ├── obs/
+    │   │   ├── circuit.go
+    │   │   ├── health.go
+    │   │   ├── metrics.go
+    │   │   ├── obs_test.go
+    │   │   └── tracing.go
+    │   ├── quant/
+    │   │   ├── interfaces.go
+    │   │   └── registry.go
+    │   ├── storage/
+    │   │   ├── interfaces.go
+    │   │   ├── registry.go
+    │   │   ├── lsm/
+    │   │   │   ├── collection.go
+    │   │   │   ├── lsm.go
+    │   │   │   └── lsm_test.go
+    │   │   ├── segments/
+    │   │   │   ├── catalog.go
+    │   │   │   ├── header.go
+    │   │   │   ├── reader.go
+    │   │   │   ├── segments_test.go
+    │   │   │   └── writer.go
+    │   │   └── wal/
+    │   │       ├── entry.go
+    │   │       ├── recovery.go
+    │   │       ├── wal.go
+    │   │       └── wal_test.go
+    │   └── util/
+    │       ├── distance.go
+    │       ├── encoding.go
+    │       ├── heap.go
+    │       ├── util_test.go
+    │       └── validation.go
+    ├── libravdb/
+    │   ├── collection.go
+    │   ├── database.go
+    │   ├── errors.go
+    │   ├── libravdb_test.go
+    │   ├── options.go
+    │   ├── query.go
+    │   └── types.go
+    ├── scripts/
+    │   ├── benchmark.sh
+    │   ├── generate_testdata.go
+    │   └── setup_dev.sh
+    ├── testdata/
+    │   ├── golden/
+    │   │   └── search_results.json
+    │   └── vectors/
+    │       ├── medium_dataset.json
+    │       └── small_dataset.json
+    └── .github/
+        └── workflows/
+            ├── ci.yml
+            └── release.yml
+
+================================================
+FILE: README.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: go.mod
+================================================
+module github.com/xDarkicex/libravdb
+
+go 1.25.0
+
+
+
+================================================
+FILE: .gitingestignore
+================================================
+*.txt
+LICENSE
+Makefile
+README.mod
+CONTRIBUTING.md 
+
+
+
+================================================
+FILE: .golangci.yml
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/design/api.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/design/architecture.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/design/hnsw.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/design/storage.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/examples/basic_usage.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: docs/schema/segment_v1.md
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/interfaces.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/registry.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/delete.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/hnsw.go
+================================================
+package hnsw
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"sync"
+
+	"github.com/xDarkicex/libravdb/internal/util"
+)
+
+// Index implements the HNSW algorithm for approximate nearest neighbor search
+type Index struct {
+	mu             sync.RWMutex
+	config         *Config
+	nodes          []*Node
+	entryPoint     *Node
+	maxLevel       int
+	levelGenerator *rand.Rand
+	distance       util.DistanceFunc
+	size           int
+}
+
+// Config holds HNSW configuration parameters
+type Config struct {
+	Dimension      int
+	M              int     // Maximum number of bi-directional links for each node
+	EfConstruction int     // Size of dynamic candidate list
+	EfSearch       int     // Size of dynamic candidate list during search
+	ML             float64 // Level generation factor (1/ln(2))
+	Metric         util.DistanceMetric
+	RandomSeed     int64 // For reproducible tests
+}
+
+// NewHNSW creates a new HNSW index
+func NewHNSW(config *Config) (*Index, error) {
+	if err := config.validate(); err != nil {
+		return nil, fmt.Errorf("invalid HNSW config: %w", err)
+	}
+
+	distanceFunc, err := util.GetDistanceFunc(config.Metric)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported distance metric: %w", err)
+	}
+
+	index := &Index{
+		config:         config,
+		nodes:          make([]*Node, 0),
+		levelGenerator: rand.New(rand.NewSource(config.RandomSeed)),
+		distance:       distanceFunc,
+	}
+
+	return index, nil
+}
+
+// Insert adds a new vector to the index
+func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Create new node
+	level := h.generateLevel()
+	node := &Node{
+		ID:       entry.ID,
+		Vector:   make([]float32, len(entry.Vector)),
+		Level:    level,
+		Metadata: entry.Metadata,
+		Links:    make([][]uint32, level+1),
+	}
+	copy(node.Vector, entry.Vector)
+
+	// Initialize empty link lists for each level
+	for i := 0; i <= level; i++ {
+		node.Links[i] = make([]uint32, 0, h.config.M)
+	}
+
+	nodeID := uint32(len(h.nodes))
+	h.nodes = append(h.nodes, node)
+
+	// If this is the first node, set it as entry point
+	if h.entryPoint == nil {
+		h.entryPoint = node
+		h.maxLevel = level
+		h.size++
+		return nil
+	}
+
+	// Find closest points and insert connections
+	if err := h.insertNode(ctx, node, nodeID); err != nil {
+		// Rollback: remove the node we just added
+		h.nodes = h.nodes[:len(h.nodes)-1]
+		return fmt.Errorf("failed to insert node: %w", err)
+	}
+
+	h.size++
+
+	// Update entry point if necessary
+	if level > h.maxLevel {
+		h.entryPoint = node
+		h.maxLevel = level
+	}
+
+	return nil
+}
+
+// Search finds the k nearest neighbors to the query vector
+func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.size == 0 {
+		return nil, fmt.Errorf("index is empty")
+	}
+
+	if len(query) != h.config.Dimension {
+		return nil, fmt.Errorf("query dimension %d does not match index dimension %d",
+			len(query), h.config.Dimension)
+	}
+
+	// Phase 1: Search from top level to level 1
+	ep := h.entryPoint
+	for level := h.maxLevel; level > 0; level-- {
+		ep = h.searchLevel(query, ep, 1, level)[0]
+	}
+
+	// Phase 2: Search level 0 with ef
+	ef := max(h.config.EfSearch, k)
+	candidates := h.searchLevel(query, ep, ef, 0)
+
+	// Convert to results and limit to k
+	results := make([]*SearchResult, 0, min(k, len(candidates)))
+	for i, candidate := range candidates {
+		if i >= k {
+			break
+		}
+		results = append(results, &SearchResult{
+			ID:       h.nodes[candidate.ID].ID,
+			Score:    candidate.Distance,
+			Vector:   h.nodes[candidate.ID].Vector,
+			Metadata: h.nodes[candidate.ID].Metadata,
+		})
+	}
+
+	return results, nil
+}
+
+// Size returns the number of vectors in the index
+func (h *Index) Size() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.size
+}
+
+// MemoryUsage returns approximate memory usage in bytes
+func (h *Index) MemoryUsage() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var usage int64
+	for _, node := range h.nodes {
+		// Vector data
+		usage += int64(len(node.Vector) * 4) // 4 bytes per float32
+
+		// Links
+		for _, links := range node.Links {
+			usage += int64(len(links) * 4) // 4 bytes per uint32
+		}
+
+		// Node overhead (approximate)
+		usage += 64
+	}
+
+	return usage
+}
+
+// Close shuts down the index
+func (h *Index) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Clear all data structures
+	h.nodes = nil
+	h.entryPoint = nil
+	h.size = 0
+
+	return nil
+}
+
+// generateLevel returns a random level for a new node
+func (h *Index) generateLevel() int {
+	level := 0
+	for h.levelGenerator.Float64() < h.config.ML && level < 16 { // Cap at 16 levels
+		level++
+	}
+	return level
+}
+
+// insertNode inserts a node into the graph structure
+func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error {
+	// TODO: Implement full HNSW insertion algorithm
+	// For now, just add basic connections to entry point
+
+	if h.entryPoint != nil {
+		entryID := h.findNodeID(h.entryPoint)
+		if entryID != ^uint32(0) {
+			// Add bidirectional connection at level 0
+			node.Links[0] = append(node.Links[0], entryID)
+			h.entryPoint.Links[0] = append(h.entryPoint.Links[0], nodeID)
+		}
+	}
+
+	return nil
+}
+
+// searchLevel performs search at a specific level
+func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int) []*Candidate {
+	visited := make(map[uint32]bool)
+	candidates := util.NewMaxHeap(ef)
+	dynamic := util.NewMinHeap(ef)
+
+	// Start with entry point
+	entryID := h.findNodeID(entryPoint)
+	if entryID == ^uint32(0) {
+		return []*Candidate{}
+	}
+
+	distance := h.distance(query, entryPoint.Vector)
+	candidate := &Candidate{ID: entryID, Distance: distance}
+
+	candidates.Push(candidate)
+	dynamic.Push(candidate)
+	visited[entryID] = true
+
+	for dynamic.Len() > 0 {
+		current := dynamic.Pop()
+
+		// Stop if current distance is worse than the ef-th best candidate
+		if candidates.Len() >= ef && current.Distance > candidates.Top().Distance {
+			break
+		}
+
+		// Check all connections at this level
+		currentNode := h.nodes[current.ID]
+		if level < len(currentNode.Links) {
+			for _, neighborID := range currentNode.Links[level] {
+				if !visited[neighborID] {
+					visited[neighborID] = true
+
+					neighborDistance := h.distance(query, h.nodes[neighborID].Vector)
+					neighborCandidate := &Candidate{ID: neighborID, Distance: neighborDistance}
+
+					if candidates.Len() < ef || neighborDistance < candidates.Top().Distance {
+						candidates.Push(neighborCandidate)
+						dynamic.Push(neighborCandidate)
+
+						if candidates.Len() > ef {
+							candidates.Pop()
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Convert to sorted slice (best first)
+	result := make([]*Candidate, 0, candidates.Len())
+	for candidates.Len() > 0 {
+		result = append([]*Candidate{candidates.Pop()}, result...)
+	}
+
+	return result
+}
+
+// findNodeID finds the ID of a node (helper function)
+func (h *Index) findNodeID(target *Node) uint32 {
+	for i, node := range h.nodes {
+		if node == target {
+			return uint32(i)
+		}
+	}
+	return ^uint32(0) // Not found
+}
+
+// validate checks if the configuration is valid
+func (c *Config) validate() error {
+	if c.Dimension <= 0 {
+		return fmt.Errorf("dimension must be positive")
+	}
+	if c.M <= 0 {
+		return fmt.Errorf("M must be positive")
+	}
+	if c.EfConstruction <= 0 {
+		return fmt.Errorf("EfConstruction must be positive")
+	}
+	if c.EfSearch <= 0 {
+		return fmt.Errorf("EfSearch must be positive")
+	}
+	if c.ML <= 0 {
+		return fmt.Errorf("ML must be positive")
+	}
+	return nil
+}
+
+
+
+================================================
+FILE: internal/index/hnsw/hnsw_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/insert.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/neighbors.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/node.go
+================================================
+package hnsw
+
+// Node represents a single node in the HNSW graph
+type Node struct {
+	ID       string                 // User-provided ID
+	Vector   []float32              // The vector data
+	Level    int                    // Maximum level this node exists in
+	Links    [][]uint32             // Adjacency lists for each level
+	Metadata map[string]interface{} // User metadata
+}
+
+// Candidate represents a search candidate with distance
+type Candidate struct {
+	ID       uint32  // Node ID in the index
+	Distance float32 // Distance to query
+}
+
+
+
+================================================
+FILE: internal/index/hnsw/params.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/index/hnsw/search.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/obs/circuit.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/obs/health.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/obs/metrics.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/obs/obs_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/obs/tracing.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/quant/interfaces.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/quant/registry.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/interfaces.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/registry.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/lsm/collection.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/lsm/lsm.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/lsm/lsm_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/segments/catalog.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/segments/header.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/segments/reader.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/segments/segments_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/segments/writer.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/wal/entry.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/wal/recovery.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/storage/wal/wal.go
+================================================
+package wal
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"time"
+)
+
+// WAL implements write-ahead logging for durability
+type WAL struct {
+	mu     sync.RWMutex
+	file   *os.File
+	writer *bufio.Writer
+	path   string
+	offset int64
+	closed bool
+}
+
+// Entry represents a single WAL entry
+type Entry struct {
+	Timestamp uint64
+	Operation Operation
+	ID        string
+	Vector    []float32
+	Metadata  map[string]interface{}
+}
+
+// Operation defines the type of operation
+type Operation uint8
+
+const (
+	OpInsert Operation = iota
+	OpUpdate
+	OpDelete
+)
+
+// New creates a new WAL instance
+func New(path string) (*WAL, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL file: %w", err)
+	}
+
+	// Get current file size
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to stat WAL file: %w", err)
+	}
+
+	wal := &WAL{
+		file:   file,
+		writer: bufio.NewWriter(file),
+		path:   path,
+		offset: stat.Size(),
+	}
+
+	return wal, nil
+}
+
+// Append adds a new entry to the WAL
+func (w *WAL) Append(ctx context.Context, entry *Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return fmt.Errorf("WAL is closed")
+	}
+
+	// Set timestamp if not provided
+	if entry.Timestamp == 0 {
+		entry.Timestamp = uint64(time.Now().UnixNano())
+	}
+
+	// Serialize entry
+	data, err := w.serializeEntry(entry)
+	if err != nil {
+		return fmt.Errorf("failed to serialize entry: %w", err)
+	}
+
+	// Write length prefix
+	if err := binary.Write(w.writer, binary.LittleEndian, uint32(len(data))); err != nil {
+		return fmt.Errorf("failed to write entry length: %w", err)
+	}
+
+	// Write data
+	if _, err := w.writer.Write(data); err != nil {
+		return fmt.Errorf("failed to write entry data: %w", err)
+	}
+
+	// Flush to ensure durability
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush WAL: %w", err)
+	}
+
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL: %w", err)
+	}
+
+	w.offset += int64(4 + len(data))
+	return nil
+}
+
+// Read reads all entries from the WAL for recovery
+func (w *WAL) Read() ([]*Entry, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	// Open read-only file handle
+	file, err := os.Open(w.path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL for reading: %w", err)
+	}
+	defer file.Close()
+
+	var entries []*Entry
+	reader := bufio.NewReader(file)
+
+	for {
+		// Read length prefix
+		var length uint32
+		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("failed to read entry length: %w", err)
+		}
+
+		// Read entry data
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return nil, fmt.Errorf("failed to read entry data: %w", err)
+		}
+
+		// Deserialize entry
+		entry, err := w.deserializeEntry(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize entry: %w", err)
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+// Truncate removes all entries from the WAL
+func (w *WAL) Truncate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return fmt.Errorf("WAL is closed")
+	}
+
+	// Close current file
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL file: %w", err)
+	}
+
+	// Recreate empty file
+	file, err := os.Create(w.path)
+	if err != nil {
+		return fmt.Errorf("failed to recreate WAL file: %w", err)
+	}
+
+	w.file = file
+	w.writer = bufio.NewWriter(file)
+	w.offset = 0
+
+	return nil
+}
+
+// Close shuts down the WAL
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+
+	var errors []error
+
+	if err := w.writer.Flush(); err != nil {
+		errors = append(errors, err)
+	}
+
+	if err := w.file.Sync(); err != nil {
+		errors = append(errors, err)
+	}
+
+	if err := w.file.Close(); err != nil {
+		errors = append(errors, err)
+	}
+
+	w.closed = true
+
+	if len(errors) > 0 {
+		return fmt.Errorf("errors during WAL close: %v", errors)
+	}
+
+	return nil
+}
+
+// serializeEntry converts an entry to bytes
+func (w *WAL) serializeEntry(entry *Entry) ([]byte, error) {
+	// TODO: Implement efficient binary serialization
+	// For Phase 1, use a simple format
+
+	// This is a placeholder implementation
+	// In production, use protobuf, msgpack, or custom binary format
+	return []byte(fmt.Sprintf("%d,%d,%s", entry.Timestamp, entry.Operation, entry.ID)), nil
+}
+
+// deserializeEntry converts bytes back to an entry
+func (w *WAL) deserializeEntry(data []byte) (*Entry, error) {
+	// TODO: Implement deserialization matching serializeEntry
+	// This is a placeholder
+	return &Entry{}, nil
+}
+
+
+
+================================================
+FILE: internal/storage/wal/wal_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/util/distance.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/util/encoding.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/util/heap.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/util/util_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: internal/util/validation.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: libravdb/collection.go
+================================================
+package libravdb
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	"github.com/xDarkice/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/storage"
+)
+
+// Collection represents a named collection of vectors with a specific schema
+type Collection struct {
+	mu      sync.RWMutex
+	name    string
+	config  *CollectionConfig
+	index   index.Index
+	storage storage.Collection
+	metrics *obs.Metrics
+	closed  bool
+}
+
+// CollectionConfig holds collection-specific configuration
+type CollectionConfig struct {
+	Dimension int
+	Metric    DistanceMetric
+	IndexType IndexType
+	// HNSW specific parameters
+	M              int     // Max connections per node
+	EfConstruction int     // Size of dynamic candidate list during construction
+	EfSearch       int     // Size of dynamic candidate list during search
+	ML             float64 // Level generation factor
+}
+
+// DistanceMetric defines the distance function to use
+type DistanceMetric int
+
+const (
+	L2Distance DistanceMetric = iota
+	InnerProduct
+	CosineDistance
+)
+
+// IndexType defines the index algorithm to use
+type IndexType int
+
+const (
+	HNSW IndexType = iota
+	IVFPQ
+)
+
+// newCollection creates a new collection instance
+func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metrics, opts ...CollectionOption) (*Collection, error) {
+	config := &CollectionConfig{
+		Dimension:      768, // Default for common embeddings
+		Metric:         CosineDistance,
+		IndexType:      HNSW,
+		M:              32,
+		EfConstruction: 200,
+		EfSearch:       50,
+		ML:             1.0 / math.Log(2.0),
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		if err := opt(config); err != nil {
+			return nil, fmt.Errorf("failed to apply collection option: %w", err)
+		}
+	}
+
+	// Validate configuration
+	if err := config.validate(); err != nil {
+		return nil, fmt.Errorf("invalid collection config: %w", err)
+	}
+
+	// Create storage for this collection
+	collectionStorage, err := storageEngine.CreateCollection(name, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create collection storage: %w", err)
+	}
+
+	// Create index
+	var idx index.Index
+	switch config.IndexType {
+	case HNSW:
+		idx, err = index.NewHNSW(&index.HNSWConfig{
+			Dimension:      config.Dimension,
+			M:              config.M,
+			EfConstruction: config.EfConstruction,
+			EfSearch:       config.EfSearch,
+			ML:             config.ML,
+			Metric:         config.Metric,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create index: %w", err)
+	}
+
+	return &Collection{
+		name:    name,
+		config:  config,
+		index:   idx,
+		storage: collectionStorage,
+		metrics: metrics,
+	}, nil
+}
+
+// Insert adds or updates a vector in the collection
+func (c *Collection) Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Validate input
+	if len(vector) != c.config.Dimension {
+		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+			len(vector), c.config.Dimension)
+	}
+
+	// Create vector entry
+	entry := &VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	// Insert into index
+	if err := c.index.Insert(ctx, entry); err != nil {
+		return fmt.Errorf("failed to insert into index: %w", err)
+	}
+
+	// Write to storage (WAL)
+	if err := c.storage.Insert(ctx, entry); err != nil {
+		// TODO: Rollback index insertion
+		return fmt.Errorf("failed to write to storage: %w", err)
+	}
+
+	// Update metrics
+	if c.metrics != nil {
+		c.metrics.VectorInserts.Inc()
+	}
+
+	return nil
+}
+
+// Search performs a vector similarity search
+func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResult, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return nil, ErrCollectionClosed
+	}
+
+	// Validate input
+	if len(vector) != c.config.Dimension {
+		return nil, fmt.Errorf("query vector dimension %d does not match collection dimension %d",
+			len(vector), c.config.Dimension)
+	}
+
+	if k <= 0 {
+		return nil, fmt.Errorf("k must be positive, got %d", k)
+	}
+
+	// Start timing
+	start := time.Now()
+	defer func() {
+		if c.metrics != nil {
+			c.metrics.SearchLatency.Observe(time.Since(start).Seconds())
+		}
+	}()
+
+	// Search index
+	results, err := c.index.Search(ctx, vector, k)
+	if err != nil {
+		if c.metrics != nil {
+			c.metrics.SearchErrors.Inc()
+		}
+		return nil, fmt.Errorf("index search failed: %w", err)
+	}
+
+	// Update metrics
+	if c.metrics != nil {
+		c.metrics.SearchQueries.Inc()
+	}
+
+	return &SearchResult{
+		Results: results,
+		Took:    time.Since(start),
+	}, nil
+}
+
+// Query returns a new query builder for this collection
+func (c *Collection) Query(ctx context.Context) *QueryBuilder {
+	return &QueryBuilder{
+		ctx:        ctx,
+		collection: c,
+		limit:      10, // default
+	}
+}
+
+// Stats returns collection statistics
+func (c *Collection) Stats() *CollectionStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return &CollectionStats{
+		Name:        c.name,
+		VectorCount: c.index.Size(),
+		Dimension:   c.config.Dimension,
+		IndexType:   c.config.IndexType.String(),
+		MemoryUsage: c.index.MemoryUsage(),
+	}
+}
+
+// Close shuts down the collection
+func (c *Collection) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil
+	}
+
+	var errors []error
+
+	if err := c.index.Close(); err != nil {
+		errors = append(errors, err)
+	}
+
+	if err := c.storage.Close(); err != nil {
+		errors = append(errors, err)
+	}
+
+	c.closed = true
+
+	if len(errors) > 0 {
+		return fmt.Errorf("errors during collection shutdown: %v", errors)
+	}
+
+	return nil
+}
+
+// validate checks if the collection configuration is valid
+func (config *CollectionConfig) validate() error {
+	if config.Dimension <= 0 {
+		return fmt.Errorf("dimension must be positive, got %d", config.Dimension)
+	}
+
+	if config.M <= 0 {
+		return fmt.Errorf("M must be positive, got %d", config.M)
+	}
+
+	if config.EfConstruction <= 0 {
+		return fmt.Errorf("EfConstruction must be positive, got %d", config.EfConstruction)
+	}
+
+	if config.EfSearch <= 0 {
+		return fmt.Errorf("EfSearch must be positive, got %d", config.EfSearch)
+	}
+
+	return nil
+}
+
+
+
+================================================
+FILE: libravdb/database.go
+================================================
+// Package libravdb provides a high-performance vector database library
+// optimized for Go applications with HNSW indexing and LSM storage.
+package libravdb
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/storage"
+)
+
+// Database represents the main vector database instance
+type Database struct {
+	mu          sync.RWMutex
+	collections map[string]*Collection
+	storage     storage.Engine
+	metrics     *obs.Metrics
+	health      *obs.HealthChecker
+	config      *Config
+	closed      bool
+}
+
+// Config holds database-wide configuration
+type Config struct {
+	StoragePath    string
+	MetricsEnabled bool
+	TracingEnabled bool
+	MaxCollections int
+}
+
+// New creates a new Database instance with the given options
+func New(opts ...Option) (*Database, error) {
+	config := &Config{
+		StoragePath:    "./data",
+		MetricsEnabled: true,
+		TracingEnabled: false,
+		MaxCollections: 100,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		if err := opt(config); err != nil {
+			return nil, fmt.Errorf("failed to apply option: %w", err)
+		}
+	}
+
+	// Initialize storage engine
+	storageEngine, err := storage.NewLSM(config.StoragePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
+
+	// Initialize observability
+	var metrics *obs.Metrics
+	if config.MetricsEnabled {
+		metrics = obs.NewMetrics()
+	}
+
+	db := &Database{
+		collections: make(map[string]*Collection),
+		storage:     storageEngine,
+		metrics:     metrics,
+		config:      config,
+	}
+
+	// Initialize health checker
+	db.health = obs.NewHealthChecker(db)
+
+	return db, nil
+}
+
+// CreateCollection creates a new collection with the specified options
+func (db *Database) CreateCollection(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	if _, exists := db.collections[name]; exists {
+		return nil, fmt.Errorf("collection %s already exists", name)
+	}
+
+	if len(db.collections) >= db.config.MaxCollections {
+		return nil, ErrTooManyCollections
+	}
+
+	collection, err := newCollection(name, db.storage, db.metrics, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create collection: %w", err)
+	}
+
+	db.collections[name] = collection
+	return collection, nil
+}
+
+// GetCollection retrieves an existing collection by name
+func (db *Database) GetCollection(name string) (*Collection, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	collection, exists := db.collections[name]
+	if !exists {
+		return nil, fmt.Errorf("collection %s not found", name)
+	}
+
+	return collection, nil
+}
+
+// ListCollections returns the names of all collections
+func (db *Database) ListCollections() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	names := make([]string, 0, len(db.collections))
+	for name := range db.collections {
+		names = append(names, name)
+	}
+	return names
+}
+
+// Health returns the current health status
+func (db *Database) Health(ctx context.Context) (*HealthStatus, error) {
+	return db.health.Check(ctx)
+}
+
+// Stats returns database statistics
+func (db *Database) Stats() *DatabaseStats {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	stats := &DatabaseStats{
+		CollectionCount: len(db.collections),
+		Collections:     make(map[string]*CollectionStats),
+	}
+
+	for name, collection := range db.collections {
+		stats.Collections[name] = collection.Stats()
+	}
+
+	return stats
+}
+
+// Close gracefully shuts down the database
+func (db *Database) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed {
+		return nil
+	}
+
+	var errors []error
+
+	// Close all collections
+	for _, collection := range db.collections {
+		if err := collection.Close(); err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	// Close storage
+	if err := db.storage.Close(); err != nil {
+		errors = append(errors, err)
+	}
+
+	db.closed = true
+
+	if len(errors) > 0 {
+		return fmt.Errorf("errors during shutdown: %v", errors)
+	}
+
+	return nil
+}
+
+
+
+================================================
+FILE: libravdb/errors.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: libravdb/libravdb_test.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: libravdb/options.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: libravdb/query.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: libravdb/types.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: scripts/benchmark.sh
+================================================
+[Empty file]
+
+
+================================================
+FILE: scripts/generate_testdata.go
+================================================
+[Empty file]
+
+
+================================================
+FILE: scripts/setup_dev.sh
+================================================
+[Empty file]
+
+
+================================================
+FILE: testdata/golden/search_results.json
+================================================
+[Empty file]
+
+
+================================================
+FILE: testdata/vectors/medium_dataset.json
+================================================
+[Empty file]
+
+
+================================================
+FILE: testdata/vectors/small_dataset.json
+================================================
+[Empty file]
+
+
+================================================
+FILE: .github/workflows/ci.yml
+================================================
+[Empty file]
+
+
+================================================
+FILE: .github/workflows/release.yml
+================================================
+[Empty file]
+
