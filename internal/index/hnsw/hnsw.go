@@ -100,7 +100,7 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		return nil
 	}
 
-	// Find closest points and insert connections
+	// Delegate to insertion logic in insert.go
 	if err := h.insertNode(ctx, node, nodeID); err != nil {
 		// Rollback: remove the node we just added
 		h.nodes = h.nodes[:len(h.nodes)-1]
@@ -211,23 +211,6 @@ func (h *Index) generateLevel() int {
 		level++
 	}
 	return level
-}
-
-// insertNode inserts a node into the graph structure
-func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error {
-	// TODO: Implement full HNSW insertion algorithm
-	// For now, just add basic connections to entry point
-
-	if h.entryPoint != nil {
-		entryID := h.findNodeID(h.entryPoint)
-		if entryID != ^uint32(0) {
-			// Add bidirectional connection at level 0
-			node.Links[0] = append(node.Links[0], entryID)
-			h.entryPoint.Links[0] = append(h.entryPoint.Links[0], nodeID)
-		}
-	}
-
-	return nil
 }
 
 // searchLevel performs search at a specific level

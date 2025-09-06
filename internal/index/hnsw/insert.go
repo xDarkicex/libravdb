@@ -8,6 +8,16 @@ import (
 
 // insertNode implements the complete HNSW insertion algorithm
 func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error {
+	// Handle the second node (simple connection to entry point)
+	if h.size == 1 {
+		entryID := h.findNodeID(h.entryPoint)
+		if entryID != ^uint32(0) && node.Level >= 0 {
+			node.Links[0] = append(node.Links[0], entryID)
+			h.entryPoint.Links[0] = append(h.entryPoint.Links[0], nodeID)
+		}
+		return nil
+	}
+
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
 	entryPoints := []*util.Candidate{{ID: h.findNodeID(h.entryPoint), Distance: 0}}
 
