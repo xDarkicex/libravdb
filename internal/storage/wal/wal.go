@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -208,19 +209,14 @@ func (w *WAL) Close() error {
 	return nil
 }
 
-// serializeEntry converts an entry to bytes
 func (w *WAL) serializeEntry(entry *Entry) ([]byte, error) {
-	// TODO: Implement efficient binary serialization
-	// For Phase 1, use a simple format
-
-	// This is a placeholder implementation
-	// In production, use protobuf, msgpack, or custom binary format
-	return []byte(fmt.Sprintf("%d,%d,%s", entry.Timestamp, entry.Operation, entry.ID)), nil
+	// TODO: true implementation, replace json
+	return json.Marshal(entry)
 }
 
-// deserializeEntry converts bytes back to an entry
 func (w *WAL) deserializeEntry(data []byte) (*Entry, error) {
-	// TODO: Implement deserialization matching serializeEntry
-	// This is a placeholder
-	return &Entry{}, nil
+	// TODO: true implementation, replace json
+	var entry Entry
+	err := json.Unmarshal(data, &entry)
+	return &entry, err
 }
