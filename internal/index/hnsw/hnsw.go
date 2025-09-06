@@ -26,14 +26,16 @@ type SearchResult struct {
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
-	mu             sync.RWMutex
-	config         *Config
-	nodes          []*Node
-	entryPoint     *Node
-	maxLevel       int
-	levelGenerator *rand.Rand
-	distance       util.DistanceFunc
-	size           int
+	mu                   sync.RWMutex
+	config               *Config
+	nodes                []*Node
+	entryPoint           *Node
+	maxLevel             int
+	levelGenerator       *rand.Rand
+	distance             util.DistanceFunc
+	size                 int
+	idToIndex            map[string]uint32 // O(1) ID to node index lookup
+	entryPointCandidates []uint32          // High-level nodes for entry point selection
 }
 
 // Config holds HNSW configuration parameters
@@ -59,19 +61,25 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 
 	index := &Index{
-		config:         config,
-		nodes:          make([]*Node, 0),
-		levelGenerator: rand.New(rand.NewSource(config.RandomSeed)),
-		distance:       distanceFunc,
+		config:               config,
+		nodes:                make([]*Node, 0),
+		levelGenerator:       rand.New(rand.NewSource(config.RandomSeed)),
+		distance:             distanceFunc,
+		idToIndex:            make(map[string]uint32),
+		entryPointCandidates: make([]uint32, 0),
 	}
 
 	return index, nil
 }
 
-// Insert adds a new vector to the index
 func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Check for duplicate ID
+	if _, exists := h.idToIndex[entry.ID]; exists {
+		return fmt.Errorf("node with ID '%s' already exists", entry.ID)
+	}
 
 	// Create new node
 	level := h.generateLevel()
@@ -92,6 +100,15 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	nodeID := uint32(len(h.nodes))
 	h.nodes = append(h.nodes, node)
 
+	// Add to ID mapping
+	h.idToIndex[entry.ID] = nodeID
+
+	// Add to entry point candidates if level is high enough
+	// Using level >= 2 as threshold for entry point candidates
+	if level >= 2 {
+		h.entryPointCandidates = append(h.entryPointCandidates, nodeID)
+	}
+
 	// If this is the first node, set it as entry point
 	if h.entryPoint == nil {
 		h.entryPoint = node
@@ -102,8 +119,19 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 
 	// Delegate to insertion logic in insert.go
 	if err := h.insertNode(ctx, node, nodeID); err != nil {
-		// Rollback: remove the node we just added
+		// Rollback: remove the node we just added and clean up mappings
 		h.nodes = h.nodes[:len(h.nodes)-1]
+		delete(h.idToIndex, entry.ID)
+
+		// Remove from entry point candidates if it was added
+		if level >= 2 && len(h.entryPointCandidates) > 0 {
+			// Remove the last added candidate (which would be this node)
+			lastIdx := len(h.entryPointCandidates) - 1
+			if h.entryPointCandidates[lastIdx] == nodeID {
+				h.entryPointCandidates = h.entryPointCandidates[:lastIdx]
+			}
+		}
+
 		return fmt.Errorf("failed to insert node: %w", err)
 	}
 
@@ -244,6 +272,5 @@ func (c *Config) validate() error {
 }
 
 func (h *Index) Delete(ctx context.Context, id string) error {
-	// TODO: Implement vector deletion
-	return fmt.Errorf("delete operation not yet implemented")
+	return h.deleteNode(ctx, id)
 }
