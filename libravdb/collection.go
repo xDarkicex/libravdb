@@ -10,6 +10,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/storage/lsm"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -26,14 +27,15 @@ type Collection struct {
 
 // CollectionConfig holds collection-specific configuration
 type CollectionConfig struct {
-	Dimension int
-	Metric    DistanceMetric
-	IndexType IndexType
+	Dimension int            `json:"dimension"`
+	Metric    DistanceMetric `json:"metric"`
+	IndexType IndexType      `json:"index_type"`
 	// HNSW specific parameters
-	M              int     // Max connections per node
-	EfConstruction int     // Size of dynamic candidate list during construction
-	EfSearch       int     // Size of dynamic candidate list during search
-	ML             float64 // Level generation factor
+	M              int     `json:"m"`               // Max connections per node
+	EfConstruction int     `json:"ef_construction"` // Size of dynamic candidate list during construction
+	EfSearch       int     `json:"ef_search"`       // Size of dynamic candidate list during search
+	ML             float64 `json:"ml"`              // Level generation factor
+	Version        int     `json:"version"`         // Config version for future compatibility
 }
 
 // DistanceMetric defines the distance function to use
@@ -77,8 +79,20 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		return nil, fmt.Errorf("invalid collection config: %w", err)
 	}
 
-	// Create storage for this collection
-	collectionStorage, err := storageEngine.CreateCollection(name, config)
+	// Convert to LSM config format
+	lsmConfig := &lsm.CollectionConfig{
+		Dimension:      config.Dimension,
+		Metric:         int(config.Metric),
+		IndexType:      int(config.IndexType),
+		M:              config.M,
+		EfConstruction: config.EfConstruction,
+		EfSearch:       config.EfSearch,
+		ML:             config.ML,
+		Version:        1,
+	}
+
+	// Create storage for this collection - PASS THE CONFIG
+	collectionStorage, err := storageEngine.CreateCollection(name, lsmConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection storage: %w", err)
 	}
@@ -110,6 +124,56 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		storage: collectionStorage,
 		metrics: metrics,
 	}, nil
+}
+
+// newCollectionFromStorage creates a collection instance from existing storage
+func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, lsmConfig *lsm.CollectionConfig) (*Collection, error) {
+	// Convert LSM config to libravdb config
+	config := &CollectionConfig{
+		Dimension:      lsmConfig.Dimension,
+		Metric:         DistanceMetric(lsmConfig.Metric),
+		IndexType:      IndexType(lsmConfig.IndexType),
+		M:              lsmConfig.M,
+		EfConstruction: lsmConfig.EfConstruction,
+		EfSearch:       lsmConfig.EfSearch,
+		ML:             lsmConfig.ML,
+		Version:        lsmConfig.Version,
+	}
+
+	// Create index with stored config
+	idx, err := index.NewHNSW(&index.HNSWConfig{
+		Dimension:      config.Dimension,
+		M:              config.M,
+		EfConstruction: config.EfConstruction,
+		EfSearch:       config.EfSearch,
+		ML:             config.ML,
+		Metric:         util.DistanceMetric(config.Metric),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create index: %w", err)
+	}
+
+	collection := &Collection{
+		name:    name,
+		config:  config,
+		index:   idx,
+		storage: storageCollection,
+		metrics: metrics,
+	}
+
+	// Rebuild index from storage data
+	if err := collection.rebuildIndex(context.Background()); err != nil {
+		return nil, fmt.Errorf("failed to rebuild index: %w", err)
+	}
+
+	return collection, nil
+}
+
+// rebuildIndex rebuilds the index from storage data
+func (c *Collection) rebuildIndex(ctx context.Context) error {
+	return c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+		return c.index.Insert(ctx, entry)
+	})
 }
 
 // Insert adds or updates a vector in the collection

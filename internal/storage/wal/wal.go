@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -210,13 +210,64 @@ func (w *WAL) Close() error {
 }
 
 func (w *WAL) serializeEntry(entry *Entry) ([]byte, error) {
-	// TODO: true implementation, replace json
-	return json.Marshal(entry)
+	// Pre-calculate size to avoid reallocations
+	size := 8 + 1 + 4 + len(entry.ID) + 4 + len(entry.Vector)*4 + 4 // base size
+	buf := make([]byte, 0, size)
+
+	// Header: timestamp (8) + operation (1)
+	buf = binary.LittleEndian.AppendUint64(buf, entry.Timestamp)
+	buf = append(buf, byte(entry.Operation))
+
+	// ID: length (4) + string bytes
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entry.ID)))
+	buf = append(buf, []byte(entry.ID)...)
+
+	// Vector: length (4) + float32 bytes
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entry.Vector)))
+	for _, f := range entry.Vector {
+		buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(f))
+	}
+
+	// Metadata: serialize as msgpack or skip for Phase 1
+	buf = binary.LittleEndian.AppendUint32(buf, 0) // metadata length = 0
+
+	return buf, nil
 }
 
 func (w *WAL) deserializeEntry(data []byte) (*Entry, error) {
-	// TODO: true implementation, replace json
-	var entry Entry
-	err := json.Unmarshal(data, &entry)
-	return &entry, err
+	if len(data) < 13 { // minimum size
+		return nil, fmt.Errorf("entry too small")
+	}
+
+	entry := &Entry{}
+	offset := 0
+
+	// Read timestamp
+	entry.Timestamp = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+
+	// Read operation
+	entry.Operation = Operation(data[offset])
+	offset += 1
+
+	// Read ID
+	idLen := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+	entry.ID = string(data[offset : offset+int(idLen)])
+	offset += int(idLen)
+
+	// Read vector
+	vecLen := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+	entry.Vector = make([]float32, vecLen)
+	for i := range entry.Vector {
+		bits := binary.LittleEndian.Uint32(data[offset:])
+		entry.Vector[i] = math.Float32frombits(bits)
+		offset += 4
+	}
+
+	// Skip metadata for Phase 1
+	entry.Metadata = make(map[string]interface{})
+
+	return entry, nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/storage/lsm" // Direct import here
 )
 
 // Database represents the main vector database instance
@@ -46,8 +47,8 @@ func New(opts ...Option) (*Database, error) {
 		}
 	}
 
-	// Initialize storage engine
-	storageEngine, err := storage.NewLSM(config.StoragePath)
+	// Initialize storage engine DIRECTLY - no more NewLSM wrapper
+	storageEngine, err := lsm.New(config.StoragePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
@@ -67,6 +68,11 @@ func New(opts ...Option) (*Database, error) {
 
 	// Initialize health checker
 	db.health = obs.NewHealthChecker(db)
+
+	// Load existing collections from storage
+	if err := db.loadExistingCollections(context.Background()); err != nil {
+		return nil, fmt.Errorf("failed to load existing collections: %w", err)
+	}
 
 	return db, nil
 }
@@ -99,17 +105,37 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 
 // GetCollection retrieves an existing collection by name
 func (db *Database) GetCollection(name string) (*Collection, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	if db.closed {
 		return nil, ErrDatabaseClosed
 	}
 
+	// Check if collection is already loaded
 	collection, exists := db.collections[name]
-	if !exists {
+	if exists {
+		return collection, nil
+	}
+
+	// Try to load collection from storage with configuration
+	if lsmEngine, ok := db.storage.(*lsm.Engine); ok {
+		storageCollection, config, err := lsmEngine.GetCollectionWithConfig(name)
+		if err != nil {
+			return nil, fmt.Errorf("collection %s not found", name)
+		}
+
+		// Create Collection wrapper with stored configuration
+		collection, err = newCollectionFromStorage(name, storageCollection, db.metrics, config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create collection from storage: %w", err)
+		}
+	} else {
 		return nil, fmt.Errorf("collection %s not found", name)
 	}
+
+	// Cache the collection
+	db.collections[name] = collection
 
 	return collection, nil
 }
@@ -146,6 +172,20 @@ func (db *Database) Stats() *DatabaseStats {
 	}
 
 	return stats
+}
+
+// loadExistingCollections discovers and loads existing collections from storage
+func (db *Database) loadExistingCollections(ctx context.Context) error {
+	// This is a simplified approach - we'll need to discover collections
+	// from the storage layer. For now, we'll implement a basic version
+	// that works with the LSM storage engine.
+
+	// The LSM engine already loads existing collections internally,
+	// but we need to create Collection wrappers for them at the database level.
+	// This is a design issue that should be addressed in a future refactor.
+
+	// For now, we'll implement lazy loading in GetCollection instead
+	return nil
 }
 
 // Close gracefully shuts down the database

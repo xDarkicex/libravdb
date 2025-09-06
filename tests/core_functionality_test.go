@@ -6,15 +6,22 @@ import (
 	"os"
 	"testing"
 
+	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
 func TestCoreFunctionality(t *testing.T) {
+	// Clean up metrics before test
+	obs.ResetForTesting()
+
 	ctx := context.Background()
 
 	// Clean up any existing test data
 	os.RemoveAll("./test_data")
-	defer os.RemoveAll("./test_data")
+	defer func() {
+		os.RemoveAll("./test_data")
+		obs.ResetForTesting() // Clean up metrics after test
+	}()
 
 	// Create database
 	db, err := libravdb.New(
