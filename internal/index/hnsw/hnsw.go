@@ -135,18 +135,18 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	// Phase 1: Search from top level to level 1
 	ep := h.entryPoint
 	for level := h.maxLevel; level > 0; level-- {
-		candidates := h.searchLevel(query, ep, 1, level)
+		candidates := h.searchLevel(query, ep, 1, level) // This calls the method from search.go
 		if len(candidates) > 0 {
 			ep = h.nodes[candidates[0].ID]
 		}
 	}
 
 	// Phase 2: Search level 0 with ef
-	ef := max(h.config.EfSearch, k)
+	ef := max(h.config.EfSearch, k) // Using builtin max function
 	candidates := h.searchLevel(query, ep, ef, 0)
 
 	// Convert to results and limit to k
-	results := make([]*SearchResult, 0, min(k, len(candidates)))
+	results := make([]*SearchResult, 0, min(k, len(candidates))) // Using builtin min function
 	for i, candidate := range candidates {
 		if i >= k {
 			break
@@ -211,66 +211,6 @@ func (h *Index) generateLevel() int {
 		level++
 	}
 	return level
-}
-
-// searchLevel performs search at a specific level
-func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int) []*util.Candidate {
-	visited := make(map[uint32]bool)
-	candidates := util.NewMaxHeap(ef)
-	dynamic := util.NewMinHeap(ef)
-
-	// Start with entry point
-	entryID := h.findNodeID(entryPoint)
-	if entryID == ^uint32(0) {
-		return []*util.Candidate{}
-	}
-
-	distance := h.distance(query, entryPoint.Vector)
-	candidate := &util.Candidate{ID: entryID, Distance: distance}
-
-	candidates.PushCandidate(candidate)
-	dynamic.PushCandidate(candidate)
-	visited[entryID] = true
-
-	for dynamic.Len() > 0 {
-		current := dynamic.PopCandidate()
-
-		// Stop if current distance is worse than the ef-th best candidate
-		if candidates.Len() >= ef && current.Distance > candidates.Top().Distance {
-			break
-		}
-
-		// Check all connections at this level
-		currentNode := h.nodes[current.ID]
-		if level < len(currentNode.Links) {
-			for _, neighborID := range currentNode.Links[level] {
-				if !visited[neighborID] {
-					visited[neighborID] = true
-
-					neighborDistance := h.distance(query, h.nodes[neighborID].Vector)
-					neighborCandidate := &util.Candidate{ID: neighborID, Distance: neighborDistance}
-
-					if candidates.Len() < ef || neighborDistance < candidates.Top().Distance {
-						candidates.PushCandidate(neighborCandidate)
-						dynamic.PushCandidate(neighborCandidate)
-
-						if candidates.Len() > ef {
-							candidates.PopCandidate()
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Convert to sorted slice (best first)
-	result := make([]*util.Candidate, 0, candidates.Len())
-	for candidates.Len() > 0 {
-		popped := candidates.PopCandidate()
-		result = append([]*util.Candidate{popped}, result...)
-	}
-
-	return result
 }
 
 // findNodeID finds the ID of a node (helper function)
