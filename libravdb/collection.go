@@ -36,6 +36,10 @@ type CollectionConfig struct {
 	EfSearch       int     `json:"ef_search"`       // Size of dynamic candidate list during search
 	ML             float64 `json:"ml"`              // Level generation factor
 	Version        int     `json:"version"`         // Config version for future compatibility
+	// Persistence configuration
+	AutoSave     bool          `json:"auto_save"`     // Enable automatic index saving
+	SaveInterval time.Duration `json:"save_interval"` // Interval between automatic saves
+	SavePath     string        `json:"save_path"`     // Path for automatic saves
 }
 
 // DistanceMetric defines the distance function to use
@@ -322,6 +326,49 @@ func (c *Collection) Close() error {
 
 	if len(errors) > 0 {
 		return fmt.Errorf("errors during collection shutdown: %v", errors)
+	}
+
+	return nil
+}
+
+// SaveIndex persists the collection's index to disk
+func (c *Collection) SaveIndex(ctx context.Context, path string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return fmt.Errorf("collection is closed")
+	}
+
+	return c.index.SaveToDisk(ctx, path)
+}
+
+// LoadIndex loads the collection's index from disk
+func (c *Collection) LoadIndex(ctx context.Context, path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return fmt.Errorf("collection is closed")
+	}
+
+	return c.index.LoadFromDisk(ctx, path)
+}
+
+// GetIndexMetadata returns metadata about the collection's index
+func (c *Collection) GetIndexMetadata() *index.PersistenceMetadata {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return nil
+	}
+
+	// Get HNSW-specific metadata if available
+	if hnswIndex, ok := c.index.(interface {
+		GetPersistenceMetadata() *index.PersistenceMetadata
+	}); ok {
+		return hnswIndex.GetPersistenceMetadata()
 	}
 
 	return nil

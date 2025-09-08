@@ -1,6 +1,9 @@
 package libravdb
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Option represents a database configuration option
 type Option func(*Config) error
@@ -79,14 +82,35 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 	}
 }
 
-// TODO: finish implementation
 // WithIndexPersistence enables or disables index persistence
 func WithIndexPersistence(enabled bool) CollectionOption {
-	// For Week 1: Just store the option, implementation comes later
 	return func(c *CollectionConfig) error {
-		// We'll add persistence config to CollectionConfig in Week 3
-		// For now, this is a no-op that validates the option works
-		_ = enabled // Use the parameter to avoid unused variable warning
+		c.AutoSave = enabled
+		if enabled {
+			c.SaveInterval = 5 * time.Minute // Default interval
+		}
+		return nil
+	}
+}
+
+// WithPersistencePath sets the path for automatic index saves
+func WithPersistencePath(path string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if path == "" {
+			return fmt.Errorf("persistence path cannot be empty")
+		}
+		c.SavePath = path
+		return nil
+	}
+}
+
+// WithSaveInterval sets the interval between automatic saves
+func WithSaveInterval(interval time.Duration) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if interval <= 0 {
+			return fmt.Errorf("save interval must be positive")
+		}
+		c.SaveInterval = interval
 		return nil
 	}
 }

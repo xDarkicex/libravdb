@@ -277,25 +277,13 @@ func (h *Index) Delete(ctx context.Context, id string) error {
 }
 
 // SaveToDisk persists the HNSW index to disk in binary format
-// This is a stub implementation for Week 1 - full implementation in Week 2
 func (h *Index) SaveToDisk(ctx context.Context, path string) error {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	// TODO: implement full SaveToDisk which should go in save.go file, hnsw file is for delegation.
-	// Week 1: Return not implemented error
-	// This will be replaced with full implementation in Week 2
-	return fmt.Errorf("SaveToDisk not yet implemented - coming in Week 2")
+	return h.saveToDiskImpl(ctx, path)
 }
 
 // LoadFromDisk rebuilds HNSW index from disk
-// This is a stub implementation for Week 1 - full implementation in Week 2
 func (h *Index) LoadFromDisk(ctx context.Context, path string) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Week 1: Return not implemented error
-	// This will be replaced with full implementation in Week 2
-	return fmt.Errorf("LoadFromDisk not yet implemented - coming in Week 2")
+	return h.loadFromDiskImpl(ctx, path)
 }
 
 // GetPersistenceMetadata returns metadata about the current index state
@@ -311,9 +299,46 @@ func (h *Index) GetPersistenceMetadata() *HNSWPersistenceMetadata {
 		Version:       FormatVersion,
 		NodeCount:     h.size,
 		Dimension:     h.config.Dimension,
-		MaxLevel:      h.maxLevel,
-		CreatedAt:     time.Now(), // Will be actual creation time in Week 2
-		ChecksumCRC32: 0,          // Will be computed in Week 2
-		FileSize:      0,          // Will be actual file size in Week 2
+		MaxLevel:      h.getMaxLevel(),
+		CreatedAt:     time.Now(),
+		ChecksumCRC32: h.calculateCRC32(),
+		FileSize:      h.estimateFileSize(),
 	}
+}
+
+// Helper methods for metadata
+func (h *Index) getMaxLevel() int {
+	maxLevel := 0
+	for _, node := range h.nodes {
+		if node != nil && node.Level > maxLevel {
+			maxLevel = node.Level
+		}
+	}
+	return maxLevel
+}
+
+func (h *Index) estimateFileSize() int64 {
+	// Rough estimate of serialized size
+	var size int64
+
+	// Header + config
+	size += 64
+
+	// Nodes
+	for _, node := range h.nodes {
+		if node != nil {
+			size += int64(len(node.ID)) + int64(len(node.Vector)*4) + 16
+		}
+	}
+
+	// Links
+	for _, node := range h.nodes {
+		if node != nil {
+			for _, connections := range node.Links {
+				size += int64(len(connections) * 4) // 4 bytes per uint32
+			}
+		}
+	}
+
+	return size
 }
