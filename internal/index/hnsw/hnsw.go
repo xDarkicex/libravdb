@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -273,4 +274,46 @@ func (c *Config) validate() error {
 
 func (h *Index) Delete(ctx context.Context, id string) error {
 	return h.deleteNode(ctx, id)
+}
+
+// SaveToDisk persists the HNSW index to disk in binary format
+// This is a stub implementation for Week 1 - full implementation in Week 2
+func (h *Index) SaveToDisk(ctx context.Context, path string) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	// TODO: implement full SaveToDisk which should go in save.go file, hnsw file is for delegation.
+	// Week 1: Return not implemented error
+	// This will be replaced with full implementation in Week 2
+	return fmt.Errorf("SaveToDisk not yet implemented - coming in Week 2")
+}
+
+// LoadFromDisk rebuilds HNSW index from disk
+// This is a stub implementation for Week 1 - full implementation in Week 2
+func (h *Index) LoadFromDisk(ctx context.Context, path string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Week 1: Return not implemented error
+	// This will be replaced with full implementation in Week 2
+	return fmt.Errorf("LoadFromDisk not yet implemented - coming in Week 2")
+}
+
+// GetPersistenceMetadata returns metadata about the current index state
+func (h *Index) GetPersistenceMetadata() *HNSWPersistenceMetadata {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.size == 0 {
+		return nil // No metadata for empty index
+	}
+
+	return &HNSWPersistenceMetadata{
+		Version:       FormatVersion,
+		NodeCount:     h.size,
+		Dimension:     h.config.Dimension,
+		MaxLevel:      h.maxLevel,
+		CreatedAt:     time.Now(), // Will be actual creation time in Week 2
+		ChecksumCRC32: 0,          // Will be computed in Week 2
+		FileSize:      0,          // Will be actual file size in Week 2
+	}
 }

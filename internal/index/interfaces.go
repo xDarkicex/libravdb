@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -15,6 +16,11 @@ type Index interface {
 	Size() int
 	MemoryUsage() int64
 	Close() error
+
+	// NEW: Index Persistence Methods
+	SaveToDisk(ctx context.Context, path string) error
+	LoadFromDisk(ctx context.Context, path string) error
+	GetPersistenceMetadata() *PersistenceMetadata
 }
 
 // VectorEntry represents a vector entry (avoid circular imports)
@@ -30,6 +36,18 @@ type SearchResult struct {
 	Score    float32
 	Vector   []float32
 	Metadata map[string]interface{}
+}
+
+// NEW: PersistenceMetadata holds metadata about persisted index
+type PersistenceMetadata struct {
+	Version       uint32    `json:"version"`        // Binary format version
+	NodeCount     int       `json:"node_count"`     // Total number of nodes
+	Dimension     int       `json:"dimension"`      // Vector dimension
+	MaxLevel      int       `json:"max_level"`      // Maximum graph level
+	IndexType     string    `json:"index_type"`     // Index algorithm (HNSW, etc.)
+	CreatedAt     time.Time `json:"created_at"`     // When index was persisted
+	ChecksumCRC32 uint32    `json:"checksum_crc32"` // File integrity checksum
+	FileSize      int64     `json:"file_size"`      // Total file size in bytes
 }
 
 // HNSWConfig holds configuration for HNSW index
@@ -94,6 +112,36 @@ func (w *hnswWrapper) MemoryUsage() int64 {
 // Close delegates to the wrapped index
 func (w *hnswWrapper) Close() error {
 	return w.index.Close()
+}
+
+// NEW: SaveToDisk delegates persistence to the wrapped index
+func (w *hnswWrapper) SaveToDisk(ctx context.Context, path string) error {
+	return w.index.SaveToDisk(ctx, path)
+}
+
+// NEW: LoadFromDisk delegates loading to the wrapped index
+func (w *hnswWrapper) LoadFromDisk(ctx context.Context, path string) error {
+	return w.index.LoadFromDisk(ctx, path)
+}
+
+// NEW: GetPersistenceMetadata delegates to the wrapped index
+func (w *hnswWrapper) GetPersistenceMetadata() *PersistenceMetadata {
+	hnswMeta := w.index.GetPersistenceMetadata()
+	if hnswMeta == nil {
+		return nil
+	}
+
+	// Convert from HNSW metadata to interface metadata
+	return &PersistenceMetadata{
+		Version:       hnswMeta.Version,
+		NodeCount:     hnswMeta.NodeCount,
+		Dimension:     hnswMeta.Dimension,
+		MaxLevel:      hnswMeta.MaxLevel,
+		IndexType:     "HNSW",
+		CreatedAt:     hnswMeta.CreatedAt,
+		ChecksumCRC32: hnswMeta.ChecksumCRC32,
+		FileSize:      hnswMeta.FileSize,
+	}
 }
 
 // NewHNSW creates a new HNSW index

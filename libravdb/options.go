@@ -78,3 +78,15 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 		return nil
 	}
 }
+
+// TODO: finish implementation
+// WithIndexPersistence enables or disables index persistence
+func WithIndexPersistence(enabled bool) CollectionOption {
+	// For Week 1: Just store the option, implementation comes later
+	return func(c *CollectionConfig) error {
+		// We'll add persistence config to CollectionConfig in Week 3
+		// For now, this is a no-op that validates the option works
+		_ = enabled // Use the parameter to avoid unused variable warning
+		return nil
+	}
+}
