@@ -118,7 +118,10 @@ func (h *Index) connectBidirectional(nodeID uint32, neighbors []*util.Candidate,
 
 		// Add node to neighbor's links
 		neighborNode := h.nodes[neighbor.ID]
-		neighborNode.Links[level] = append(neighborNode.Links[level], nodeID)
+		// Only add the connection if the neighbor has this level
+		if level < len(neighborNode.Links) {
+			neighborNode.Links[level] = append(neighborNode.Links[level], nodeID)
+		}
 	}
 }
 
@@ -131,6 +134,11 @@ func (h *Index) pruneNeighborConnections(neighbors []*util.Candidate, level int)
 
 	for _, neighbor := range neighbors {
 		neighborNode := h.nodes[neighbor.ID]
+
+		// Skip if neighbor doesn't have this level
+		if level >= len(neighborNode.Links) {
+			continue
+		}
 
 		if len(neighborNode.Links[level]) > maxM {
 			// Need to prune - select best maxM connections
