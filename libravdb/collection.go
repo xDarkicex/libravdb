@@ -9,6 +9,7 @@ import (
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/storage/lsm"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -40,6 +41,8 @@ type CollectionConfig struct {
 	AutoSave     bool          `json:"auto_save"`     // Enable automatic index saving
 	SaveInterval time.Duration `json:"save_interval"` // Interval between automatic saves
 	SavePath     string        `json:"save_path"`     // Path for automatic saves
+	// Quantization configuration (optional)
+	Quantization *quant.QuantizationConfig `json:"quantization,omitempty"`
 }
 
 // DistanceMetric defines the distance function to use
@@ -112,6 +115,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 			EfSearch:       config.EfSearch,
 			ML:             config.ML,
 			Metric:         util.DistanceMetric(config.Metric),
+			Quantization:   config.Quantization,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
@@ -152,6 +156,7 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		EfSearch:       config.EfSearch,
 		ML:             config.ML,
 		Metric:         util.DistanceMetric(config.Metric),
+		Quantization:   config.Quantization,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create index: %w", err)

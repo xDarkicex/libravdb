@@ -16,7 +16,23 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 		return []*util.Candidate{}
 	}
 
-	distance := h.distance(query, entryPoint.Vector)
+	// Compute distance handling quantization
+	var distance float32
+	var err error
+	if entryPoint.CompressedVector != nil && h.quantizer != nil {
+		distance, err = h.quantizer.DistanceToQuery(entryPoint.CompressedVector, query)
+		if err != nil {
+			// Fall back to decompressed vector
+			vec, decompErr := h.quantizer.Decompress(entryPoint.CompressedVector)
+			if decompErr != nil {
+				return []*util.Candidate{}
+			}
+			distance = h.distance(query, vec)
+		}
+	} else {
+		distance = h.distance(query, entryPoint.Vector)
+	}
+
 	candidate := &util.Candidate{ID: entryID, Distance: distance}
 
 	candidates.PushCandidate(candidate)
@@ -38,7 +54,24 @@ func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int
 				if !visited[neighborID] {
 					visited[neighborID] = true
 
-					neighborDistance := h.distance(query, h.nodes[neighborID].Vector)
+					// Compute distance handling quantization
+					var neighborDistance float32
+					neighborNode := h.nodes[neighborID]
+					if neighborNode.CompressedVector != nil && h.quantizer != nil {
+						var err error
+						neighborDistance, err = h.quantizer.DistanceToQuery(neighborNode.CompressedVector, query)
+						if err != nil {
+							// Fall back to decompressed vector
+							vec, decompErr := h.quantizer.Decompress(neighborNode.CompressedVector)
+							if decompErr != nil {
+								continue // Skip this neighbor if decompression fails
+							}
+							neighborDistance = h.distance(query, vec)
+						}
+					} else {
+						neighborDistance = h.distance(query, neighborNode.Vector)
+					}
+
 					neighborCandidate := &util.Candidate{
 						ID:       neighborID,
 						Distance: neighborDistance,

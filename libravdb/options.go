@@ -3,6 +3,8 @@ package libravdb
 import (
 	"fmt"
 	"time"
+
+	"github.com/xDarkicex/libravdb/internal/quant"
 )
 
 // Option represents a database configuration option
@@ -111,6 +113,54 @@ func WithSaveInterval(interval time.Duration) CollectionOption {
 			return fmt.Errorf("save interval must be positive")
 		}
 		c.SaveInterval = interval
+		return nil
+	}
+}
+
+// WithQuantization enables vector quantization for the collection
+func WithQuantization(config *quant.QuantizationConfig) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if config == nil {
+			return fmt.Errorf("quantization config cannot be nil")
+		}
+		if err := config.Validate(); err != nil {
+			return fmt.Errorf("invalid quantization config: %w", err)
+		}
+		c.Quantization = config
+		return nil
+	}
+}
+
+// WithProductQuantization enables Product Quantization with specified parameters
+func WithProductQuantization(codebooks, bits int, trainRatio float64) CollectionOption {
+	return func(c *CollectionConfig) error {
+		config := &quant.QuantizationConfig{
+			Type:       quant.ProductQuantization,
+			Codebooks:  codebooks,
+			Bits:       bits,
+			TrainRatio: trainRatio,
+			CacheSize:  1000, // Default cache size
+		}
+		if err := config.Validate(); err != nil {
+			return fmt.Errorf("invalid product quantization config: %w", err)
+		}
+		c.Quantization = config
+		return nil
+	}
+}
+
+// WithScalarQuantization enables Scalar Quantization with specified parameters
+func WithScalarQuantization(bits int, trainRatio float64) CollectionOption {
+	return func(c *CollectionConfig) error {
+		config := &quant.QuantizationConfig{
+			Type:       quant.ScalarQuantization,
+			Bits:       bits,
+			TrainRatio: trainRatio,
+		}
+		if err := config.Validate(); err != nil {
+			return fmt.Errorf("invalid scalar quantization config: %w", err)
+		}
+		c.Quantization = config
 		return nil
 	}
 }

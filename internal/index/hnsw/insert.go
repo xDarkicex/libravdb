@@ -90,16 +90,30 @@ func (h *Index) selectNeighborsHeuristic(queryVector []float32, candidates []*ut
 
 // shouldSelectCandidate checks if a candidate should be selected based on the heuristic
 func (h *Index) shouldSelectCandidate(queryVector []float32, candidate *util.Candidate, selected []*util.Candidate) bool {
-	candidateVector := h.nodes[candidate.ID].Vector
+	candidateNode := h.nodes[candidate.ID]
+
+	// Get candidate vector (handling quantization)
+	candidateVector, err := h.getNodeVector(candidateNode)
+	if err != nil {
+		return false // Skip if we can't get the vector
+	}
 
 	// Check pruning condition: don't select if there's a closer neighbor
 	// that makes this candidate redundant
 	for _, sel := range selected {
-		selectedVector := h.nodes[sel.ID].Vector
+		selectedNode := h.nodes[sel.ID]
+		selectedVector, err := h.getNodeVector(selectedNode)
+		if err != nil {
+			continue // Skip if we can't get the vector
+		}
 
 		// If the distance from candidate to selected neighbor is less than
 		// the distance from candidate to query, then candidate is redundant
-		distCandidateToSelected := h.distance(candidateVector, selectedVector)
+		distCandidateToSelected, err := h.computeDistance(candidateVector, selectedVector, candidateNode, selectedNode)
+		if err != nil {
+			continue // Skip if distance computation fails
+		}
+
 		if distCandidateToSelected < candidate.Distance {
 			return false
 		}
@@ -145,7 +159,18 @@ func (h *Index) pruneNeighborConnections(neighbors []*util.Candidate, level int)
 			candidates := make([]*util.Candidate, 0, len(neighborNode.Links[level]))
 
 			for _, linkID := range neighborNode.Links[level] {
-				distance := h.distance(neighborNode.Vector, h.nodes[linkID].Vector)
+				linkNode := h.nodes[linkID]
+				distance, err := h.computeDistance(nil, nil, neighborNode, linkNode)
+				if err != nil {
+					// Fall back to decompressed vectors
+					neighborVec, err1 := h.getNodeVector(neighborNode)
+					linkVec, err2 := h.getNodeVector(linkNode)
+					if err1 != nil || err2 != nil {
+						continue // Skip if we can't get vectors
+					}
+					distance = h.distance(neighborVec, linkVec)
+				}
+
 				candidates = append(candidates, &util.Candidate{
 					ID:       linkID,
 					Distance: distance,

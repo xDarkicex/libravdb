@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -37,6 +38,10 @@ type Index struct {
 	size                 int
 	idToIndex            map[string]uint32 // O(1) ID to node index lookup
 	entryPointCandidates []uint32          // High-level nodes for entry point selection
+	// Quantization support
+	quantizer           quant.Quantizer
+	trainingVectors     [][]float32 // Vectors collected for quantizer training
+	quantizationTrained bool
 }
 
 // Config holds HNSW configuration parameters
@@ -48,6 +53,8 @@ type Config struct {
 	ML             float64 // Level generation factor (1/ln(2))
 	Metric         util.DistanceMetric
 	RandomSeed     int64 // For reproducible tests
+	// Quantization configuration (optional)
+	Quantization *quant.QuantizationConfig
 }
 
 // NewHNSW creates a new HNSW index
@@ -68,6 +75,17 @@ func NewHNSW(config *Config) (*Index, error) {
 		distance:             distanceFunc,
 		idToIndex:            make(map[string]uint32),
 		entryPointCandidates: make([]uint32, 0),
+		trainingVectors:      make([][]float32, 0),
+		quantizationTrained:  false,
+	}
+
+	// Initialize quantizer if quantization is configured
+	if config.Quantization != nil {
+		quantizer, err := quant.Create(config.Quantization)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create quantizer: %w", err)
+		}
+		index.quantizer = quantizer
 	}
 
 	return index, nil
@@ -82,16 +100,45 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		return fmt.Errorf("node with ID '%s' already exists", entry.ID)
 	}
 
+	// Handle quantization training collection
+	if h.quantizer != nil && !h.quantizationTrained {
+		// Collect vectors for training
+		vectorCopy := make([]float32, len(entry.Vector))
+		copy(vectorCopy, entry.Vector)
+		h.trainingVectors = append(h.trainingVectors, vectorCopy)
+
+		// Train quantizer when we have enough training data
+		if len(h.trainingVectors) >= h.getTrainingThreshold() {
+			if err := h.trainQuantizer(ctx); err != nil {
+				return fmt.Errorf("failed to train quantizer: %w", err)
+			}
+		}
+	}
+
 	// Create new node
 	level := h.generateLevel()
 	node := &Node{
 		ID:       entry.ID,
-		Vector:   make([]float32, len(entry.Vector)),
 		Level:    level,
 		Metadata: entry.Metadata,
 		Links:    make([][]uint32, level+1),
 	}
-	copy(node.Vector, entry.Vector)
+
+	// Handle vector storage (quantized or original)
+	if h.quantizer != nil && h.quantizationTrained {
+		// Compress the vector
+		compressed, err := h.quantizer.Compress(entry.Vector)
+		if err != nil {
+			return fmt.Errorf("failed to compress vector: %w", err)
+		}
+		node.CompressedVector = compressed
+		// Don't store original vector to save memory
+		node.Vector = nil
+	} else {
+		// Store original vector
+		node.Vector = make([]float32, len(entry.Vector))
+		copy(node.Vector, entry.Vector)
+	}
 
 	// Initialize empty link lists for each level
 	for i := 0; i <= level; i++ {
@@ -180,11 +227,27 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 		if i >= k {
 			break
 		}
+
+		node := h.nodes[candidate.ID]
+
+		// Get the vector for the result (decompressed if quantized)
+		var resultVector []float32
+		if node.CompressedVector != nil && h.quantizer != nil {
+			var err error
+			resultVector, err = h.quantizer.Decompress(node.CompressedVector)
+			if err != nil {
+				// If decompression fails, return nil vector
+				resultVector = nil
+			}
+		} else {
+			resultVector = node.Vector
+		}
+
 		results = append(results, &SearchResult{
-			ID:       h.nodes[candidate.ID].ID,
+			ID:       node.ID,
 			Score:    candidate.Distance,
-			Vector:   h.nodes[candidate.ID].Vector,
-			Metadata: h.nodes[candidate.ID].Metadata,
+			Vector:   resultVector,
+			Metadata: node.Metadata,
 		})
 	}
 
@@ -205,8 +268,12 @@ func (h *Index) MemoryUsage() int64 {
 
 	var usage int64
 	for _, node := range h.nodes {
-		// Vector data
-		usage += int64(len(node.Vector) * 4) // 4 bytes per float32
+		// Vector data (original or compressed)
+		if node.CompressedVector != nil {
+			usage += int64(len(node.CompressedVector))
+		} else if node.Vector != nil {
+			usage += int64(len(node.Vector) * 4) // 4 bytes per float32
+		}
 
 		// Links
 		for _, links := range node.Links {
@@ -215,6 +282,18 @@ func (h *Index) MemoryUsage() int64 {
 
 		// Node overhead (approximate)
 		usage += 64
+	}
+
+	// Add quantizer memory usage if present
+	if h.quantizer != nil {
+		usage += h.quantizer.MemoryUsage()
+	}
+
+	// Add training vectors memory usage if still collecting
+	if h.trainingVectors != nil {
+		for _, vec := range h.trainingVectors {
+			usage += int64(len(vec) * 4)
+		}
 	}
 
 	return usage
@@ -269,7 +348,91 @@ func (c *Config) validate() error {
 	if c.ML <= 0 {
 		return fmt.Errorf("ML must be positive")
 	}
+
+	// Validate quantization config if present
+	if c.Quantization != nil {
+		if err := c.Quantization.Validate(); err != nil {
+			return fmt.Errorf("invalid quantization config: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// getTrainingThreshold returns the minimum number of vectors needed for training
+func (h *Index) getTrainingThreshold() int {
+	if h.config.Quantization == nil {
+		return 0
+	}
+
+	// Use a reasonable threshold based on quantization type
+	switch h.config.Quantization.Type {
+	case quant.ProductQuantization:
+		// PQ needs more training data for k-means clustering
+		return max(1000, h.config.Quantization.Codebooks*256)
+	case quant.ScalarQuantization:
+		// Scalar quantization needs less training data
+		return max(100, h.config.Dimension*10)
+	default:
+		return 1000
+	}
+}
+
+// trainQuantizer trains the quantizer using collected training vectors
+func (h *Index) trainQuantizer(ctx context.Context) error {
+	if h.quantizer == nil || len(h.trainingVectors) == 0 {
+		return fmt.Errorf("no quantizer or training data available")
+	}
+
+	// Use a subset of training vectors based on TrainRatio
+	trainRatio := h.config.Quantization.TrainRatio
+	if trainRatio <= 0 || trainRatio > 1 {
+		trainRatio = 0.1 // Default to 10%
+	}
+
+	trainCount := int(float64(len(h.trainingVectors)) * trainRatio)
+	if trainCount < 1 {
+		trainCount = len(h.trainingVectors)
+	}
+
+	trainingSet := h.trainingVectors[:trainCount]
+
+	if err := h.quantizer.Train(ctx, trainingSet); err != nil {
+		return fmt.Errorf("quantizer training failed: %w", err)
+	}
+
+	h.quantizationTrained = true
+
+	// Clear training vectors to free memory
+	h.trainingVectors = nil
+
+	return nil
+}
+
+// getNodeVector returns the vector for a node, handling quantization
+func (h *Index) getNodeVector(node *Node) ([]float32, error) {
+	if node.CompressedVector != nil && h.quantizer != nil {
+		return h.quantizer.Decompress(node.CompressedVector)
+	}
+	return node.Vector, nil
+}
+
+// computeDistance computes distance between vectors, handling quantization
+func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float32, error) {
+	// If both nodes are quantized, use quantized distance computation
+	if node1 != nil && node2 != nil &&
+		node1.CompressedVector != nil && node2.CompressedVector != nil &&
+		h.quantizer != nil {
+		return h.quantizer.Distance(node1.CompressedVector, node2.CompressedVector)
+	}
+
+	// If one is a query vector and the other is quantized
+	if node2 != nil && node2.CompressedVector != nil && h.quantizer != nil {
+		return h.quantizer.DistanceToQuery(node2.CompressedVector, vec1)
+	}
+
+	// Fall back to regular distance computation
+	return h.distance(vec1, vec2), nil
 }
 
 func (h *Index) Delete(ctx context.Context, id string) error {

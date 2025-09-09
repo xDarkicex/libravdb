@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
+	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -58,6 +59,8 @@ type HNSWConfig struct {
 	EfSearch       int
 	ML             float64
 	Metric         util.DistanceMetric
+	// Quantization configuration (optional)
+	Quantization *quant.QuantizationConfig
 }
 
 // hnswWrapper wraps the HNSW index to adapt between interface types
@@ -155,6 +158,7 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		ML:             config.ML,
 		Metric:         config.Metric,
 		RandomSeed:     0, // Default seed for Phase 1
+		Quantization:   config.Quantization,
 	}
 
 	hnswIndex, err := hnsw.NewHNSW(hnswConfig)
