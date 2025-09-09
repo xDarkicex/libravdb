@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 )
 
@@ -161,6 +162,138 @@ func WithScalarQuantization(bits int, trainRatio float64) CollectionOption {
 			return fmt.Errorf("invalid scalar quantization config: %w", err)
 		}
 		c.Quantization = config
+		return nil
+	}
+}
+
+// WithFlat configures the collection to use a Flat (brute-force) index
+func WithFlat() CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.IndexType = Flat
+		return nil
+	}
+}
+
+// WithAutoIndexSelection enables automatic index type selection based on collection size
+// Small collections (<10K vectors) use Flat, medium collections use HNSW, large collections use IVF-PQ
+func WithAutoIndexSelection(enabled bool) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.AutoIndexSelection = enabled
+		return nil
+	}
+}
+
+// WithMemoryLimit sets the maximum memory usage for the collection in bytes
+func WithMemoryLimit(bytes int64) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if bytes < 0 {
+			return fmt.Errorf("memory limit must be non-negative, got %d", bytes)
+		}
+		c.MemoryLimit = bytes
+		return nil
+	}
+}
+
+// WithCachePolicy sets the cache eviction policy for the collection
+func WithCachePolicy(policy CachePolicy) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.CachePolicy = policy
+		return nil
+	}
+}
+
+// WithMemoryMapping enables or disables memory mapping for large indices
+func WithMemoryMapping(enabled bool) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.EnableMMapping = enabled
+		return nil
+	}
+}
+
+// WithMemoryConfig sets advanced memory management configuration
+func WithMemoryConfig(config *memory.MemoryConfig) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if config == nil {
+			return fmt.Errorf("memory config cannot be nil")
+		}
+		if config.MaxMemory < 0 {
+			return fmt.Errorf("max memory must be non-negative, got %d", config.MaxMemory)
+		}
+		if config.MonitorInterval <= 0 {
+			return fmt.Errorf("monitor interval must be positive, got %v", config.MonitorInterval)
+		}
+		c.MemoryConfig = config
+		return nil
+	}
+}
+
+// WithMetadataSchema sets the schema for metadata fields with type validation
+func WithMetadataSchema(schema MetadataSchema) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if err := schema.Validate(); err != nil {
+			return fmt.Errorf("invalid metadata schema: %w", err)
+		}
+		c.MetadataSchema = schema
+		return nil
+	}
+}
+
+// WithIndexedFields specifies which metadata fields should be indexed for faster filtering
+func WithIndexedFields(fields ...string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if len(fields) == 0 {
+			return fmt.Errorf("at least one field must be specified")
+		}
+
+		// Validate that all fields exist in schema if schema is set
+		if c.MetadataSchema != nil {
+			for _, field := range fields {
+				if _, exists := c.MetadataSchema[field]; !exists {
+					return fmt.Errorf("indexed field '%s' not found in metadata schema", field)
+				}
+			}
+		}
+
+		c.IndexedFields = fields
+		return nil
+	}
+}
+
+// WithBatchConfig sets the batch processing configuration
+func WithBatchConfig(config BatchConfig) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if config.ChunkSize <= 0 {
+			return fmt.Errorf("batch chunk size must be positive, got %d", config.ChunkSize)
+		}
+		if config.MaxConcurrency <= 0 {
+			return fmt.Errorf("batch max concurrency must be positive, got %d", config.MaxConcurrency)
+		}
+		if config.TimeoutPerChunk <= 0 {
+			return fmt.Errorf("batch timeout per chunk must be positive, got %v", config.TimeoutPerChunk)
+		}
+		c.BatchConfig = config
+		return nil
+	}
+}
+
+// WithBatchChunkSize sets the chunk size for batch operations
+func WithBatchChunkSize(size int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if size <= 0 {
+			return fmt.Errorf("batch chunk size must be positive, got %d", size)
+		}
+		c.BatchConfig.ChunkSize = size
+		return nil
+	}
+}
+
+// WithBatchConcurrency sets the maximum concurrency for batch operations
+func WithBatchConcurrency(concurrency int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if concurrency <= 0 {
+			return fmt.Errorf("batch concurrency must be positive, got %d", concurrency)
+		}
+		c.BatchConfig.MaxConcurrency = concurrency
 		return nil
 	}
 }

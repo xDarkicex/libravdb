@@ -1,6 +1,7 @@
 package libravdb
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -49,7 +50,111 @@ func (it IndexType) String() string {
 		return "HNSW"
 	case IVFPQ:
 		return "IVF-PQ"
+	case Flat:
+		return "Flat"
 	default:
 		return "Unknown"
+	}
+}
+
+// FieldType represents the type of a metadata field for schema validation
+type FieldType int
+
+const (
+	StringField FieldType = iota
+	IntField
+	FloatField
+	BoolField
+	TimeField
+	StringArrayField
+	IntArrayField
+	FloatArrayField
+)
+
+// String returns the string representation of the field type
+func (ft FieldType) String() string {
+	switch ft {
+	case StringField:
+		return "string"
+	case IntField:
+		return "int"
+	case FloatField:
+		return "float"
+	case BoolField:
+		return "bool"
+	case TimeField:
+		return "time"
+	case StringArrayField:
+		return "string_array"
+	case IntArrayField:
+		return "int_array"
+	case FloatArrayField:
+		return "float_array"
+	default:
+		return "unknown"
+	}
+}
+
+// CachePolicy defines cache eviction policies
+type CachePolicy int
+
+const (
+	LRUCache CachePolicy = iota
+	LFUCache
+	FIFOCache
+)
+
+// String returns the string representation of the cache policy
+func (cp CachePolicy) String() string {
+	switch cp {
+	case LRUCache:
+		return "lru"
+	case LFUCache:
+		return "lfu"
+	case FIFOCache:
+		return "fifo"
+	default:
+		return "unknown"
+	}
+}
+
+// MetadataSchema defines the schema for metadata fields
+type MetadataSchema map[string]FieldType
+
+// Validate checks if the metadata schema is valid
+func (ms MetadataSchema) Validate() error {
+	for field, fieldType := range ms {
+		if field == "" {
+			return fmt.Errorf("field name cannot be empty")
+		}
+		if fieldType < StringField || fieldType > FloatArrayField {
+			return fmt.Errorf("invalid field type for field '%s': %v", field, fieldType)
+		}
+	}
+	return nil
+}
+
+// BatchConfig configures batch operation behavior
+type BatchConfig struct {
+	// ChunkSize is the number of items to process in each chunk
+	ChunkSize int `json:"chunk_size"`
+
+	// MaxConcurrency is the maximum number of concurrent workers
+	MaxConcurrency int `json:"max_concurrency"`
+
+	// FailFast determines if batch operations should stop on first error
+	FailFast bool `json:"fail_fast"`
+
+	// TimeoutPerChunk is the timeout for processing each chunk
+	TimeoutPerChunk time.Duration `json:"timeout_per_chunk"`
+}
+
+// DefaultBatchConfig returns sensible default batch configuration
+func DefaultBatchConfig() BatchConfig {
+	return BatchConfig{
+		ChunkSize:       1000,
+		MaxConcurrency:  4,
+		FailFast:        false,
+		TimeoutPerChunk: 30 * time.Second,
 	}
 }
