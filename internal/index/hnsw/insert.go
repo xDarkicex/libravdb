@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -21,17 +22,23 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
 	entryPoints := []*util.Candidate{{ID: h.findNodeID(h.entryPoint), Distance: 0}}
 
+	// Get the vector for search (original or decompressed)
+	searchVector, err := h.getNodeVector(node)
+	if err != nil {
+		return fmt.Errorf("failed to get node vector for search: %w", err)
+	}
+
 	for level := h.maxLevel; level > node.Level; level-- {
-		entryPoints = h.searchLevel(node.Vector, h.nodes[entryPoints[0].ID], 1, level)
+		entryPoints = h.searchLevel(searchVector, h.nodes[entryPoints[0].ID], 1, level)
 	}
 
 	// Phase 2: From node.Level down to 0, search with efConstruction and connect
 	for level := node.Level; level >= 0; level-- {
 		// Search for efConstruction candidates
-		candidates := h.searchLevel(node.Vector, h.nodes[entryPoints[0].ID], h.config.EfConstruction, level)
+		candidates := h.searchLevel(searchVector, h.nodes[entryPoints[0].ID], h.config.EfConstruction, level)
 
 		// Select M neighbors using heuristic
-		selected := h.selectNeighborsHeuristic(node.Vector, candidates, level)
+		selected := h.selectNeighborsHeuristic(searchVector, candidates, level)
 
 		// Connect bidirectionally
 		h.connectBidirectional(nodeID, selected, level)

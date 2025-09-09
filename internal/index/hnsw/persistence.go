@@ -24,7 +24,11 @@ const (
 func (h *Index) saveToDiskImpl(ctx context.Context, path string) error {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	return h.saveToDiskWithoutLock(ctx, path)
+}
 
+// saveToDiskWithoutLock saves to disk without acquiring locks (must be called with lock held)
+func (h *Index) saveToDiskWithoutLock(ctx context.Context, path string) error {
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)

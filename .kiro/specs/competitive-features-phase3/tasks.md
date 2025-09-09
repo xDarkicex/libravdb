@@ -20,28 +20,28 @@
   - Write unit tests comparing accuracy vs compression ratio
   - _Requirements: 1.2, 1.4, 1.5, 1.6_
 
-- [-] 4. Integrate quantization with existing HNSW index
+- [x] 4. Integrate quantization with existing HNSW index
   - Modify HNSW index to support optional quantization during insertion
   - Update search algorithms to work with compressed vectors
   - Add quantization training during index building phase
   - Write integration tests for quantized HNSW performance
   - _Requirements: 1.3, 1.4, 1.5, 1.6_
 
-- [ ] 5. Create memory management infrastructure
+- [x] 5. Create memory management infrastructure
   - Implement memory usage monitoring and tracking system
   - Create memory limit enforcement with configurable thresholds
   - Add LRU cache interface and basic implementation
   - Write unit tests for memory limit enforcement
   - _Requirements: 5.1, 5.2, 5.5_
 
-- [ ] 6. Implement memory mapping support for large indices
+- [x] 6. Implement memory mapping support for large indices
   - Add memory mapping option for HNSW index storage
   - Implement automatic mmap activation based on index size
   - Create memory pressure detection and response system
   - Write tests for mmap functionality and memory usage reduction
   - _Requirements: 5.3, 5.4, 5.6_
 
-- [ ] 7. Build metadata filtering query engine foundation
+- [-] 7. Build metadata filtering query engine foundation
   - Create filter interface hierarchy for different filter types
   - Implement equality, range, and containment filter classes
   - Add filter parsing and validation logic

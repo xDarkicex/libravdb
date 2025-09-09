@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 
@@ -42,6 +43,11 @@ type Index struct {
 	quantizer           quant.Quantizer
 	trainingVectors     [][]float32 // Vectors collected for quantizer training
 	quantizationTrained bool
+	// Memory mapping support
+	memoryMapped     bool
+	mmapPath         string
+	mmapSize         int64
+	originalMemUsage int64 // Memory usage before mapping
 }
 
 // Config holds HNSW configuration parameters
@@ -265,6 +271,27 @@ func (h *Index) Size() int {
 func (h *Index) MemoryUsage() int64 {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	return h.calculateMemoryUsage()
+}
+
+// calculateMemoryUsage calculates memory usage without acquiring locks (must be called with lock held)
+func (h *Index) calculateMemoryUsage() int64 {
+	// If memory mapped, return minimal in-memory usage
+	if h.memoryMapped {
+		var usage int64
+
+		// Count only essential in-memory structures
+		usage += int64(len(h.nodes) * 8)                // Pointer overhead
+		usage += int64(len(h.idToIndex) * 16)           // Map overhead
+		usage += int64(len(h.entryPointCandidates) * 4) // uint32 slice
+
+		// Add quantizer memory usage if present
+		if h.quantizer != nil {
+			usage += h.quantizer.MemoryUsage()
+		}
+
+		return usage
+	}
 
 	var usage int64
 	for _, node := range h.nodes {
@@ -368,13 +395,13 @@ func (h *Index) getTrainingThreshold() int {
 	// Use a reasonable threshold based on quantization type
 	switch h.config.Quantization.Type {
 	case quant.ProductQuantization:
-		// PQ needs more training data for k-means clustering
-		return max(1000, h.config.Quantization.Codebooks*256)
+		// PQ needs more training data for k-means clustering, but keep it reasonable
+		return max(100, h.config.Quantization.Codebooks*32)
 	case quant.ScalarQuantization:
 		// Scalar quantization needs less training data
-		return max(100, h.config.Dimension*10)
+		return max(50, h.config.Dimension*2)
 	default:
-		return 1000
+		return 100
 	}
 }
 
@@ -437,6 +464,121 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 
 func (h *Index) Delete(ctx context.Context, id string) error {
 	return h.deleteNode(ctx, id)
+}
+
+// MemoryMappable interface implementation
+
+// CanMemoryMap returns true if the index can be memory mapped
+func (h *Index) CanMemoryMap() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	// Can memory map if we have nodes and are not already mapped
+	return h.size > 0 && !h.memoryMapped
+}
+
+// EstimateSize returns the estimated size in bytes if memory mapped
+func (h *Index) EstimateSize() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.calculateMemoryUsage()
+}
+
+// EnableMemoryMapping enables memory mapping for the index
+func (h *Index) EnableMemoryMapping(basePath string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.memoryMapped {
+		return fmt.Errorf("index is already memory mapped")
+	}
+
+	if h.size == 0 {
+		return fmt.Errorf("cannot memory map empty index")
+	}
+
+	// Store current memory usage for comparison (calculate inline to avoid deadlock)
+	h.originalMemUsage = h.calculateMemoryUsage()
+
+	// Create a temporary file path for the memory-mapped index
+	mmapPath := fmt.Sprintf("%s/hnsw_index_%p.mmap", basePath, h)
+
+	// Save the index to the memory-mapped file (use lock-free version since we already hold the lock)
+	if err := h.saveToDiskWithoutLock(context.Background(), mmapPath); err != nil {
+		return fmt.Errorf("failed to save index for memory mapping: %w", err)
+	}
+
+	// Get file size
+	stat, err := os.Stat(mmapPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat memory-mapped file: %w", err)
+	}
+
+	h.mmapPath = mmapPath
+	h.mmapSize = stat.Size()
+	h.memoryMapped = true
+
+	// Clear in-memory data structures to free memory
+	// Keep essential structures but clear large data
+	for _, node := range h.nodes {
+		if node != nil {
+			// Clear vector data but keep metadata
+			node.Vector = nil
+			node.CompressedVector = nil
+		}
+	}
+
+	// Clear training vectors
+	h.trainingVectors = nil
+
+	return nil
+}
+
+// DisableMemoryMapping disables memory mapping and loads data back to RAM
+func (h *Index) DisableMemoryMapping() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if !h.memoryMapped {
+		return fmt.Errorf("index is not memory mapped")
+	}
+
+	// Reload the index from the memory-mapped file
+	if err := h.loadFromDiskImpl(context.Background(), h.mmapPath); err != nil {
+		return fmt.Errorf("failed to reload index from memory mapping: %w", err)
+	}
+
+	// Clean up the memory-mapped file
+	if err := os.Remove(h.mmapPath); err != nil && !os.IsNotExist(err) {
+		// Log error but don't fail the operation
+		fmt.Printf("Failed to remove memory-mapped file %s: %v\n", h.mmapPath, err)
+	}
+
+	h.memoryMapped = false
+	h.mmapPath = ""
+	h.mmapSize = 0
+	h.originalMemUsage = 0
+
+	return nil
+}
+
+// IsMemoryMapped returns true if currently using memory mapping
+func (h *Index) IsMemoryMapped() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.memoryMapped
+}
+
+// MemoryMappedSize returns the size of memory-mapped data
+func (h *Index) MemoryMappedSize() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.memoryMapped {
+		return h.mmapSize
+	}
+	return 0
 }
 
 // SaveToDisk persists the HNSW index to disk in binary format

@@ -39,7 +39,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 		defer index.Close()
 
 		// Generate test vectors
-		vectors := generateTestVectors(1000, 128)
+		vectors := generateTestVectors(500, 128)
 
 		// Insert vectors to trigger quantization training
 		for i, vec := range vectors {

@@ -204,3 +204,7 @@ build/
 dist/
 # Release artifacts
 release/
+# Kiro files
+.kiro/*
+MEMORY_MAPPING_IMPLEMENTATION.md
+VALIDATION_TESTS_COMPLETE.md
