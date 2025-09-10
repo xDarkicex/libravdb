@@ -1,0 +1,37 @@
+LibraVDB
+Copyright 2024 LibraVDB Contributors
+
+This product includes software developed by the LibraVDB project
+(https://github.com/xDarkicex/libravdb).
+
+This software contains code derived from or inspired by the following projects:
+
+1. HNSW Algorithm Implementation
+   Based on the research paper "Efficient and robust approximate nearest neighbor 
+   search using Hierarchical Navigable Small World graphs" by Yu. A. Malkov and 
+   D. A. Yashunin (2016).
+
+2. LSM-Tree Storage Architecture
+   Inspired by the design principles described in "The Log-Structured Merge-Tree (LSM-Tree)"
+   by Patrick O'Neil, Edward Cheng, Dieter Gawlick, and Elizabeth O'Neil.
+
+3. Product Quantization Techniques
+   Based on research in "Product quantization for nearest neighbor search" 
+   by Hervé Jégou, Matthijs Douze, and Cordelia Schmid.
+
+4. Go Programming Language
+   This software is written in Go and uses the Go standard library.
+   Go is developed by Google Inc. and the Go community.
+
+5. Prometheus Client Library
+   This software uses the Prometheus Go client library for metrics collection.
+   Copyright 2012-2015 The Prometheus Authors
+   Licensed under the Apache License, Version 2.0
+
+Additional acknowledgments:
+- The vector database community for research and best practices
+- Contributors to open source vector similarity search algorithms
+- The Go community for excellent tooling and libraries
+
+For a complete list of dependencies and their licenses, please see the go.mod file
+and the respective project repositories.

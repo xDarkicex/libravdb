@@ -660,7 +660,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 					// Conservative early termination: only if k-th distance is significantly better
 					if kthDistance < nextClusterDist*0.8 {
 						cluster.mutex.RUnlock()
-						break
+						goto searchComplete
 					}
 				}
 			}
@@ -669,6 +669,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		cluster.mutex.RUnlock()
 	}
 
+searchComplete:
 	// Sort all candidates by distance
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].distance < candidates[j].distance

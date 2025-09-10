@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
@@ -167,11 +168,145 @@ func (db *Database) Stats() *DatabaseStats {
 		Collections:     make(map[string]*CollectionStats),
 	}
 
+	var totalMemory int64
 	for name, collection := range db.collections {
-		stats.Collections[name] = collection.Stats()
+		collectionStats := collection.Stats()
+		stats.Collections[name] = collectionStats
+		totalMemory += collectionStats.MemoryUsage
 	}
 
+	stats.MemoryUsage = totalMemory
 	return stats
+}
+
+// OptimizeCollection performs optimization on a specific collection
+func (db *Database) OptimizeCollection(ctx context.Context, name string, options *OptimizationOptions) error {
+	collection, err := db.GetCollection(name)
+	if err != nil {
+		return fmt.Errorf("collection not found: %w", err)
+	}
+
+	return collection.OptimizeCollection(ctx, options)
+}
+
+// OptimizeAllCollections performs optimization on all collections
+func (db *Database) OptimizeAllCollections(ctx context.Context, options *OptimizationOptions) error {
+	db.mu.RLock()
+	collections := make([]*Collection, 0, len(db.collections))
+	for _, collection := range db.collections {
+		collections = append(collections, collection)
+	}
+	db.mu.RUnlock()
+
+	var errors []error
+	for _, collection := range collections {
+		if err := collection.OptimizeCollection(ctx, options); err != nil {
+			errors = append(errors, fmt.Errorf("failed to optimize collection %s: %w", collection.name, err))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("optimization errors: %v", errors)
+	}
+
+	return nil
+}
+
+// SetGlobalMemoryLimit sets a memory limit that applies to all collections
+func (db *Database) SetGlobalMemoryLimit(bytes int64) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+
+	// Distribute memory limit across collections
+	collectionCount := len(db.collections)
+	if collectionCount == 0 {
+		return nil
+	}
+
+	perCollectionLimit := bytes / int64(collectionCount)
+
+	var errors []error
+	for _, collection := range db.collections {
+		if err := collection.SetMemoryLimit(perCollectionLimit); err != nil {
+			errors = append(errors, fmt.Errorf("failed to set memory limit for collection %s: %w", collection.name, err))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("memory limit errors: %v", errors)
+	}
+
+	return nil
+}
+
+// GetGlobalMemoryUsage returns total memory usage across all collections
+func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	usage := &GlobalMemoryUsage{
+		Collections: make(map[string]*CollectionMemoryStats),
+		Timestamp:   time.Now(),
+	}
+
+	for name, collection := range db.collections {
+		memUsage, err := collection.GetMemoryUsage()
+		if err != nil {
+			continue // Skip collections with errors
+		}
+
+		collectionMemStats := &CollectionMemoryStats{
+			Total:         memUsage.Total,
+			Index:         memUsage.Indices,
+			Cache:         memUsage.Caches,
+			Quantized:     memUsage.Quantized,
+			MemoryMapped:  memUsage.MemoryMapped,
+			Limit:         memUsage.Limit,
+			Available:     memUsage.Available,
+			PressureLevel: "normal", // TODO: Calculate pressure level
+			Timestamp:     memUsage.Timestamp,
+		}
+
+		usage.Collections[name] = collectionMemStats
+		usage.TotalMemory += memUsage.Total
+		usage.TotalIndex += memUsage.Indices
+		usage.TotalCache += memUsage.Caches
+		usage.TotalQuantized += memUsage.Quantized
+		usage.TotalMemoryMapped += memUsage.MemoryMapped
+	}
+
+	return usage, nil
+}
+
+// TriggerGlobalGC forces garbage collection across all collections
+func (db *Database) TriggerGlobalGC() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+
+	var errors []error
+	for name, collection := range db.collections {
+		if err := collection.TriggerGC(); err != nil {
+			errors = append(errors, fmt.Errorf("failed to trigger GC for collection %s: %w", name, err))
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("GC errors: %v", errors)
+	}
+
+	return nil
 }
 
 // loadExistingCollections discovers and loads existing collections from storage

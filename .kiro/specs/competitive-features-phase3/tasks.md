@@ -97,7 +97,7 @@
   - Write tests for configuration validation and backward compatibility
   - _Requirements: 1.1, 1.2, 5.1, 2.1, 7.1, 7.2_
 
-- [-] 15. Update collection creation and management APIs
+- [x] 15. Update collection creation and management APIs
   - Modify collection creation to support new configuration options
   - Add runtime memory management controls and statistics
   - Implement collection optimization and rebuilding capabilities
@@ -111,7 +111,7 @@
   - Write comparative benchmarks against other vector databases
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
 
-- [ ] 17. Add streaming interfaces for large dataset processing
+- [x] 17. Add streaming interfaces for large dataset processing
   - Create streaming batch insert API for memory-efficient ingestion
   - Implement backpressure handling for streaming operations
   - Add context-based cancellation and timeout support

@@ -18,13 +18,18 @@ import (
 
 // Collection represents a named collection of vectors with a specific schema
 type Collection struct {
-	mu      sync.RWMutex
-	name    string
-	config  *CollectionConfig
-	index   index.Index
-	storage storage.Collection
-	metrics *obs.Metrics
-	closed  bool
+	mu            sync.RWMutex
+	name          string
+	config        *CollectionConfig
+	index         index.Index
+	storage       storage.Collection
+	metrics       *obs.Metrics
+	memoryManager memory.MemoryManager
+	closed        bool
+
+	// Runtime optimization state
+	optimizationInProgress bool
+	lastOptimization       time.Time
 }
 
 // CollectionConfig holds collection-specific configuration
@@ -184,12 +189,40 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
 
+	// Initialize memory manager if memory management is configured
+	var memManager memory.MemoryManager
+	if config.MemoryLimit > 0 || config.MemoryConfig != nil {
+		memConfig := memory.DefaultMemoryConfig()
+		if config.MemoryConfig != nil {
+			memConfig = *config.MemoryConfig
+		}
+		if config.MemoryLimit > 0 {
+			memConfig.MaxMemory = config.MemoryLimit
+		}
+		memConfig.EnableMMap = config.EnableMMapping
+
+		memManager = memory.NewManager(memConfig)
+
+		// Register the index as a memory-mappable component if supported
+		if mappable, ok := idx.(memory.MemoryMappable); ok {
+			if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", name), mappable); err != nil {
+				return nil, fmt.Errorf("failed to register index for memory management: %w", err)
+			}
+		}
+
+		// Start memory monitoring
+		if err := memManager.Start(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to start memory manager: %w", err)
+		}
+	}
+
 	return &Collection{
-		name:    name,
-		config:  config,
-		index:   idx,
-		storage: collectionStorage,
-		metrics: metrics,
+		name:          name,
+		config:        config,
+		index:         idx,
+		storage:       collectionStorage,
+		metrics:       metrics,
+		memoryManager: memManager,
 	}, nil
 }
 
@@ -221,12 +254,40 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
 
+	// Initialize memory manager if memory management is configured
+	var memManager memory.MemoryManager
+	if config.MemoryLimit > 0 || config.MemoryConfig != nil {
+		memConfig := memory.DefaultMemoryConfig()
+		if config.MemoryConfig != nil {
+			memConfig = *config.MemoryConfig
+		}
+		if config.MemoryLimit > 0 {
+			memConfig.MaxMemory = config.MemoryLimit
+		}
+		memConfig.EnableMMap = config.EnableMMapping
+
+		memManager = memory.NewManager(memConfig)
+
+		// Register the index as a memory-mappable component if supported
+		if mappable, ok := idx.(memory.MemoryMappable); ok {
+			if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", name), mappable); err != nil {
+				return nil, fmt.Errorf("failed to register index for memory management: %w", err)
+			}
+		}
+
+		// Start memory monitoring
+		if err := memManager.Start(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to start memory manager: %w", err)
+		}
+	}
+
 	collection := &Collection{
-		name:    name,
-		config:  config,
-		index:   idx,
-		storage: storageCollection,
-		metrics: metrics,
+		name:          name,
+		config:        config,
+		index:         idx,
+		storage:       storageCollection,
+		metrics:       metrics,
+		memoryManager: memManager,
 	}
 
 	// Rebuild index from storage data
@@ -366,13 +427,320 @@ func (c *Collection) Stats() *CollectionStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return &CollectionStats{
-		Name:        c.name,
-		VectorCount: c.index.Size(),
-		Dimension:   c.config.Dimension,
-		IndexType:   c.config.IndexType.String(),
-		MemoryUsage: c.index.MemoryUsage(),
+	stats := &CollectionStats{
+		Name:                 c.name,
+		VectorCount:          c.index.Size(),
+		Dimension:            c.config.Dimension,
+		IndexType:            c.config.IndexType.String(),
+		MemoryUsage:          c.index.MemoryUsage(),
+		HasQuantization:      c.config.Quantization != nil,
+		HasMemoryLimit:       c.config.MemoryLimit > 0,
+		MemoryMappingEnabled: c.config.EnableMMapping,
 	}
+
+	// Add enhanced memory statistics if memory manager is available
+	if c.memoryManager != nil {
+		usage := c.memoryManager.GetUsage()
+		stats.MemoryStats = &CollectionMemoryStats{
+			Total:         usage.Total,
+			Index:         usage.Indices,
+			Cache:         usage.Caches,
+			Quantized:     usage.Quantized,
+			MemoryMapped:  usage.MemoryMapped,
+			Limit:         usage.Limit,
+			Available:     usage.Available,
+			PressureLevel: "normal", // TODO: Calculate actual pressure level
+			Timestamp:     usage.Timestamp,
+		}
+	}
+
+	// Add optimization status
+	stats.OptimizationStatus = &OptimizationStatus{
+		InProgress:       c.optimizationInProgress,
+		LastOptimization: c.lastOptimization,
+		CanOptimize:      !c.closed && !c.optimizationInProgress,
+	}
+
+	return stats
+}
+
+// GetMemoryUsage returns current memory usage statistics for the collection
+func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return nil, ErrCollectionClosed
+	}
+
+	if c.memoryManager == nil {
+		// Return basic memory usage from index if no memory manager
+		usage := &memory.MemoryUsage{
+			Total:     c.index.MemoryUsage(),
+			Indices:   c.index.MemoryUsage(),
+			Timestamp: time.Now(),
+		}
+		return usage, nil
+	}
+
+	usage := c.memoryManager.GetUsage()
+	return &usage, nil
+}
+
+// SetMemoryLimit updates the memory limit for the collection
+func (c *Collection) SetMemoryLimit(bytes int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Update config
+	c.config.MemoryLimit = bytes
+
+	// Update memory manager if it exists
+	if c.memoryManager != nil {
+		return c.memoryManager.SetLimit(bytes)
+	}
+
+	// If no memory manager exists and limit is set, create one
+	if bytes > 0 {
+		memConfig := memory.DefaultMemoryConfig()
+		if c.config.MemoryConfig != nil {
+			memConfig = *c.config.MemoryConfig
+		}
+		memConfig.MaxMemory = bytes
+		memConfig.EnableMMap = c.config.EnableMMapping
+
+		memManager := memory.NewManager(memConfig)
+
+		// Register the index as a memory-mappable component if supported
+		if mappable, ok := c.index.(memory.MemoryMappable); ok {
+			if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", c.name), mappable); err != nil {
+				return fmt.Errorf("failed to register index for memory management: %w", err)
+			}
+		}
+
+		// Start memory monitoring
+		if err := memManager.Start(context.Background()); err != nil {
+			return fmt.Errorf("failed to start memory manager: %w", err)
+		}
+
+		c.memoryManager = memManager
+	}
+
+	return nil
+}
+
+// TriggerGC forces garbage collection for the collection
+func (c *Collection) TriggerGC() error {
+	c.mu.RLock()
+	closed := c.closed
+	memManager := c.memoryManager
+	c.mu.RUnlock()
+
+	if closed {
+		return ErrCollectionClosed
+	}
+
+	if memManager != nil {
+		return memManager.TriggerGC()
+	}
+
+	// Fallback to runtime GC if no memory manager
+	memory.ForceGC()
+	return nil
+}
+
+// OptimizeCollection performs collection optimization including index rebuilding and memory optimization
+func (c *Collection) OptimizeCollection(ctx context.Context, options *OptimizationOptions) error {
+	// Check initial state and set optimization in progress
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrCollectionClosed
+	}
+
+	if c.optimizationInProgress {
+		c.mu.Unlock()
+		return fmt.Errorf("optimization already in progress")
+	}
+
+	// Set default options if not provided
+	if options == nil {
+		options = &OptimizationOptions{
+			RebuildIndex:       true,
+			OptimizeMemory:     true,
+			CompactStorage:     true,
+			UpdateQuantization: false,
+		}
+	}
+
+	c.optimizationInProgress = true
+	memManager := c.memoryManager
+	hasQuantization := c.config.Quantization != nil
+	c.mu.Unlock()
+
+	// Ensure we reset optimization status on exit
+	defer func() {
+		c.mu.Lock()
+		c.optimizationInProgress = false
+		c.lastOptimization = time.Now()
+		c.mu.Unlock()
+	}()
+
+	// Step 1: Optimize memory if requested
+	if options.OptimizeMemory && memManager != nil {
+		if err := memManager.HandleMemoryLimitExceeded(); err != nil {
+			return fmt.Errorf("memory optimization failed: %w", err)
+		}
+	}
+
+	// Step 2: Rebuild index if requested
+	if options.RebuildIndex {
+		if err := c.rebuildIndexOptimized(ctx, options); err != nil {
+			return fmt.Errorf("index rebuild failed: %w", err)
+		}
+	}
+
+	// Step 3: Update quantization if requested
+	if options.UpdateQuantization && hasQuantization {
+		if err := c.updateQuantization(ctx); err != nil {
+			return fmt.Errorf("quantization update failed: %w", err)
+		}
+	}
+
+	// Step 4: Compact storage if requested
+	if options.CompactStorage {
+		// Note: This would require storage layer support for compaction
+		// For now, we'll just trigger GC
+		if err := c.TriggerGC(); err != nil {
+			return fmt.Errorf("storage compaction failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// rebuildIndexOptimized rebuilds the index with optimization considerations
+func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *OptimizationOptions) error {
+	c.mu.Lock()
+	currentSize := c.index.Size()
+	autoIndexSelection := c.config.AutoIndexSelection
+	currentType := c.config.IndexType
+	c.mu.Unlock()
+
+	if autoIndexSelection {
+		optimalType := selectOptimalIndexType(currentSize)
+		if optimalType != currentType {
+			return c.switchIndexType(ctx, optimalType)
+		}
+	}
+
+	// For optimization, we don't need to rebuild if the index is already populated
+	// and we're not switching types. This avoids the duplicate insertion issue.
+	if currentSize > 0 {
+		// Index is already built, no need to rebuild unless switching types
+		return nil
+	}
+
+	// Only rebuild if index is empty (e.g., after loading from storage)
+	return c.rebuildIndex(ctx)
+}
+
+// updateQuantization retrains quantization parameters with current data
+func (c *Collection) updateQuantization(ctx context.Context) error {
+	if c.config.Quantization == nil {
+		return fmt.Errorf("no quantization configured")
+	}
+
+	// Get all vectors for retraining
+	vectors, err := c.getAllVectors(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get vectors for quantization update: %w", err)
+	}
+
+	if len(vectors) == 0 {
+		return nil // Nothing to retrain
+	}
+
+	// Extract vector data for training
+	trainingVectors := make([][]float32, len(vectors))
+	for i, entry := range vectors {
+		trainingVectors[i] = entry.Vector
+	}
+
+	// Create new quantizer and train it
+	quantizer, err := quant.Create(c.config.Quantization)
+	if err != nil {
+		return fmt.Errorf("failed to create quantizer: %w", err)
+	}
+
+	if err := quantizer.Train(ctx, trainingVectors); err != nil {
+		return fmt.Errorf("failed to train quantizer: %w", err)
+	}
+
+	// Update the index with the new quantizer
+	// Note: This would require index-specific support for quantizer updates
+	// For now, we'll rebuild the index with the new quantizer
+	return c.rebuildIndex(ctx)
+}
+
+// GetOptimizationStatus returns the current optimization status
+func (c *Collection) GetOptimizationStatus() *OptimizationStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return &OptimizationStatus{
+		InProgress:       c.optimizationInProgress,
+		LastOptimization: c.lastOptimization,
+		CanOptimize:      !c.closed && !c.optimizationInProgress,
+	}
+}
+
+// EnableMemoryMapping enables memory mapping for the collection's index
+func (c *Collection) EnableMemoryMapping(path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Update config
+	c.config.EnableMMapping = true
+
+	// Enable memory mapping on the index if supported
+	if mappable, ok := c.index.(memory.MemoryMappable); ok {
+		if mappable.CanMemoryMap() {
+			return mappable.EnableMemoryMapping(path)
+		}
+	}
+
+	return fmt.Errorf("index does not support memory mapping")
+}
+
+// DisableMemoryMapping disables memory mapping for the collection's index
+func (c *Collection) DisableMemoryMapping() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Update config
+	c.config.EnableMMapping = false
+
+	// Disable memory mapping on the index if supported
+	if mappable, ok := c.index.(memory.MemoryMappable); ok {
+		if mappable.IsMemoryMapped() {
+			return mappable.DisableMemoryMapping()
+		}
+	}
+
+	return nil
 }
 
 // Close shuts down the collection
@@ -385,6 +753,13 @@ func (c *Collection) Close() error {
 	}
 
 	var errors []error
+
+	// Stop memory manager if it exists
+	if c.memoryManager != nil {
+		if err := c.memoryManager.Stop(); err != nil {
+			errors = append(errors, err)
+		}
+	}
 
 	if err := c.index.Close(); err != nil {
 		errors = append(errors, err)

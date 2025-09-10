@@ -204,7 +204,19 @@ build/
 dist/
 # Release artifacts
 release/
-# Kiro files
+# =============================================================================
+# Development Tools & IDE-Specific Files
+# =============================================================================
+# Kiro IDE files (development tool, not for production)
+.kiro/
 .kiro/*
+
+# Development documentation (internal)
 MEMORY_MAPPING_IMPLEMENTATION.md
 VALIDATION_TESTS_COMPLETE.md
+DOCUMENTATION_SUMMARY.md
+DOCUMENTATION_COMPLETION_SUMMARY.md
+
+# Example binaries (when testing compilation)
+examples/*/
+!examples/*.go

@@ -42,6 +42,17 @@ type CollectionStats struct {
 	Dimension   int    `json:"dimension"`
 	IndexType   string `json:"index_type"`
 	MemoryUsage int64  `json:"memory_usage"`
+
+	// Enhanced memory statistics
+	MemoryStats *CollectionMemoryStats `json:"memory_stats,omitempty"`
+
+	// Optimization information
+	OptimizationStatus *OptimizationStatus `json:"optimization_status,omitempty"`
+
+	// Configuration information
+	HasQuantization      bool `json:"has_quantization"`
+	HasMemoryLimit       bool `json:"has_memory_limit"`
+	MemoryMappingEnabled bool `json:"memory_mapping_enabled"`
 }
 
 func (it IndexType) String() string {
@@ -157,4 +168,91 @@ func DefaultBatchConfig() BatchConfig {
 		FailFast:        false,
 		TimeoutPerChunk: 30 * time.Second,
 	}
+}
+
+// OptimizationOptions configures collection optimization behavior
+type OptimizationOptions struct {
+	// RebuildIndex determines if the index should be rebuilt
+	RebuildIndex bool `json:"rebuild_index"`
+
+	// OptimizeMemory determines if memory optimization should be performed
+	OptimizeMemory bool `json:"optimize_memory"`
+
+	// CompactStorage determines if storage compaction should be performed
+	CompactStorage bool `json:"compact_storage"`
+
+	// UpdateQuantization determines if quantization parameters should be retrained
+	UpdateQuantization bool `json:"update_quantization"`
+
+	// ForceIndexTypeSwitch forces switching to optimal index type regardless of current type
+	ForceIndexTypeSwitch bool `json:"force_index_type_switch"`
+}
+
+// OptimizationStatus represents the current optimization state of a collection
+type OptimizationStatus struct {
+	// InProgress indicates if optimization is currently running
+	InProgress bool `json:"in_progress"`
+
+	// LastOptimization is the timestamp of the last completed optimization
+	LastOptimization time.Time `json:"last_optimization"`
+
+	// CanOptimize indicates if optimization can be started
+	CanOptimize bool `json:"can_optimize"`
+
+	// RecommendedOptimizations suggests which optimizations would be beneficial
+	RecommendedOptimizations []string `json:"recommended_optimizations,omitempty"`
+}
+
+// CollectionMemoryStats represents memory usage statistics for a collection
+type CollectionMemoryStats struct {
+	// Total memory usage in bytes
+	Total int64 `json:"total"`
+
+	// Index memory usage in bytes
+	Index int64 `json:"index"`
+
+	// Cache memory usage in bytes
+	Cache int64 `json:"cache"`
+
+	// Quantized data memory usage in bytes
+	Quantized int64 `json:"quantized"`
+
+	// Memory-mapped data size in bytes
+	MemoryMapped int64 `json:"memory_mapped"`
+
+	// Memory limit in bytes (0 = no limit)
+	Limit int64 `json:"limit"`
+
+	// Available memory before hitting limit
+	Available int64 `json:"available"`
+
+	// Memory pressure level
+	PressureLevel string `json:"pressure_level"`
+
+	// Timestamp of measurement
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// GlobalMemoryUsage represents memory usage across all collections in the database
+type GlobalMemoryUsage struct {
+	// Total memory usage across all collections
+	TotalMemory int64 `json:"total_memory"`
+
+	// Total index memory usage
+	TotalIndex int64 `json:"total_index"`
+
+	// Total cache memory usage
+	TotalCache int64 `json:"total_cache"`
+
+	// Total quantized data memory usage
+	TotalQuantized int64 `json:"total_quantized"`
+
+	// Total memory-mapped data size
+	TotalMemoryMapped int64 `json:"total_memory_mapped"`
+
+	// Per-collection memory statistics
+	Collections map[string]*CollectionMemoryStats `json:"collections"`
+
+	// Timestamp of measurement
+	Timestamp time.Time `json:"timestamp"`
 }

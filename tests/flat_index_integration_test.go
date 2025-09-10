@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/xDarkicex/libravdb/libravdb"
 )
@@ -18,8 +19,9 @@ func TestFlatIndexIntegration(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create a collection with flat index
-	collection, err := db.CreateCollection(ctx, "test_flat",
+	// Create a collection with flat index using unique name
+	collectionName := fmt.Sprintf("test_flat_%d", time.Now().UnixNano())
+	collection, err := db.CreateCollection(ctx, collectionName,
 		libravdb.WithDimension(3),
 		libravdb.WithMetric(libravdb.CosineDistance),
 		libravdb.WithFlat(),
@@ -84,8 +86,9 @@ func TestAutoIndexSelection(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create a collection with auto index selection
-	collection, err := db.CreateCollection(ctx, "test_auto",
+	// Create a collection with auto index selection using unique name
+	collectionName := fmt.Sprintf("test_auto_%d", time.Now().UnixNano())
+	collection, err := db.CreateCollection(ctx, collectionName,
 		libravdb.WithDimension(3),
 		libravdb.WithMetric(libravdb.CosineDistance),
 		libravdb.WithAutoIndexSelection(true),
@@ -126,8 +129,9 @@ func TestFlatIndexPerformance(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create a collection with flat index
-	collection, err := db.CreateCollection(ctx, "test_perf",
+	// Create a collection with flat index using unique name
+	collectionName := fmt.Sprintf("test_perf_%d", time.Now().UnixNano())
+	collection, err := db.CreateCollection(ctx, collectionName,
 		libravdb.WithDimension(128),
 		libravdb.WithMetric(libravdb.CosineDistance),
 		libravdb.WithFlat(),

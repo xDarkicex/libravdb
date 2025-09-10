@@ -1,0 +1,10 @@
+{
+  "dimension": 128,
+  "metric": 2,
+  "index_type": 2,
+  "m": 32,
+  "ef_construction": 200,
+  "ef_search": 50,
+  "ml": 1.4426950408889634,
+  "version": 1
+}
