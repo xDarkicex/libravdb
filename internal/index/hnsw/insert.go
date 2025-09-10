@@ -7,7 +7,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
-// insertNode implements the complete HNSW insertion algorithm
+// insertNode implements the optimized HNSW insertion algorithm
 func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error {
 	// Handle the second node (simple connection to entry point)
 	if h.size == 1 {
@@ -17,6 +17,11 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 			h.entryPoint.Links[0] = append(h.entryPoint.Links[0], nodeID)
 		}
 		return nil
+	}
+
+	// Initialize neighbor selector if not already done
+	if h.neighborSelector == nil {
+		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
 	}
 
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
@@ -37,14 +42,14 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 		// Search for efConstruction candidates
 		candidates := h.searchLevel(searchVector, h.nodes[entryPoints[0].ID], h.config.EfConstruction, level)
 
-		// Select M neighbors using heuristic
-		selected := h.selectNeighborsHeuristic(searchVector, candidates, level)
+		// Select M neighbors using optimized heuristic
+		selected := h.neighborSelector.SelectNeighborsOptimized(searchVector, candidates, level, h)
 
 		// Connect bidirectionally
-		h.connectBidirectional(nodeID, selected, level)
+		h.connectBidirectionalOptimized(nodeID, selected, level)
 
 		// Prune connections of neighbors if they exceed maxM
-		h.pruneNeighborConnections(selected, level)
+		h.pruneNeighborConnectionsOptimized(selected, level)
 
 		// Update entry points for next level
 		entryPoints = selected
@@ -53,85 +58,29 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 	return nil
 }
 
-// selectNeighborsHeuristic implements the heuristic neighbor selection
-// This prevents clustering and maintains graph navigability
+// Legacy method for backward compatibility - delegates to optimized version
 func (h *Index) selectNeighborsHeuristic(queryVector []float32, candidates []*util.Candidate, level int) []*util.Candidate {
-	maxM := h.config.M
-	if level == 0 && len(candidates) > maxM {
-		// Level 0 can have more connections for better recall
-		maxM = maxM * 2
+	if h.neighborSelector == nil {
+		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
 	}
-
-	if len(candidates) <= maxM {
-		return candidates
-	}
-
-	// Sort candidates by distance
-	selected := make([]*util.Candidate, 0, maxM)
-	remaining := make([]*util.Candidate, len(candidates))
-	copy(remaining, candidates)
-
-	for len(selected) < maxM && len(remaining) > 0 {
-		bestIdx := 0
-		bestCandidate := remaining[0]
-
-		// Find the best candidate using the heuristic
-		for i, candidate := range remaining {
-			if h.shouldSelectCandidate(queryVector, candidate, selected) {
-				if candidate.Distance < bestCandidate.Distance ||
-					!h.shouldSelectCandidate(queryVector, bestCandidate, selected) {
-					bestIdx = i
-					bestCandidate = candidate
-				}
-			}
-		}
-
-		selected = append(selected, bestCandidate)
-		// Remove selected candidate from remaining
-		remaining[bestIdx] = remaining[len(remaining)-1]
-		remaining = remaining[:len(remaining)-1]
-	}
-
-	return selected
+	return h.neighborSelector.SelectNeighborsOptimized(queryVector, candidates, level, h)
 }
 
-// shouldSelectCandidate checks if a candidate should be selected based on the heuristic
-func (h *Index) shouldSelectCandidate(queryVector []float32, candidate *util.Candidate, selected []*util.Candidate) bool {
-	candidateNode := h.nodes[candidate.ID]
-
-	// Get candidate vector (handling quantization)
-	candidateVector, err := h.getNodeVector(candidateNode)
-	if err != nil {
-		return false // Skip if we can't get the vector
-	}
-
-	// Check pruning condition: don't select if there's a closer neighbor
-	// that makes this candidate redundant
-	for _, sel := range selected {
-		selectedNode := h.nodes[sel.ID]
-		selectedVector, err := h.getNodeVector(selectedNode)
-		if err != nil {
-			continue // Skip if we can't get the vector
-		}
-
-		// If the distance from candidate to selected neighbor is less than
-		// the distance from candidate to query, then candidate is redundant
-		distCandidateToSelected, err := h.computeDistance(candidateVector, selectedVector, candidateNode, selectedNode)
-		if err != nil {
-			continue // Skip if distance computation fails
-		}
-
-		if distCandidateToSelected < candidate.Distance {
-			return false
-		}
-	}
-
-	return true
-}
-
-// connectBidirectional creates bidirectional connections between node and neighbors
+// Legacy method for backward compatibility - delegates to optimized version
 func (h *Index) connectBidirectional(nodeID uint32, neighbors []*util.Candidate, level int) {
+	h.connectBidirectionalOptimized(nodeID, neighbors, level)
+}
+
+// connectBidirectionalOptimized creates bidirectional connections with better memory management
+func (h *Index) connectBidirectionalOptimized(nodeID uint32, neighbors []*util.Candidate, level int) {
 	node := h.nodes[nodeID]
+
+	// Pre-allocate slice capacity to avoid reallocations
+	if cap(node.Links[level]) < len(neighbors) {
+		newLinks := make([]uint32, len(node.Links[level]), len(neighbors)+h.config.M)
+		copy(newLinks, node.Links[level])
+		node.Links[level] = newLinks
+	}
 
 	for _, neighbor := range neighbors {
 		// Add neighbor to node's links
@@ -141,58 +90,33 @@ func (h *Index) connectBidirectional(nodeID uint32, neighbors []*util.Candidate,
 		neighborNode := h.nodes[neighbor.ID]
 		// Only add the connection if the neighbor has this level
 		if level < len(neighborNode.Links) {
+			// Pre-allocate capacity for neighbor's links too
+			if cap(neighborNode.Links[level]) < len(neighborNode.Links[level])+1 {
+				newLinks := make([]uint32, len(neighborNode.Links[level]), len(neighborNode.Links[level])+h.config.M)
+				copy(newLinks, neighborNode.Links[level])
+				neighborNode.Links[level] = newLinks
+			}
 			neighborNode.Links[level] = append(neighborNode.Links[level], nodeID)
 		}
 	}
 }
 
-// pruneNeighborConnections ensures neighbors don't exceed maxM connections
-func (h *Index) pruneNeighborConnections(neighbors []*util.Candidate, level int) {
-	maxM := h.config.M
-	if level == 0 {
-		maxM = maxM * 2 // Level 0 can have more connections
+// pruneNeighborConnectionsOptimized ensures neighbors don't exceed maxM connections using optimized algorithm
+func (h *Index) pruneNeighborConnectionsOptimized(neighbors []*util.Candidate, level int) {
+	if h.neighborSelector == nil {
+		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
 	}
 
 	for _, neighbor := range neighbors {
-		neighborNode := h.nodes[neighbor.ID]
-
-		// Skip if neighbor doesn't have this level
-		if level >= len(neighborNode.Links) {
+		if err := h.neighborSelector.PruneConnections(neighbor.ID, level, h); err != nil {
+			// Log error but continue - this is not critical for correctness
 			continue
 		}
-
-		if len(neighborNode.Links[level]) > maxM {
-			// Need to prune - select best maxM connections
-			candidates := make([]*util.Candidate, 0, len(neighborNode.Links[level]))
-
-			for _, linkID := range neighborNode.Links[level] {
-				linkNode := h.nodes[linkID]
-				distance, err := h.computeDistance(nil, nil, neighborNode, linkNode)
-				if err != nil {
-					// Fall back to decompressed vectors
-					neighborVec, err1 := h.getNodeVector(neighborNode)
-					linkVec, err2 := h.getNodeVector(linkNode)
-					if err1 != nil || err2 != nil {
-						continue // Skip if we can't get vectors
-					}
-					distance = h.distance(neighborVec, linkVec)
-				}
-
-				candidates = append(candidates, &util.Candidate{
-					ID:       linkID,
-					Distance: distance,
-				})
-			}
-
-			// Select best connections using heuristic
-			selected := h.selectNeighborsHeuristic(neighborNode.Vector, candidates, level)
-
-			// Update the neighbor's links
-			newLinks := make([]uint32, 0, len(selected))
-			for _, sel := range selected {
-				newLinks = append(newLinks, sel.ID)
-			}
-			neighborNode.Links[level] = newLinks
-		}
 	}
+}
+
+// Legacy methods for backward compatibility
+// pruneNeighborConnections ensures neighbors don't exceed maxM connections
+func (h *Index) pruneNeighborConnections(neighbors []*util.Candidate, level int) {
+	h.pruneNeighborConnectionsOptimized(neighbors, level)
 }

@@ -14,6 +14,7 @@ import (
 // Index defines the interface for vector indexes
 type Index interface {
 	Insert(ctx context.Context, entry *VectorEntry) error
+	BatchInsert(ctx context.Context, entries []*VectorEntry) error // NEW: Optimized batch insertion
 	Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error)
 	Delete(ctx context.Context, id string) error
 	Size() int
@@ -122,6 +123,19 @@ func (w *hnswWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 	return w.index.Insert(ctx, hnswEntry)
 }
 
+// BatchInsert adapts the interface VectorEntry slice to HNSW VectorEntry slice
+func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	hnswEntries := make([]*hnsw.VectorEntry, len(entries))
+	for i, entry := range entries {
+		hnswEntries[i] = &hnsw.VectorEntry{
+			ID:       entry.ID,
+			Vector:   entry.Vector,
+			Metadata: entry.Metadata,
+		}
+	}
+	return w.index.BatchInsert(ctx, hnswEntries)
+}
+
 // Search adapts the search results from HNSW to interface types
 func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
 	hnswResults, err := w.index.Search(ctx, query, k)
@@ -226,6 +240,16 @@ func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 		Metadata: entry.Metadata,
 	}
 	return w.index.Insert(ctx, ivfpqEntry)
+}
+
+// BatchInsert provides batch insertion for IVF-PQ (fallback to individual inserts for now)
+func (w *ivfpqWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	for _, entry := range entries {
+		if err := w.Insert(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Search adapts the search results from IVF-PQ to interface types
@@ -333,6 +357,16 @@ func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 		Metadata: entry.Metadata,
 	}
 	return w.index.Insert(ctx, flatEntry)
+}
+
+// BatchInsert provides batch insertion for Flat (fallback to individual inserts for now)
+func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	for _, entry := range entries {
+		if err := w.Insert(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Search adapts the search results from Flat to interface types

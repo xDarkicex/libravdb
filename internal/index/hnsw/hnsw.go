@@ -39,6 +39,8 @@ type Index struct {
 	size                 int
 	idToIndex            map[string]uint32 // O(1) ID to node index lookup
 	entryPointCandidates []uint32          // High-level nodes for entry point selection
+	// Performance optimizations
+	neighborSelector *NeighborSelector // Optimized neighbor selection
 	// Quantization support
 	quantizer           quant.Quantizer
 	trainingVectors     [][]float32 // Vectors collected for quantizer training
@@ -101,6 +103,11 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	return h.insertSingle(ctx, entry)
+}
+
+// insertSingle handles single vector insertion (must be called with lock held)
+func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	// Check for duplicate ID
 	if _, exists := h.idToIndex[entry.ID]; exists {
 		return fmt.Errorf("node with ID '%s' already exists", entry.ID)
@@ -121,7 +128,7 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		}
 	}
 
-	// Create new node
+	// Create new node with optimized memory allocation
 	level := h.generateLevel()
 	node := &Node{
 		ID:       entry.ID,
@@ -141,14 +148,19 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		// Don't store original vector to save memory
 		node.Vector = nil
 	} else {
-		// Store original vector
+		// Store original vector with pre-allocated capacity
 		node.Vector = make([]float32, len(entry.Vector))
 		copy(node.Vector, entry.Vector)
 	}
 
-	// Initialize empty link lists for each level
+	// Initialize empty link lists for each level with pre-allocated capacity
+	maxConnections := h.config.M
 	for i := 0; i <= level; i++ {
-		node.Links[i] = make([]uint32, 0, h.config.M)
+		capacity := maxConnections
+		if i == 0 {
+			capacity = maxConnections * 2 // Level 0 can have more connections
+		}
+		node.Links[i] = make([]uint32, 0, capacity)
 	}
 
 	nodeID := uint32(len(h.nodes))
@@ -195,6 +207,69 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	if level > h.maxLevel {
 		h.entryPoint = node
 		h.maxLevel = level
+	}
+
+	return nil
+}
+
+// BatchInsert provides optimized batch insertion for better performance with large datasets
+func (h *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// For small batches, use regular insertion
+	if len(entries) <= 10 {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		for _, entry := range entries {
+			if err := h.insertSingle(ctx, entry); err != nil {
+				return fmt.Errorf("failed to insert entry %s: %w", entry.ID, err)
+			}
+		}
+		return nil
+	}
+
+	// For larger batches, use optimized batch processing
+	return h.batchInsertOptimized(ctx, entries)
+}
+
+// batchInsertOptimized handles large batch insertions with memory optimization
+func (h *Index) batchInsertOptimized(ctx context.Context, entries []*VectorEntry) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Pre-allocate space for nodes to avoid repeated slice growth
+	initialSize := len(h.nodes)
+	expectedSize := initialSize + len(entries)
+
+	// Grow nodes slice if needed
+	if cap(h.nodes) < expectedSize {
+		newNodes := make([]*Node, len(h.nodes), expectedSize+len(entries)/2) // Add some extra capacity
+		copy(newNodes, h.nodes)
+		h.nodes = newNodes
+	}
+
+	// Process entries in chunks to manage memory usage
+	chunkSize := 100 // Process 100 entries at a time
+	for i := 0; i < len(entries); i += chunkSize {
+		end := min(i+chunkSize, len(entries))
+		chunk := entries[i:end]
+
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Process chunk
+		for _, entry := range chunk {
+			if err := h.insertSingle(ctx, entry); err != nil {
+				return fmt.Errorf("failed to insert entry %s in batch: %w", entry.ID, err)
+			}
+		}
 	}
 
 	return nil

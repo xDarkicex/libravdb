@@ -354,6 +354,146 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	return nil
 }
 
+// Update modifies an existing vector in the collection
+func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Validate input
+	if id == "" {
+		return fmt.Errorf("vector ID cannot be empty")
+	}
+
+	if vector != nil && len(vector) != c.config.Dimension {
+		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+			len(vector), c.config.Dimension)
+	}
+
+	// For now, implement update as delete + insert
+	// This ensures consistency across index and storage layers
+	// TODO: Optimize with native update operations when available
+
+	// First, try to get the existing entry for partial updates
+	var existingEntry *index.VectorEntry
+	if vector == nil || metadata == nil {
+		// Need to retrieve existing data for partial update
+		_ = c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+			if entry.ID == id {
+				existingEntry = &index.VectorEntry{
+					ID:       entry.ID,
+					Vector:   make([]float32, len(entry.Vector)),
+					Metadata: make(map[string]interface{}),
+				}
+				copy(existingEntry.Vector, entry.Vector)
+				for k, v := range entry.Metadata {
+					existingEntry.Metadata[k] = v
+				}
+				return fmt.Errorf("found") // Use error to break iteration
+			}
+			return nil
+		})
+
+		if existingEntry == nil {
+			return fmt.Errorf("vector with ID %s not found", id)
+		}
+	}
+
+	// Prepare the updated entry
+	updatedEntry := &index.VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	// Use existing data for partial updates
+	if existingEntry != nil {
+		if vector == nil {
+			updatedEntry.Vector = existingEntry.Vector
+		}
+		if metadata == nil {
+			updatedEntry.Metadata = existingEntry.Metadata
+		} else if existingEntry.Metadata != nil {
+			// Merge metadata (new values override existing ones)
+			mergedMetadata := make(map[string]interface{})
+			for k, v := range existingEntry.Metadata {
+				mergedMetadata[k] = v
+			}
+			for k, v := range metadata {
+				mergedMetadata[k] = v
+			}
+			updatedEntry.Metadata = mergedMetadata
+		}
+	}
+
+	// Delete the existing entry from index
+	if err := c.index.Delete(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete existing vector from index: %w", err)
+	}
+
+	// Insert the updated entry into index
+	if err := c.index.Insert(ctx, updatedEntry); err != nil {
+		// TODO: Rollback the delete operation
+		return fmt.Errorf("failed to insert updated vector into index: %w", err)
+	}
+
+	// Update storage (this will append to WAL)
+	if err := c.storage.Insert(ctx, updatedEntry); err != nil {
+		// TODO: Rollback index operations
+		return fmt.Errorf("failed to write update to storage: %w", err)
+	}
+
+	// Update metrics
+	if c.metrics != nil {
+		c.metrics.VectorUpdates.Inc()
+	}
+
+	return nil
+}
+
+// Delete removes a vector from the collection
+func (c *Collection) Delete(ctx context.Context, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	// Validate input
+	if id == "" {
+		return fmt.Errorf("vector ID cannot be empty")
+	}
+
+	// Delete from index
+	if err := c.index.Delete(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete vector from index: %w", err)
+	}
+
+	// Mark as deleted in storage (tombstone record)
+	// Create a tombstone entry to mark the vector as deleted
+	tombstone := &index.VectorEntry{
+		ID:       id,
+		Vector:   nil, // Nil vector indicates deletion
+		Metadata: map[string]interface{}{"_deleted": true, "_deleted_at": time.Now()},
+	}
+
+	if err := c.storage.Insert(ctx, tombstone); err != nil {
+		// TODO: Rollback index deletion
+		return fmt.Errorf("failed to write deletion to storage: %w", err)
+	}
+
+	// Update metrics
+	if c.metrics != nil {
+		c.metrics.VectorDeletes.Inc()
+	}
+
+	return nil
+}
+
 // Search performs a vector similarity search
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
 	c.mu.RLock()
