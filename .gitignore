@@ -39,6 +39,12 @@
 # Keep the source package tracked on case-insensitive filesystems.
 !/libravdb/
 !/libravdb/*.go
+!/libravdb/*_test.go
+
+# Local test/runtime artifacts inside the public package dir.
+/libravdb/.hidden_errors
+/libravdb/:memory:/
+/libravdb/data/
 
 # =============================================================================
 # Go Testing & Development
