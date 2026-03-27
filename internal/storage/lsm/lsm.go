@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/xDarkicex/libravdb/internal/index"
@@ -21,6 +22,8 @@ type Engine struct {
 
 // New creates a new LSM storage engine at the specified path
 func New(basePath string) (storage.Engine, error) {
+	basePath = normalizeBasePath(basePath)
+
 	// Create base directory if it doesn't exist
 	if err := os.MkdirAll(basePath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
@@ -141,6 +144,37 @@ func (e *Engine) Close() error {
 	}
 
 	return nil
+}
+
+func normalizeBasePath(basePath string) string {
+	if basePath == "" {
+		return "./data"
+	}
+
+	if strings.HasPrefix(basePath, ":memory:") {
+		suffix := strings.TrimPrefix(basePath, ":memory:")
+		if suffix == "" {
+			suffix = "default"
+		}
+		return filepath.Join(os.TempDir(), "libravdb-memory", sanitizePathSegment(suffix))
+	}
+
+	return basePath
+}
+
+func sanitizePathSegment(value string) string {
+	replacer := strings.NewReplacer(
+		":", "-",
+		"/", "-",
+		"\\", "-",
+		string(filepath.Separator), "-",
+	)
+	safe := replacer.Replace(value)
+	safe = strings.Trim(safe, ".- ")
+	if safe == "" {
+		return "default"
+	}
+	return safe
 }
 
 // loadExistingCollections discovers and loads existing collections on startup
