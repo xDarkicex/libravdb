@@ -24,26 +24,43 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
 	}
 
-	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
-	entryPoints := []*util.Candidate{{ID: h.findNodeID(h.entryPoint), Distance: 0}}
-
 	// Get the vector for search (original or decompressed)
 	searchVector, err := h.getNodeVector(node)
 	if err != nil {
 		return fmt.Errorf("failed to get node vector for search: %w", err)
 	}
 
+	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
+	entryPoints := h.fallbackEntryPoints(searchVector, h.entryPoint)
+
 	for level := h.maxLevel; level > node.Level; level-- {
-		entryPoints = h.searchLevel(searchVector, h.nodes[entryPoints[0].ID], 1, level)
+		currentNode := h.pickEntryNode(entryPoints)
+		if currentNode == nil {
+			currentNode = h.entryPoint
+		}
+		entryPoints = h.searchLevel(searchVector, currentNode, 1, level)
+		if len(entryPoints) == 0 {
+			entryPoints = h.fallbackEntryPoints(searchVector, currentNode)
+		}
 	}
 
 	// Phase 2: From node.Level down to 0, search with efConstruction and connect
 	for level := node.Level; level >= 0; level-- {
 		// Search for efConstruction candidates
-		candidates := h.searchLevel(searchVector, h.nodes[entryPoints[0].ID], h.config.EfConstruction, level)
+		currentNode := h.pickEntryNode(entryPoints)
+		if currentNode == nil {
+			currentNode = h.entryPoint
+		}
+		candidates := h.searchLevel(searchVector, currentNode, h.config.EfConstruction, level)
+		if len(candidates) == 0 {
+			candidates = h.fallbackEntryPoints(searchVector, currentNode)
+		}
 
 		// Select M neighbors using optimized heuristic
 		selected := h.neighborSelector.SelectNeighborsOptimized(searchVector, candidates, level, h)
+		if len(selected) == 0 {
+			selected = h.fallbackEntryPoints(searchVector, currentNode)
+		}
 
 		// Connect bidirectionally
 		h.connectBidirectionalOptimized(nodeID, selected, level)
@@ -56,6 +73,39 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32) error
 	}
 
 	return nil
+}
+
+func (h *Index) pickEntryNode(entryPoints []*util.Candidate) *Node {
+	if len(entryPoints) == 0 {
+		return nil
+	}
+
+	entryID := entryPoints[0].ID
+	if int(entryID) >= len(h.nodes) {
+		return nil
+	}
+	return h.nodes[entryID]
+}
+
+func (h *Index) fallbackEntryPoints(searchVector []float32, node *Node) []*util.Candidate {
+	if node == nil {
+		return nil
+	}
+
+	entryID := h.findNodeID(node)
+	if entryID == ^uint32(0) || int(entryID) >= len(h.nodes) {
+		return nil
+	}
+
+	distance := h.computeDistanceOptimized(searchVector, node)
+	if distance < 0 {
+		distance = 0
+	}
+
+	return []*util.Candidate{{
+		ID:       entryID,
+		Distance: distance,
+	}}
 }
 
 // Legacy method for backward compatibility - delegates to optimized version
