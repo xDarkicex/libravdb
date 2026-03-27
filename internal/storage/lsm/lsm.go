@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
@@ -156,7 +157,12 @@ func normalizeBasePath(basePath string) string {
 		if suffix == "" {
 			suffix = "default"
 		}
-		return filepath.Join(os.TempDir(), "libravdb-memory", sanitizePathSegment(suffix))
+		safeSuffix := sanitizePathSegment(suffix)
+		return filepath.Join(
+			os.TempDir(),
+			"libravdb-memory",
+			fmt.Sprintf("%s-%d", safeSuffix, time.Now().UnixNano()),
+		)
 	}
 
 	return basePath

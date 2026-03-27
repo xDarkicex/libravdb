@@ -32,9 +32,13 @@
 # =============================================================================
 # Your project's main executables
 # Unix/Linux/macOS binary
-libraVDB
+/libraVDB
 # Windows binary
-libraVDB.exe
+/libraVDB.exe
+
+# Keep the source package tracked on case-insensitive filesystems.
+!/libravdb/
+!/libravdb/*.go
 
 # =============================================================================
 # Go Testing & Development
