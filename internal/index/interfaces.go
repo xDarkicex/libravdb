@@ -30,12 +30,14 @@ type Index interface {
 // VectorEntry represents a vector entry (avoid circular imports)
 type VectorEntry struct {
 	ID       string
+	Ordinal  uint32
 	Vector   []float32
 	Metadata map[string]interface{}
 }
 
 // SearchResult represents a search result (avoid circular imports)
 type SearchResult struct {
+	Ordinal  uint32
 	ID       string
 	Score    float32
 	Vector   []float32
@@ -85,6 +87,9 @@ type HNSWConfig struct {
 	EfSearch       int
 	ML             float64
 	Metric         util.DistanceMetric
+	Provider       hnsw.VectorProvider
+	RawVectorStore string
+	RawStoreCap    int
 	// Quantization configuration (optional)
 	Quantization *quant.QuantizationConfig
 }
@@ -113,10 +118,15 @@ type hnswWrapper struct {
 	index *hnsw.Index
 }
 
+func (w *hnswWrapper) RawVectorStoreProfile() map[string]any {
+	return w.index.RawVectorStoreProfile()
+}
+
 // Insert adapts the interface VectorEntry to HNSW VectorEntry
 func (w *hnswWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 	hnswEntry := &hnsw.VectorEntry{
 		ID:       entry.ID,
+		Ordinal:  entry.Ordinal,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
 	}
@@ -129,6 +139,7 @@ func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 	for i, entry := range entries {
 		hnswEntries[i] = &hnsw.VectorEntry{
 			ID:       entry.ID,
+			Ordinal:  entry.Ordinal,
 			Vector:   entry.Vector,
 			Metadata: entry.Metadata,
 		}
@@ -146,6 +157,7 @@ func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int) ([]*Se
 	results := make([]*SearchResult, len(hnswResults))
 	for i, r := range hnswResults {
 		results[i] = &SearchResult{
+			Ordinal:  r.Ordinal,
 			ID:       r.ID,
 			Score:    r.Score,
 			Vector:   r.Vector,
@@ -215,7 +227,10 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		EfSearch:       config.EfSearch,
 		ML:             config.ML,
 		Metric:         config.Metric,
+		Provider:       config.Provider,
 		RandomSeed:     0, // Default seed for Phase 1
+		RawVectorStore: config.RawVectorStore,
+		RawStoreCap:    config.RawStoreCap,
 		Quantization:   config.Quantization,
 	}
 

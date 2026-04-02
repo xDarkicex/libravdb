@@ -2,7 +2,7 @@ package libravdb
 
 import (
 	"context"
-	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,14 +12,13 @@ import (
 
 func TestEnhancedCollectionConfiguration(t *testing.T) {
 	// Create a temporary directory for testing
-	tmpDir := "/tmp/libravdb_test_enhanced"
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	ctx := context.Background()
 
 	// Create database with enhanced configuration
 	db, err := New(
-		WithStoragePath(tmpDir),
+		WithStoragePath(filepath.Join(tmpDir, "enhanced.libravdb")),
 		WithMetrics(true),
 	)
 	if err != nil {
@@ -154,10 +153,9 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 
 func TestBackwardCompatibleConfiguration(t *testing.T) {
 	// Test that old-style configuration still works
-	tmpDir := "/tmp/libravdb_test_compat"
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
-	db, err := New(WithStoragePath(tmpDir))
+	db, err := New(WithStoragePath(filepath.Join(tmpDir, "compat.libravdb")))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -201,10 +199,9 @@ func TestBackwardCompatibleConfiguration(t *testing.T) {
 }
 
 func TestConfigurationValidationIntegration(t *testing.T) {
-	tmpDir := "/tmp/libravdb_test_validation"
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
-	db, err := New(WithStoragePath(tmpDir))
+	db, err := New(WithStoragePath(filepath.Join(tmpDir, "validation.libravdb")))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

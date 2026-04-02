@@ -118,6 +118,7 @@ type Engine interface {
     CreateCollection(name string, config *CollectionConfig) (Collection, error)
     GetCollection(name string) (Collection, error)
     ListCollections() ([]string, error)
+    DeleteCollection(name string) error
     Close() error
 }
 ```

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func createTestDB(t *testing.T) *Database {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	db, err := New(WithStoragePath(tmpDir))
+	db, err := New(WithStoragePath(filepath.Join(tmpDir, "test.libravdb")))
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create database: %v", err)
@@ -162,6 +163,44 @@ func TestBatchInsert_Chunking(t *testing.T) {
 	}
 	if result.Failed != 0 {
 		t.Errorf("Expected 0 failed inserts, got %d", result.Failed)
+	}
+}
+
+func TestBatchInsert_ConcurrentChunkOrdering(t *testing.T) {
+	db := createTestDB(t)
+
+	collection, err := db.CreateCollection(context.Background(), "test_concurrent_chunk_ordering", WithDimension(3))
+	if err != nil {
+		t.Fatalf("Failed to create collection: %v", err)
+	}
+
+	entries := make([]*VectorEntry, 24)
+	for i := 0; i < len(entries); i++ {
+		entries[i] = &VectorEntry{
+			ID:       fmt.Sprintf("item_%02d", i),
+			Vector:   []float32{float32(i), float32(i + 1), float32(i + 2)},
+			Metadata: map[string]interface{}{"index": i},
+		}
+	}
+
+	batch := collection.NewBatchInsert(entries, &BatchOptions{
+		ChunkSize:      3,
+		MaxConcurrency: 4,
+	})
+
+	result, err := batch.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Batch insert failed: %v", err)
+	}
+
+	if result.Successful != len(entries) {
+		t.Fatalf("Expected %d successful inserts, got %d", len(entries), result.Successful)
+	}
+
+	for i, item := range result.Items {
+		if item.Index != i {
+			t.Fatalf("Expected item result index %d, got %d", i, item.Index)
+		}
 	}
 }
 

@@ -45,16 +45,17 @@
 
 ## 🎯 Overview
 
-LibraVDB is a high-performance, production-ready vector database library designed specifically for Go applications. Built from the ground up with performance, scalability, and developer experience in mind, it provides enterprise-grade vector similarity search capabilities with support for multiple indexing algorithms, advanced quantization techniques, and sophisticated metadata filtering.
+LibraVDB is a high-performance vector database library for Go applications. It provides similarity search, metadata-aware retrieval, batch and streaming ingestion, and persistent single-file storage with HNSW, IVF-PQ, and Flat indexing.
 
 ### Why LibraVDB?
 
 - **🚀 Performance First**: Optimized for high-throughput insertions and sub-millisecond search latency
 - **🔧 Go Native**: Designed specifically for Go with idiomatic APIs and zero external dependencies
-- **📈 Production Ready**: Comprehensive error handling, observability, and recovery mechanisms
+- **📈 Durable by Default**: Single-file binary persistence with reopen/rebuild support
 - **🧠 Memory Efficient**: Advanced quantization and memory mapping for large-scale deployments
 - **🔍 Feature Rich**: Complex filtering, streaming operations, and automatic optimization
 - **📊 Observable**: Built-in metrics, health checks, and performance monitoring
+- **🛡️ Safer Writes**: Bounded write admission for concurrent, batch, and streaming writers
 
 ## ✨ Key Features
 
@@ -64,15 +65,43 @@ LibraVDB is a high-performance, production-ready vector database library designe
 - **Rich Metadata Filtering**: Complex AND/OR/NOT operations with type-safe schemas
 - **Streaming Operations**: High-throughput batch processing with backpressure control
 - **Memory Management**: Configurable limits, memory mapping, and automatic optimization
-- **Persistent Storage**: LSM-tree architecture with Write-Ahead Log for durability
+- **Persistent Storage**: Single-file binary storage with WAL-backed durability
+- **Storage-Owned HNSW**: Canonical vectors and metadata live in storage; HNSW owns graph topology plus optional compressed artifacts
 
 ### Enterprise Features
 - **Observability**: Prometheus metrics, health checks, and distributed tracing
 - **Error Recovery**: Automatic recovery mechanisms and circuit breakers
 - **Performance Monitoring**: Real-time performance metrics and optimization suggestions
-- **Concurrent Access**: Thread-safe operations with fine-grained locking
+- **Concurrent Access**: Thread-safe operations with bounded write admission and queueing
 - **Configuration Management**: Extensive configuration options with validation
 - **Documentation**: Comprehensive API documentation and usage guides
+
+## 📦 Persistence Model
+
+LibraVDB persists databases as a single `.libravdb` file.
+
+- Importing the package does not create files.
+- A database file is created or opened when you call `libravdb.New(...)`.
+- If no path is provided, the default path resolves to `./data.libravdb`.
+- `WithStoragePath(...)` should point to a database file such as `./mydb.libravdb`.
+- The `.libravdb` file is the portable unit you can move or copy after closing the database.
+
+For HNSW-backed collections:
+- canonical raw vectors and metadata are stored once in canonical storage
+- HNSW uses internal ordinals and provider-backed vector access
+- HNSW nodes do not own raw vectors or metadata
+- optional compressed vectors remain index-owned derived data
+
+## 🛡️ Write Concurrency Safety
+
+LibraVDB now includes a Phase 1 write-admission layer intended to make local and plugin-style usage safer.
+
+- direct writes, batch writes, and streaming writes are admitted through a bounded per-collection write gate
+- queued writers are bounded instead of piling up indefinitely
+- waiting writers respect context cancellation
+- batch and streaming worker counts are clamped to collection write parallelism
+
+This improves safety under bursty or subagent-style write traffic, but it is not yet the full adaptive scheduler. If you expect very heavy write concurrency, keep batch and streaming concurrency conservative and prefer one coordinated writer path per collection.
 
 ## 📊 Performance Benchmarks
 
@@ -146,9 +175,9 @@ import (
 )
 
 func main() {
-    // Create database with optimized settings
+    // Create a single-file database
     db, err := libravdb.New(
-        libravdb.WithStoragePath("./vector_data"),
+        libravdb.WithStoragePath("./vector_data.libravdb"),
         libravdb.WithMetrics(true),
     )
     if err != nil {
@@ -254,11 +283,11 @@ collection, err := db.CreateCollection(ctx, "documents",
 ### High-Throughput Batch Processing
 
 ```go
-// Configure for maximum throughput
+// Configure for controlled throughput
 opts := &libravdb.StreamingOptions{
     BufferSize:     50000,
     ChunkSize:      5000,
-    MaxConcurrency: runtime.NumCPU(),
+    MaxConcurrency: 2,
     Timeout:        5 * time.Minute,
     ProgressCallback: func(stats *libravdb.StreamingStats) {
         fmt.Printf("Processed: %d/%d (%.1f%%), Rate: %.0f/sec\n",
@@ -271,7 +300,7 @@ opts := &libravdb.StreamingOptions{
 stream := collection.NewStreamingBatchInsert(opts)
 stream.Start()
 
-// Process millions of vectors efficiently
+// Process large numbers of vectors without unbounded writer fan-out
 for _, entry := range millionVectorDataset {
     stream.Send(entry)
 }
@@ -338,7 +367,7 @@ LibraVDB employs a layered architecture designed for performance, scalability, a
 │  HNSW │ IVF-PQ │ Flat │  Quantization  │  Cache  │  Monitoring │
 ├─────────────────────────────────────────────────────────────────┤
 │                        Storage Layer                           │
-│      LSM Engine      │       WAL        │     Segments        │
+│ Single-File Engine │ Canonical Records │   WAL / Snapshot     │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Operating System                          │
 └─────────────────────────────────────────────────────────────────┘
@@ -347,9 +376,9 @@ LibraVDB employs a layered architecture designed for performance, scalability, a
 ### Key Components
 
 - **Database Layer**: Collection management, global configuration, health monitoring
-- **Collection Layer**: Vector operations, metadata management, index coordination
+- **Collection Layer**: Vector operations, metadata management, index coordination, write admission
 - **Index Layer**: HNSW, IVF-PQ, and Flat algorithms with automatic selection
-- **Storage Layer**: LSM-tree architecture with WAL for durability and performance
+- **Storage Layer**: Single-file canonical storage with WAL-backed durability and reopen/rebuild support
 - **Memory Layer**: Advanced memory management with limits, mapping, and optimization
 - **Observability Layer**: Metrics, tracing, health checks, and performance monitoring
 
@@ -372,7 +401,7 @@ Detailed architecture documentation: [docs/design/architecture.md](docs/design/a
 ### Advanced Topics
 - [**Architecture Design**](docs/design/architecture.md) - System architecture and component design
 - [**HNSW Implementation**](docs/design/hnsw.md) - Detailed HNSW algorithm implementation
-- [**Storage Design**](docs/design/storage.md) - LSM-tree storage architecture
+- [**Storage Design**](docs/design/storage.md) - Single-file storage architecture
 - [**API Design**](docs/design/api.md) - API design principles and patterns
 
 ### Examples & Tutorials
@@ -387,7 +416,7 @@ Detailed architecture documentation: [docs/design/architecture.md](docs/design/a
 - **Go 1.25+**: LibraVDB requires Go 1.25 or later
 - **Memory**: Minimum 1GB RAM (4GB+ recommended for production)
 - **Storage**: SSD recommended for optimal performance
-- **CPU**: Multi-core processor recommended for parallel operations
+- **CPU**: Multi-core processor recommended for search and controlled batch ingestion
 
 ### Install via Go Modules
 
@@ -433,10 +462,12 @@ LibraVDB provides extensive configuration options for optimal performance:
 
 ```go
 db, err := libravdb.New(
-    libravdb.WithStoragePath("/var/lib/libravdb"),      // Production storage path
+    libravdb.WithStoragePath("/var/lib/libravdb/data.libravdb"), // Production database file
     libravdb.WithMetrics(true),                        // Enable Prometheus metrics
     libravdb.WithTracing(true),                        // Enable distributed tracing
     libravdb.WithMaxCollections(1000),                 // Maximum collections
+    libravdb.WithMaxConcurrentWrites(2),               // Conservative write parallelism
+    libravdb.WithMaxWriteQueueDepth(32),               // Bound queued writers
 )
 ```
 
@@ -464,9 +495,6 @@ collection, err := db.CreateCollection(ctx, "vectors",
     libravdb.WithMetadataSchema(schema),
     libravdb.WithIndexedFields("category", "timestamp"),
     
-    // Batch processing
-    libravdb.WithBatchChunkSize(5000),
-    libravdb.WithBatchConcurrency(16),
 )
 ```
 
@@ -474,25 +502,29 @@ collection, err := db.CreateCollection(ctx, "vectors",
 
 **Development**:
 ```go
-libravdb.WithStoragePath("./dev_data")
+libravdb.WithStoragePath("./dev_data.libravdb")
 libravdb.WithMetrics(false)
 libravdb.WithMemoryLimit(1*1024*1024*1024) // 1GB
 ```
 
 **Production**:
 ```go
-libravdb.WithStoragePath("/var/lib/libravdb")
+libravdb.WithStoragePath("/var/lib/libravdb/data.libravdb")
 libravdb.WithMetrics(true)
 libravdb.WithTracing(true)
+libravdb.WithMaxConcurrentWrites(2)
+libravdb.WithMaxWriteQueueDepth(64)
 libravdb.WithMemoryLimit(32*1024*1024*1024) // 32GB
 ```
 
 **High-Scale**:
 ```go
+libravdb.WithStoragePath("/var/lib/libravdb/data.libravdb")
 libravdb.WithAutoIndexSelection(true)
 libravdb.WithMemoryMapping(true)
 libravdb.WithProductQuantization(16, 8, 0.05)
-libravdb.WithBatchConcurrency(32)
+libravdb.WithMaxConcurrentWrites(2)
+libravdb.WithMaxWriteQueueDepth(128)
 ```
 
 Complete configuration guide: [docs/configuration/configuration.md](docs/configuration/configuration.md)
@@ -551,6 +583,31 @@ results, err := collection.Query(ctx).
     WithThreshold(0.8).
     Limit(50).
     Execute()
+```
+
+### Lifecycle And Export
+
+```go
+collections := db.ListCollections()
+
+records, err := collection.Query(ctx).
+    Eq("sessionId", "s1").
+    Limit(100).
+    List()
+if err != nil {
+    log.Fatal(err)
+}
+
+count, err := collection.Count(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("collection has %d records\n", count)
+
+if err := db.DeleteCollection(ctx, "session:old"); err != nil {
+    log.Fatal(err)
+}
 ```
 
 ### Performance Monitoring
@@ -842,7 +899,7 @@ LibraVDB builds upon decades of research and development in vector databases and
 
 ### Research Foundations
 - **HNSW Algorithm**: Based on research by Yu. A. Malkov and D. A. Yashunin
-- **LSM-Tree Architecture**: Inspired by Google's Bigtable and LevelDB
+- **Single-File Storage Design**: Informed by WAL, snapshot, and durable embedded database design patterns
 - **Product Quantization**: Based on work by Hervé Jégou, Matthijs Douze, and Cordelia Schmid
 - **Vector Database Concepts**: Building on research from Facebook AI, Google Research, and academic institutions
 

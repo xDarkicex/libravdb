@@ -102,6 +102,7 @@ func TestIVFPQvsHNSWPerformance(t *testing.T) {
 				M:              16,
 				EfConstruction: 200,
 				EfSearch:       50,
+				ML:             1.0 / math.Log(2.0),
 				Metric:         util.L2Distance,
 				RandomSeed:     42,
 			}

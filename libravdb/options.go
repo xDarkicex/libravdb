@@ -49,6 +49,28 @@ func WithMaxCollections(max int) Option {
 	}
 }
 
+// WithMaxConcurrentWrites bounds collection write execution parallelism.
+func WithMaxConcurrentWrites(max int) Option {
+	return func(c *Config) error {
+		if max <= 0 {
+			return fmt.Errorf("max concurrent writes must be positive")
+		}
+		c.MaxConcurrentWrites = max
+		return nil
+	}
+}
+
+// WithMaxWriteQueueDepth bounds queued writers waiting for collection admission.
+func WithMaxWriteQueueDepth(depth int) Option {
+	return func(c *Config) error {
+		if depth < 0 {
+			return fmt.Errorf("max write queue depth must be non-negative")
+		}
+		c.MaxWriteQueueDepth = depth
+		return nil
+	}
+}
+
 // CollectionOption represents a collection configuration option
 type CollectionOption func(*CollectionConfig) error
 
@@ -81,6 +103,26 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 		c.M = m
 		c.EfConstruction = efConstruction
 		c.EfSearch = efSearch
+		return nil
+	}
+}
+
+// WithRawVectorStoreMemory keeps raw vector payloads in the default in-memory store.
+func WithRawVectorStoreMemory() CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.RawVectorStore = "memory"
+		return nil
+	}
+}
+
+// WithRawVectorStoreSlabby stores raw vector payloads in a slabby-backed fixed-size store.
+func WithRawVectorStoreSlabby(segmentCapacity int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if segmentCapacity <= 0 {
+			return fmt.Errorf("slabby segment capacity must be positive")
+		}
+		c.RawVectorStore = "slabby"
+		c.RawStoreCap = segmentCapacity
 		return nil
 	}
 }

@@ -12,7 +12,7 @@ import (
 
 // TestRollbackEdgeCases tests various edge cases for rollback functionality
 func TestRollbackEdgeCases(t *testing.T) {
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestRollbackStress(t *testing.T) {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestRollbackStress(t *testing.T) {
 
 // TestRollbackFailureScenarios tests various rollback failure scenarios
 func TestRollbackFailureScenarios(t *testing.T) {
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestRollbackFailureScenarios(t *testing.T) {
 
 // TestRollbackDataConsistency tests data consistency after rollback operations
 func TestRollbackDataConsistency(t *testing.T) {
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestRollbackPerformance(t *testing.T) {
 		t.Skip("Skipping rollback performance benchmark; set LIBRAVDB_RUN_PERF=1 to run")
 	}
 
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestRollbackPerformance(t *testing.T) {
 
 // TestRollbackIntegration tests rollback with other system components
 func TestRollbackIntegration(t *testing.T) {
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

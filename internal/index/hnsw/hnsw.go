@@ -15,16 +15,23 @@ import (
 // VectorEntry represents a vector entry for HNSW indexing
 type VectorEntry struct {
 	ID       string
+	Ordinal  uint32
 	Vector   []float32
 	Metadata map[string]interface{}
 }
 
 // SearchResult represents a search result from HNSW
 type SearchResult struct {
+	Ordinal  uint32
 	ID       string
 	Score    float32
 	Vector   []float32
 	Metadata map[string]interface{}
+}
+
+type VectorProvider interface {
+	GetByOrdinal(ordinal uint32) ([]float32, error)
+	Distance(query []float32, ordinal uint32) (float32, error)
 }
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
@@ -37,10 +44,14 @@ type Index struct {
 	levelGenerator       *rand.Rand
 	distance             util.DistanceFunc
 	size                 int
-	idToIndex            map[string]uint32 // O(1) ID to node index lookup
+	provider             VectorProvider
+	idToIndex            map[string]uint32 // Legacy standalone HNSW path
+	ordinalToID          map[uint32]string // Legacy standalone HNSW path
 	entryPointCandidates []uint32          // High-level nodes for entry point selection
 	// Performance optimizations
-	neighborSelector *NeighborSelector // Optimized neighbor selection
+	neighborSelector  *NeighborSelector // Optimized neighbor selection
+	searchScratchPool sync.Pool
+	rawVectorStore    RawVectorStore
 	// Quantization support
 	quantizer           quant.Quantizer
 	trainingVectors     [][]float32 // Vectors collected for quantizer training
@@ -61,6 +72,9 @@ type Config struct {
 	ML             float64 // Level generation factor (1/ln(2))
 	Metric         util.DistanceMetric
 	RandomSeed     int64 // For reproducible tests
+	Provider       VectorProvider
+	RawVectorStore string
+	RawStoreCap    int
 	// Quantization configuration (optional)
 	Quantization *quant.QuantizationConfig
 }
@@ -81,10 +95,29 @@ func NewHNSW(config *Config) (*Index, error) {
 		nodes:                make([]*Node, 0),
 		levelGenerator:       rand.New(rand.NewSource(config.RandomSeed)),
 		distance:             distanceFunc,
+		provider:             config.Provider,
 		idToIndex:            make(map[string]uint32),
+		ordinalToID:          make(map[uint32]string),
 		entryPointCandidates: make([]uint32, 0),
 		trainingVectors:      make([][]float32, 0),
 		quantizationTrained:  false,
+	}
+	index.searchScratchPool.New = func() interface{} {
+		return &searchScratch{}
+	}
+	if config.Provider == nil {
+		switch config.RawVectorStore {
+		case "", RawVectorStoreMemory:
+			index.rawVectorStore = NewInMemoryRawVectorStore(config.Dimension)
+		case RawVectorStoreSlabby:
+			store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create slabby raw vector store: %w", err)
+			}
+			index.rawVectorStore = store
+		default:
+			return nil, fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
+		}
 	}
 
 	// Initialize quantizer if quantization is configured
@@ -108,9 +141,10 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 
 // insertSingle handles single vector insertion (must be called with lock held)
 func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
-	// Check for duplicate ID
-	if _, exists := h.idToIndex[entry.ID]; exists {
-		return fmt.Errorf("node with ID '%s' already exists", entry.ID)
+	if entry.ID != "" {
+		if _, exists := h.idToIndex[entry.ID]; exists {
+			return fmt.Errorf("node with ID '%s' already exists", entry.ID)
+		}
 	}
 
 	// Handle quantization training collection
@@ -130,11 +164,17 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 
 	// Create new node with optimized memory allocation
 	level := h.generateLevel()
+	ordinal := entry.Ordinal
+	if h.provider == nil {
+		ordinal = uint32(len(h.nodes))
+	}
+	if int(ordinal) < len(h.nodes) && h.nodes[ordinal] != nil {
+		return fmt.Errorf("node with ordinal %d already exists", ordinal)
+	}
 	node := &Node{
-		ID:       entry.ID,
-		Level:    level,
-		Metadata: entry.Metadata,
-		Links:    make([][]uint32, level+1),
+		Ordinal: ordinal,
+		Level:   level,
+		Links:   newNodeLinks(level, h.config.M),
 	}
 
 	// Handle vector storage (quantized or original)
@@ -145,29 +185,25 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 			return fmt.Errorf("failed to compress vector: %w", err)
 		}
 		node.CompressedVector = compressed
-		// Don't store original vector to save memory
-		node.Vector = nil
-	} else {
-		// Store original vector with pre-allocated capacity
-		node.Vector = make([]float32, len(entry.Vector))
-		copy(node.Vector, entry.Vector)
-	}
-
-	// Initialize empty link lists for each level with pre-allocated capacity
-	maxConnections := h.config.M
-	for i := 0; i <= level; i++ {
-		capacity := maxConnections
-		if i == 0 {
-			capacity = maxConnections * 2 // Level 0 can have more connections
+	} else if h.provider == nil {
+		_, err := h.rawVectorStore.Put(entry.Vector)
+		if err != nil {
+			return fmt.Errorf("failed to store raw vector: %w", err)
 		}
-		node.Links[i] = make([]uint32, 0, capacity)
 	}
 
-	nodeID := uint32(len(h.nodes))
-	h.nodes = append(h.nodes, node)
+	nodeID := node.Ordinal
+	if int(nodeID) >= len(h.nodes) {
+		h.ensureNodeCapacity(int(nodeID) + 1)
+	}
+	h.nodes[nodeID] = node
 
-	// Add to ID mapping
-	h.idToIndex[entry.ID] = nodeID
+	if entry.ID != "" {
+		h.idToIndex[entry.ID] = nodeID
+		if h.provider == nil {
+			h.ordinalToID[nodeID] = entry.ID
+		}
+	}
 
 	// Add to entry point candidates if level is high enough
 	// Using level >= 2 as threshold for entry point candidates
@@ -184,14 +220,14 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	}
 
 	// Delegate to insertion logic in insert.go
-	if err := h.insertNode(ctx, node, nodeID); err != nil {
-		// Rollback: remove the node we just added and clean up mappings
-		h.nodes = h.nodes[:len(h.nodes)-1]
-		delete(h.idToIndex, entry.ID)
+	if err := h.insertNode(ctx, node, nodeID, entry.Vector); err != nil {
+		h.nodes[nodeID] = nil
+		if entry.ID != "" {
+			delete(h.idToIndex, entry.ID)
+			delete(h.ordinalToID, nodeID)
+		}
 
-		// Remove from entry point candidates if it was added
 		if level >= 2 && len(h.entryPointCandidates) > 0 {
-			// Remove the last added candidate (which would be this node)
 			lastIdx := len(h.entryPointCandidates) - 1
 			if h.entryPointCandidates[lastIdx] == nodeID {
 				h.entryPointCandidates = h.entryPointCandidates[:lastIdx]
@@ -210,6 +246,32 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	}
 
 	return nil
+}
+
+func newNodeLinks(level int, baseM int) [][]uint32 {
+	links := make([][]uint32, level+1)
+	totalCapacity := 0
+	for i := 0; i <= level; i++ {
+		totalCapacity += initialNodeLinkCapacity(baseM, i)
+	}
+
+	backing := make([]uint32, 0, totalCapacity)
+	offset := 0
+	for i := 0; i <= level; i++ {
+		capacity := initialNodeLinkCapacity(baseM, i)
+		links[i] = backing[offset : offset : offset+capacity]
+		offset += capacity
+	}
+
+	return links
+}
+
+func initialNodeLinkCapacity(baseM int, level int) int {
+	maxLinks := levelMaxLinks(baseM, level)
+	if level == 0 {
+		return maxLinks + max(8, maxLinks/2)
+	}
+	return maxLinks
 }
 
 // BatchInsert provides optimized batch insertion for better performance with large datasets
@@ -241,14 +303,16 @@ func (h *Index) batchInsertOptimized(ctx context.Context, entries []*VectorEntry
 	defer h.mu.Unlock()
 
 	// Pre-allocate space for nodes to avoid repeated slice growth
-	initialSize := len(h.nodes)
-	expectedSize := initialSize + len(entries)
-
-	// Grow nodes slice if needed
-	if cap(h.nodes) < expectedSize {
-		newNodes := make([]*Node, len(h.nodes), expectedSize+len(entries)/2) // Add some extra capacity
-		copy(newNodes, h.nodes)
-		h.nodes = newNodes
+	expectedSize := len(h.nodes) + len(entries)
+	if h.provider != nil {
+		for _, entry := range entries {
+			if entry != nil && int(entry.Ordinal)+1 > expectedSize {
+				expectedSize = int(entry.Ordinal) + 1
+			}
+		}
+	}
+	if expectedSize > len(h.nodes) {
+		h.ensureNodeCapacity(expectedSize)
 	}
 
 	// Process entries in chunks to manage memory usage
@@ -292,9 +356,9 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	// Phase 1: Search from top level to level 1
 	ep := h.entryPoint
 	for level := h.maxLevel; level > 0; level-- {
-		candidates := h.searchLevel(query, ep, 1, level) // This calls the method from search.go
-		if len(candidates) > 0 {
-			ep = h.nodes[candidates[0].ID]
+		candidate := h.greedySearchLevel(query, ep, level)
+		if candidate != nil {
+			ep = h.nodes[candidate.ID]
 		}
 	}
 
@@ -303,32 +367,33 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	candidates := h.searchLevel(query, ep, ef, 0)
 
 	// Convert to results and limit to k
-	results := make([]*SearchResult, 0, min(k, len(candidates))) // Using builtin min function
+	results := make([]*SearchResult, 0, min(k, len(candidates)))
 	for i, candidate := range candidates {
 		if i >= k {
 			break
 		}
 
 		node := h.nodes[candidate.ID]
+		if node == nil {
+			continue
+		}
 
-		// Get the vector for the result (decompressed if quantized)
 		var resultVector []float32
 		if node.CompressedVector != nil && h.quantizer != nil {
 			var err error
 			resultVector, err = h.quantizer.Decompress(node.CompressedVector)
 			if err != nil {
-				// If decompression fails, return nil vector
 				resultVector = nil
 			}
-		} else {
-			resultVector = node.Vector
+		} else if h.provider == nil {
+			resultVector, _ = h.getNodeVector(node)
 		}
 
 		results = append(results, &SearchResult{
-			ID:       node.ID,
-			Score:    candidate.Distance,
-			Vector:   resultVector,
-			Metadata: node.Metadata,
+			Ordinal: node.Ordinal,
+			ID:      h.ordinalToID[node.Ordinal],
+			Score:   candidate.Distance,
+			Vector:  resultVector,
 		})
 	}
 
@@ -347,6 +412,30 @@ func (h *Index) MemoryUsage() int64 {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.calculateMemoryUsage()
+}
+
+func (h *Index) RawVectorStoreProfile() map[string]any {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.rawVectorStore == nil {
+		return nil
+	}
+	profile := h.rawVectorStore.Profile()
+	return map[string]any{
+		"backend":              profile.Backend,
+		"vector_count":         profile.VectorCount,
+		"dimension":            profile.Dimension,
+		"bytes_per_vector":     profile.BytesPerVector,
+		"memory_usage":         profile.MemoryUsage,
+		"reserved_bytes":       profile.ReservedBytes,
+		"reserved_data_bytes":  profile.ReservedDataBytes,
+		"reserved_meta_bytes":  profile.ReservedMetaBytes,
+		"reserved_guard_bytes": profile.ReservedGuardBytes,
+		"live_bytes":           profile.LiveBytes,
+		"free_bytes":           profile.FreeBytes,
+		"capacity_utilization": profile.CapacityUtilization,
+	}
 }
 
 // calculateMemoryUsage calculates memory usage without acquiring locks (must be called with lock held)
@@ -370,11 +459,12 @@ func (h *Index) calculateMemoryUsage() int64 {
 
 	var usage int64
 	for _, node := range h.nodes {
+		if node == nil {
+			continue
+		}
 		// Vector data (original or compressed)
 		if node.CompressedVector != nil {
 			usage += int64(len(node.CompressedVector))
-		} else if node.Vector != nil {
-			usage += int64(len(node.Vector) * 4) // 4 bytes per float32
 		}
 
 		// Links
@@ -383,12 +473,15 @@ func (h *Index) calculateMemoryUsage() int64 {
 		}
 
 		// Node overhead (approximate)
-		usage += 64
+		usage += 32
 	}
 
 	// Add quantizer memory usage if present
 	if h.quantizer != nil {
 		usage += h.quantizer.MemoryUsage()
+	}
+	if h.rawVectorStore != nil {
+		usage += h.rawVectorStore.MemoryUsage()
 	}
 
 	// Add training vectors memory usage if still collecting
@@ -410,6 +503,11 @@ func (h *Index) Close() error {
 	h.nodes = nil
 	h.entryPoint = nil
 	h.size = 0
+	h.idToIndex = make(map[string]uint32)
+	h.ordinalToID = make(map[uint32]string)
+	if h.rawVectorStore != nil {
+		_ = h.rawVectorStore.Reset()
+	}
 
 	return nil
 }
@@ -423,14 +521,42 @@ func (h *Index) generateLevel() int {
 	return level
 }
 
-// findNodeID finds the ID of a node (helper function)
+// findNodeID returns the stable node index without scanning h.nodes.
 func (h *Index) findNodeID(target *Node) uint32 {
-	for i, node := range h.nodes {
-		if node == target {
-			return uint32(i)
+	if target == nil {
+		return ^uint32(0)
+	}
+	if int(target.Ordinal) >= len(h.nodes) || h.nodes[target.Ordinal] != target {
+		return ^uint32(0)
+	}
+	return target.Ordinal
+}
+
+func (h *Index) ensureNodeCapacity(minSize int) {
+	if minSize <= len(h.nodes) {
+		return
+	}
+	grown := make([]*Node, nextNodeCapacity(len(h.nodes), minSize))
+	copy(grown, h.nodes)
+	h.nodes = grown
+}
+
+func nextNodeCapacity(currentLen, minSize int) int {
+	if minSize <= currentLen {
+		return currentLen
+	}
+	newSize := currentLen
+	if newSize < 16 {
+		newSize = 16
+	}
+	for newSize < minSize {
+		if newSize < 1024 {
+			newSize *= 2
+		} else {
+			newSize += newSize / 2
 		}
 	}
-	return ^uint32(0) // Not found
+	return newSize
 }
 
 // validate checks if the configuration is valid
@@ -516,7 +642,19 @@ func (h *Index) getNodeVector(node *Node) ([]float32, error) {
 	if node.CompressedVector != nil && h.quantizer != nil {
 		return h.quantizer.Decompress(node.CompressedVector)
 	}
-	return node.Vector, nil
+	if h.provider != nil {
+		return h.provider.GetByOrdinal(node.Ordinal)
+	}
+	if h.rawVectorStore != nil {
+		ref := VectorRef{
+			Kind:  VectorEncodingRaw,
+			Slot:  node.Ordinal,
+			Bytes: uint32(h.config.Dimension * 4),
+			Valid: true,
+		}
+		return h.rawVectorStore.Get(ref)
+	}
+	return nil, fmt.Errorf("vector unavailable for ordinal %d", node.Ordinal)
 }
 
 // computeDistance computes distance between vectors, handling quantization
@@ -533,12 +671,30 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 		return h.quantizer.DistanceToQuery(node2.CompressedVector, vec1)
 	}
 
-	// Fall back to regular distance computation
+	if vec1 == nil && node1 != nil {
+		var err error
+		vec1, err = h.getNodeVector(node1)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if vec2 == nil && node2 != nil {
+		var err error
+		vec2, err = h.getNodeVector(node2)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	return h.distance(vec1, vec2), nil
 }
 
 func (h *Index) Delete(ctx context.Context, id string) error {
 	return h.deleteNode(ctx, id)
+}
+
+func (h *Index) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
+	return h.deleteNodeByOrdinal(ctx, ordinal)
 }
 
 // MemoryMappable interface implementation
@@ -598,10 +754,11 @@ func (h *Index) EnableMemoryMapping(basePath string) error {
 	// Keep essential structures but clear large data
 	for _, node := range h.nodes {
 		if node != nil {
-			// Clear vector data but keep metadata
-			node.Vector = nil
 			node.CompressedVector = nil
 		}
+	}
+	if h.rawVectorStore != nil {
+		_ = h.rawVectorStore.Reset()
 	}
 
 	// Clear training vectors
@@ -707,7 +864,14 @@ func (h *Index) estimateFileSize() int64 {
 	// Nodes
 	for _, node := range h.nodes {
 		if node != nil {
-			size += int64(len(node.ID)) + int64(len(node.Vector)*4) + 16
+			vectorBytes := int64(0)
+			switch {
+			case node.CompressedVector != nil:
+				vectorBytes = int64(len(node.CompressedVector))
+			case h.provider == nil:
+				vectorBytes = int64(h.config.Dimension * 4)
+			}
+			size += vectorBytes + 24
 		}
 	}
 

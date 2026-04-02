@@ -11,17 +11,29 @@ import (
 func (h *Index) deleteNode(ctx context.Context, id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
 	if h.size == 0 {
 		return fmt.Errorf("cannot delete from empty index")
 	}
-
-	// Find the node to delete using O(1) map lookup
 	nodeID, node := h.findNodeByID(id)
 	if nodeID == ^uint32(0) {
 		return fmt.Errorf("node with ID '%s' not found", id)
 	}
+	return h.deleteNodeLocked(ctx, nodeID, node, id)
+}
 
+func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.size == 0 {
+		return fmt.Errorf("cannot delete from empty index")
+	}
+	if ordinal >= uint32(len(h.nodes)) || h.nodes[ordinal] == nil {
+		return fmt.Errorf("node with ordinal %d not found", ordinal)
+	}
+	return h.deleteNodeLocked(ctx, ordinal, h.nodes[ordinal], h.ordinalToID[ordinal])
+}
+
+func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node, id string) error {
 	// Handle special case: deleting the only node
 	if h.size == 1 {
 		h.nodes = h.nodes[:0]
@@ -29,6 +41,7 @@ func (h *Index) deleteNode(ctx context.Context, id string) error {
 		h.maxLevel = 0
 		h.size = 0
 		delete(h.idToIndex, id)
+		delete(h.ordinalToID, nodeID)
 		h.entryPointCandidates = h.entryPointCandidates[:0]
 		return nil
 	}
@@ -53,10 +66,9 @@ func (h *Index) deleteNode(ctx context.Context, id string) error {
 // findNodeByID finds a node by its ID using O(1) map lookup
 func (h *Index) findNodeByID(id string) (uint32, *Node) {
 	if idx, exists := h.idToIndex[id]; exists {
-		if idx < uint32(len(h.nodes)) && h.nodes[idx] != nil && h.nodes[idx].ID == id {
+		if idx < uint32(len(h.nodes)) && h.nodes[idx] != nil {
 			return idx, h.nodes[idx]
 		}
-		// Remove stale entry if found
 		delete(h.idToIndex, id)
 	}
 	return ^uint32(0), nil
@@ -158,7 +170,10 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 				continue
 			}
 
-			dist := h.distance(node1.Vector, node2.Vector)
+			dist, err := h.computeDistance(nil, nil, node1, node2)
+			if err != nil {
+				continue
+			}
 			distanceCache[[2]uint32{id1, id2}] = dist
 			distanceCache[[2]uint32{id2, id1}] = dist
 		}
@@ -266,13 +281,13 @@ func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int
 	// Add nodeID2 to nodeID1's connections
 	node1 := h.nodes[nodeID1]
 	if node1 != nil && level < len(node1.Links) {
-		node1.Links[level] = append(node1.Links[level], nodeID2)
+		appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2)
 	}
 
 	// Add nodeID1 to nodeID2's connections
 	node2 := h.nodes[nodeID2]
 	if node2 != nil && level < len(node2.Links) {
-		node2.Links[level] = append(node2.Links[level], nodeID1)
+		appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1)
 	}
 }
 
@@ -368,19 +383,12 @@ func (h *Index) rebuildEntryPointCandidates() {
 
 // removeNodeFromIndex removes a node from all index data structures
 func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
-	// Remove from ID mapping
 	delete(h.idToIndex, id)
+	delete(h.ordinalToID, nodeID)
 
-	// Remove from entry point candidates
 	h.removeFromEntryPointCandidates(nodeID)
 
-	// Mark slot as nil in nodes array
 	if nodeID < uint32(len(h.nodes)) {
 		h.nodes[nodeID] = nil
-	}
-
-	// Compact nodes array if possible (remove trailing nils)
-	for len(h.nodes) > 0 && h.nodes[len(h.nodes)-1] == nil {
-		h.nodes = h.nodes[:len(h.nodes)-1]
 	}
 }

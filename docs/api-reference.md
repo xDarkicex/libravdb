@@ -48,7 +48,22 @@ Retrieves an existing collection by name.
 func (db *Database) ListCollections() []string
 ```
 
-Returns the names of all collections in the database.
+Returns the names of all persisted collections in the database, including
+collections discovered during reopen before any `GetCollection` calls.
+
+#### DeleteCollection
+```go
+func (db *Database) DeleteCollection(ctx context.Context, name string) error
+```
+
+Deletes a collection and its persisted data.
+
+#### DeleteCollections
+```go
+func (db *Database) DeleteCollections(ctx context.Context, names []string) error
+```
+
+Deletes multiple collections by exact name.
 
 #### Health
 ```go
@@ -129,6 +144,55 @@ Inserts or updates a vector in the collection.
 - `vector` - Float32 array matching collection dimension
 - `metadata` - Optional key-value pairs for filtering
 
+#### InsertBatch
+```go
+func (c *Collection) InsertBatch(ctx context.Context, entries []VectorEntry) error
+```
+
+Inserts multiple vectors through a stable public batch API.
+
+#### Delete
+```go
+func (c *Collection) Delete(ctx context.Context, id string) error
+```
+
+Deletes a single vector by ID.
+
+#### DeleteBatch
+```go
+func (c *Collection) DeleteBatch(ctx context.Context, ids []string) error
+```
+
+Deletes multiple vectors by ID.
+
+#### Iterate
+```go
+func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error
+```
+
+Iterates all persisted records in the collection.
+
+#### ListAll
+```go
+func (c *Collection) ListAll(ctx context.Context) ([]Record, error)
+```
+
+Returns all persisted records in the collection.
+
+#### ListByMetadata
+```go
+func (c *Collection) ListByMetadata(ctx context.Context, field string, value interface{}) ([]Record, error)
+```
+
+Returns records whose metadata field exactly matches the supplied value.
+
+#### Count
+```go
+func (c *Collection) Count(ctx context.Context) (int, error)
+```
+
+Returns the exact number of live records in the collection.
+
 #### Search
 ```go
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error)
@@ -174,6 +238,7 @@ The QueryBuilder provides a fluent interface for complex queries with filtering.
 func (qb *QueryBuilder) WithVector(vector []float32) *QueryBuilder
 func (qb *QueryBuilder) Limit(limit int) *QueryBuilder
 func (qb *QueryBuilder) WithThreshold(threshold float32) *QueryBuilder
+func (qb *QueryBuilder) List() ([]Record, error)
 func (qb *QueryBuilder) Execute() (*SearchResults, error)
 ```
 
@@ -188,15 +253,12 @@ func (qb *QueryBuilder) NotEq(field string, value interface{}) *QueryBuilder
 #### Range Filters
 ```go
 func (qb *QueryBuilder) Gt(field string, value interface{}) *QueryBuilder
-func (qb *QueryBuilder) Gte(field string, value interface{}) *QueryBuilder
 func (qb *QueryBuilder) Lt(field string, value interface{}) *QueryBuilder
-func (qb *QueryBuilder) Lte(field string, value interface{}) *QueryBuilder
 func (qb *QueryBuilder) Between(field string, min, max interface{}) *QueryBuilder
 ```
 
 #### Containment Filters
 ```go
-func (qb *QueryBuilder) Contains(field string, value interface{}) *QueryBuilder
 func (qb *QueryBuilder) ContainsAny(field string, values []interface{}) *QueryBuilder
 func (qb *QueryBuilder) ContainsAll(field string, values []interface{}) *QueryBuilder
 ```
@@ -218,6 +280,14 @@ results, err := collection.Query(ctx).
     Eq("category", "documents").
     Limit(10).
     Execute()
+```
+
+#### Metadata-Only Listing
+```go
+records, err := collection.Query(ctx).
+    Eq("sessionId", "s1").
+    Limit(100).
+    List()
 ```
 
 #### Range Filter

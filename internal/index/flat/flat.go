@@ -155,14 +155,8 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		}
 
 		result := &SearchResult{
-			ID:       entry.ID,
-			Score:    distance,
-			Vector:   make([]float32, len(entry.Vector)),
-			Metadata: make(map[string]interface{}),
-		}
-		copy(result.Vector, entry.Vector)
-		for k, v := range entry.Metadata {
-			result.Metadata[k] = v
+			ID:    entry.ID,
+			Score: distance,
 		}
 
 		allResults = append(allResults, result)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +106,19 @@ func (e *Engine) GetCollection(name string) (storage.Collection, error) {
 	return collection, nil
 }
 
+// ListCollections returns all discovered collection names in stable order.
+func (e *Engine) ListCollections() ([]string, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	names := make([]string, 0, len(e.collections))
+	for name := range e.collections {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 // GetCollectionWithConfig retrieves an existing collection and its configuration
 func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *CollectionConfig, error) {
 	e.mu.RLock()
@@ -122,6 +136,29 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *Coll
 	}
 
 	return collection, config, nil
+}
+
+// DeleteCollection removes a collection from the engine and deletes its persisted data.
+func (e *Engine) DeleteCollection(name string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	collection, exists := e.collections[name]
+	if !exists {
+		return fmt.Errorf("collection %s not found", name)
+	}
+
+	if err := collection.Close(); err != nil {
+		return fmt.Errorf("failed to close collection %s: %w", name, err)
+	}
+
+	delete(e.collections, name)
+
+	if err := os.RemoveAll(collection.path); err != nil {
+		return fmt.Errorf("failed to remove collection %s: %w", name, err)
+	}
+
+	return nil
 }
 
 // Close shuts down the LSM engine and all collections

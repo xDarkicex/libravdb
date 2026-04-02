@@ -485,7 +485,9 @@ func TestAutoRecoveryWorkflow(t *testing.T) {
 		}
 
 		// Simulate memory usage improvement
+		memMgr.mu.Lock()
 		memMgr.usage.Total = 500 * 1024 * 1024 // Reduce to 500MB
+		memMgr.mu.Unlock()
 
 		// Wait for auto-recovery to kick in
 		time.Sleep(300 * time.Millisecond)

@@ -23,17 +23,36 @@ type CollectionConfig struct {
 	EfSearch       int     `json:"ef_search"`
 	ML             float64 `json:"ml"`
 	Version        int     `json:"version"`
+	RawVectorStore string  `json:"raw_vector_store,omitempty"`
+	RawStoreCap    int     `json:"raw_store_cap,omitempty"`
 }
 
 // Collection represents a storage collection with WAL persistence and in-memory cache
 type Collection struct {
-	mu      sync.RWMutex
-	name    string
-	path    string
-	walPath string
-	wal     *wal.WAL
-	cache   map[string]*index.VectorEntry
-	closed  bool
+	mu          sync.RWMutex
+	name        string
+	path        string
+	walPath     string
+	wal         *wal.WAL
+	cache       map[string]*index.VectorEntry
+	ordinalToID []string
+	nextOrdinal uint32
+	closed      bool
+}
+
+func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error {
+	_ = ctx
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, entry := range entries {
+		if current, ok := c.cache[entry.ID]; ok {
+			entry.Ordinal = current.Ordinal
+			continue
+		}
+		entry.Ordinal = c.nextOrdinal
+		c.nextOrdinal++
+	}
+	return nil
 }
 
 // Insert persists a vector entry to WAL and updates the in-memory cache
@@ -61,10 +80,71 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 	// Update in-memory cache
 	c.cache[entry.ID] = &index.VectorEntry{
 		ID:       entry.ID,
+		Ordinal:  entry.Ordinal,
 		Vector:   make([]float32, len(entry.Vector)),
 		Metadata: entry.Metadata,
 	}
 	copy(c.cache[entry.ID].Vector, entry.Vector)
+	if int(entry.Ordinal) >= len(c.ordinalToID) {
+		grown := make([]string, entry.Ordinal+1)
+		copy(grown, c.ordinalToID)
+		c.ordinalToID = grown
+	}
+	c.ordinalToID[entry.Ordinal] = entry.ID
+
+	return nil
+}
+
+// InsertBatch persists multiple vector entries with a single WAL flush/sync.
+func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEntry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return fmt.Errorf("collection %s is closed", c.name)
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	walEntries := make([]*wal.Entry, 0, len(entries))
+	cacheUpdates := make([]*index.VectorEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("entry cannot be nil")
+		}
+
+		walEntries = append(walEntries, &wal.Entry{
+			Operation: wal.OpInsert,
+			ID:        entry.ID,
+			Vector:    entry.Vector,
+			Metadata:  entry.Metadata,
+		})
+
+		cacheEntry := &index.VectorEntry{
+			ID:       entry.ID,
+			Ordinal:  entry.Ordinal,
+			Vector:   make([]float32, len(entry.Vector)),
+			Metadata: entry.Metadata,
+		}
+		copy(cacheEntry.Vector, entry.Vector)
+		cacheUpdates = append(cacheUpdates, cacheEntry)
+	}
+
+	if err := c.wal.AppendBatch(ctx, walEntries); err != nil {
+		return fmt.Errorf("failed to write batch to WAL: %w", err)
+	}
+
+	for _, entry := range cacheUpdates {
+		c.cache[entry.ID] = entry
+		if int(entry.Ordinal) >= len(c.ordinalToID) {
+			grown := make([]string, entry.Ordinal+1)
+			copy(grown, c.ordinalToID)
+			c.ordinalToID = grown
+		}
+		c.ordinalToID[entry.Ordinal] = entry.ID
+	}
 
 	return nil
 }
@@ -86,9 +166,60 @@ func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, er
 	// Return a copy to prevent external modifications
 	return &index.VectorEntry{
 		ID:       entry.ID,
+		Ordinal:  entry.Ordinal,
 		Vector:   append([]float32(nil), entry.Vector...),
 		Metadata: entry.Metadata,
 	}, nil
+}
+
+func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
+	_ = ctx
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return false, fmt.Errorf("collection %s is closed", c.name)
+	}
+
+	_, exists := c.cache[id]
+	return exists, nil
+}
+
+func (c *Collection) GetIDByOrdinal(ctx context.Context, ordinal uint32) (string, error) {
+	_ = ctx
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if int(ordinal) >= len(c.ordinalToID) || c.ordinalToID[ordinal] == "" {
+		return "", fmt.Errorf("ordinal %d not found", ordinal)
+	}
+	return c.ordinalToID[ordinal], nil
+}
+
+func (c *Collection) MemoryUsage(ctx context.Context) (int64, error) {
+	_ = ctx
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var usage int64
+	for id, entry := range c.cache {
+		if entry == nil {
+			continue
+		}
+		usage += int64(len(id))
+		usage += int64(len(entry.Vector) * 4)
+		for key, value := range entry.Metadata {
+			usage += int64(len(key))
+			switch typed := value.(type) {
+			case string:
+				usage += int64(len(typed))
+			case []string:
+				for _, item := range typed {
+					usage += int64(len(item))
+				}
+			}
+		}
+	}
+	return usage, nil
 }
 
 // Delete removes a vector entry by persisting delete operation and updating cache
@@ -169,6 +300,18 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 	}
 
 	return nil
+}
+
+// Count returns the exact number of live entries in the collection.
+func (c *Collection) Count(ctx context.Context) (int, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+
+	return len(c.cache), nil
 }
 
 // saveConfig saves the collection configuration to disk
@@ -268,9 +411,6 @@ func (c *Collection) recoverFromWAL() error {
 			return fmt.Errorf("unknown WAL operation: %v", entry.Operation)
 		}
 	}
-
-	fmt.Printf("Recovered %d operations for collection %s (%d entries in cache)\n",
-		recoveredCount, c.name, len(c.cache))
 
 	return nil
 }

@@ -190,7 +190,8 @@ func (s *StreamingBatchInsert) Start() error {
 	s.stats.mutex.Unlock()
 
 	// Start worker goroutines
-	for i := 0; i < s.options.MaxConcurrency; i++ {
+	workerCount := s.collection.effectiveWriteConcurrency(s.options.MaxConcurrency)
+	for i := 0; i < workerCount; i++ {
 		s.wg.Add(1)
 		go s.worker(i)
 	}
@@ -221,7 +222,9 @@ func (s *StreamingBatchInsert) Send(entry *VectorEntry) error {
 	}
 
 	// Check backpressure
-	if s.backpressure.ShouldApplyBackpressure() {
+	backpressureActive := s.backpressure.ShouldApplyBackpressure()
+	currentBuffer := atomic.LoadInt32(&s.backpressure.currentBufferSize)
+	if backpressureActive && currentBuffer >= int32(s.options.BufferSize) {
 		return ErrBackpressureActive
 	}
 
@@ -235,7 +238,7 @@ func (s *StreamingBatchInsert) Send(entry *VectorEntry) error {
 	case <-s.ctx.Done():
 		atomic.AddInt32(&s.backpressure.currentBufferSize, -1)
 		return s.ctx.Err()
-	default:
+	case <-time.After(10 * time.Millisecond):
 		atomic.AddInt32(&s.backpressure.currentBufferSize, -1)
 		return ErrBackpressureActive
 	}
@@ -264,21 +267,36 @@ func (s *StreamingBatchInsert) Errors() <-chan error {
 // Stats returns current streaming statistics
 func (s *StreamingBatchInsert) Stats() *StreamingStats {
 	s.stats.mutex.RLock()
-	defer s.stats.mutex.RUnlock()
-
-	// Create a copy to avoid race conditions
-	statsCopy := *s.stats
-	statsCopy.ErrorsByType = make(map[string]int64)
+	statsCopy := StreamingStats{
+		TotalReceived:   atomic.LoadInt64(&s.stats.TotalReceived),
+		TotalProcessed:  atomic.LoadInt64(&s.stats.TotalProcessed),
+		TotalSuccessful: atomic.LoadInt64(&s.stats.TotalSuccessful),
+		TotalFailed:     atomic.LoadInt64(&s.stats.TotalFailed),
+		ItemsPerSecond:  s.stats.ItemsPerSecond,
+		SuccessRate:     s.stats.SuccessRate,
+		ErrorRate:       s.stats.ErrorRate,
+		StartTime:       s.stats.StartTime,
+		LastUpdate:      s.stats.LastUpdate,
+		ElapsedTime:     s.stats.ElapsedTime,
+		EstimatedETA:    s.stats.EstimatedETA,
+		ActiveWorkers:   s.stats.ActiveWorkers,
+		Status:          s.stats.Status,
+		LastError:       s.stats.LastError,
+		ErrorsByType:    make(map[string]int64, len(s.stats.ErrorsByType)),
+		RecentErrors:    make([]error, len(s.stats.RecentErrors)),
+	}
 	for k, v := range s.stats.ErrorsByType {
 		statsCopy.ErrorsByType[k] = v
 	}
-
-	statsCopy.RecentErrors = make([]error, len(s.stats.RecentErrors))
 	copy(statsCopy.RecentErrors, s.stats.RecentErrors)
+	s.stats.mutex.RUnlock()
 
 	// Refresh live queue/backpressure state so callers do not depend on the
 	// periodic stats ticker for correctness-sensitive reads.
 	currentBuffer := atomic.LoadInt32(&s.backpressure.currentBufferSize)
+	s.backpressure.mutex.RLock()
+	statsCopy.CurrentMemoryUsage = s.backpressure.currentMemory
+	s.backpressure.mutex.RUnlock()
 	statsCopy.BufferUtilization = float64(currentBuffer) / float64(s.options.BufferSize)
 	statsCopy.QueuedItems = int(currentBuffer)
 	statsCopy.BackpressureActive = s.backpressure.IsActive()
@@ -504,19 +522,26 @@ func (s *StreamingBatchInsert) updateStats() {
 	s.stats.LastUpdate = now
 	s.stats.ElapsedTime = now.Sub(s.stats.StartTime)
 
+	totalProcessed := atomic.LoadInt64(&s.stats.TotalProcessed)
+	totalSuccessful := atomic.LoadInt64(&s.stats.TotalSuccessful)
+	totalFailed := atomic.LoadInt64(&s.stats.TotalFailed)
+
 	// Calculate rates
 	if s.stats.ElapsedTime > 0 {
-		s.stats.ItemsPerSecond = float64(s.stats.TotalProcessed) / s.stats.ElapsedTime.Seconds()
+		s.stats.ItemsPerSecond = float64(totalProcessed) / s.stats.ElapsedTime.Seconds()
 	}
 
-	total := s.stats.TotalSuccessful + s.stats.TotalFailed
+	total := totalSuccessful + totalFailed
 	if total > 0 {
-		s.stats.SuccessRate = float64(s.stats.TotalSuccessful) / float64(total)
-		s.stats.ErrorRate = float64(s.stats.TotalFailed) / float64(total)
+		s.stats.SuccessRate = float64(totalSuccessful) / float64(total)
+		s.stats.ErrorRate = float64(totalFailed) / float64(total)
 	}
 
 	// Update buffer utilization
 	currentBuffer := atomic.LoadInt32(&s.backpressure.currentBufferSize)
+	s.backpressure.mutex.RLock()
+	s.stats.CurrentMemoryUsage = s.backpressure.currentMemory
+	s.backpressure.mutex.RUnlock()
 	s.stats.BufferUtilization = float64(currentBuffer) / float64(s.options.BufferSize)
 	s.stats.QueuedItems = int(currentBuffer)
 

@@ -12,6 +12,13 @@ type VectorEntry struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
+// Record represents a persisted vector record returned by iteration/list APIs.
+type Record struct {
+	ID       string                 `json:"id"`
+	Vector   []float32              `json:"vector"`
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
 // SearchResult represents a single search result
 type SearchResult struct {
 	ID       string                 `json:"id"`
@@ -44,7 +51,8 @@ type CollectionStats struct {
 	MemoryUsage int64  `json:"memory_usage"`
 
 	// Enhanced memory statistics
-	MemoryStats *CollectionMemoryStats `json:"memory_stats,omitempty"`
+	MemoryStats         *CollectionMemoryStats `json:"memory_stats,omitempty"`
+	RawVectorStoreStats *RawVectorStoreStats   `json:"raw_vector_store_stats,omitempty"`
 
 	// Optimization information
 	OptimizationStatus *OptimizationStatus `json:"optimization_status,omitempty"`
@@ -53,6 +61,21 @@ type CollectionStats struct {
 	HasQuantization      bool `json:"has_quantization"`
 	HasMemoryLimit       bool `json:"has_memory_limit"`
 	MemoryMappingEnabled bool `json:"memory_mapping_enabled"`
+}
+
+type RawVectorStoreStats struct {
+	Backend             string  `json:"backend"`
+	VectorCount         int     `json:"vector_count"`
+	Dimension           int     `json:"dimension"`
+	BytesPerVector      int     `json:"bytes_per_vector"`
+	MemoryUsage         int64   `json:"memory_usage"`
+	ReservedBytes       int64   `json:"reserved_bytes"`
+	ReservedDataBytes   int64   `json:"reserved_data_bytes"`
+	ReservedMetaBytes   int64   `json:"reserved_meta_bytes"`
+	ReservedGuardBytes  int64   `json:"reserved_guard_bytes"`
+	LiveBytes           int64   `json:"live_bytes"`
+	FreeBytes           int64   `json:"free_bytes"`
+	CapacityUtilization float64 `json:"capacity_utilization"`
 }
 
 func (it IndexType) String() string {
@@ -207,6 +230,9 @@ type OptimizationStatus struct {
 type CollectionMemoryStats struct {
 	// Total memory usage in bytes
 	Total int64 `json:"total"`
+
+	// Canonical storage memory usage in bytes
+	Storage int64 `json:"storage"`
 
 	// Index memory usage in bytes
 	Index int64 `json:"index"`

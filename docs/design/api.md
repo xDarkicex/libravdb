@@ -38,6 +38,8 @@ type Database interface {
     CreateCollection(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error)
     GetCollection(name string) (*Collection, error)
     ListCollections() []string
+    DeleteCollection(ctx context.Context, name string) error
+    DeleteCollections(ctx context.Context, names []string) error
     Health(ctx context.Context) (*HealthStatus, error)
     Stats() *DatabaseStats
     Close() error
@@ -54,8 +56,15 @@ type Database interface {
 ```go
 type Collection interface {
     Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error
+    InsertBatch(ctx context.Context, entries []VectorEntry) error
+    Delete(ctx context.Context, id string) error
+    DeleteBatch(ctx context.Context, ids []string) error
     Search(ctx context.Context, vector []float32, k int) (*SearchResults, error)
     Query(ctx context.Context) *QueryBuilder
+    Iterate(ctx context.Context, fn func(Record) error) error
+    ListAll(ctx context.Context) ([]Record, error)
+    ListByMetadata(ctx context.Context, field string, value interface{}) ([]Record, error)
+    Count(ctx context.Context) (int, error)
     Stats() *CollectionStats
     Close() error
 }
@@ -75,6 +84,7 @@ type QueryBuilder interface {
     And() *QueryBuilder
     Or() *QueryBuilder
     Limit(limit int) *QueryBuilder
+    List() ([]Record, error)
     Execute() (*SearchResults, error)
 }
 ```

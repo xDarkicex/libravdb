@@ -11,7 +11,7 @@ import (
 
 func TestCollectionMemoryManagement(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestCollectionMemoryManagement(t *testing.T) {
 
 func TestCollectionOptimization(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestCollectionOptimization(t *testing.T) {
 
 func TestCollectionMemoryMapping(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestCollectionMemoryMapping(t *testing.T) {
 
 func TestDatabaseGlobalMemoryManagement(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestDatabaseGlobalMemoryManagement(t *testing.T) {
 
 func TestCollectionStatsEnhancement(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestCollectionStatsEnhancement(t *testing.T) {
 
 func TestCollectionConfigurationValidation(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestCollectionConfigurationValidation(t *testing.T) {
 
 func TestCollectionLifecycleWithMemoryManagement(t *testing.T) {
 	// Create database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

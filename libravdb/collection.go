@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/filter"
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/storage"
-	"github.com/xDarkicex/libravdb/internal/storage/lsm"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -23,6 +23,7 @@ type Collection struct {
 	config        *CollectionConfig
 	index         index.Index
 	storage       storage.Collection
+	writes        *writeController
 	metrics       *obs.Metrics
 	memoryManager memory.MemoryManager
 	closed        bool
@@ -43,6 +44,8 @@ type CollectionConfig struct {
 	EfSearch       int     `json:"ef_search"`       // Size of dynamic candidate list during search
 	ML             float64 `json:"ml"`              // Level generation factor
 	Version        int     `json:"version"`         // Config version for future compatibility
+	RawVectorStore string  `json:"raw_vector_store,omitempty"`
+	RawStoreCap    int     `json:"raw_store_cap,omitempty"`
 	// Persistence configuration
 	AutoSave     bool          `json:"auto_save"`     // Enable automatic index saving
 	SaveInterval time.Duration `json:"save_interval"` // Interval between automatic saves
@@ -99,7 +102,7 @@ func selectOptimalIndexType(vectorCount int) IndexType {
 }
 
 // newCollection creates a new collection instance
-func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metrics, opts ...CollectionOption) (*Collection, error) {
+func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metrics, writes *writeController, opts ...CollectionOption) (*Collection, error) {
 	config := &CollectionConfig{
 		Dimension:      768, // Default for common embeddings
 		Metric:         CosineDistance,
@@ -108,6 +111,8 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		EfConstruction: 200,
 		EfSearch:       50,
 		ML:             1.0 / math.Log(2.0),
+		RawVectorStore: "slabby",
+		RawStoreCap:    4096,
 		// Default memory management settings
 		MemoryLimit:    0, // No limit by default
 		CachePolicy:    LRUCache,
@@ -134,7 +139,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 	}
 
 	// Convert to LSM config format
-	lsmConfig := &lsm.CollectionConfig{
+	engineConfig := &storage.CollectionConfig{
 		Dimension:      config.Dimension,
 		Metric:         int(config.Metric),
 		IndexType:      int(config.IndexType),
@@ -143,10 +148,12 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		EfSearch:       config.EfSearch,
 		ML:             config.ML,
 		Version:        1,
+		RawVectorStore: config.RawVectorStore,
+		RawStoreCap:    config.RawStoreCap,
 	}
 
 	// Create storage for this collection - PASS THE CONFIG
-	collectionStorage, err := storageEngine.CreateCollection(name, lsmConfig)
+	collectionStorage, err := storageEngine.CreateCollection(name, engineConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection storage: %w", err)
 	}
@@ -155,6 +162,10 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 	var idx index.Index
 	switch config.IndexType {
 	case HNSW:
+		provider, _ := collectionStorage.(interface {
+			GetByOrdinal(uint32) ([]float32, error)
+			Distance([]float32, uint32) (float32, error)
+		})
 		idx, err = index.NewHNSW(&index.HNSWConfig{
 			Dimension:      config.Dimension,
 			M:              config.M,
@@ -162,6 +173,9 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 			EfSearch:       config.EfSearch,
 			ML:             config.ML,
 			Metric:         util.DistanceMetric(config.Metric),
+			Provider:       provider,
+			RawVectorStore: config.RawVectorStore,
+			RawStoreCap:    config.RawStoreCap,
 			Quantization:   config.Quantization,
 		})
 	case IVFPQ:
@@ -221,35 +235,71 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		config:        config,
 		index:         idx,
 		storage:       collectionStorage,
+		writes:        writes,
 		metrics:       metrics,
 		memoryManager: memManager,
 	}, nil
 }
 
 // newCollectionFromStorage creates a collection instance from existing storage
-func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, lsmConfig *lsm.CollectionConfig) (*Collection, error) {
+func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController) (*Collection, error) {
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
-		Dimension:      lsmConfig.Dimension,
-		Metric:         DistanceMetric(lsmConfig.Metric),
-		IndexType:      IndexType(lsmConfig.IndexType),
-		M:              lsmConfig.M,
-		EfConstruction: lsmConfig.EfConstruction,
-		EfSearch:       lsmConfig.EfSearch,
-		ML:             lsmConfig.ML,
-		Version:        lsmConfig.Version,
+		Dimension:      engineConfig.Dimension,
+		Metric:         DistanceMetric(engineConfig.Metric),
+		IndexType:      IndexType(engineConfig.IndexType),
+		M:              engineConfig.M,
+		EfConstruction: engineConfig.EfConstruction,
+		EfSearch:       engineConfig.EfSearch,
+		ML:             engineConfig.ML,
+		Version:        engineConfig.Version,
+		RawVectorStore: engineConfig.RawVectorStore,
+		RawStoreCap:    engineConfig.RawStoreCap,
 	}
 
-	// Create index with stored config
-	idx, err := index.NewHNSW(&index.HNSWConfig{
-		Dimension:      config.Dimension,
-		M:              config.M,
-		EfConstruction: config.EfConstruction,
-		EfSearch:       config.EfSearch,
-		ML:             config.ML,
-		Metric:         util.DistanceMetric(config.Metric),
-		Quantization:   config.Quantization,
-	})
+	// Create index with stored config.
+	var (
+		idx index.Index
+		err error
+	)
+	switch config.IndexType {
+	case HNSW:
+		provider, _ := storageCollection.(interface {
+			GetByOrdinal(uint32) ([]float32, error)
+			Distance([]float32, uint32) (float32, error)
+		})
+		idx, err = index.NewHNSW(&index.HNSWConfig{
+			Dimension:      config.Dimension,
+			M:              config.M,
+			EfConstruction: config.EfConstruction,
+			EfSearch:       config.EfSearch,
+			ML:             config.ML,
+			Metric:         util.DistanceMetric(config.Metric),
+			Provider:       provider,
+			RawVectorStore: config.RawVectorStore,
+			RawStoreCap:    config.RawStoreCap,
+			Quantization:   config.Quantization,
+		})
+	case IVFPQ:
+		idx, err = index.NewIVFPQ(&index.IVFPQConfig{
+			Dimension:     config.Dimension,
+			NClusters:     100,
+			NProbes:       10,
+			Metric:        util.DistanceMetric(config.Metric),
+			Quantization:  config.Quantization,
+			MaxIterations: 100,
+			Tolerance:     1e-4,
+			RandomSeed:    42,
+		})
+	case Flat:
+		idx, err = index.NewFlat(&index.FlatConfig{
+			Dimension:    config.Dimension,
+			Metric:       util.DistanceMetric(config.Metric),
+			Quantization: config.Quantization,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
@@ -286,6 +336,7 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		config:        config,
 		index:         idx,
 		storage:       storageCollection,
+		writes:        writes,
 		metrics:       metrics,
 		memoryManager: memManager,
 	}
@@ -307,6 +358,12 @@ func (c *Collection) rebuildIndex(ctx context.Context) error {
 
 // Insert adds or updates a vector in the collection
 func (c *Collection) Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	release, err := c.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -327,15 +384,22 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		Metadata: metadata,
 	}
 
-	// Insert into index (convert to index VectorEntry if needed)
-	if err := c.index.Insert(ctx, storageEntry); err != nil {
-		return fmt.Errorf("failed to insert into index: %w", err)
+	if exists, err := c.storage.Exists(ctx, id); err != nil {
+		return fmt.Errorf("failed to check existing vector: %w", err)
+	} else if exists {
+		return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
 	}
 
-	// Write to storage (WAL)
+	if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
+		return fmt.Errorf("failed to assign ordinal: %w", err)
+	}
+
 	if err := c.storage.Insert(ctx, storageEntry); err != nil {
-		// TODO: Rollback index insertion
 		return fmt.Errorf("failed to write to storage: %w", err)
+	}
+	if err := c.index.Insert(ctx, storageEntry); err != nil {
+		_ = c.storage.Delete(ctx, id)
+		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
 	// Update metrics
@@ -354,8 +418,90 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	return nil
 }
 
+func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEntry) error {
+	release, err := c.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrCollectionClosed
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, ok := seen[entry.ID]; ok {
+			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", entry.ID)
+		}
+		seen[entry.ID] = struct{}{}
+		exists, err := c.storage.Exists(ctx, entry.ID)
+		if err != nil {
+			return fmt.Errorf("failed to check existing vector: %w", err)
+		}
+		if exists {
+			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", entry.ID)
+		}
+	}
+
+	if err := c.storage.AssignOrdinals(ctx, entries); err != nil {
+		return fmt.Errorf("failed to assign ordinals: %w", err)
+	}
+	insertedIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if len(entry.Vector) != c.config.Dimension {
+			return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+				len(entry.Vector), c.config.Dimension)
+		}
+	}
+
+	if err := c.storage.InsertBatch(ctx, entries); err != nil {
+		return fmt.Errorf("failed to write batch to storage: %w", err)
+	}
+	for _, entry := range entries {
+		if err := c.index.Insert(ctx, entry); err != nil {
+			for _, storedEntry := range entries {
+				_ = c.storage.Delete(ctx, storedEntry.ID)
+			}
+			return fmt.Errorf("failed to insert into index: %w", err)
+		}
+		insertedIDs = append(insertedIDs, entry.ID)
+	}
+
+	if c.metrics != nil {
+		c.metrics.VectorInserts.Add(float64(len(entries)))
+	}
+
+	if c.config.AutoIndexSelection {
+		if err := c.checkAndSwitchIndexType(ctx); err != nil {
+			// TODO: Add proper logging
+		}
+	}
+
+	return nil
+}
+
+func (c *Collection) rollbackBatchIndex(ctx context.Context, ids []string) {
+	for i := len(ids) - 1; i >= 0; i-- {
+		_ = c.index.Delete(ctx, ids[i])
+	}
+}
+
 // Update modifies an existing vector in the collection
 func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	release, err := c.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -429,21 +575,24 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 		}
 	}
 
-	// Delete the existing entry from index
-	if err := c.index.Delete(ctx, id); err != nil {
+	if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{updatedEntry}); err != nil {
+		return fmt.Errorf("failed to assign ordinal: %w", err)
+	}
+	if deleter, ok := c.index.(interface {
+		DeleteByOrdinal(context.Context, uint32) error
+	}); ok {
+		if err := deleter.DeleteByOrdinal(ctx, updatedEntry.Ordinal); err != nil {
+			return fmt.Errorf("failed to delete existing vector from index: %w", err)
+		}
+	} else if err := c.index.Delete(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete existing vector from index: %w", err)
 	}
 
-	// Insert the updated entry into index
-	if err := c.index.Insert(ctx, updatedEntry); err != nil {
-		// TODO: Rollback the delete operation
-		return fmt.Errorf("failed to insert updated vector into index: %w", err)
-	}
-
-	// Update storage (this will append to WAL)
 	if err := c.storage.Insert(ctx, updatedEntry); err != nil {
-		// TODO: Rollback index operations
 		return fmt.Errorf("failed to write update to storage: %w", err)
+	}
+	if err := c.index.Insert(ctx, updatedEntry); err != nil {
+		return fmt.Errorf("failed to insert updated vector into index: %w", err)
 	}
 
 	// Update metrics
@@ -456,6 +605,12 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 
 // Delete removes a vector from the collection
 func (c *Collection) Delete(ctx context.Context, id string) error {
+	release, err := c.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -468,20 +623,21 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("vector ID cannot be empty")
 	}
 
-	// Delete from index
-	if err := c.index.Delete(ctx, id); err != nil {
+	if entry, err := c.storage.Get(ctx, id); err == nil {
+		if deleter, ok := c.index.(interface {
+			DeleteByOrdinal(context.Context, uint32) error
+		}); ok {
+			if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+				return fmt.Errorf("failed to delete vector from index: %w", err)
+			}
+		} else if err := c.index.Delete(ctx, id); err != nil {
+			return fmt.Errorf("failed to delete vector from index: %w", err)
+		}
+	} else if err := c.index.Delete(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete vector from index: %w", err)
 	}
 
-	// Mark as deleted in storage (tombstone record)
-	// Create a tombstone entry to mark the vector as deleted
-	tombstone := &index.VectorEntry{
-		ID:       id,
-		Vector:   nil, // Nil vector indicates deletion
-		Metadata: map[string]interface{}{"_deleted": true, "_deleted_at": time.Now()},
-	}
-
-	if err := c.storage.Insert(ctx, tombstone); err != nil {
+	if err := c.storage.Delete(ctx, id); err != nil {
 		// TODO: Rollback index deletion
 		return fmt.Errorf("failed to write deletion to storage: %w", err)
 	}
@@ -492,6 +648,113 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// InsertBatch inserts multiple vectors using the public collection API.
+func (c *Collection) InsertBatch(ctx context.Context, entries []VectorEntry) error {
+	indexEntries := make([]*index.VectorEntry, 0, len(entries))
+	for _, entry := range entries {
+		indexEntries = append(indexEntries, &index.VectorEntry{
+			ID:       entry.ID,
+			Vector:   cloneVector(entry.Vector),
+			Metadata: cloneMetadata(entry.Metadata),
+		})
+	}
+	return c.insertBatch(ctx, indexEntries)
+}
+
+// DeleteBatch deletes multiple vectors by ID.
+func (c *Collection) DeleteBatch(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		if err := c.Delete(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Iterate walks all persisted records in the collection.
+func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return ErrCollectionClosed
+	}
+	c.mu.RUnlock()
+
+	return c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+		return fn(recordFromIndexEntry(entry))
+	})
+}
+
+// ListAll returns all persisted records in the collection.
+func (c *Collection) ListAll(ctx context.Context) ([]Record, error) {
+	records := make([]Record, 0)
+	if err := c.Iterate(ctx, func(record Record) error {
+		records = append(records, record)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// ListByMetadata returns records where the given metadata field equals the provided value.
+func (c *Collection) ListByMetadata(ctx context.Context, field string, value interface{}) ([]Record, error) {
+	records, err := c.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered, err := filter.NewEqualityFilter(field, value).Apply(ctx, filterEntriesFromRecords(records))
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]Record, 0, len(filtered))
+	for _, entry := range filtered {
+		result = append(result, Record{
+			ID:       entry.ID,
+			Vector:   cloneVector(entry.Vector),
+			Metadata: cloneMetadata(entry.Metadata),
+		})
+	}
+	return result, nil
+}
+
+// Count returns the exact number of live records in the collection.
+func (c *Collection) Count(ctx context.Context) (int, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return 0, ErrCollectionClosed
+	}
+	c.mu.RUnlock()
+
+	return c.storage.Count(ctx)
+}
+
+func (c *Collection) acquireWrite(ctx context.Context) (func(), error) {
+	if c == nil {
+		return func() {}, nil
+	}
+	if c.writes == nil {
+		return func() {}, nil
+	}
+	return c.writes.acquire(ctx)
+}
+
+func (c *Collection) effectiveWriteConcurrency(requested int) int {
+	if requested <= 0 {
+		requested = 1
+	}
+	if c == nil || c.writes == nil {
+		return requested
+	}
+	if limit := c.writes.maxParallelism(); limit > 0 && requested > limit {
+		return limit
+	}
+	return requested
 }
 
 // Search performs a vector similarity search
@@ -533,12 +796,42 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 	// Convert from index.SearchResult to libravdb.SearchResult
 	results := make([]*SearchResult, len(indexResults))
 	for i, r := range indexResults {
-		results[i] = &SearchResult{
-			ID:       r.ID,
-			Score:    r.Score,
-			Vector:   r.Vector,
-			Metadata: r.Metadata,
+		result := &SearchResult{
+			ID:    r.ID,
+			Score: r.Score,
 		}
+		if len(r.Vector) > 0 {
+			result.Vector = cloneVector(r.Vector)
+		}
+		if r.Metadata != nil {
+			result.Metadata = cloneMetadata(r.Metadata)
+		}
+		if result.ID == "" {
+			if idGetter, ok := c.storage.(interface {
+				GetIDByOrdinal(context.Context, uint32) (string, error)
+			}); ok {
+				if resolvedID, idErr := idGetter.GetIDByOrdinal(ctx, r.Ordinal); idErr == nil {
+					result.ID = resolvedID
+				}
+			}
+		}
+		if result.Vector == nil || result.Metadata == nil {
+			entry, getErr := c.storage.Get(ctx, result.ID)
+			if getErr == nil {
+				result.ID = entry.ID
+				if result.Vector == nil {
+					result.Vector = cloneVector(entry.Vector)
+				}
+				if result.Metadata == nil {
+					result.Metadata = cloneMetadata(entry.Metadata)
+				}
+			} else {
+				if result.Metadata == nil {
+					result.Metadata = map[string]interface{}{}
+				}
+			}
+		}
+		results[i] = result
 	}
 
 	// Update metrics
@@ -567,12 +860,14 @@ func (c *Collection) Stats() *CollectionStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	storageUsage := c.storageMemoryUsageLocked()
+	indexUsage := c.index.MemoryUsage()
 	stats := &CollectionStats{
 		Name:                 c.name,
 		VectorCount:          c.index.Size(),
 		Dimension:            c.config.Dimension,
 		IndexType:            c.config.IndexType.String(),
-		MemoryUsage:          c.index.MemoryUsage(),
+		MemoryUsage:          storageUsage + indexUsage,
 		HasQuantization:      c.config.Quantization != nil,
 		HasMemoryLimit:       c.config.MemoryLimit > 0,
 		MemoryMappingEnabled: c.config.EnableMMapping,
@@ -582,7 +877,8 @@ func (c *Collection) Stats() *CollectionStats {
 	if c.memoryManager != nil {
 		usage := c.memoryManager.GetUsage()
 		stats.MemoryStats = &CollectionMemoryStats{
-			Total:         usage.Total,
+			Total:         storageUsage + usage.Total,
+			Storage:       storageUsage,
 			Index:         usage.Indices,
 			Cache:         usage.Caches,
 			Quantized:     usage.Quantized,
@@ -591,6 +887,30 @@ func (c *Collection) Stats() *CollectionStats {
 			Available:     usage.Available,
 			PressureLevel: "normal", // TODO: Calculate actual pressure level
 			Timestamp:     usage.Timestamp,
+		}
+	} else {
+		stats.MemoryStats = &CollectionMemoryStats{
+			Total:         storageUsage + indexUsage,
+			Storage:       storageUsage,
+			Index:         indexUsage,
+			PressureLevel: "normal",
+			Timestamp:     time.Now(),
+		}
+	}
+	if rawProfile := c.DebugRawVectorStoreProfile(); rawProfile != nil {
+		stats.RawVectorStoreStats = &RawVectorStoreStats{
+			Backend:             rawProfile["backend"].(string),
+			VectorCount:         rawProfile["vector_count"].(int),
+			Dimension:           rawProfile["dimension"].(int),
+			BytesPerVector:      rawProfile["bytes_per_vector"].(int),
+			MemoryUsage:         rawProfile["memory_usage"].(int64),
+			ReservedBytes:       rawProfile["reserved_bytes"].(int64),
+			ReservedDataBytes:   rawProfile["reserved_data_bytes"].(int64),
+			ReservedMetaBytes:   rawProfile["reserved_meta_bytes"].(int64),
+			ReservedGuardBytes:  rawProfile["reserved_guard_bytes"].(int64),
+			LiveBytes:           rawProfile["live_bytes"].(int64),
+			FreeBytes:           rawProfile["free_bytes"].(int64),
+			CapacityUtilization: rawProfile["capacity_utilization"].(float64),
 		}
 	}
 
@@ -613,18 +933,44 @@ func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
 		return nil, ErrCollectionClosed
 	}
 
+	storageUsage := c.storageMemoryUsageLocked()
 	if c.memoryManager == nil {
-		// Return basic memory usage from index if no memory manager
 		usage := &memory.MemoryUsage{
-			Total:     c.index.MemoryUsage(),
+			Total:     storageUsage + c.index.MemoryUsage(),
 			Indices:   c.index.MemoryUsage(),
+			Caches:    storageUsage,
 			Timestamp: time.Now(),
 		}
 		return usage, nil
 	}
 
 	usage := c.memoryManager.GetUsage()
+	usage.Total += storageUsage
+	usage.Caches += storageUsage
 	return &usage, nil
+}
+
+func (c *Collection) storageMemoryUsageLocked() int64 {
+	if c.storage == nil {
+		return 0
+	}
+	usage, err := c.storage.MemoryUsage(context.Background())
+	if err != nil {
+		return 0
+	}
+	return usage
+}
+
+// DebugRawVectorStoreProfile exposes backend-specific raw vector storage stats
+// for profiling and benchmarking.
+func (c *Collection) DebugRawVectorStoreProfile() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if profiler, ok := c.index.(interface{ RawVectorStoreProfile() map[string]any }); ok {
+		return profiler.RawVectorStoreProfile()
+	}
+	return nil
 }
 
 // SetMemoryLimit updates the memory limit for the collection
@@ -1062,6 +1408,49 @@ func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, e
 	return vectors, nil
 }
 
+func recordFromIndexEntry(entry *index.VectorEntry) Record {
+	if entry == nil {
+		return Record{}
+	}
+
+	return Record{
+		ID:       entry.ID,
+		Vector:   cloneVector(entry.Vector),
+		Metadata: cloneMetadata(entry.Metadata),
+	}
+}
+
+func filterEntriesFromRecords(records []Record) []*filter.VectorEntry {
+	entries := make([]*filter.VectorEntry, 0, len(records))
+	for _, record := range records {
+		entries = append(entries, &filter.VectorEntry{
+			ID:       record.ID,
+			Vector:   cloneVector(record.Vector),
+			Metadata: cloneMetadata(record.Metadata),
+		})
+	}
+	return entries
+}
+
+func cloneVector(vector []float32) []float32 {
+	if vector == nil {
+		return nil
+	}
+	return append([]float32(nil), vector...)
+}
+
+func cloneMetadata(metadata map[string]interface{}) map[string]interface{} {
+	if metadata == nil {
+		return nil
+	}
+
+	cloned := make(map[string]interface{}, len(metadata))
+	for k, v := range metadata {
+		cloned[k] = v
+	}
+	return cloned
+}
+
 // validate checks if the collection configuration is valid
 func (config *CollectionConfig) validate() error {
 	if config.Dimension <= 0 {
@@ -1078,6 +1467,15 @@ func (config *CollectionConfig) validate() error {
 
 	if config.EfSearch <= 0 {
 		return fmt.Errorf("EfSearch must be positive, got %d", config.EfSearch)
+	}
+
+	switch config.RawVectorStore {
+	case "", "memory", "slabby":
+	default:
+		return fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
+	}
+	if config.RawVectorStore == "slabby" && config.RawStoreCap <= 0 {
+		return fmt.Errorf("slabby raw store capacity must be positive, got %d", config.RawStoreCap)
 	}
 
 	// Validate quantization configuration if provided

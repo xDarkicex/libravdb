@@ -1,7 +1,7 @@
 package hnsw
 
 import (
-	"sort"
+	"slices"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -10,6 +10,38 @@ import (
 type NeighborSelector struct {
 	maxConnections  int
 	levelMultiplier float64
+}
+
+func compareCandidatePtrs(a, b *util.Candidate) int {
+	if a.Distance < b.Distance {
+		return -1
+	}
+	if a.Distance > b.Distance {
+		return 1
+	}
+	if a.ID < b.ID {
+		return -1
+	}
+	if a.ID > b.ID {
+		return 1
+	}
+	return 0
+}
+
+func compareCandidateValues(a, b util.Candidate) int {
+	if a.Distance < b.Distance {
+		return -1
+	}
+	if a.Distance > b.Distance {
+		return 1
+	}
+	if a.ID < b.ID {
+		return -1
+	}
+	if a.ID > b.ID {
+		return 1
+	}
+	return 0
 }
 
 // NewNeighborSelector creates a new optimized neighbor selector
@@ -39,12 +71,54 @@ func (ns *NeighborSelector) SelectNeighborsOptimized(
 	}
 
 	// Pre-sort candidates by distance for better performance
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Distance < candidates[j].Distance
-	})
+	slices.SortFunc(candidates, compareCandidatePtrs)
+
+	// Bound the heuristic working set so insertion cost remains proportional to
+	// the graph degree rather than the full efConstruction frontier.
+	candidateLimit := maxM * 4
+	if level > 0 {
+		candidateLimit = maxM * 2
+	}
+	if candidateLimit < maxM {
+		candidateLimit = maxM
+	}
+	if len(candidates) > candidateLimit {
+		candidates = candidates[:candidateLimit]
+	}
 
 	// Use a more efficient selection algorithm
 	return ns.selectWithSimpleHeuristic(queryVector, candidates, maxM, index)
+}
+
+func (ns *NeighborSelector) SelectNeighborsOptimizedValues(
+	queryVector []float32,
+	candidates []util.Candidate,
+	level int,
+	index *Index,
+) []util.Candidate {
+	maxM := ns.maxConnections
+	if level == 0 {
+		maxM = int(float64(maxM) * ns.levelMultiplier)
+	}
+
+	if len(candidates) <= maxM {
+		return candidates
+	}
+
+	slices.SortFunc(candidates, compareCandidateValues)
+
+	candidateLimit := maxM * 4
+	if level > 0 {
+		candidateLimit = maxM * 2
+	}
+	if candidateLimit < maxM {
+		candidateLimit = maxM
+	}
+	if len(candidates) > candidateLimit {
+		candidates = candidates[:candidateLimit]
+	}
+
+	return ns.selectWithSimpleHeuristicValues(queryVector, candidates, maxM, index)
 }
 
 // selectWithSimpleHeuristic uses a simplified but efficient heuristic
@@ -60,9 +134,15 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 	}
 
 	selected := make([]*util.Candidate, 0, maxM)
+	selectedVectors := make([][]float32, 0, min(maxM, 4))
 
 	// Always select the closest candidate
 	selected = append(selected, candidates[0])
+	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
+		selectedVectors = append(selectedVectors, vector)
+	} else {
+		selectedVectors = append(selectedVectors, nil)
+	}
 
 	// For remaining selections, use distance-based selection with simple diversity check
 	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
@@ -70,18 +150,16 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 
 		// Simple diversity check: ensure candidate is not too close to already selected nodes
 		shouldSelect := true
-		candidateNode := index.nodes[candidate.ID]
-		candidateVector, err := index.getNodeVector(candidateNode)
-		if err != nil {
+		candidateVector, ok := index.nodeVectorForHeuristic(candidate.ID)
+		if !ok {
 			continue // Skip if we can't get the vector
 		}
 
 		// Check against a limited number of already selected nodes for efficiency
 		checkLimit := min(len(selected), 3) // Only check against 3 closest selected nodes
 		for j := 0; j < checkLimit; j++ {
-			selectedNode := index.nodes[selected[j].ID]
-			selectedVector, err := index.getNodeVector(selectedNode)
-			if err != nil {
+			selectedVector := selectedVectors[j]
+			if selectedVector == nil {
 				continue
 			}
 
@@ -96,6 +174,9 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 
 		if shouldSelect {
 			selected = append(selected, candidate)
+			if len(selectedVectors) < maxM {
+				selectedVectors = append(selectedVectors, candidateVector)
+			}
 		}
 	}
 
@@ -118,12 +199,83 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 	return selected
 }
 
+func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
+	queryVector []float32,
+	candidates []util.Candidate,
+	maxM int,
+	index *Index,
+) []util.Candidate {
+	if len(candidates) <= maxM {
+		return candidates
+	}
+
+	selectedCount := 1
+	var selectedVectorBuf [4][]float32
+	selectedVectors := selectedVectorBuf[:0]
+
+	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
+		selectedVectors = append(selectedVectors, vector)
+	} else {
+		selectedVectors = append(selectedVectors, nil)
+	}
+
+	for i := 1; i < len(candidates) && selectedCount < maxM; i++ {
+		candidate := candidates[i]
+		shouldSelect := true
+		candidateVector, ok := index.nodeVectorForHeuristic(candidate.ID)
+		if !ok {
+			continue
+		}
+
+		checkLimit := min(selectedCount, 3)
+		for j := 0; j < checkLimit; j++ {
+			selectedVector := selectedVectors[j]
+			if selectedVector == nil {
+				continue
+			}
+			distToSelected := index.distance(candidateVector, selectedVector)
+			if distToSelected < candidate.Distance*0.8 {
+				shouldSelect = false
+				break
+			}
+		}
+
+		if shouldSelect {
+			candidates[selectedCount] = candidate
+			selectedCount++
+			if len(selectedVectors) < len(selectedVectorBuf) {
+				selectedVectors = append(selectedVectors, candidateVector)
+			}
+		}
+	}
+
+	for i := 1; i < len(candidates) && selectedCount < maxM; i++ {
+		candidate := candidates[i]
+		alreadySelected := false
+		for j := 0; j < selectedCount; j++ {
+			if candidates[j].ID == candidate.ID {
+				alreadySelected = true
+				break
+			}
+		}
+		if !alreadySelected {
+			candidates[selectedCount] = candidate
+			selectedCount++
+		}
+	}
+
+	return candidates[:selectedCount]
+}
+
 // PruneConnections optimizes the connections of a node to maintain graph quality
 func (ns *NeighborSelector) PruneConnections(
 	nodeID uint32,
 	level int,
 	index *Index,
 ) error {
+	scratch := index.acquireSearchScratch()
+	defer index.releaseSearchScratch(scratch)
+
 	node := index.nodes[nodeID]
 	if level >= len(node.Links) {
 		return nil
@@ -134,7 +286,8 @@ func (ns *NeighborSelector) PruneConnections(
 		maxM = int(float64(maxM) * ns.levelMultiplier)
 	}
 
-	if len(node.Links[level]) <= maxM {
+	overflowSlack := levelOverflowSlack(maxM)
+	if len(node.Links[level]) <= maxM+overflowSlack {
 		return nil // No pruning needed
 	}
 
@@ -145,7 +298,12 @@ func (ns *NeighborSelector) PruneConnections(
 	}
 
 	// Create candidates from current connections
-	candidates := make([]*util.Candidate, 0, len(node.Links[level]))
+	if cap(scratch.pruneBuf) < len(node.Links[level]) {
+		scratch.pruneBuf = make([]util.Candidate, 0, len(node.Links[level]))
+	} else {
+		scratch.pruneBuf = scratch.pruneBuf[:0]
+	}
+	candidates := scratch.pruneBuf
 	for _, linkID := range node.Links[level] {
 		linkNode := index.nodes[linkID]
 		linkVector, err := index.getNodeVector(linkNode)
@@ -154,21 +312,47 @@ func (ns *NeighborSelector) PruneConnections(
 		}
 
 		distance := index.distance(nodeVector, linkVector)
-		candidates = append(candidates, &util.Candidate{
+		candidates = append(candidates, util.Candidate{
 			ID:       linkID,
 			Distance: distance,
 		})
 	}
 
-	// Select best connections
-	selected := ns.SelectNeighborsOptimized(nodeVector, candidates, level, index)
+	if len(candidates) <= maxM {
+		newLinks := node.Links[level][:0]
+		for _, candidate := range candidates {
+			newLinks = append(newLinks, candidate.ID)
+		}
+		node.Links[level] = newLinks
+		return nil
+	}
+
+	// Pruning runs on every insertion and is a major write-path hot loop.
+	// Keeping the closest neighbors is much cheaper here than re-running the
+	// full diversity heuristic, while still preserving bounded graph degree.
+	slices.SortFunc(candidates, compareCandidateValues)
 
 	// Update the node's connections
-	newLinks := make([]uint32, 0, len(selected))
-	for _, sel := range selected {
+	newLinks := node.Links[level][:0]
+	for _, sel := range candidates[:maxM] {
 		newLinks = append(newLinks, sel.ID)
 	}
 	node.Links[level] = newLinks
 
 	return nil
+}
+
+func (h *Index) nodeVectorForHeuristic(nodeID uint32) ([]float32, bool) {
+	if int(nodeID) >= len(h.nodes) {
+		return nil, false
+	}
+	node := h.nodes[nodeID]
+	if node == nil {
+		return nil, false
+	}
+	vector, err := h.getNodeVector(node)
+	if err != nil {
+		return nil, false
+	}
+	return vector, true
 }

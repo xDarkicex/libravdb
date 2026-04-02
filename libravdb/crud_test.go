@@ -10,7 +10,7 @@ import (
 
 func TestCollectionCRUDOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestCollectionCRUDOperations(t *testing.T) {
 
 func TestBatchUpdateOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestBatchUpdateOperations(t *testing.T) {
 
 func TestBatchDeleteOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestBatchDeleteOperations(t *testing.T) {
 
 func TestStreamingUpdateOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestStreamingUpdateOperations(t *testing.T) {
 
 func TestStreamingDeleteOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

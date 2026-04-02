@@ -2,7 +2,10 @@ module github.com/xDarkicex/libravdb
 
 go 1.25.0
 
-require github.com/prometheus/client_golang v1.17.0
+require (
+	github.com/prometheus/client_golang v1.17.0
+	github.com/xDarkicex/slabby v0.0.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -12,6 +15,8 @@ require (
 	github.com/prometheus/client_model v0.4.1-0.20230718164431-9a2bf3000d16 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.11.1 // indirect
-	golang.org/x/sys v0.11.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 )
+
+replace github.com/xDarkicex/slabby => /Users/z3robit/Development/golang/src/github.com/xDarkicex/slabby

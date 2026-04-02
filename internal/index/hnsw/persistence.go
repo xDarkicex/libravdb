@@ -188,8 +188,11 @@ func (h *Index) writeNodes(writer io.Writer) error {
 				return err
 			}
 
-			// Write node ID length and ID
-			idBytes := []byte(node.ID)
+			if err := binary.Write(writer, binary.LittleEndian, node.Ordinal); err != nil {
+				return err
+			}
+
+			idBytes := []byte(h.ordinalToID[node.Ordinal])
 			if err := binary.Write(writer, binary.LittleEndian, uint32(len(idBytes))); err != nil {
 				return err
 			}
@@ -197,11 +200,16 @@ func (h *Index) writeNodes(writer io.Writer) error {
 				return err
 			}
 
+			vector, err := h.getNodeVector(node)
+			if err != nil {
+				return fmt.Errorf("failed to get node vector for persistence: %w", err)
+			}
+
 			// Write vector dimension and data
-			if err := binary.Write(writer, binary.LittleEndian, uint32(len(node.Vector))); err != nil {
+			if err := binary.Write(writer, binary.LittleEndian, uint32(len(vector))); err != nil {
 				return err
 			}
-			for _, val := range node.Vector {
+			for _, val := range vector {
 				if err := binary.Write(writer, binary.LittleEndian, val); err != nil {
 					return err
 				}
@@ -273,11 +281,7 @@ func (h *Index) writeMetadata(writer io.Writer) error {
 		if err := binary.Write(writer, binary.LittleEndian, uint8(1)); err != nil {
 			return err
 		}
-		entryBytes := []byte(h.entryPoint.ID)
-		if err := binary.Write(writer, binary.LittleEndian, uint32(len(entryBytes))); err != nil {
-			return err
-		}
-		if _, err := writer.Write(entryBytes); err != nil {
+		if err := binary.Write(writer, binary.LittleEndian, h.entryPoint.Ordinal); err != nil {
 			return err
 		}
 	} else {
@@ -460,7 +464,11 @@ func (h *Index) readNodes(reader io.Reader) error {
 			continue
 		}
 
-		// Read node ID
+		var ordinal uint32
+		if err := binary.Read(reader, binary.LittleEndian, &ordinal); err != nil {
+			return err
+		}
+
 		var idLen uint32
 		if err := binary.Read(reader, binary.LittleEndian, &idLen); err != nil {
 			return err
@@ -493,11 +501,24 @@ func (h *Index) readNodes(reader io.Reader) error {
 
 		// Create node
 		node := &Node{
-			ID:     nodeID,
-			Vector: vector,
-			Level:  int(level),
+			Ordinal: ordinal,
+			Level:   int(level),
 		}
-		h.nodes[i] = node
+		if h.rawVectorStore != nil {
+			if _, err := h.rawVectorStore.Put(vector); err != nil {
+				return fmt.Errorf("failed to restore raw vector into store: %w", err)
+			}
+		}
+		if int(ordinal) >= len(h.nodes) {
+			grown := make([]*Node, ordinal+1)
+			copy(grown, h.nodes)
+			h.nodes = grown
+		}
+		h.nodes[ordinal] = node
+		if nodeID != "" {
+			h.idToIndex[nodeID] = ordinal
+			h.ordinalToID[ordinal] = nodeID
+		}
 	}
 
 	return nil
@@ -570,23 +591,12 @@ func (h *Index) readMetadata(reader io.Reader) error {
 	}
 
 	if hasEntryPoint == 1 {
-		// Read entry point ID
-		var idLen uint32
-		if err := binary.Read(reader, binary.LittleEndian, &idLen); err != nil {
+		var entryPointOrdinal uint32
+		if err := binary.Read(reader, binary.LittleEndian, &entryPointOrdinal); err != nil {
 			return err
 		}
-		idBytes := make([]byte, idLen)
-		if _, err := io.ReadFull(reader, idBytes); err != nil {
-			return err
-		}
-		entryPointID := string(idBytes)
-
-		// Find the entry point node
-		for _, node := range h.nodes {
-			if node != nil && node.ID == entryPointID {
-				h.entryPoint = node
-				break
-			}
+		if int(entryPointOrdinal) < len(h.nodes) {
+			h.entryPoint = h.nodes[entryPointOrdinal]
 		}
 	}
 
@@ -605,7 +615,9 @@ func (h *Index) rebuildIndexState() error {
 	for i, node := range h.nodes {
 		if node != nil {
 			h.size++
-			h.idToIndex[node.ID] = uint32(i)
+			if id, ok := h.ordinalToID[uint32(i)]; ok && id != "" {
+				h.idToIndex[id] = uint32(i)
+			}
 
 			// Update max level
 			if node.Level > h.maxLevel {

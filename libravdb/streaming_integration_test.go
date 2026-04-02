@@ -3,6 +3,8 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -29,9 +31,14 @@ func TestStreamingIntegration_MemoryUsage(t *testing.T) {
 	opts.MaxMemoryUsage = 1024 * 1024 // 1MB limit
 	opts.EnableBackpressure = true
 
-	var memoryUsageReports []int64
+	var (
+		memoryUsageReports []int64
+		reportsMu          sync.Mutex
+	)
 	opts.ProgressCallback = func(stats *StreamingStats) {
+		reportsMu.Lock()
 		memoryUsageReports = append(memoryUsageReports, stats.CurrentMemoryUsage)
+		reportsMu.Unlock()
 	}
 
 	stream := collection.NewStreamingBatchInsert(opts)
@@ -145,15 +152,15 @@ func TestStreamingIntegration_ErrorRecovery(t *testing.T) {
 	}
 
 	// Track errors
-	var errorCount int
-	var lastError error
+	var errorCount atomic.Int32
+	var lastError atomic.Value
 
 	opts := DefaultStreamingOptions()
 	opts.BufferSize = 20
 	opts.ChunkSize = 5
 	opts.ErrorCallback = func(err error, entry *VectorEntry) {
-		errorCount++
-		lastError = err
+		errorCount.Add(1)
+		lastError.Store(err)
 	}
 
 	stream := collection.NewStreamingBatchInsert(opts)
@@ -178,24 +185,33 @@ func TestStreamingIntegration_ErrorRecovery(t *testing.T) {
 		}
 	}
 
-	// Wait for processing
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the invalid entries to be processed. Race builds add enough
+	// overhead that a fixed sleep can miss the callback/statistics updates.
+	deadline := time.Now().Add(3 * time.Second)
+	var stats *StreamingStats
+	for time.Now().Before(deadline) {
+		stats = stream.Stats()
+		if errorCount.Load() > 0 && len(stats.ErrorsByType) > 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// Check error handling
-	if errorCount == 0 {
+	if errorCount.Load() == 0 {
 		t.Error("Should have encountered some errors from invalid entries")
 	}
 
-	if lastError == nil {
+	lastErr, _ := lastError.Load().(error)
+	if lastErr == nil {
 		t.Error("Should have recorded the last error")
 	}
 
 	// Check statistics
-	stats := stream.Stats()
 	if len(stats.ErrorsByType) == 0 {
 		t.Error("Should have error statistics by type")
 	}
 
-	t.Logf("Error count: %d, Last error: %v", errorCount, lastError)
+	t.Logf("Error count: %d, Last error: %v", errorCount.Load(), lastErr)
 	t.Logf("Error stats: %+v", stats.ErrorsByType)
 }

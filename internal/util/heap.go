@@ -113,3 +113,8 @@ func (h *MaxHeap) Top() *Candidate {
 	}
 	return h.candidates[0]
 }
+
+// Candidates returns the current heap contents in heap order.
+func (h *MaxHeap) Candidates() []*Candidate {
+	return h.candidates
+}

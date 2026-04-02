@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -73,25 +74,56 @@ func (w *WAL) Append(ctx context.Context, entry *Entry) error {
 		return fmt.Errorf("WAL is closed")
 	}
 
-	// Set timestamp if not provided
-	if entry.Timestamp == 0 {
-		entry.Timestamp = uint64(time.Now().UnixNano())
+	return w.appendEntriesLocked(ctx, []*Entry{entry})
+}
+
+// AppendBatch adds multiple entries to the WAL and flushes once for the batch.
+func (w *WAL) AppendBatch(ctx context.Context, entries []*Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return fmt.Errorf("WAL is closed")
 	}
 
-	// Serialize entry
-	data, err := w.serializeEntry(entry)
-	if err != nil {
-		return fmt.Errorf("failed to serialize entry: %w", err)
+	return w.appendEntriesLocked(ctx, entries)
+}
+
+func (w *WAL) appendEntriesLocked(ctx context.Context, entries []*Entry) error {
+	if len(entries) == 0 {
+		return nil
 	}
 
-	// Write length prefix
-	if err := binary.Write(w.writer, binary.LittleEndian, uint32(len(data))); err != nil {
-		return fmt.Errorf("failed to write entry length: %w", err)
-	}
+	var lenBuf [4]byte
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	// Write data
-	if _, err := w.writer.Write(data); err != nil {
-		return fmt.Errorf("failed to write entry data: %w", err)
+		if entry == nil {
+			return fmt.Errorf("WAL entry cannot be nil")
+		}
+
+		// Set timestamp if not provided
+		if entry.Timestamp == 0 {
+			entry.Timestamp = uint64(time.Now().UnixNano())
+		}
+
+		entrySize := serializedEntrySize(entry)
+
+		// Write length prefix
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(entrySize))
+		if _, err := w.writer.Write(lenBuf[:]); err != nil {
+			return fmt.Errorf("failed to write entry length: %w", err)
+		}
+
+		if err := w.writeEntryData(entry); err != nil {
+			return fmt.Errorf("failed to write entry data: %w", err)
+		}
+
+		w.offset += int64(4 + entrySize)
 	}
 
 	// Flush to ensure durability
@@ -103,7 +135,62 @@ func (w *WAL) Append(ctx context.Context, entry *Entry) error {
 		return fmt.Errorf("failed to sync WAL: %w", err)
 	}
 
-	w.offset += int64(4 + len(data))
+	return nil
+}
+
+func serializedEntrySize(entry *Entry) int {
+	metadataBytes, _ := json.Marshal(entry.Metadata)
+	return 8 + 1 + 4 + len(entry.ID) + 4 + len(entry.Vector)*4 + 4 + len(metadataBytes)
+}
+
+func (w *WAL) writeEntryData(entry *Entry) error {
+	var u32 [4]byte
+	var u64 [8]byte
+
+	binary.LittleEndian.PutUint64(u64[:], entry.Timestamp)
+	if _, err := w.writer.Write(u64[:]); err != nil {
+		return err
+	}
+
+	if err := w.writer.WriteByte(byte(entry.Operation)); err != nil {
+		return err
+	}
+
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(entry.ID)))
+	if _, err := w.writer.Write(u32[:]); err != nil {
+		return err
+	}
+	if _, err := w.writer.WriteString(entry.ID); err != nil {
+		return err
+	}
+
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(entry.Vector)))
+	if _, err := w.writer.Write(u32[:]); err != nil {
+		return err
+	}
+	for _, f := range entry.Vector {
+		binary.LittleEndian.PutUint32(u32[:], math.Float32bits(f))
+		if _, err := w.writer.Write(u32[:]); err != nil {
+			return err
+		}
+	}
+
+	metadataBytes, err := json.Marshal(entry.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(metadataBytes)))
+	if _, err := w.writer.Write(u32[:]); err != nil {
+		return err
+	}
+
+	if len(metadataBytes) > 0 {
+		if _, err := w.writer.Write(metadataBytes); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -211,7 +298,7 @@ func (w *WAL) Close() error {
 
 func (w *WAL) serializeEntry(entry *Entry) ([]byte, error) {
 	// Pre-calculate size to avoid reallocations
-	size := 8 + 1 + 4 + len(entry.ID) + 4 + len(entry.Vector)*4 + 4 // base size
+	size := serializedEntrySize(entry)
 	buf := make([]byte, 0, size)
 
 	// Header: timestamp (8) + operation (1)
@@ -266,8 +353,22 @@ func (w *WAL) deserializeEntry(data []byte) (*Entry, error) {
 		offset += 4
 	}
 
-	// Skip metadata for Phase 1
+	metadataLen := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	if metadataLen == 0 {
+		entry.Metadata = make(map[string]interface{})
+		return entry, nil
+	}
+
+	if offset+int(metadataLen) > len(data) {
+		return nil, fmt.Errorf("metadata length exceeds entry size")
+	}
+
 	entry.Metadata = make(map[string]interface{})
+	if err := json.Unmarshal(data[offset:offset+int(metadataLen)], &entry.Metadata); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
 
 	return entry, nil
 }

@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -301,6 +302,10 @@ func (b *BatchInsert) Execute(ctx context.Context) (*BatchResult, error) {
 	}
 
 	totalChunks := (len(b.entries) + chunkSize - 1) / chunkSize
+	workerConcurrency := b.collection.effectiveWriteConcurrency(b.options.MaxConcurrency)
+	if workerConcurrency > 1 && totalChunks > 1 {
+		return b.executeConcurrent(ctx, result, startTime, chunkSize, totalChunks, workerConcurrency)
+	}
 
 	for chunkIdx := 0; chunkIdx < totalChunks; chunkIdx++ {
 		startIdx := chunkIdx * chunkSize
@@ -376,6 +381,129 @@ func (b *BatchInsert) Execute(ctx context.Context) (*BatchResult, error) {
 	}
 
 	result.Duration = time.Since(startTime)
+	b.sortResultItems(result)
+	return result, nil
+}
+
+func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult, startTime time.Time, chunkSize, totalChunks int, workerConcurrency int) (*BatchResult, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type chunkOutcome struct {
+		chunkIdx int
+		result   *chunkResult
+		err      error
+	}
+
+	outcomes := make(chan chunkOutcome, totalChunks)
+	pool := newWorkerPool(workerConcurrency)
+	defer pool.close()
+
+	for chunkIdx := 0; chunkIdx < totalChunks; chunkIdx++ {
+		startIdx := chunkIdx * chunkSize
+		endIdx := startIdx + chunkSize
+		if endIdx > len(b.entries) {
+			endIdx = len(b.entries)
+		}
+
+		chunk := b.entries[startIdx:endIdx]
+		chunkIdxCopy := chunkIdx
+		startIdxCopy := startIdx
+		pool.submit(func() error {
+			chunkResult, err := b.processChunk(ctx, chunk, startIdxCopy, chunkIdxCopy)
+			outcomes <- chunkOutcome{
+				chunkIdx: chunkIdxCopy,
+				result:   chunkResult,
+				err:      err,
+			}
+			return nil
+		})
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		_ = pool.wait(ctx)
+		close(waitDone)
+	}()
+
+	chunkResults := make([]*chunkResult, totalChunks)
+	chunkErrors := make([]error, totalChunks)
+
+	completedChunks := 0
+	for completedChunks < totalChunks {
+		select {
+		case outcome := <-outcomes:
+			chunkResults[outcome.chunkIdx] = outcome.result
+			chunkErrors[outcome.chunkIdx] = outcome.err
+			completedChunks++
+			if outcome.err != nil {
+				operationErr := outcome.err
+				if operationErr != nil && b.options.FailFast {
+					cancel()
+				}
+			}
+		case <-waitDone:
+			// Workers have drained. Continue consuming already-buffered outcomes.
+			waitDone = nil
+		case <-ctx.Done():
+			operationErr := ctx.Err()
+			_ = operationErr
+			completedChunks = totalChunks
+		}
+	}
+
+	var operationErr error
+	for chunkIdx := 0; chunkIdx < totalChunks; chunkIdx++ {
+		if chunkErrors[chunkIdx] != nil && operationErr == nil {
+			operationErr = chunkErrors[chunkIdx]
+		}
+
+		chunkResult := chunkResults[chunkIdx]
+		if chunkResult == nil {
+			continue
+		}
+
+		b.mergeChunkResult(result, chunkResult)
+		b.progressTracker.update(
+			result.Successful+result.Failed,
+			result.Successful,
+			result.Failed,
+			chunkIdx+1,
+			chunkResult.lastError,
+		)
+
+		if b.options.ProgressCallback != nil {
+			b.options.ProgressCallback(result.Successful+result.Failed, len(b.entries))
+		}
+		if b.options.DetailedProgress != nil {
+			b.options.DetailedProgress(b.progressTracker.getProgress())
+		}
+
+		if chunkResult.lastError != nil && operationErr == nil {
+			operationErr = chunkResult.lastError
+		}
+
+		if b.options.FailFast && (chunkErrors[chunkIdx] != nil || result.Failed > 0) {
+			break
+		}
+	}
+
+	if operationErr != nil || ctx.Err() != nil {
+		if operationErr == nil {
+			operationErr = ctx.Err()
+		}
+		if b.options.EnableRollback {
+			rollbackErr := b.rollback(context.Background())
+			result.RollbackRequired = true
+			result.RollbackError = rollbackErr
+		}
+		result.Duration = time.Since(startTime)
+		b.sortResultItems(result)
+		return result, operationErr
+	}
+
+	result.Duration = time.Since(startTime)
+	b.sortResultItems(result)
 	return result, nil
 }
 
@@ -388,6 +516,65 @@ type chunkResult struct {
 
 // processChunk processes a single chunk of entries
 func (b *BatchInsert) processChunk(ctx context.Context, chunk []*VectorEntry, startIndex int, chunkIdx int) (*chunkResult, error) {
+	if fastResult, handled, err := b.tryProcessChunkFast(ctx, chunk, startIndex); handled {
+		return fastResult, err
+	}
+
+	return b.processChunkIndividually(ctx, chunk, startIndex, chunkIdx)
+}
+
+func (b *BatchInsert) tryProcessChunkFast(ctx context.Context, chunk []*VectorEntry, startIndex int) (*chunkResult, bool, error) {
+	if len(chunk) == 0 {
+		return &chunkResult{
+			items:  []*BatchItemResult{},
+			errors: map[int]error{},
+		}, true, nil
+	}
+
+	indexEntries := make([]*index.VectorEntry, 0, len(chunk))
+	for _, entry := range chunk {
+		if err := b.validateEntry(entry); err != nil {
+			return nil, false, nil
+		}
+		indexEntries = append(indexEntries, &index.VectorEntry{
+			ID:       entry.ID,
+			Vector:   entry.Vector,
+			Metadata: entry.Metadata,
+		})
+	}
+
+	if err := b.collection.insertBatch(ctx, indexEntries); err != nil {
+		return nil, false, nil
+	}
+
+	result := &chunkResult{
+		items:  make([]*BatchItemResult, 0, len(chunk)),
+		errors: make(map[int]error),
+	}
+
+	now := time.Now()
+	b.rollbackMutex.Lock()
+	for i, entry := range chunk {
+		globalIndex := startIndex + i
+		result.items = append(result.items, &BatchItemResult{
+			Index:     globalIndex,
+			ID:        entry.ID,
+			Success:   true,
+			Timestamp: time.Now(),
+		})
+		b.insertedIDs = append(b.insertedIDs, entry.ID)
+	}
+	b.rollbackMutex.Unlock()
+
+	result.lastError = nil
+	for i := range result.items {
+		result.items[i].Timestamp = now
+	}
+
+	return result, true, nil
+}
+
+func (b *BatchInsert) processChunkIndividually(ctx context.Context, chunk []*VectorEntry, startIndex int, chunkIdx int) (*chunkResult, error) {
 	result := &chunkResult{
 		items:  make([]*BatchItemResult, 0, len(chunk)),
 		errors: make(map[int]error),
@@ -487,6 +674,12 @@ func (b *BatchInsert) mergeChunkResult(result *BatchResult, chunkResult *chunkRe
 	for idx, err := range chunkResult.errors {
 		result.Errors[idx] = err
 	}
+}
+
+func (b *BatchInsert) sortResultItems(result *BatchResult) {
+	sort.Slice(result.Items, func(i, j int) bool {
+		return result.Items[i].Index < result.Items[j].Index
+	})
 }
 
 // rollback removes all successfully inserted items

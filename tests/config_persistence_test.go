@@ -11,15 +11,12 @@ import (
 
 func TestConfigPersistence(t *testing.T) {
 	ctx := context.Background()
-	testDir := "./test_config_persistence"
-
-	// Clean up before and after test
-	defer os.RemoveAll(testDir)
-	os.RemoveAll(testDir)
+	testDir := t.TempDir()
+	dbPath := filepath.Join(testDir, "test_config_persistence.libravdb")
 
 	// Create database with custom configuration
 	db, err := libravdb.New(
-		libravdb.WithStoragePath(testDir),
+		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -57,10 +54,8 @@ func TestConfigPersistence(t *testing.T) {
 		t.Fatalf("Failed to insert vector: %v", err)
 	}
 
-	// Verify config file was created
-	configPath := filepath.Join(testDir, "test_config", "config.json")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		t.Fatalf("Config file was not created at %s", configPath)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("Database file was not created at %s: %v", dbPath, err)
 	}
 
 	// Close database
@@ -70,7 +65,7 @@ func TestConfigPersistence(t *testing.T) {
 
 	// Reopen database
 	db2, err := libravdb.New(
-		libravdb.WithStoragePath(testDir),
+		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
@@ -122,7 +117,7 @@ func TestConfigPersistence(t *testing.T) {
 	}
 
 	t.Log("✅ Configuration persistence test passed!")
-	t.Logf("   - Config file created at: %s", configPath)
+	t.Logf("   - Database file created at: %s", dbPath)
 	t.Logf("   - Collection recovered with preserved configuration")
 	t.Logf("   - Data persisted correctly across database restarts")
 	t.Logf("   - Custom dimension (128) preserved and working")

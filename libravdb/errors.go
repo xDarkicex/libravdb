@@ -27,6 +27,7 @@ var (
 	ErrStreamingStopped   = errors.New("streaming operation has been stopped")
 	ErrStreamingTimeout   = errors.New("streaming operation timed out")
 	ErrBufferFull         = errors.New("streaming buffer is full")
+	ErrWriteQueueFull     = errors.New("write queue is full")
 )
 
 // Memory management errors

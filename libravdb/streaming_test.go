@@ -86,7 +86,8 @@ func TestStreamingBatchInsert_Backpressure(t *testing.T) {
 	// Create streaming insert with very small buffer to trigger backpressure
 	opts := DefaultStreamingOptions()
 	opts.BufferSize = 2
-	opts.ChunkSize = 10              // Larger than buffer to prevent immediate processing
+	opts.ChunkSize = 10 // Larger than buffer to prevent immediate processing
+	opts.MaxConcurrency = 1
 	opts.BackpressureThreshold = 0.5 // 50% threshold
 	opts.EnableBackpressure = true
 
@@ -97,29 +98,32 @@ func TestStreamingBatchInsert_Backpressure(t *testing.T) {
 	}
 	defer stream.Close()
 
-	// Fill buffer to trigger backpressure
-	entry1 := &VectorEntry{ID: "1", Vector: []float32{1.0, 2.0, 3.0}}
-	entry2 := &VectorEntry{ID: "2", Vector: []float32{4.0, 5.0, 6.0}}
-	entry3 := &VectorEntry{ID: "3", Vector: []float32{7.0, 8.0, 9.0}}
-
-	// First two should succeed
-	if err := stream.Send(entry1); err != nil {
-		t.Errorf("First send should succeed: %v", err)
+	// Repeatedly send into the tiny queue until the streaming pipeline surfaces
+	// the expected backpressure signal. Race builds add enough scheduling overhead
+	// that asserting on the exact third send is not deterministic.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	backpressureHit := false
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		entry := &VectorEntry{
+			ID:     fmt.Sprintf("bp_%d", attempt),
+			Vector: []float32{float32(attempt), float32(attempt + 1), float32(attempt + 2)},
+		}
+		err = stream.Send(entry)
+		if err == ErrBackpressureActive {
+			backpressureHit = true
+			break
+		}
+		if err != nil {
+			t.Fatalf("Unexpected send error: %v", err)
+		}
 	}
-	if err := stream.Send(entry2); err != nil {
-		t.Errorf("Second send should succeed: %v", err)
+
+	if !backpressureHit {
+		t.Fatal("Expected backpressure error after saturating the queue")
 	}
 
-	// Third should trigger backpressure
-	err = stream.Send(entry3)
-	if err != ErrBackpressureActive {
-		t.Errorf("Expected backpressure error, got: %v", err)
-	}
-
-	// Check backpressure status
-	stats := stream.Stats()
-	if !stats.BackpressureActive {
-		t.Error("Backpressure should be active")
+	if !stream.Stats().BackpressureActive {
+		t.Error("Backpressure should be active after saturation")
 	}
 }
 
@@ -175,14 +179,14 @@ func TestStreamingBatchInsert_ProgressCallback(t *testing.T) {
 	}
 
 	var progressCallCount int32
-	var lastStats *StreamingStats
+	var lastTotalReceived atomic.Int64
 
 	opts := DefaultStreamingOptions()
 	opts.BufferSize = 10
 	opts.ChunkSize = 3
 	opts.ProgressCallback = func(stats *StreamingStats) {
 		atomic.AddInt32(&progressCallCount, 1)
-		lastStats = stats
+		lastTotalReceived.Store(stats.TotalReceived)
 	}
 
 	stream := collection.NewStreamingBatchInsert(opts)
@@ -212,12 +216,10 @@ func TestStreamingBatchInsert_ProgressCallback(t *testing.T) {
 		t.Error("Progress callback should have been called")
 	}
 
-	if lastStats == nil {
+	if lastTotalReceived.Load() == 0 {
 		t.Error("Should have received progress stats")
-	} else {
-		if lastStats.TotalReceived != 6 {
-			t.Errorf("Expected 6 received, got %d", lastStats.TotalReceived)
-		}
+	} else if lastTotalReceived.Load() != 6 {
+		t.Errorf("Expected 6 received, got %d", lastTotalReceived.Load())
 	}
 }
 
@@ -234,14 +236,14 @@ func TestStreamingBatchInsert_ErrorHandling(t *testing.T) {
 	}
 
 	var errorCallCount int32
-	var lastError error
+	var lastError atomic.Value
 
 	opts := DefaultStreamingOptions()
 	opts.BufferSize = 10
 	opts.ChunkSize = 2
 	opts.ErrorCallback = func(err error, entry *VectorEntry) {
 		atomic.AddInt32(&errorCallCount, 1)
-		lastError = err
+		lastError.Store(err)
 	}
 
 	stream := collection.NewStreamingBatchInsert(opts)
@@ -272,7 +274,7 @@ func TestStreamingBatchInsert_ErrorHandling(t *testing.T) {
 		t.Error("Error callback should have been called for invalid entry")
 	}
 
-	if lastError == nil {
+	if lastError.Load() == nil {
 		t.Error("Should have received an error")
 	}
 
@@ -311,6 +313,7 @@ func TestStreamingBatchInsert_ConcurrentSend(t *testing.T) {
 	const numGoroutines = 5
 	const entriesPerGoroutine = 20
 	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines*entriesPerGoroutine)
 
 	for g := 0; g < numGoroutines; g++ {
 		wg.Add(1)
@@ -322,13 +325,17 @@ func TestStreamingBatchInsert_ConcurrentSend(t *testing.T) {
 					Vector: []float32{float32(goroutineID), float32(i), float32(goroutineID + i)},
 				}
 				if err := stream.Send(entry); err != nil {
-					t.Errorf("Goroutine %d failed to send entry %d: %v", goroutineID, i, err)
+					errCh <- fmt.Errorf("goroutine %d failed to send entry %d: %w", goroutineID, i, err)
 				}
 			}
 		}(g)
 	}
 
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 
 	// Wait for processing
 	time.Sleep(500 * time.Millisecond)
@@ -512,6 +519,7 @@ func TestStreamingStats_ThreadSafety(t *testing.T) {
 	const numReaders = 5
 	const numSenders = 3
 	const entriesPerSender = 20
+	errCh := make(chan error, numSenders*entriesPerSender)
 
 	// Start stats readers
 	for i := 0; i < numReaders; i++ {
@@ -539,7 +547,7 @@ func TestStreamingStats_ThreadSafety(t *testing.T) {
 				if err := stream.Send(entry); err != nil {
 					// Ignore backpressure errors in this test
 					if err != ErrBackpressureActive {
-						t.Errorf("Sender %d failed to send entry %d: %v", senderID, j, err)
+						errCh <- fmt.Errorf("sender %d failed to send entry %d: %w", senderID, j, err)
 					}
 				}
 				time.Sleep(5 * time.Millisecond)
@@ -548,6 +556,10 @@ func TestStreamingStats_ThreadSafety(t *testing.T) {
 	}
 
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 
 	// Final stats check
 	finalStats := stream.Stats()

@@ -11,16 +11,13 @@ import (
 
 func TestCollectionPersistence(t *testing.T) {
 	ctx := context.Background()
-	testDir := "./test_collection_persistence"
+	testDir := t.TempDir()
+	dbPath := filepath.Join(testDir, "test_collection_persistence.libravdb")
 	indexPath := filepath.Join(testDir, "test_index.bin")
-
-	// Clean up before and after test
-	defer os.RemoveAll(testDir)
-	os.RemoveAll(testDir)
 
 	// Create database and collection
 	db, err := libravdb.New(
-		libravdb.WithStoragePath(testDir),
+		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)

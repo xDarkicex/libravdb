@@ -3,6 +3,8 @@ package libravdb
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,7 +145,7 @@ func TestErrorRecoveryManager(t *testing.T) {
 			t.Errorf("expected recovery to succeed, got error: %v", recoveryErr)
 		}
 
-		if !strategy.recoverCalled {
+		if !strategy.recoverCalled.Load() {
 			t.Error("expected recovery strategy to be called")
 		}
 	})
@@ -343,7 +345,7 @@ type mockRecoveryStrategy struct {
 	canRecover    bool
 	shouldFail    bool
 	delay         time.Duration
-	recoverCalled bool
+	recoverCalled atomic.Bool
 }
 
 func (mrs *mockRecoveryStrategy) CanRecover(err *VectorDBError) bool {
@@ -351,7 +353,7 @@ func (mrs *mockRecoveryStrategy) CanRecover(err *VectorDBError) bool {
 }
 
 func (mrs *mockRecoveryStrategy) Recover(ctx context.Context, err *VectorDBError) error {
-	mrs.recoverCalled = true
+	mrs.recoverCalled.Store(true)
 
 	if mrs.delay > 0 {
 		select {
@@ -373,6 +375,7 @@ func (mrs *mockRecoveryStrategy) GetRecoveryAction() RecoveryAction {
 }
 
 type mockMemoryManager struct {
+	mu                sync.RWMutex
 	usage             MemoryUsage
 	handleLimitCalled bool
 	handleLimitError  error
@@ -385,10 +388,14 @@ type mockMemoryManager struct {
 }
 
 func (mmm *mockMemoryManager) GetUsage() MemoryUsage {
+	mmm.mu.RLock()
+	defer mmm.mu.RUnlock()
 	return mmm.usage
 }
 
 func (mmm *mockMemoryManager) HandleMemoryLimitExceeded() error {
+	mmm.mu.Lock()
+	defer mmm.mu.Unlock()
 	mmm.handleLimitCalled = true
 	if mmm.handleLimitError != nil {
 		return mmm.handleLimitError
@@ -400,6 +407,8 @@ func (mmm *mockMemoryManager) HandleMemoryLimitExceeded() error {
 }
 
 func (mmm *mockMemoryManager) TriggerGC() error {
+	mmm.mu.Lock()
+	defer mmm.mu.Unlock()
 	if mmm.shouldFailGC {
 		return errors.New("GC failed")
 	}
@@ -408,6 +417,8 @@ func (mmm *mockMemoryManager) TriggerGC() error {
 }
 
 func (mmm *mockMemoryManager) EvictCaches(bytes int64) (int64, error) {
+	mmm.mu.Lock()
+	defer mmm.mu.Unlock()
 	if mmm.shouldFailEvict {
 		return 0, errors.New("cache eviction failed")
 	}
@@ -416,6 +427,8 @@ func (mmm *mockMemoryManager) EvictCaches(bytes int64) (int64, error) {
 }
 
 func (mmm *mockMemoryManager) EnableMemoryMapping() error {
+	mmm.mu.Lock()
+	defer mmm.mu.Unlock()
 	if mmm.shouldFailMmap {
 		return errors.New("memory mapping failed")
 	}
@@ -424,6 +437,8 @@ func (mmm *mockMemoryManager) EnableMemoryMapping() error {
 }
 
 func (mmm *mockMemoryManager) DisableMemoryMapping() error {
+	mmm.mu.Lock()
+	defer mmm.mu.Unlock()
 	mmm.mmapEnabled = false
 	return nil
 }

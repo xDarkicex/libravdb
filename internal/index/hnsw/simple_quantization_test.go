@@ -76,8 +76,9 @@ func TestSimpleQuantizationIntegration(t *testing.T) {
 			if node.CompressedVector != nil {
 				t.Error("Nodes should not be quantized before training")
 			}
-			if node.Vector == nil {
-				t.Error("Nodes should have original vectors before training")
+			vec, err := index.getNodeVector(node)
+			if err != nil || vec == nil {
+				t.Error("Nodes should have accessible original vectors before training")
 			}
 		}
 	})

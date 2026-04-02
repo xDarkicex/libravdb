@@ -9,7 +9,7 @@ import (
 
 func TestBatchInsertRollback(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestBatchInsertRollback(t *testing.T) {
 
 func TestBatchUpdateRollback(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestBatchUpdateRollback(t *testing.T) {
 
 func TestBatchDeleteRollback(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestBatchDeleteRollback(t *testing.T) {
 
 func TestBatchOperationsWithoutRollback(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(t.TempDir()))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

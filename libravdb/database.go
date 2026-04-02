@@ -5,12 +5,14 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
-	"github.com/xDarkicex/libravdb/internal/storage/lsm" // Direct import here
+	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
 
 // Database represents the main vector database instance
@@ -26,19 +28,23 @@ type Database struct {
 
 // Config holds database-wide configuration
 type Config struct {
-	StoragePath    string
-	MetricsEnabled bool
-	TracingEnabled bool
-	MaxCollections int
+	StoragePath         string
+	MetricsEnabled      bool
+	TracingEnabled      bool
+	MaxCollections      int
+	MaxConcurrentWrites int
+	MaxWriteQueueDepth  int
 }
 
 // New creates a new Database instance with the given options
 func New(opts ...Option) (*Database, error) {
 	config := &Config{
-		StoragePath:    "./data",
-		MetricsEnabled: true,
-		TracingEnabled: false,
-		MaxCollections: 100,
+		StoragePath:         "./data",
+		MetricsEnabled:      true,
+		TracingEnabled:      false,
+		MaxCollections:      100,
+		MaxConcurrentWrites: defaultMaxConcurrentWrites(),
+		MaxWriteQueueDepth:  32,
 	}
 
 	// Apply options
@@ -48,8 +54,7 @@ func New(opts ...Option) (*Database, error) {
 		}
 	}
 
-	// Initialize storage engine DIRECTLY - no more NewLSM wrapper
-	storageEngine, err := lsm.New(config.StoragePath)
+	storageEngine, err := singlefile.New(config.StoragePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
@@ -95,7 +100,7 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, ErrTooManyCollections
 	}
 
-	collection, err := newCollection(name, db.storage, db.metrics, opts...)
+	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
@@ -119,17 +124,14 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 		return collection, nil
 	}
 
-	// Try to load collection from storage with configuration
-	if lsmEngine, ok := db.storage.(*lsm.Engine); ok {
-		storageCollection, config, err := lsmEngine.GetCollectionWithConfig(name)
+	// Try to load collection from storage with configuration.
+	if fileEngine, ok := db.storage.(interface {
+		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
+	}); ok {
+		var err error
+		collection, err = db.loadCollectionFromStorage(name, fileEngine)
 		if err != nil {
-			return nil, fmt.Errorf("collection %s not found", name)
-		}
-
-		// Create Collection wrapper with stored configuration
-		collection, err = newCollectionFromStorage(name, storageCollection, db.metrics, config)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create collection from storage: %w", err)
+			return nil, err
 		}
 	} else {
 		return nil, fmt.Errorf("collection %s not found", name)
@@ -144,13 +146,65 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 // ListCollections returns the names of all collections
 func (db *Database) ListCollections() []string {
 	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	names := make([]string, 0, len(db.collections))
+	namesMap := make(map[string]struct{}, len(db.collections))
 	for name := range db.collections {
-		names = append(names, name)
+		namesMap[name] = struct{}{}
 	}
-	return names
+	db.mu.RUnlock()
+
+	if names, err := db.storage.ListCollections(); err == nil {
+		for _, name := range names {
+			namesMap[name] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(namesMap))
+	for name := range namesMap {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// DeleteCollection removes a collection and its persisted data.
+func (db *Database) DeleteCollection(ctx context.Context, name string) error {
+	db.mu.Lock()
+	if db.closed {
+		db.mu.Unlock()
+		return ErrDatabaseClosed
+	}
+
+	collection := db.collections[name]
+	delete(db.collections, name)
+	db.mu.Unlock()
+
+	if collection != nil {
+		if err := collection.Close(); err != nil {
+			return fmt.Errorf("failed to close collection %s: %w", name, err)
+		}
+	}
+
+	if err := db.storage.DeleteCollection(name); err != nil {
+		return err
+	}
+
+	_ = ctx
+	return nil
+}
+
+// DeleteCollections removes multiple collections by exact name.
+func (db *Database) DeleteCollections(ctx context.Context, names []string) error {
+	var errs []error
+	for _, name := range names {
+		if err := db.DeleteCollection(ctx, name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("delete collections failed: %v", errs)
+	}
+	return nil
 }
 
 // Health returns the current health status
@@ -311,16 +365,60 @@ func (db *Database) TriggerGlobalGC() error {
 
 // loadExistingCollections discovers and loads existing collections from storage
 func (db *Database) loadExistingCollections(ctx context.Context) error {
-	// This is a simplified approach - we'll need to discover collections
-	// from the storage layer. For now, we'll implement a basic version
-	// that works with the LSM storage engine.
+	fileEngine, ok := db.storage.(interface {
+		ListCollections() ([]string, error)
+		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
+	})
+	if !ok {
+		return nil
+	}
 
-	// The LSM engine already loads existing collections internally,
-	// but we need to create Collection wrappers for them at the database level.
-	// This is a design issue that should be addressed in a future refactor.
+	names, err := fileEngine.ListCollections()
+	if err != nil {
+		return fmt.Errorf("failed to list collections: %w", err)
+	}
 
-	// For now, we'll implement lazy loading in GetCollection instead
+	for _, name := range names {
+		collection, err := db.loadCollectionFromStorage(name, fileEngine)
+		if err != nil {
+			return err
+		}
+		db.collections[name] = collection
+	}
+
+	_ = ctx
 	return nil
+}
+
+func (db *Database) loadCollectionFromStorage(name string, engine interface {
+	GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
+}) (*Collection, error) {
+	storageCollection, config, err := engine.GetCollectionWithConfig(name)
+	if err != nil {
+		return nil, fmt.Errorf("collection %s not found", name)
+	}
+
+	collection, err := newCollectionFromStorage(name, storageCollection, db.metrics, config, db.newWriteController())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
+	}
+
+	return collection, nil
+}
+
+func (db *Database) newWriteController() *writeController {
+	return newWriteController(db.config.MaxConcurrentWrites, db.config.MaxWriteQueueDepth)
+}
+
+func defaultMaxConcurrentWrites() int {
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 1 {
+		return 1
+	}
+	if procs > 2 {
+		return 2
+	}
+	return procs
 }
 
 // Close gracefully shuts down the database

@@ -3,7 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
-	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/xDarkicex/libravdb/internal/filter"
@@ -11,14 +11,8 @@ import (
 
 func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 	// Create temporary directory for test database
-	tempDir, err := os.MkdirTemp("", "libravdb_query_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
 	// Create test database and collection
-	db, err := New(WithStoragePath(tempDir))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -166,6 +160,44 @@ func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 		}
 	})
 
+	t.Run("Contains Convenience Filter", func(t *testing.T) {
+		results, err := collection.Query(ctx).
+			WithVector(queryVector).
+			Contains("tags", "mobile").
+			Limit(10).
+			Execute()
+
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+
+		if len(results.Results) != 2 {
+			t.Errorf("Expected 2 results, got %d", len(results.Results))
+		}
+	})
+
+	t.Run("Inclusive Range Convenience Filters", func(t *testing.T) {
+		results, err := collection.Query(ctx).
+			WithVector(queryVector).
+			And().
+			Gte("rating", 4.5).
+			Lte("price", 100.0).
+			End().
+			Limit(10).
+			Execute()
+
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+
+		if len(results.Results) != 1 {
+			t.Errorf("Expected 1 result, got %d", len(results.Results))
+		}
+		if len(results.Results) == 1 && results.Results[0].ID != "1" {
+			t.Errorf("Expected result ID 1, got %s", results.Results[0].ID)
+		}
+	})
+
 	t.Run("AND Filter Chain", func(t *testing.T) {
 		results, err := collection.Query(ctx).
 			WithVector(queryVector).
@@ -240,6 +272,42 @@ func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 
 		if len(results.Results) != 3 {
 			t.Errorf("Expected 3 results, got %d", len(results.Results))
+		}
+	})
+
+	t.Run("Nested Chain Builder", func(t *testing.T) {
+		results, err := collection.Query(ctx).
+			WithVector(queryVector).
+			And().
+			Or().
+			Eq("category", "books").
+			Eq("category", "electronics").
+			End().
+			Not().
+			Contains("tags", "computer").
+			End().
+			End().
+			Limit(10).
+			Execute()
+
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+
+		if len(results.Results) != 4 {
+			t.Errorf("Expected 4 results, got %d", len(results.Results))
+		}
+
+		for _, result := range results.Results {
+			tags, ok := result.Metadata["tags"].([]string)
+			if !ok {
+				t.Fatalf("expected []string tags, got %T", result.Metadata["tags"])
+			}
+			for _, tag := range tags {
+				if tag == "computer" {
+					t.Fatalf("unexpected excluded tag in result %s", result.ID)
+				}
+			}
 		}
 	})
 
@@ -346,14 +414,8 @@ func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 
 func TestQueryBuilderErrorHandling(t *testing.T) {
 	// Create temporary directory for test database
-	tempDir, err := os.MkdirTemp("", "libravdb_query_error_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
 	// Create test database and collection
-	db, err := New(WithStoragePath(tempDir))
+	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -476,15 +538,8 @@ func TestFilterSelectivityEstimation(t *testing.T) {
 }
 
 func BenchmarkQueryBuilderFiltering(b *testing.B) {
-	// Create temporary directory for benchmark database
-	tempDir, err := os.MkdirTemp("", "libravdb_query_bench")
-	if err != nil {
-		b.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
 	// Create test database and collection
-	db, err := New(WithStoragePath(tempDir))
+	db, err := New(WithStoragePath(filepath.Join(b.TempDir(), "query_bench.libravdb")))
 	if err != nil {
 		b.Fatalf("Failed to create database: %v", err)
 	}
