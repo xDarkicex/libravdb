@@ -334,6 +334,8 @@ func (enc *binaryEncoder) writeCollectionConfig(config storage.CollectionConfig)
 	enc.writeUint32(uint32(config.Version))
 	enc.writeString(config.RawVectorStore)
 	enc.writeUint32(uint32(config.RawStoreCap))
+	enc.writeUint32(uint32(config.NClusters))
+	enc.writeUint32(uint32(config.NProbes))
 	return nil
 }
 
@@ -486,7 +488,7 @@ func estimateCollectionSize(collection *persistedCollection) int {
 }
 
 func estimateCollectionConfigSize(config storage.CollectionConfig) int {
-	return 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4
+	return 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4 + 4 + 4
 }
 
 func estimateCollectionCreatePayloadSize(payload collectionCreatePayload) int {
@@ -685,6 +687,22 @@ func (dec *binaryDecoder) readCollectionConfig() (storage.CollectionConfig, erro
 	if err != nil {
 		return storage.CollectionConfig{}, err
 	}
+
+	var nClusters uint32
+	if dec.off+4 <= len(dec.data) {
+		nClusters, err = dec.readUint32()
+		if err != nil {
+			return storage.CollectionConfig{}, err
+		}
+	}
+
+	var nProbes uint32
+	if dec.off+4 <= len(dec.data) {
+		nProbes, err = dec.readUint32()
+		if err != nil {
+			return storage.CollectionConfig{}, err
+		}
+	}
 	return storage.CollectionConfig{
 		Dimension:      int(dimension),
 		Metric:         int(metric),
@@ -692,6 +710,8 @@ func (dec *binaryDecoder) readCollectionConfig() (storage.CollectionConfig, erro
 		M:              int(m),
 		EfConstruction: int(efConstruction),
 		EfSearch:       int(efSearch),
+		NClusters:      int(nClusters),
+		NProbes:        int(nProbes),
 		ML:             ml,
 		Version:        int(version),
 		RawVectorStore: rawVectorStore,

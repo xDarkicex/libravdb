@@ -10,13 +10,14 @@ import (
 
 // QueryBuilder provides a fluent interface for building vector queries
 type QueryBuilder struct {
-	ctx        context.Context
-	collection *Collection
-	vector     []float32
-	filters    []filter.Filter
-	limit      int
-	threshold  float32
-	efSearch   int // Override collection default
+	ctx          context.Context
+	collection   *Collection
+	vector       []float32
+	filters      []filter.Filter
+	limit        int
+	threshold    float32
+	thresholdSet bool
+	efSearch     int // Override collection default
 }
 
 // Filter represents a metadata filter condition (deprecated, use filter package)
@@ -303,9 +304,11 @@ func (qb *QueryBuilder) Limit(k int) *QueryBuilder {
 	return qb
 }
 
-// WithThreshold sets a minimum similarity threshold
+// WithThreshold sets a minimum public relevance threshold.
+// Thresholds use the same "higher is better" score semantics as SearchResult.Score.
 func (qb *QueryBuilder) WithThreshold(threshold float32) *QueryBuilder {
 	qb.threshold = threshold
+	qb.thresholdSet = true
 	return qb
 }
 
@@ -344,7 +347,7 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	}
 
 	// Apply threshold filtering
-	if qb.threshold > 0 {
+	if qb.thresholdSet {
 		result.Results = qb.applyThreshold(result.Results)
 	}
 
@@ -381,7 +384,7 @@ func (qb *QueryBuilder) List() ([]Record, error) {
 		if err != nil {
 			return nil, err
 		}
-		if qb.threshold > 0 {
+		if qb.thresholdSet {
 			results.Results = qb.applyThreshold(results.Results)
 		}
 		records = recordsFromSearchResults(results.Results)

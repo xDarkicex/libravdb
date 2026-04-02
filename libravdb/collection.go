@@ -42,8 +42,10 @@ type CollectionConfig struct {
 	M              int     `json:"m"`               // Max connections per node
 	EfConstruction int     `json:"ef_construction"` // Size of dynamic candidate list during construction
 	EfSearch       int     `json:"ef_search"`       // Size of dynamic candidate list during search
-	ML             float64 `json:"ml"`              // Level generation factor
-	Version        int     `json:"version"`         // Config version for future compatibility
+	NClusters      int     `json:"n_clusters,omitempty"`
+	NProbes        int     `json:"n_probes,omitempty"`
+	ML             float64 `json:"ml"`      // Level generation factor
+	Version        int     `json:"version"` // Config version for future compatibility
 	RawVectorStore string  `json:"raw_vector_store,omitempty"`
 	RawStoreCap    int     `json:"raw_store_cap,omitempty"`
 	// Persistence configuration
@@ -78,6 +80,82 @@ const (
 	CosineDistance
 )
 
+type trainableIndex interface {
+	Train(ctx context.Context, vectors [][]float32) error
+	IsTrained() bool
+}
+
+func trainingIndexState(idx index.Index) (trainableIndex, bool) {
+	trainable, ok := idx.(trainableIndex)
+	if !ok || trainable.IsTrained() {
+		return nil, false
+	}
+	return trainable, true
+}
+
+func (c *Collection) ivfpqConfig() *index.IVFPQConfig {
+	nClusters := c.config.NClusters
+	if nClusters <= 0 {
+		nClusters = 100
+	}
+
+	nProbes := c.config.NProbes
+	if nProbes <= 0 {
+		nProbes = 10
+	}
+	if nProbes > nClusters {
+		nProbes = nClusters
+	}
+
+	return &index.IVFPQConfig{
+		Dimension:     c.config.Dimension,
+		NClusters:     nClusters,
+		NProbes:       nProbes,
+		Metric:        util.DistanceMetric(c.config.Metric),
+		Quantization:  c.config.Quantization,
+		MaxIterations: 100,
+		Tolerance:     1e-4,
+		RandomSeed:    42,
+	}
+}
+
+func prepareIndexForEntries(ctx context.Context, idx index.Index, entries []*index.VectorEntry) error {
+	trainable, ok := trainingIndexState(idx)
+	if !ok {
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	vectors := make([][]float32, len(entries))
+	for i, entry := range entries {
+		vectors[i] = entry.Vector
+	}
+
+	if err := trainable.Train(ctx, vectors); err != nil {
+		return fmt.Errorf("failed to train index: %w", err)
+	}
+	return nil
+}
+
+func insertEntriesIntoIndex(ctx context.Context, idx index.Index, entries []*index.VectorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	if _, ok := idx.(trainableIndex); ok {
+		return idx.BatchInsert(ctx, entries)
+	}
+
+	for _, entry := range entries {
+		if err := idx.Insert(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // IndexType defines the index algorithm to use
 type IndexType int
 
@@ -110,6 +188,8 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		M:              32,
 		EfConstruction: 200,
 		EfSearch:       50,
+		NClusters:      100,
+		NProbes:        10,
 		ML:             1.0 / math.Log(2.0),
 		RawVectorStore: "slabby",
 		RawStoreCap:    4096,
@@ -146,6 +226,8 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		M:              config.M,
 		EfConstruction: config.EfConstruction,
 		EfSearch:       config.EfSearch,
+		NClusters:      config.NClusters,
+		NProbes:        config.NProbes,
 		ML:             config.ML,
 		Version:        1,
 		RawVectorStore: config.RawVectorStore,
@@ -179,16 +261,8 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 			Quantization:   config.Quantization,
 		})
 	case IVFPQ:
-		idx, err = index.NewIVFPQ(&index.IVFPQConfig{
-			Dimension:     config.Dimension,
-			NClusters:     100, // Default cluster count
-			NProbes:       10,  // Default probe count
-			Metric:        util.DistanceMetric(config.Metric),
-			Quantization:  config.Quantization,
-			MaxIterations: 100,
-			Tolerance:     1e-4,
-			RandomSeed:    42,
-		})
+		temp := &Collection{config: config}
+		idx, err = index.NewIVFPQ(temp.ivfpqConfig())
 	case Flat:
 		idx, err = index.NewFlat(&index.FlatConfig{
 			Dimension:    config.Dimension,
@@ -251,10 +325,18 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		M:              engineConfig.M,
 		EfConstruction: engineConfig.EfConstruction,
 		EfSearch:       engineConfig.EfSearch,
+		NClusters:      engineConfig.NClusters,
+		NProbes:        engineConfig.NProbes,
 		ML:             engineConfig.ML,
 		Version:        engineConfig.Version,
 		RawVectorStore: engineConfig.RawVectorStore,
 		RawStoreCap:    engineConfig.RawStoreCap,
+	}
+	if config.NClusters <= 0 {
+		config.NClusters = 100
+	}
+	if config.NProbes <= 0 {
+		config.NProbes = min(config.NClusters, 10)
 	}
 
 	// Create index with stored config.
@@ -281,16 +363,8 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 			Quantization:   config.Quantization,
 		})
 	case IVFPQ:
-		idx, err = index.NewIVFPQ(&index.IVFPQConfig{
-			Dimension:     config.Dimension,
-			NClusters:     100,
-			NProbes:       10,
-			Metric:        util.DistanceMetric(config.Metric),
-			Quantization:  config.Quantization,
-			MaxIterations: 100,
-			Tolerance:     1e-4,
-			RandomSeed:    42,
-		})
+		temp := &Collection{config: config}
+		idx, err = index.NewIVFPQ(temp.ivfpqConfig())
 	case Flat:
 		idx, err = index.NewFlat(&index.FlatConfig{
 			Dimension:    config.Dimension,
@@ -351,9 +425,14 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 
 // rebuildIndex rebuilds the index from storage data
 func (c *Collection) rebuildIndex(ctx context.Context) error {
-	return c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-		return c.index.Insert(ctx, entry)
-	})
+	vectors, err := c.getAllVectors(ctx)
+	if err != nil {
+		return err
+	}
+	if err := prepareIndexForEntries(ctx, c.index, vectors); err != nil {
+		return err
+	}
+	return insertEntriesIntoIndex(ctx, c.index, vectors)
 }
 
 // Insert adds or updates a vector in the collection
@@ -392,6 +471,16 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 
 	if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
 		return fmt.Errorf("failed to assign ordinal: %w", err)
+	}
+
+	if _, needsTraining := trainingIndexState(c.index); needsTraining {
+		existingVectors, err := c.getAllVectors(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to prepare index training set: %w", err)
+		}
+		if err := prepareIndexForEntries(ctx, c.index, append(existingVectors, storageEntry)); err != nil {
+			return err
+		}
 	}
 
 	if err := c.storage.Insert(ctx, storageEntry); err != nil {
@@ -453,6 +542,16 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 
 	if err := c.storage.AssignOrdinals(ctx, entries); err != nil {
 		return fmt.Errorf("failed to assign ordinals: %w", err)
+	}
+	if _, needsTraining := trainingIndexState(c.index); needsTraining {
+		existingVectors, err := c.getAllVectors(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to prepare index training set: %w", err)
+		}
+		trainingVectors := append(existingVectors, entries...)
+		if err := prepareIndexForEntries(ctx, c.index, trainingVectors); err != nil {
+			return err
+		}
 	}
 	insertedIDs := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -793,7 +892,8 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		return nil, fmt.Errorf("index search failed: %w", err)
 	}
 
-	// Convert from index.SearchResult to libravdb.SearchResult
+	// Convert from index.SearchResult to libravdb.SearchResult.
+	// Public API scores are normalized to consumer-facing relevance semantics.
 	results := make([]*SearchResult, len(indexResults))
 	for i, r := range indexResults {
 		result := &SearchResult{
@@ -833,6 +933,8 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		}
 		results[i] = result
 	}
+
+	normalizePublicSearchResults(c.config.Metric, results)
 
 	// Update metrics
 	if c.metrics != nil {
@@ -1342,16 +1444,7 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 			Quantization:   c.config.Quantization,
 		})
 	case IVFPQ:
-		newIndex, err = index.NewIVFPQ(&index.IVFPQConfig{
-			Dimension:     c.config.Dimension,
-			NClusters:     100,
-			NProbes:       10,
-			Metric:        util.DistanceMetric(c.config.Metric),
-			Quantization:  c.config.Quantization,
-			MaxIterations: 100,
-			Tolerance:     1e-4,
-			RandomSeed:    42,
-		})
+		newIndex, err = index.NewIVFPQ(c.ivfpqConfig())
 	case Flat:
 		newIndex, err = index.NewFlat(&index.FlatConfig{
 			Dimension:    c.config.Dimension,
@@ -1366,12 +1459,15 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 		return fmt.Errorf("failed to create new index: %w", err)
 	}
 
+	if err := prepareIndexForEntries(ctx, newIndex, vectors); err != nil {
+		newIndex.Close()
+		return err
+	}
+
 	// Insert all vectors into new index
-	for _, vector := range vectors {
-		if err := newIndex.Insert(ctx, vector); err != nil {
-			newIndex.Close() // Clean up on failure
-			return fmt.Errorf("failed to insert vector during index switch: %w", err)
-		}
+	if err := insertEntriesIntoIndex(ctx, newIndex, vectors); err != nil {
+		newIndex.Close()
+		return fmt.Errorf("failed to insert vectors during index switch: %w", err)
 	}
 
 	// Close old index and switch
@@ -1390,6 +1486,7 @@ func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, e
 		// Create a copy to avoid reference issues
 		vectorCopy := &index.VectorEntry{
 			ID:       entry.ID,
+			Ordinal:  entry.Ordinal,
 			Vector:   make([]float32, len(entry.Vector)),
 			Metadata: make(map[string]interface{}),
 		}

@@ -14,6 +14,8 @@ type CollectionConfig struct {
 	M              int
 	EfConstruction int
 	EfSearch       int
+	NClusters      int
+	NProbes        int
 	ML             float64
 	Version        int
 	RawVectorStore string

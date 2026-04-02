@@ -19,7 +19,10 @@ type Record struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// SearchResult represents a single search result
+// SearchResult represents a single search result.
+// Score is a consumer-facing relevance score where higher is always better.
+// For cosine collections, Score uses cosine similarity semantics.
+// Other metrics expose a normalized monotone relevance score.
 type SearchResult struct {
 	ID       string                 `json:"id"`
 	Score    float32                `json:"score"`
@@ -27,7 +30,8 @@ type SearchResult struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// SearchResults represents the complete search response
+// SearchResults represents the complete search response.
+// Results are ordered by descending public relevance score.
 type SearchResults struct {
 	Results []*SearchResult `json:"results"`
 	Took    time.Duration   `json:"took"`

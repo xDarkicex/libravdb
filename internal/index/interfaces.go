@@ -247,6 +247,14 @@ type ivfpqWrapper struct {
 	index *ivfpq.Index
 }
 
+func (w *ivfpqWrapper) Train(ctx context.Context, vectors [][]float32) error {
+	return w.index.Train(ctx, vectors)
+}
+
+func (w *ivfpqWrapper) IsTrained() bool {
+	return w.index.IsTrained()
+}
+
 // Insert adapts the interface VectorEntry to IVF-PQ VectorEntry
 func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 	ivfpqEntry := &ivfpq.VectorEntry{

@@ -216,6 +216,22 @@ func WithFlat() CollectionOption {
 	}
 }
 
+// WithIVFPQ configures the collection to use an IVF-PQ index.
+func WithIVFPQ(nClusters, nProbes int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if nClusters <= 0 {
+			return fmt.Errorf("IVF-PQ cluster count must be positive")
+		}
+		if nProbes <= 0 || nProbes > nClusters {
+			return fmt.Errorf("IVF-PQ probe count must be between 1 and %d", nClusters)
+		}
+		c.IndexType = IVFPQ
+		c.NClusters = nClusters
+		c.NProbes = nProbes
+		return nil
+	}
+}
+
 // WithAutoIndexSelection enables automatic index type selection based on collection size
 // Small collections (<10K vectors) use Flat, medium collections use HNSW, large collections use IVF-PQ
 func WithAutoIndexSelection(enabled bool) CollectionOption {

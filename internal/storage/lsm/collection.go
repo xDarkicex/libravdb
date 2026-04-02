@@ -21,6 +21,8 @@ type CollectionConfig struct {
 	M              int     `json:"m"`
 	EfConstruction int     `json:"ef_construction"`
 	EfSearch       int     `json:"ef_search"`
+	NClusters      int     `json:"n_clusters,omitempty"`
+	NProbes        int     `json:"n_probes,omitempty"`
 	ML             float64 `json:"ml"`
 	Version        int     `json:"version"`
 	RawVectorStore string  `json:"raw_vector_store,omitempty"`
