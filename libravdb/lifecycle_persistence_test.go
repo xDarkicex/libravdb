@@ -32,7 +32,10 @@ func TestListCollectionsPersistsAcrossReopen(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	got := reopened.ListCollections()
+	got, err := reopened.ListCollectionsWithContext(ctx)
+	if err != nil {
+		t.Fatalf("list collections with context: %v", err)
+	}
 	sort.Strings(names)
 	if len(got) != len(names) {
 		t.Fatalf("expected %d collections, got %d: %v", len(names), len(got), got)
@@ -152,6 +155,44 @@ func TestDeleteCollectionPersistsAcrossReopen(t *testing.T) {
 
 	got := reopened.ListCollections()
 	if len(got) != 1 || got[0] != "user:u1:256d" {
+		t.Fatalf("expected only surviving collection, got %v", got)
+	}
+}
+
+func TestDeleteCollectionsPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	for _, name := range []string{"user:u1", "user:u1:64d", "global"} {
+		if _, err := db.CreateCollection(ctx, name, WithDimension(3)); err != nil {
+			t.Fatalf("create collection %s: %v", name, err)
+		}
+	}
+
+	if err := db.DeleteCollections(ctx, []string{"user:u1", "global"}); err != nil {
+		t.Fatalf("delete collections: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	got, err := reopened.ListCollectionsWithContext(ctx)
+	if err != nil {
+		t.Fatalf("list collections with context: %v", err)
+	}
+	if len(got) != 1 || got[0] != "user:u1:64d" {
 		t.Fatalf("expected only surviving collection, got %v", got)
 	}
 }
@@ -373,6 +414,83 @@ func TestQueryBuilderListSupportsMetadataOnlyListing(t *testing.T) {
 	defer reopened.Close()
 
 	reloaded, err := reopened.GetCollection("session:q1")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+
+	checkMatches(reloaded)
+}
+
+func TestQueryBuilderListHonorsThresholdWithVectorQuery(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	collection, err := db.CreateCollection(ctx, "session:threshold", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	if err := collection.InsertBatch(ctx, []VectorEntry{
+		{ID: "exact", Vector: []float32{1, 0, 0}, Metadata: map[string]interface{}{"sessionId": "s1"}},
+		{ID: "close", Vector: []float32{0.9, 0.1, 0}, Metadata: map[string]interface{}{"sessionId": "s1"}},
+		{ID: "far", Vector: []float32{0, 1, 0}, Metadata: map[string]interface{}{"sessionId": "s1"}},
+	}); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	checkMatches := func(c *Collection) {
+		t.Helper()
+
+		results, err := c.Query(ctx).
+			WithVector([]float32{1, 0, 0}).
+			WithThreshold(0.8).
+			Limit(10).
+			Execute()
+		if err != nil {
+			t.Fatalf("query builder threshold execute: %v", err)
+		}
+
+		records, err := c.Query(ctx).
+			WithVector([]float32{1, 0, 0}).
+			WithThreshold(0.8).
+			Limit(10).
+			List()
+		if err != nil {
+			t.Fatalf("query builder threshold list: %v", err)
+		}
+		if len(records) != len(results.Results) {
+			t.Fatalf("threshold list/execute mismatch: list=%d execute=%d", len(records), len(results.Results))
+		}
+
+		recordIDs := make(map[string]struct{}, len(records))
+		for _, record := range records {
+			recordIDs[record.ID] = struct{}{}
+		}
+		for _, result := range results.Results {
+			if _, ok := recordIDs[result.ID]; !ok {
+				t.Fatalf("threshold list missing execute result %q: list=%v execute=%v", result.ID, records, results.Results)
+			}
+		}
+	}
+
+	checkMatches(collection)
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	reloaded, err := reopened.GetCollection("session:threshold")
 	if err != nil {
 		t.Fatalf("get collection: %v", err)
 	}

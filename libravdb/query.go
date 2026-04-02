@@ -381,6 +381,9 @@ func (qb *QueryBuilder) List() ([]Record, error) {
 		if err != nil {
 			return nil, err
 		}
+		if qb.threshold > 0 {
+			results.Results = qb.applyThreshold(results.Results)
+		}
 		records = recordsFromSearchResults(results.Results)
 	}
 

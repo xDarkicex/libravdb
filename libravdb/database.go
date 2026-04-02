@@ -143,19 +143,37 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 	return collection, nil
 }
 
-// ListCollections returns the names of all collections
+// ListCollections returns the names of all collections as a best-effort
+// compatibility helper. Use ListCollectionsWithContext when you need explicit
+// error reporting from storage-backed discovery.
 func (db *Database) ListCollections() []string {
+	names, _ := db.ListCollectionsWithContext(context.Background())
+	return names
+}
+
+// ListCollectionsWithContext returns the names of all persisted collections.
+func (db *Database) ListCollectionsWithContext(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, ErrDatabaseClosed
+	}
 	namesMap := make(map[string]struct{}, len(db.collections))
 	for name := range db.collections {
 		namesMap[name] = struct{}{}
 	}
 	db.mu.RUnlock()
 
-	if names, err := db.storage.ListCollections(); err == nil {
-		for _, name := range names {
-			namesMap[name] = struct{}{}
-		}
+	names, err := db.storage.ListCollections()
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range names {
+		namesMap[name] = struct{}{}
 	}
 
 	result := make([]string, 0, len(namesMap))
@@ -163,7 +181,7 @@ func (db *Database) ListCollections() []string {
 		result = append(result, name)
 	}
 	sort.Strings(result)
-	return result
+	return result, nil
 }
 
 // DeleteCollection removes a collection and its persisted data.

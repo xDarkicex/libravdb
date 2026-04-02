@@ -51,6 +51,14 @@ func (db *Database) ListCollections() []string
 Returns the names of all persisted collections in the database, including
 collections discovered during reopen before any `GetCollection` calls.
 
+#### ListCollectionsWithContext
+```go
+func (db *Database) ListCollectionsWithContext(ctx context.Context) ([]string, error)
+```
+
+Returns the same storage-backed collection list, but surfaces discovery errors to
+callers that need strict reopen/lifecycle handling.
+
 #### DeleteCollection
 ```go
 func (db *Database) DeleteCollection(ctx context.Context, name string) error

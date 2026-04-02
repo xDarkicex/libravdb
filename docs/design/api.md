@@ -38,6 +38,7 @@ type Database interface {
     CreateCollection(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error)
     GetCollection(name string) (*Collection, error)
     ListCollections() []string
+    ListCollectionsWithContext(ctx context.Context) ([]string, error)
     DeleteCollection(ctx context.Context, name string) error
     DeleteCollections(ctx context.Context, names []string) error
     Health(ctx context.Context) (*HealthStatus, error)
