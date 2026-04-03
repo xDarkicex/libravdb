@@ -1,17 +1,22 @@
-//go:build linux || darwin || freebsd || netbsd || openbsd
+//go:build windows
 
 package memory
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"golang.org/x/sys/windows"
 )
 
-// MemoryMap represents a memory-mapped file
+// ErrPlatformUnsupported is returned when mmap is not supported on the platform
+var ErrPlatformUnsupported = errors.New("memory mapping is not supported on this platform")
+
+// MemoryMap represents a memory-mapped file on Windows
 type MemoryMap struct {
 	mu       sync.RWMutex
 	file     *os.File
@@ -19,6 +24,9 @@ type MemoryMap struct {
 	size     int64
 	path     string
 	readOnly bool
+
+	// Windows-specific handle for file mapping
+	mappingHandle windows.Handle
 }
 
 // NewMemoryMap creates a new memory map for the given file
@@ -37,7 +45,6 @@ func NewMemoryMap(path string, size int64, readOnly bool) (*MemoryMap, error) {
 	} else {
 		file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 		if err == nil && size > 0 {
-			// Ensure file is large enough
 			if err := file.Truncate(size); err != nil {
 				file.Close()
 				return nil, fmt.Errorf("failed to truncate file: %w", err)
@@ -64,24 +71,58 @@ func NewMemoryMap(path string, size int64, readOnly bool) (*MemoryMap, error) {
 		return nil, fmt.Errorf("cannot memory map empty file")
 	}
 
-	// Memory map the file
-	prot := unix.PROT_READ
-	if !readOnly {
-		prot |= unix.PROT_WRITE
+	// Create file mapping
+	var access uint32
+	if readOnly {
+		access = windows.PAGE_READONLY
+	} else {
+		access = windows.PAGE_READWRITE
 	}
 
-	data, err := unix.Mmap(int(file.Fd()), 0, int(size), prot, unix.MAP_SHARED)
+	mappingHandle, err := windows.CreateFileMapping(
+		windows.Handle(file.Fd()),
+		nil,
+		access,
+		uint32(size>>32),
+		uint32(size),
+		nil,
+	)
 	if err != nil {
 		file.Close()
-		return nil, fmt.Errorf("failed to mmap file: %w", err)
+		return nil, fmt.Errorf("failed to create file mapping: %w", err)
 	}
 
+	// Map the file into memory
+	var mapAccess uint32
+	if readOnly {
+		mapAccess = windows.FILE_MAP_READ
+	} else {
+		mapAccess = windows.FILE_MAP_READ | windows.FILE_MAP_WRITE
+	}
+
+	addr, err := windows.MapViewOfFile(
+		mappingHandle,
+		mapAccess,
+		0, // offset high
+		0, // offset low
+		uintptr(size),
+	)
+	if err != nil {
+		windows.CloseHandle(mappingHandle)
+		file.Close()
+		return nil, fmt.Errorf("failed to map view of file: %w", err)
+	}
+
+	// Create slice from the mapped memory
+	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), int(size))
+
 	return &MemoryMap{
-		file:     file,
-		data:     data,
-		size:     size,
-		path:     path,
-		readOnly: readOnly,
+		file:          file,
+		data:          data,
+		size:          size,
+		path:          path,
+		readOnly:      readOnly,
+		mappingHandle: mappingHandle,
 	}, nil
 }
 
@@ -119,12 +160,19 @@ func (m *MemoryMap) Sync() error {
 	}
 
 	if m.readOnly {
-		return nil // No need to sync read-only mappings
+		return nil
 	}
 
-	// Use msync to flush changes
-	if err := unix.Msync(m.data, unix.MS_SYNC); err != nil {
-		return fmt.Errorf("msync failed: %w", err)
+	// Flush view of mapped memory
+	if err := windows.FlushViewOfFile(uintptr(unsafe.Pointer(&m.data[0])), uintptr(m.size)); err != nil {
+		return fmt.Errorf("failed to flush view: %w", err)
+	}
+
+	// Ensure file metadata is flushed
+	if m.file != nil {
+		if err := m.file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync file: %w", err)
+		}
 	}
 
 	return nil
@@ -137,15 +185,23 @@ func (m *MemoryMap) Close() error {
 
 	var err error
 
-	// Unmap memory
+	// Unmap the view
 	if m.data != nil {
-		if unmapErr := unix.Munmap(m.data); unmapErr != nil {
-			err = fmt.Errorf("failed to unmap memory: %w", unmapErr)
+		if unmapErr := windows.UnmapViewOfFile(uintptr(unsafe.Pointer(&m.data[0]))); unmapErr != nil {
+			err = fmt.Errorf("failed to unmap view of file: %w", unmapErr)
 		}
 		m.data = nil
 	}
 
-	// Close file
+	// Close the mapping handle
+	if m.mappingHandle != 0 {
+		if closeErr := windows.CloseHandle(m.mappingHandle); closeErr != nil && err == nil {
+			err = fmt.Errorf("failed to close mapping handle: %w", closeErr)
+		}
+		m.mappingHandle = 0
+	}
+
+	// Close the file
 	if m.file != nil {
 		if closeErr := m.file.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("failed to close file: %w", closeErr)
@@ -169,9 +225,15 @@ func (m *MemoryMap) Resize(newSize int64) error {
 		return fmt.Errorf("memory map is closed")
 	}
 
-	// Unmap current mapping
-	if err := unix.Munmap(m.data); err != nil {
-		return fmt.Errorf("failed to unmap memory: %w", err)
+	// Unmap current view
+	if unmapErr := windows.UnmapViewOfFile(uintptr(unsafe.Pointer(&m.data[0]))); unmapErr != nil {
+		return fmt.Errorf("failed to unmap view of file: %w", unmapErr)
+	}
+
+	// Close current mapping handle
+	if m.mappingHandle != 0 {
+		windows.CloseHandle(m.mappingHandle)
+		m.mappingHandle = 0
 	}
 
 	// Resize file
@@ -179,20 +241,40 @@ func (m *MemoryMap) Resize(newSize int64) error {
 		return fmt.Errorf("failed to truncate file: %w", err)
 	}
 
-	// Remap with new size
-	data, err := unix.Mmap(int(m.file.Fd()), 0, int(newSize),
-		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	// Create new mapping with new size
+	mappingHandle, err := windows.CreateFileMapping(
+		windows.Handle(m.file.Fd()),
+		nil,
+		windows.PAGE_READWRITE,
+		uint32(newSize>>32),
+		uint32(newSize),
+		nil,
+	)
 	if err != nil {
-		return fmt.Errorf("failed to remap file: %w", err)
+		return fmt.Errorf("failed to create new file mapping: %w", err)
 	}
 
-	m.data = data
+	// Map new view
+	addr, err := windows.MapViewOfFile(
+		mappingHandle,
+		windows.FILE_MAP_READ|windows.FILE_MAP_WRITE,
+		0,
+		0,
+		uintptr(newSize),
+	)
+	if err != nil {
+		windows.CloseHandle(mappingHandle)
+		return fmt.Errorf("failed to map new view of file: %w", err)
+	}
+
+	m.data = unsafe.Slice((*byte)(unsafe.Pointer(addr)), int(newSize))
 	m.size = newSize
+	m.mappingHandle = mappingHandle
 
 	return nil
 }
 
-// MemoryMapManager manages multiple memory mappings
+// MemoryMapManager manages multiple memory mappings on Windows
 type MemoryMapManager struct {
 	mu       sync.RWMutex
 	mappings map[string]*MemoryMap
