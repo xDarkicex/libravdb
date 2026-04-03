@@ -230,3 +230,6 @@ DOCUMENTATION_COMPLETION_SUMMARY.md
 # Example binaries (when testing compilation)
 examples/*/
 !examples/*.go
+
+# Claude Code
+CLAUDE.md
