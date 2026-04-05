@@ -232,11 +232,30 @@ func WithIVFPQ(nClusters, nProbes int) CollectionOption {
 	}
 }
 
-// WithAutoIndexSelection enables automatic index type selection based on collection size
-// Small collections (<10K vectors) use Flat, medium collections use HNSW, large collections use IVF-PQ
+// WithAutoIndexSelection enables automatic index type selection based on collection size.
+// Small collections (<2000 vectors) use Flat, medium collections use HNSW, large collections use IVF-PQ.
+// The thresholds can be customized via WithAutoIndexThresholds.
 func WithAutoIndexSelection(enabled bool) CollectionOption {
 	return func(c *CollectionConfig) error {
 		c.AutoIndexSelection = enabled
+		return nil
+	}
+}
+
+// WithAutoIndexThresholds overrides the default auto-index selection thresholds.
+// This allows tuning when HNSW or IVF-PQ is selected instead of Flat.
+// hnswThreshold: vector count at which HNSW is selected over Flat (default: 10000)
+// ivfpqThreshold: vector count at which IVF-PQ is selected over HNSW (default: 1000000)
+func WithAutoIndexThresholds(hnswThreshold, ivfpqThreshold int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if hnswThreshold < 0 {
+			return fmt.Errorf("hnsw threshold must be non-negative, got %d", hnswThreshold)
+		}
+		if ivfpqThreshold < hnswThreshold {
+			return fmt.Errorf("ivfpq threshold (%d) must be >= hnsw threshold (%d)", ivfpqThreshold, hnswThreshold)
+		}
+		c.AutoIndexThresholds.HNSWThreshold = hnswThreshold
+		c.AutoIndexThresholds.IVFPQThreshold = ivfpqThreshold
 		return nil
 	}
 }

@@ -56,6 +56,12 @@ type CollectionConfig struct {
 	Quantization *quant.QuantizationConfig `json:"quantization,omitempty"`
 	// Automatic index selection based on collection size
 	AutoIndexSelection bool `json:"auto_index_selection,omitempty"`
+	// AutoIndexThresholds overrides the default thresholds for auto-index selection.
+	// If set to zero values, DefaultHNSWThreshold and DefaultIVFPQThreshold are used.
+	AutoIndexThresholds struct {
+		HNSWThreshold  int `json:"hnsw_threshold,omitempty"`
+		IVFPQThreshold int `json:"ivfpq_threshold,omitempty"`
+	} `json:"auto_index_thresholds,omitempty"`
 
 	// NEW: Memory management configuration
 	MemoryLimit    int64                `json:"memory_limit,omitempty"`    // Maximum memory usage in bytes (0 = no limit)
@@ -165,12 +171,28 @@ const (
 	Flat
 )
 
-// selectOptimalIndexType chooses the best index type based on collection size
-func selectOptimalIndexType(vectorCount int) IndexType {
-	if vectorCount < 10000 {
+// DefaultAutoIndexThresholds defines the default thresholds for auto-index selection.
+// These can be overridden via CollectionOption when creating a collection.
+const (
+	// DefaultHNSWThreshold is the default vector count at which HNSW is selected over Flat.
+	// Collections with fewer vectors use Flat (exact search).
+	// Collections at or above this count use HNSW (approximate search with better asymptotic performance).
+	// The value 2000 balances query latency savings against HNSW build/update overhead.
+	DefaultHNSWThreshold = 2000
+
+	// DefaultIVFPQThreshold is the default vector count at which IVF-PQ is selected over HNSW.
+	// Collections below this use HNSW for accuracy/speed balance.
+	// Collections at or above this use IVF-PQ for memory efficiency at scale.
+	DefaultIVFPQThreshold = 1000000
+)
+
+// selectOptimalIndexType chooses the best index type based on collection size.
+// Uses the provided thresholds to determine the switching points.
+func selectOptimalIndexType(vectorCount int, hnswThreshold, ivfpqThreshold int) IndexType {
+	if vectorCount < hnswThreshold {
 		// Small collections: use Flat for exact search and simplicity
 		return Flat
-	} else if vectorCount < 1000000 {
+	} else if vectorCount < ivfpqThreshold {
 		// Medium collections: use HNSW for good balance of speed and accuracy
 		return HNSW
 	} else {
@@ -215,7 +237,15 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 
 	// Apply automatic index selection if enabled
 	if config.AutoIndexSelection {
-		config.IndexType = selectOptimalIndexType(0) // Start with 0 vectors
+		hnswThreshold := config.AutoIndexThresholds.HNSWThreshold
+		if hnswThreshold == 0 {
+			hnswThreshold = DefaultHNSWThreshold
+		}
+		ivfpqThreshold := config.AutoIndexThresholds.IVFPQThreshold
+		if ivfpqThreshold == 0 {
+			ivfpqThreshold = DefaultIVFPQThreshold
+		}
+		config.IndexType = selectOptimalIndexType(0, hnswThreshold, ivfpqThreshold) // Start with 0 vectors
 	}
 
 	// Convert to LSM config format
@@ -1217,10 +1247,18 @@ func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *Optimiz
 	currentSize := c.index.Size()
 	autoIndexSelection := c.config.AutoIndexSelection
 	currentType := c.config.IndexType
+	hnswThreshold := c.config.AutoIndexThresholds.HNSWThreshold
+	if hnswThreshold == 0 {
+		hnswThreshold = DefaultHNSWThreshold
+	}
+	ivfpqThreshold := c.config.AutoIndexThresholds.IVFPQThreshold
+	if ivfpqThreshold == 0 {
+		ivfpqThreshold = DefaultIVFPQThreshold
+	}
 	c.mu.Unlock()
 
 	if autoIndexSelection {
-		optimalType := selectOptimalIndexType(currentSize)
+		optimalType := selectOptimalIndexType(currentSize, hnswThreshold, ivfpqThreshold)
 		if optimalType != currentType {
 			return c.switchIndexType(ctx, optimalType)
 		}
@@ -1412,7 +1450,15 @@ func (c *Collection) GetIndexMetadata() *index.PersistenceMetadata {
 // checkAndSwitchIndexType checks if the index type should be changed based on collection size
 func (c *Collection) checkAndSwitchIndexType(ctx context.Context) error {
 	currentSize := c.index.Size()
-	optimalType := selectOptimalIndexType(currentSize)
+	hnswThreshold := c.config.AutoIndexThresholds.HNSWThreshold
+	if hnswThreshold == 0 {
+		hnswThreshold = DefaultHNSWThreshold
+	}
+	ivfpqThreshold := c.config.AutoIndexThresholds.IVFPQThreshold
+	if ivfpqThreshold == 0 {
+		ivfpqThreshold = DefaultIVFPQThreshold
+	}
+	optimalType := selectOptimalIndexType(currentSize, hnswThreshold, ivfpqThreshold)
 
 	// If the optimal type is different from current, switch
 	if optimalType != c.config.IndexType {

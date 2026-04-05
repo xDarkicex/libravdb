@@ -44,6 +44,7 @@ type Index struct {
 	levelGenerator       *rand.Rand
 	distance             util.DistanceFunc
 	size                 int
+	nextOrdinal          uint32 // monotonic counter for standalone (no-provider) inserts
 	provider             VectorProvider
 	idToIndex            map[string]uint32 // Legacy standalone HNSW path
 	ordinalToID          map[uint32]string // Legacy standalone HNSW path
@@ -101,6 +102,7 @@ func NewHNSW(config *Config) (*Index, error) {
 		entryPointCandidates: make([]uint32, 0),
 		trainingVectors:      make([][]float32, 0),
 		quantizationTrained:  false,
+		nextOrdinal:          0,
 	}
 	index.searchScratchPool.New = func() interface{} {
 		return &searchScratch{}
@@ -166,7 +168,7 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	level := h.generateLevel()
 	ordinal := entry.Ordinal
 	if h.provider == nil {
-		ordinal = uint32(len(h.nodes))
+		ordinal = h.nextOrdinal
 	}
 	if int(ordinal) < len(h.nodes) && h.nodes[ordinal] != nil {
 		return fmt.Errorf("node with ordinal %d already exists", ordinal)
@@ -197,6 +199,9 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 		h.ensureNodeCapacity(int(nodeID) + 1)
 	}
 	h.nodes[nodeID] = node
+	if h.provider == nil {
+		h.nextOrdinal++
+	}
 
 	if entry.ID != "" {
 		h.idToIndex[entry.ID] = nodeID
@@ -503,6 +508,7 @@ func (h *Index) Close() error {
 	h.nodes = nil
 	h.entryPoint = nil
 	h.size = 0
+	h.nextOrdinal = 0
 	h.idToIndex = make(map[string]uint32)
 	h.ordinalToID = make(map[uint32]string)
 	if h.rawVectorStore != nil {
@@ -536,16 +542,16 @@ func (h *Index) ensureNodeCapacity(minSize int) {
 	if minSize <= len(h.nodes) {
 		return
 	}
-	grown := make([]*Node, nextNodeCapacity(len(h.nodes), minSize))
+	grown := make([]*Node, minSize, nextNodeCapacity(cap(h.nodes), minSize))
 	copy(grown, h.nodes)
 	h.nodes = grown
 }
 
-func nextNodeCapacity(currentLen, minSize int) int {
-	if minSize <= currentLen {
-		return currentLen
+func nextNodeCapacity(currentCap, minSize int) int {
+	if minSize <= currentCap {
+		return currentCap
 	}
-	newSize := currentLen
+	newSize := currentCap
 	if newSize < 16 {
 		newSize = 16
 	}
@@ -639,6 +645,9 @@ func (h *Index) trainQuantizer(ctx context.Context) error {
 
 // getNodeVector returns the vector for a node, handling quantization
 func (h *Index) getNodeVector(node *Node) ([]float32, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
 	if node.CompressedVector != nil && h.quantizer != nil {
 		return h.quantizer.Decompress(node.CompressedVector)
 	}

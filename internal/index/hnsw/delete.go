@@ -36,6 +36,7 @@ func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
 func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node, id string) error {
 	// Handle special case: deleting the only node
 	if h.size == 1 {
+		h.deleteStoredVector(node)
 		h.nodes = h.nodes[:0]
 		h.entryPoint = nil
 		h.maxLevel = 0
@@ -55,6 +56,8 @@ func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node,
 	if err := h.handleEntryPointReplacement(nodeID, node); err != nil {
 		return fmt.Errorf("failed to handle entry point replacement: %w", err)
 	}
+
+	h.deleteStoredVector(node)
 
 	// Remove the node from data structures
 	h.removeNodeFromIndex(nodeID, id)
@@ -82,12 +85,10 @@ func (h *Index) removeAllConnections(ctx context.Context, targetID uint32, targe
 		neighbors := make([]uint32, len(targetNode.Links[level]))
 		copy(neighbors, targetNode.Links[level])
 
-		// Remove target from each neighbor's connection list
-		for _, neighborID := range neighbors {
-			if neighborID < uint32(len(h.nodes)) && h.nodes[neighborID] != nil {
-				h.removeConnection(neighborID, targetID, level)
-			}
-		}
+		// Remove target from every node that still references it. This repairs
+		// older asymmetric graph state where incoming edges may exist without a
+		// matching outgoing edge on the deleted node.
+		neighbors = appendUniqueIDs(neighbors, h.removeIncomingConnections(targetID, level)...)
 
 		// Reconnect the neighbors to maintain graph connectivity
 		if err := h.reconnectNeighborsOptimized(ctx, neighbors, level, targetNode); err != nil {
@@ -96,6 +97,35 @@ func (h *Index) removeAllConnections(ctx context.Context, targetID uint32, targe
 	}
 
 	return nil
+}
+
+func (h *Index) removeIncomingConnections(targetID uint32, level int) []uint32 {
+	affected := make([]uint32, 0)
+	for nodeID, node := range h.nodes {
+		if node == nil || uint32(nodeID) == targetID || level >= len(node.Links) {
+			continue
+		}
+
+		links := node.Links[level]
+		if len(links) == 0 {
+			continue
+		}
+
+		newLinks := links[:0]
+		removed := false
+		for _, linkID := range links {
+			if linkID == targetID {
+				removed = true
+				continue
+			}
+			newLinks = append(newLinks, linkID)
+		}
+		if removed {
+			node.Links[level] = newLinks
+			affected = append(affected, uint32(nodeID))
+		}
+	}
+	return affected
 }
 
 // removeConnection removes a specific connection between two nodes at a given level
@@ -389,6 +419,36 @@ func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
 	h.removeFromEntryPointCandidates(nodeID)
 
 	if nodeID < uint32(len(h.nodes)) {
+		h.nodes[nodeID].Links = nil
+		h.nodes[nodeID].CompressedVector = nil
 		h.nodes[nodeID] = nil
 	}
+}
+
+func (h *Index) deleteStoredVector(node *Node) {
+	if node == nil || h.provider != nil || h.rawVectorStore == nil {
+		return
+	}
+	_ = h.rawVectorStore.Delete(VectorRef{
+		Kind:  VectorEncodingRaw,
+		Slot:  node.Ordinal,
+		Bytes: uint32(h.config.Dimension * 4),
+		Valid: true,
+	})
+}
+
+func appendUniqueIDs(dst []uint32, ids ...uint32) []uint32 {
+	for _, id := range ids {
+		seen := false
+		for _, existing := range dst {
+			if existing == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dst = append(dst, id)
+		}
+	}
+	return dst
 }

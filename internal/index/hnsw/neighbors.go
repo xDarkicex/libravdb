@@ -277,6 +277,9 @@ func (ns *NeighborSelector) PruneConnections(
 	defer index.releaseSearchScratch(scratch)
 
 	node := index.nodes[nodeID]
+	if node == nil {
+		return nil
+	}
 	if level >= len(node.Links) {
 		return nil
 	}
@@ -287,43 +290,55 @@ func (ns *NeighborSelector) PruneConnections(
 	}
 
 	overflowSlack := levelOverflowSlack(maxM)
-	if len(node.Links[level]) <= maxM+overflowSlack {
-		return nil // No pruning needed
-	}
-
-	// Get node vector for distance calculations
 	nodeVector, err := index.getNodeVector(node)
 	if err != nil {
 		return err
 	}
 
-	// Create candidates from current connections
-	if cap(scratch.pruneBuf) < len(node.Links[level]) {
-		scratch.pruneBuf = make([]util.Candidate, 0, len(node.Links[level]))
+	originalLinks := node.Links[level]
+
+	// Create candidates from current live connections and compact stale links.
+	if cap(scratch.pruneBuf) < len(originalLinks) {
+		scratch.pruneBuf = make([]util.Candidate, 0, len(originalLinks))
 	} else {
 		scratch.pruneBuf = scratch.pruneBuf[:0]
 	}
 	candidates := scratch.pruneBuf
-	for _, linkID := range node.Links[level] {
+	liveLinks := make([]uint32, 0, len(originalLinks))
+	for _, linkID := range originalLinks {
+		if int(linkID) >= len(index.nodes) {
+			continue
+		}
 		linkNode := index.nodes[linkID]
+		if linkNode == nil {
+			continue
+		}
 		linkVector, err := index.getNodeVector(linkNode)
 		if err != nil {
-			continue // Skip if we can't get the vector
+			continue
 		}
 
 		distance := index.distance(nodeVector, linkVector)
+		liveLinks = append(liveLinks, linkID)
 		candidates = append(candidates, util.Candidate{
 			ID:       linkID,
 			Distance: distance,
 		})
 	}
 
+	if len(candidates) <= maxM+overflowSlack && len(liveLinks) == len(originalLinks) {
+		return nil
+	}
+
+	keepIDs := make(map[uint32]struct{}, min(len(candidates), maxM))
 	if len(candidates) <= maxM {
 		newLinks := node.Links[level][:0]
 		for _, candidate := range candidates {
 			newLinks = append(newLinks, candidate.ID)
+			keepIDs[candidate.ID] = struct{}{}
 		}
 		node.Links[level] = newLinks
+		ns.removeDroppedBacklinks(nodeID, level, liveLinks, keepIDs, index)
 		return nil
 	}
 
@@ -336,10 +351,27 @@ func (ns *NeighborSelector) PruneConnections(
 	newLinks := node.Links[level][:0]
 	for _, sel := range candidates[:maxM] {
 		newLinks = append(newLinks, sel.ID)
+		keepIDs[sel.ID] = struct{}{}
 	}
 	node.Links[level] = newLinks
+	ns.removeDroppedBacklinks(nodeID, level, liveLinks, keepIDs, index)
 
 	return nil
+}
+
+func (ns *NeighborSelector) removeDroppedBacklinks(
+	nodeID uint32,
+	level int,
+	original []uint32,
+	keepIDs map[uint32]struct{},
+	index *Index,
+) {
+	for _, linkID := range original {
+		if _, keep := keepIDs[linkID]; keep {
+			continue
+		}
+		index.removeConnection(linkID, nodeID, level)
+	}
 }
 
 func (h *Index) nodeVectorForHeuristic(nodeID uint32) ([]float32, bool) {

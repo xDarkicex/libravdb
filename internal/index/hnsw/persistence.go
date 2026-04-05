@@ -607,6 +607,7 @@ func (h *Index) readMetadata(reader io.Reader) error {
 func (h *Index) rebuildIndexState() error {
 	// Reset state
 	h.size = 0
+	h.nextOrdinal = 0
 	h.maxLevel = 0
 	h.idToIndex = make(map[string]uint32)
 	h.entryPoint = nil
@@ -615,6 +616,9 @@ func (h *Index) rebuildIndexState() error {
 	for i, node := range h.nodes {
 		if node != nil {
 			h.size++
+			if h.provider == nil && node.Ordinal >= h.nextOrdinal {
+				h.nextOrdinal = node.Ordinal + 1
+			}
 			if id, ok := h.ordinalToID[uint32(i)]; ok && id != "" {
 				h.idToIndex[id] = uint32(i)
 			}
