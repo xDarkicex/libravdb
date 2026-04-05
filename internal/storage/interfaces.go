@@ -31,6 +31,30 @@ type Engine interface {
 	Close() error
 }
 
+// TxOperationType describes a transactional row mutation.
+type TxOperationType uint8
+
+const (
+	TxOperationPut TxOperationType = iota
+	TxOperationDelete
+)
+
+// TxOperation represents one row-level mutation in a transactional batch.
+type TxOperation struct {
+	Type       TxOperationType
+	Collection string
+	ID         string
+	Ordinal    uint32
+	Vector     []float32
+	Metadata   map[string]interface{}
+}
+
+// TransactionalEngine extends Engine with atomic multi-collection commit support.
+type TransactionalEngine interface {
+	PrepareTx(ctx context.Context, ops []TxOperation) ([]TxOperation, error)
+	CommitTx(ctx context.Context, ops []TxOperation) error
+}
+
 // Collection defines the collection storage interface
 type Collection interface {
 	AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error

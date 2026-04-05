@@ -164,7 +164,15 @@ type Engine struct {
 	dirty          bool
 	dirtyBytes     uint64
 	dirtyOps       int
+	replayedTxs    uint64
+	discardedTxs   uint64
 	closed         bool
+}
+
+// RecoveryStats exposes WAL replay outcomes for debugging and tests.
+type RecoveryStats struct {
+	ReplayedTransactions  uint64
+	DiscardedTransactions uint64
 }
 
 // Collection is a storage-backed collection view.
@@ -523,8 +531,10 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 				if err := e.applyCommittedFrames(frames); err != nil {
 					return err
 				}
+				e.replayedTxs++
 				delete(pending, record.Header.TxID)
 			case recordTypeTxAbort:
+				e.discardedTxs++
 				delete(pending, record.Header.TxID)
 			default:
 				pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
@@ -538,6 +548,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		}
 		offset += int64(16 + chunk.PayloadLen)
 	}
+	e.discardedTxs += uint64(len(pending))
 	return nil
 }
 
@@ -1035,6 +1046,144 @@ func (e *Engine) deleteRecord(name, id string) error {
 	return e.maybeCheckpointLocked()
 }
 
+// PrepareTx validates transactional operations and assigns ordinals for new rows
+// without mutating durable state.
+func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]storage.TxOperation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.closed {
+		return nil, fmt.Errorf("database is closed")
+	}
+
+	prepared := make([]storage.TxOperation, len(ops))
+	nextOrdinals := make(map[string]uint32, len(ops))
+	for i, op := range ops {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		collection := e.state.Collections[op.Collection]
+		if collection == nil || collection.Deleted {
+			return nil, fmt.Errorf("collection %s not found", op.Collection)
+		}
+
+		prepared[i] = storage.TxOperation{
+			Type:       op.Type,
+			Collection: op.Collection,
+			ID:         op.ID,
+			Ordinal:    op.Ordinal,
+			Vector:     append([]float32(nil), op.Vector...),
+			Metadata:   cloneMetadata(op.Metadata),
+		}
+
+		if op.Type != storage.TxOperationPut {
+			continue
+		}
+
+		if current := collection.Records[op.ID]; current != nil {
+			prepared[i].Ordinal = current.Ordinal
+			continue
+		}
+
+		nextOrdinal, ok := nextOrdinals[op.Collection]
+		if !ok {
+			nextOrdinal = collection.NextOrdinal
+		}
+		prepared[i].Ordinal = nextOrdinal
+		nextOrdinals[op.Collection] = nextOrdinal + 1
+	}
+
+	return prepared, nil
+}
+
+// CommitTx durably appends a single atomic transaction spanning multiple collections.
+func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return fmt.Errorf("database is closed")
+	}
+
+	txID := e.nextTxIDLocked()
+	beginLSN := e.nextLSNLocked()
+	frames := make([]walRecord, len(ops)+2)
+	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
+	prevLSN := beginLSN
+
+	for i, op := range ops {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		collection := e.state.Collections[op.Collection]
+		if collection == nil || collection.Deleted {
+			return fmt.Errorf("collection %s not found", op.Collection)
+		}
+
+		lsn := e.nextLSNLocked()
+		switch op.Type {
+		case storage.TxOperationPut:
+			payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+				Collection: op.Collection,
+				ID:         op.ID,
+				Ordinal:    op.Ordinal,
+				Vector:     op.Vector,
+				Metadata:   op.Metadata,
+			})
+			if err != nil {
+				return err
+			}
+			frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+		case storage.TxOperationDelete:
+			payload, err := encodeRecordDeletePayloadBinary(recordDeletePayload{
+				Collection: op.Collection,
+				ID:         op.ID,
+			})
+			if err != nil {
+				return err
+			}
+			frames[i+1] = newFrame(recordTypeRecordDelete, lsn, txID, prevLSN, payload)
+		default:
+			return fmt.Errorf("unsupported transaction operation type %d", op.Type)
+		}
+		prevLSN = lsn
+	}
+
+	commitLSN := e.nextLSNLocked()
+	frames[len(frames)-1] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		return err
+	}
+
+	for i, op := range ops {
+		recordLSN := frames[i+1].Header.LSN
+		switch op.Type {
+		case storage.TxOperationPut:
+			if err := e.applyRecordPutFields(op.Collection, op.ID, op.Ordinal, op.Vector, op.Metadata, recordLSN, false); err != nil {
+				return err
+			}
+		case storage.TxOperationDelete:
+			e.applyRecordDelete(op.Collection, op.ID, recordLSN)
+		}
+	}
+
+	e.markDirtyLocked(written, len(ops))
+	return e.maybeCheckpointLocked()
+}
+
 // CreateCollection creates a new collection with persisted config.
 func (e *Engine) CreateCollection(name string, config interface{}) (storage.Collection, error) {
 	cfg, ok := config.(*storage.CollectionConfig)
@@ -1165,6 +1314,16 @@ func (e *Engine) maybeCheckpointLocked() error {
 		return nil
 	}
 	return e.checkpointLocked()
+}
+
+// RecoveryStats returns WAL replay/discard counters observed during open.
+func (e *Engine) RecoveryStats() RecoveryStats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return RecoveryStats{
+		ReplayedTransactions:  e.replayedTxs,
+		DiscardedTransactions: e.discardedTxs,
+	}
 }
 
 func (e *Engine) visibleCollectionCountLocked() int {

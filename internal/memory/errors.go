@@ -328,7 +328,7 @@ func (mhm *MemoryHealthMonitor) Start(ctx context.Context) error {
 	}
 
 	mhm.ctx, mhm.cancel = context.WithCancel(ctx)
-	go mhm.monitorLoop()
+	go mhm.monitorLoop(mhm.ctx)
 	return nil
 }
 
@@ -349,13 +349,13 @@ func (mhm *MemoryHealthMonitor) Stop() error {
 	return nil
 }
 
-// monitorLoop runs the monitoring loop
-func (mhm *MemoryHealthMonitor) monitorLoop() {
+// monitorLoop runs the monitoring loop.
+func (mhm *MemoryHealthMonitor) monitorLoop(ctx context.Context) {
 	if mhm.interval <= 0 {
 		mhm.interval = time.Second * 5 // Default interval
 	}
 
-	if mhm.ctx == nil {
+	if ctx == nil {
 		return // No context available
 	}
 
@@ -364,16 +364,16 @@ func (mhm *MemoryHealthMonitor) monitorLoop() {
 
 	for {
 		select {
-		case <-mhm.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			mhm.checkMemoryHealth()
+			mhm.checkMemoryHealth(ctx)
 		}
 	}
 }
 
 // checkMemoryHealth checks current memory health and triggers recovery if needed
-func (mhm *MemoryHealthMonitor) checkMemoryHealth() {
+func (mhm *MemoryHealthMonitor) checkMemoryHealth(ctx context.Context) {
 	if mhm.manager == nil {
 		return // No manager available
 	}
@@ -397,7 +397,7 @@ func (mhm *MemoryHealthMonitor) checkMemoryHealth() {
 		).WithUsage(usage).WithRecoverable(true)
 
 		if mhm.recoveryManager != nil {
-			if recoveryErr := mhm.recoveryManager.RecoverFromMemoryPressure(mhm.ctx, err); recoveryErr != nil {
+			if recoveryErr := mhm.recoveryManager.RecoverFromMemoryPressure(ctx, err); recoveryErr != nil {
 				// Log recovery failure (in a real implementation, use proper logging)
 				fmt.Printf("Memory recovery failed: %v\n", recoveryErr)
 			}

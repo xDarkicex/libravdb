@@ -167,9 +167,9 @@ func TestFlatIndexPerformance(t *testing.T) {
 		t.Errorf("expected 10 results, got %d", len(results.Results))
 	}
 
-	// Verify search is exact (flat index should give exact results)
-	// Allow for small floating-point precision errors
-	if results.Results[0].Score > 1e-6 {
-		t.Errorf("expected near-exact match (score ~0.0), got %f", results.Results[0].Score)
+	// Public API scores are normalized so higher is better. For cosine search,
+	// an exact match should be very close to 1.0.
+	if results.Results[0].Score < 1.0-1e-6 {
+		t.Errorf("expected near-exact normalized score (~1.0), got %f", results.Results[0].Score)
 	}
 }

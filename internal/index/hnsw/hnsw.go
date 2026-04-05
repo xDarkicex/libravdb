@@ -652,7 +652,9 @@ func (h *Index) getNodeVector(node *Node) ([]float32, error) {
 		return h.quantizer.Decompress(node.CompressedVector)
 	}
 	if h.provider != nil {
-		return h.provider.GetByOrdinal(node.Ordinal)
+		if vec, err := h.provider.GetByOrdinal(node.Ordinal); err == nil && vec != nil {
+			return vec, nil
+		}
 	}
 	if h.rawVectorStore != nil {
 		ref := VectorRef{

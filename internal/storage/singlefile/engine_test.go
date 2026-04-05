@@ -187,4 +187,87 @@ func TestReplayIgnoresUncommittedTransactions(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("expected uncommitted record to be ignored, got count=%d", count)
 	}
+
+	stats := reopened.RecoveryStats()
+	if stats.DiscardedTransactions == 0 {
+		t.Fatalf("expected discarded transaction to be tracked, got %+v", stats)
+	}
+}
+
+func TestRecoveryStatsTrackReplayedAndDiscardedTransactions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery-stats.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	if err := engine.createCollection("global", storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	}); err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	collectionIface, err := engine.GetCollection("global")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	if err := collectionIface.Insert(context.Background(), &index.VectorEntry{
+		ID:       "committed",
+		Vector:   []float32{1, 0, 0},
+		Metadata: map[string]interface{}{"source": "committed"},
+	}); err != nil {
+		t.Fatalf("insert committed record: %v", err)
+	}
+
+	engine.mu.Lock()
+	txID := engine.nextTxIDLocked()
+	beginLSN := engine.nextLSNLocked()
+	putLSN := engine.nextLSNLocked()
+	begin := newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
+	payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+		Collection: "global",
+		ID:         "dangling",
+		Vector:     []float32{0, 1, 0},
+		Metadata:   map[string]interface{}{"source": "dangling"},
+	})
+	if err != nil {
+		engine.mu.Unlock()
+		t.Fatalf("encode payload: %v", err)
+	}
+	put := newFrame(recordTypeRecordPut, putLSN, txID, beginLSN, payload)
+	if _, err := engine.appendTransactionLocked([]walRecord{begin, put}); err != nil {
+		engine.mu.Unlock()
+		t.Fatalf("append dangling transaction: %v", err)
+	}
+	engine.mu.Unlock()
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	reopenedIface, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+
+	stats := reopened.RecoveryStats()
+	if stats.ReplayedTransactions == 0 {
+		t.Fatalf("expected replayed transaction count > 0, got %+v", stats)
+	}
+	if stats.DiscardedTransactions == 0 {
+		t.Fatalf("expected discarded transaction count > 0, got %+v", stats)
+	}
 }

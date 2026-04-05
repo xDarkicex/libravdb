@@ -162,6 +162,57 @@ func insertEntriesIntoIndex(ctx context.Context, idx index.Index, entries []*ind
 	return nil
 }
 
+func createIndexForCollection(config *CollectionConfig, provider interface {
+	GetByOrdinal(uint32) ([]float32, error)
+	Distance([]float32, uint32) (float32, error)
+}) (index.Index, error) {
+	switch config.IndexType {
+	case HNSW:
+		return index.NewHNSW(&index.HNSWConfig{
+			Dimension:      config.Dimension,
+			M:              config.M,
+			EfConstruction: config.EfConstruction,
+			EfSearch:       config.EfSearch,
+			ML:             config.ML,
+			Metric:         util.DistanceMetric(config.Metric),
+			Provider:       provider,
+			RawVectorStore: config.RawVectorStore,
+			RawStoreCap:    config.RawStoreCap,
+			Quantization:   config.Quantization,
+		})
+	case IVFPQ:
+		temp := &Collection{config: config}
+		return index.NewIVFPQ(temp.ivfpqConfig())
+	case Flat:
+		return index.NewFlat(&index.FlatConfig{
+			Dimension:    config.Dimension,
+			Metric:       util.DistanceMetric(config.Metric),
+			Quantization: config.Quantization,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
+	}
+}
+
+func buildIndexForEntries(ctx context.Context, config *CollectionConfig, provider interface {
+	GetByOrdinal(uint32) ([]float32, error)
+	Distance([]float32, uint32) (float32, error)
+}, entries []*index.VectorEntry) (index.Index, error) {
+	idx, err := createIndexForCollection(config, provider)
+	if err != nil {
+		return nil, err
+	}
+	if err := prepareIndexForEntries(ctx, idx, entries); err != nil {
+		idx.Close()
+		return nil, err
+	}
+	if err := insertEntriesIntoIndex(ctx, idx, entries); err != nil {
+		idx.Close()
+		return nil, fmt.Errorf("failed to insert vectors into index: %w", err)
+	}
+	return idx, nil
+}
+
 // IndexType defines the index algorithm to use
 type IndexType int
 
@@ -271,37 +322,11 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 	}
 
 	// Create index
-	var idx index.Index
-	switch config.IndexType {
-	case HNSW:
-		provider, _ := collectionStorage.(interface {
-			GetByOrdinal(uint32) ([]float32, error)
-			Distance([]float32, uint32) (float32, error)
-		})
-		idx, err = index.NewHNSW(&index.HNSWConfig{
-			Dimension:      config.Dimension,
-			M:              config.M,
-			EfConstruction: config.EfConstruction,
-			EfSearch:       config.EfSearch,
-			ML:             config.ML,
-			Metric:         util.DistanceMetric(config.Metric),
-			Provider:       provider,
-			RawVectorStore: config.RawVectorStore,
-			RawStoreCap:    config.RawStoreCap,
-			Quantization:   config.Quantization,
-		})
-	case IVFPQ:
-		temp := &Collection{config: config}
-		idx, err = index.NewIVFPQ(temp.ivfpqConfig())
-	case Flat:
-		idx, err = index.NewFlat(&index.FlatConfig{
-			Dimension:    config.Dimension,
-			Metric:       util.DistanceMetric(config.Metric),
-			Quantization: config.Quantization,
-		})
-	default:
-		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
-	}
+	provider, _ := collectionStorage.(interface {
+		GetByOrdinal(uint32) ([]float32, error)
+		Distance([]float32, uint32) (float32, error)
+	})
+	idx, err := createIndexForCollection(config, provider)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create index: %w", err)
@@ -370,40 +395,11 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 	}
 
 	// Create index with stored config.
-	var (
-		idx index.Index
-		err error
-	)
-	switch config.IndexType {
-	case HNSW:
-		provider, _ := storageCollection.(interface {
-			GetByOrdinal(uint32) ([]float32, error)
-			Distance([]float32, uint32) (float32, error)
-		})
-		idx, err = index.NewHNSW(&index.HNSWConfig{
-			Dimension:      config.Dimension,
-			M:              config.M,
-			EfConstruction: config.EfConstruction,
-			EfSearch:       config.EfSearch,
-			ML:             config.ML,
-			Metric:         util.DistanceMetric(config.Metric),
-			Provider:       provider,
-			RawVectorStore: config.RawVectorStore,
-			RawStoreCap:    config.RawStoreCap,
-			Quantization:   config.Quantization,
-		})
-	case IVFPQ:
-		temp := &Collection{config: config}
-		idx, err = index.NewIVFPQ(temp.ivfpqConfig())
-	case Flat:
-		idx, err = index.NewFlat(&index.FlatConfig{
-			Dimension:    config.Dimension,
-			Metric:       util.DistanceMetric(config.Metric),
-			Quantization: config.Quantization,
-		})
-	default:
-		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
-	}
+	provider, _ := storageCollection.(interface {
+		GetByOrdinal(uint32) ([]float32, error)
+		Distance([]float32, uint32) (float32, error)
+	})
+	idx, err := createIndexForCollection(config, provider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create index: %w", err)
 	}
@@ -1476,44 +1472,15 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 		return fmt.Errorf("failed to get vectors for index switch: %w", err)
 	}
 
-	// Create new index with the new type
-	var newIndex index.Index
-	switch newType {
-	case HNSW:
-		newIndex, err = index.NewHNSW(&index.HNSWConfig{
-			Dimension:      c.config.Dimension,
-			M:              c.config.M,
-			EfConstruction: c.config.EfConstruction,
-			EfSearch:       c.config.EfSearch,
-			ML:             c.config.ML,
-			Metric:         util.DistanceMetric(c.config.Metric),
-			Quantization:   c.config.Quantization,
-		})
-	case IVFPQ:
-		newIndex, err = index.NewIVFPQ(c.ivfpqConfig())
-	case Flat:
-		newIndex, err = index.NewFlat(&index.FlatConfig{
-			Dimension:    c.config.Dimension,
-			Metric:       util.DistanceMetric(c.config.Metric),
-			Quantization: c.config.Quantization,
-		})
-	default:
-		return fmt.Errorf("unsupported index type: %v", newType)
-	}
-
+	provider, _ := c.storage.(interface {
+		GetByOrdinal(uint32) ([]float32, error)
+		Distance([]float32, uint32) (float32, error)
+	})
+	updatedConfig := *c.config
+	updatedConfig.IndexType = newType
+	newIndex, err := buildIndexForEntries(ctx, &updatedConfig, provider, vectors)
 	if err != nil {
-		return fmt.Errorf("failed to create new index: %w", err)
-	}
-
-	if err := prepareIndexForEntries(ctx, newIndex, vectors); err != nil {
-		newIndex.Close()
-		return err
-	}
-
-	// Insert all vectors into new index
-	if err := insertEntriesIntoIndex(ctx, newIndex, vectors); err != nil {
-		newIndex.Close()
-		return fmt.Errorf("failed to insert vectors during index switch: %w", err)
+		return fmt.Errorf("failed to build new index: %w", err)
 	}
 
 	// Close old index and switch

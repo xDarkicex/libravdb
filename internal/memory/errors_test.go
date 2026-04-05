@@ -83,12 +83,13 @@ func TestMemoryError(t *testing.T) {
 
 func TestMemoryRecoveryManager(t *testing.T) {
 	t.Run("successful lightweight recovery", func(t *testing.T) {
-		// Create a mock that simulates memory reduction after GC
 		mockManager := &mockMemoryManager{
 			usage: MemoryUsage{
 				Total: 1100, // Start above limit
 				Limit: 1000,
 			},
+			usageDropOnGetAfterCall: 1,
+			usageDropOnGetAmount:    200,
 		}
 
 		mrm := NewMemoryRecoveryManager(mockManager)
@@ -346,12 +347,14 @@ func TestMemoryHealthMonitor(t *testing.T) {
 // Mock implementations for testing
 
 type mockMemoryManager struct {
-	usage              MemoryUsage
-	handleLimitCalled  bool
-	handleLimitError   error
-	handleLimitSuccess bool
-	gcCalled           bool
-	getUsageCallCount  int
+	usage                   MemoryUsage
+	handleLimitCalled       bool
+	handleLimitError        error
+	handleLimitSuccess      bool
+	gcCalled                bool
+	getUsageCallCount       int
+	usageDropOnGetAfterCall int
+	usageDropOnGetAmount    int64
 }
 
 func (mmm *mockMemoryManager) SetLimit(bytes int64) error {
@@ -362,9 +365,12 @@ func (mmm *mockMemoryManager) SetLimit(bytes int64) error {
 func (mmm *mockMemoryManager) GetUsage() MemoryUsage {
 	mmm.getUsageCallCount++
 
-	// Simulate memory reduction after first call (simulating GC effect)
-	if mmm.getUsageCallCount > 1 && mmm.usage.Total > 200 {
-		mmm.usage.Total -= 200
+	// Some tests need to simulate lower observed usage after GC without
+	// forcing that behavior globally for every recovery path.
+	if mmm.usageDropOnGetAmount > 0 &&
+		mmm.getUsageCallCount > mmm.usageDropOnGetAfterCall &&
+		mmm.usage.Total > mmm.usageDropOnGetAmount {
+		mmm.usage.Total -= mmm.usageDropOnGetAmount
 	}
 
 	// Return a copy to avoid race conditions

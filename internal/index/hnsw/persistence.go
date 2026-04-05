@@ -85,6 +85,23 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
+	// Always restore a local raw vector store during load so the persisted
+	// index can answer searches even before external storage is populated.
+	if h.rawVectorStore == nil {
+		switch h.config.RawVectorStore {
+		case "", RawVectorStoreMemory:
+			h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+		case RawVectorStoreSlabby:
+			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
+			if err != nil {
+				return fmt.Errorf("failed to create slabby raw vector store: %w", err)
+			}
+			h.rawVectorStore = store
+		default:
+			return fmt.Errorf("unsupported raw vector store backend: %s", h.config.RawVectorStore)
+		}
+	}
+
 	if err := h.readNodes(reader); err != nil {
 		return fmt.Errorf("failed to read nodes: %w", err)
 	}
