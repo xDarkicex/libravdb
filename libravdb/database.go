@@ -104,6 +104,7 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
+	collection.db = db
 
 	db.collections[name] = collection
 	return collection, nil
@@ -420,6 +421,7 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
+	collection.db = db
 
 	return collection, nil
 }

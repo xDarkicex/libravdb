@@ -19,13 +19,33 @@ var (
 	ErrTxRollbackFailed    = errors.New("transaction rollback failed")
 	ErrTxEngineUnsupported = errors.New("storage engine does not support transactions")
 	ErrTxConflict          = errors.New("transaction conflict")
+	ErrRecordNotFound      = errors.New("record not found")
+	ErrVersionConflict     = errors.New("version conflict")
 )
+
+// VersionConflictError reports an optimistic concurrency failure.
+type VersionConflictError struct {
+	Collection      string
+	ID              string
+	ExpectedVersion uint64
+	ActualVersion   uint64
+}
+
+func (e *VersionConflictError) Error() string {
+	return fmt.Sprintf("version conflict for %s/%s: expected version %d, actual version %d", e.Collection, e.ID, e.ExpectedVersion, e.ActualVersion)
+}
+
+func (e *VersionConflictError) Is(target error) bool {
+	return target == ErrVersionConflict
+}
 
 // Tx exposes an explicit transactional batch write API.
 type Tx interface {
 	Insert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
 	Update(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
 	Delete(ctx context.Context, collection, id string) error
+	UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error
+	DeleteIfVersion(ctx context.Context, collection, id string, expectedVersion uint64) error
 	DeleteBatch(ctx context.Context, collection string, ids []string) error
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
@@ -40,11 +60,13 @@ const (
 )
 
 type txMutation struct {
-	kind       txMutationKind
-	collection string
-	id         string
-	vector     []float32
-	metadata   map[string]interface{}
+	kind               txMutationKind
+	collection         string
+	id                 string
+	vector             []float32
+	metadata           map[string]interface{}
+	hasExpectedVersion bool
+	expectedVersion    uint64
 }
 
 type transaction struct {
@@ -105,19 +127,37 @@ func (tx *transaction) Insert(ctx context.Context, collection, id string, vector
 }
 
 func (tx *transaction) Update(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	return tx.update(ctx, collection, id, vector, metadata, 0, false)
+}
+
+func (tx *transaction) UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
+	return tx.update(ctx, collection, id, vector, metadata, expectedVersion, true)
+}
+
+func (tx *transaction) update(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64, hasExpectedVersion bool) error {
 	if err := tx.validateStage(ctx, collection, id, vector, false); err != nil {
 		return err
 	}
 	return tx.append(txMutation{
-		kind:       txMutationUpdate,
-		collection: collection,
-		id:         id,
-		vector:     cloneVector(vector),
-		metadata:   cloneMetadata(metadata),
+		kind:               txMutationUpdate,
+		collection:         collection,
+		id:                 id,
+		vector:             cloneVector(vector),
+		metadata:           cloneMetadata(metadata),
+		hasExpectedVersion: hasExpectedVersion,
+		expectedVersion:    expectedVersion,
 	})
 }
 
 func (tx *transaction) Delete(ctx context.Context, collection, id string) error {
+	return tx.delete(ctx, collection, id, 0, false)
+}
+
+func (tx *transaction) DeleteIfVersion(ctx context.Context, collection, id string, expectedVersion uint64) error {
+	return tx.delete(ctx, collection, id, expectedVersion, true)
+}
+
+func (tx *transaction) delete(ctx context.Context, collection, id string, expectedVersion uint64, hasExpectedVersion bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -131,9 +171,11 @@ func (tx *transaction) Delete(ctx context.Context, collection, id string) error 
 		return fmt.Errorf("%w: %v", ErrCollectionNotFound, err)
 	}
 	return tx.append(txMutation{
-		kind:       txMutationDelete,
-		collection: collection,
-		id:         id,
+		kind:               txMutationDelete,
+		collection:         collection,
+		id:                 id,
+		hasExpectedVersion: hasExpectedVersion,
+		expectedVersion:    expectedVersion,
 	})
 }
 
@@ -165,8 +207,14 @@ func (tx *transaction) Commit(ctx context.Context) error {
 		tx.mu.Lock()
 		tx.closed = false
 		tx.mu.Unlock()
-		if tx.db.metrics != nil && (errors.Is(err, ErrTxValidation) || errors.Is(err, ErrTxConflict) || errors.Is(err, ErrCollectionNotFound)) {
-			tx.db.metrics.TxConflicts.Inc()
+		if tx.db.metrics != nil {
+			if errors.Is(err, ErrVersionConflict) {
+				tx.db.metrics.CASConflicts.Inc()
+				tx.db.metrics.CASAborts.Inc()
+			}
+			if errors.Is(err, ErrTxValidation) || errors.Is(err, ErrTxConflict) || errors.Is(err, ErrCollectionNotFound) || errors.Is(err, ErrRecordNotFound) {
+				tx.db.metrics.TxConflicts.Inc()
+			}
 		}
 		return fmt.Errorf("%w: %v", ErrTxCommitFailed, err)
 	}
@@ -287,6 +335,9 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	if err := state.apply(ops); err != nil {
 		return err
 	}
+	if err := state.validateCAS(); err != nil {
+		return err
+	}
 
 	preparedOps, err := engine.PrepareTx(ctx, state.storageOps())
 	if err != nil {
@@ -303,6 +354,17 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 
 	if err := engine.CommitTx(ctx, preparedOps); err != nil {
 		return err
+	}
+
+	hasCAS := false
+	for _, op := range preparedOps {
+		if op.HasExpectedVersion {
+			hasCAS = true
+			break
+		}
+	}
+	if hasCAS && db.metrics != nil {
+		db.metrics.CASSuccesses.Inc()
 	}
 
 	for _, name := range names {
@@ -345,6 +407,8 @@ type txCollectionState struct {
 	base       map[string]*index.VectorEntry
 	working    map[string]*index.VectorEntry
 	touched    map[string]struct{}
+	expected   map[string]uint64
+	casTouched map[string]struct{}
 }
 
 type txCommitState struct {
@@ -375,6 +439,8 @@ func buildTransactionState(ctx context.Context, collections map[string]*Collecti
 			base:       base,
 			working:    working,
 			touched:    make(map[string]struct{}),
+			expected:   make(map[string]uint64),
+			casTouched: make(map[string]struct{}),
 		}
 	}
 
@@ -388,6 +454,13 @@ func (s *txCommitState) apply(ops []txMutation) error {
 			return fmt.Errorf("%w: collection %s not found", ErrTxValidation, op.collection)
 		}
 		state.touched[op.id] = struct{}{}
+		if op.hasExpectedVersion {
+			if existing, ok := state.expected[op.id]; ok && existing != op.expectedVersion {
+				return fmt.Errorf("%w: conflicting expected versions for %s/%s", ErrTxConflict, op.collection, op.id)
+			}
+			state.expected[op.id] = op.expectedVersion
+			state.casTouched[op.id] = struct{}{}
+		}
 
 		switch op.kind {
 		case txMutationInsert:
@@ -409,6 +482,9 @@ func (s *txCommitState) apply(ops []txMutation) error {
 		case txMutationUpdate:
 			current := state.working[op.id]
 			if current == nil {
+				if op.hasExpectedVersion {
+					return fmt.Errorf("%w: %s", ErrRecordNotFound, op.id)
+				}
 				return fmt.Errorf("%w: vector with ID %s not found", ErrTxValidation, op.id)
 			}
 			updated := cloneIndexEntry(current)
@@ -430,6 +506,9 @@ func (s *txCommitState) apply(ops []txMutation) error {
 			state.working[op.id] = updated
 		case txMutationDelete:
 			if _, exists := state.working[op.id]; !exists {
+				if op.hasExpectedVersion {
+					return fmt.Errorf("%w: %s", ErrRecordNotFound, op.id)
+				}
 				if _, existed := state.base[op.id]; existed {
 					continue
 				}
@@ -458,24 +537,50 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 			after := state.working[id]
 			switch {
 			case after == nil && before != nil:
+				expectedVersion, hasExpectedVersion := state.expected[id]
 				ops = append(ops, storage.TxOperation{
-					Type:       storage.TxOperationDelete,
-					Collection: collectionName,
-					ID:         id,
+					Type:               storage.TxOperationDelete,
+					Collection:         collectionName,
+					ID:                 id,
+					ExpectedVersion:    expectedVersion,
+					HasExpectedVersion: hasExpectedVersion,
 				})
 			case after != nil:
+				expectedVersion, hasExpectedVersion := state.expected[id]
 				ops = append(ops, storage.TxOperation{
-					Type:       storage.TxOperationPut,
-					Collection: collectionName,
-					ID:         id,
-					Ordinal:    after.Ordinal,
-					Vector:     cloneVector(after.Vector),
-					Metadata:   cloneMetadata(after.Metadata),
+					Type:               storage.TxOperationPut,
+					Collection:         collectionName,
+					ID:                 id,
+					Ordinal:            after.Ordinal,
+					Vector:             cloneVector(after.Vector),
+					Metadata:           cloneMetadata(after.Metadata),
+					ExpectedVersion:    expectedVersion,
+					HasExpectedVersion: hasExpectedVersion,
 				})
 			}
 		}
 	}
 	return ops
+}
+
+func (s *txCommitState) validateCAS() error {
+	for collectionName, state := range s.collections {
+		for id, expectedVersion := range state.expected {
+			current := state.base[id]
+			if current == nil {
+				return fmt.Errorf("%w: %s", ErrRecordNotFound, id)
+			}
+			if current.Version != expectedVersion {
+				return &VersionConflictError{
+					Collection:      collectionName,
+					ID:              id,
+					ExpectedVersion: expectedVersion,
+					ActualVersion:   current.Version,
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *txCommitState) applyPreparedOrdinals(ops []storage.TxOperation) {
@@ -537,5 +642,6 @@ func cloneIndexEntry(entry *index.VectorEntry) *index.VectorEntry {
 		Ordinal:  entry.Ordinal,
 		Vector:   cloneVector(entry.Vector),
 		Metadata: cloneMetadata(entry.Metadata),
+		Version:  entry.Version,
 	}
 }

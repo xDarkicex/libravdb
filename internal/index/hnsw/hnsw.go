@@ -18,6 +18,7 @@ type VectorEntry struct {
 	Ordinal  uint32
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 // SearchResult represents a search result from HNSW
@@ -27,6 +28,7 @@ type SearchResult struct {
 	Score    float32
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 type VectorProvider interface {

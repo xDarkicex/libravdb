@@ -16,6 +16,9 @@ type Metrics struct {
 	TxCommits       prometheus.Counter
 	TxRollbacks     prometheus.Counter
 	TxConflicts     prometheus.Counter
+	CASSuccesses    prometheus.Counter
+	CASConflicts    prometheus.Counter
+	CASAborts       prometheus.Counter
 	TxCommitOps     prometheus.Histogram
 	TxCommitLatency prometheus.Histogram
 	SearchQueries   prometheus.Counter
@@ -64,6 +67,18 @@ func NewMetrics() *Metrics {
 			TxConflicts: factory.NewCounter(prometheus.CounterOpts{
 				Name: "libravdb_transaction_conflicts_total",
 				Help: "Total transaction conflicts or validation failures",
+			}),
+			CASSuccesses: factory.NewCounter(prometheus.CounterOpts{
+				Name: "libravdb_cas_success_total",
+				Help: "Total successful compare-and-swap writes",
+			}),
+			CASConflicts: factory.NewCounter(prometheus.CounterOpts{
+				Name: "libravdb_cas_conflict_total",
+				Help: "Total compare-and-swap version conflicts",
+			}),
+			CASAborts: factory.NewCounter(prometheus.CounterOpts{
+				Name: "libravdb_cas_abort_total",
+				Help: "Total transaction aborts caused by compare-and-swap precondition failures",
 			}),
 			TxCommitOps: factory.NewHistogram(prometheus.HistogramOpts{
 				Name:    "libravdb_transaction_commit_ops",

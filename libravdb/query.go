@@ -455,8 +455,10 @@ func (qb *QueryBuilder) applyFilters(results []*SearchResult, filters []filter.F
 	// Convert back to libravdb.SearchResult, preserving scores
 	// Create a map for quick lookup of original scores
 	scoreMap := make(map[string]float32)
+	versionMap := make(map[string]uint64)
 	for _, result := range results {
 		scoreMap[result.ID] = result.Score
+		versionMap[result.ID] = result.Version
 	}
 
 	filteredResults := make([]*SearchResult, len(filterEntries))
@@ -466,6 +468,7 @@ func (qb *QueryBuilder) applyFilters(results []*SearchResult, filters []filter.F
 			Score:    scoreMap[entry.ID], // Preserve original score
 			Vector:   entry.Vector,
 			Metadata: entry.Metadata,
+			Version:  versionMap[entry.ID],
 		}
 	}
 
@@ -561,6 +564,7 @@ func recordsFromSearchResults(results []*SearchResult) []Record {
 			ID:       result.ID,
 			Vector:   cloneVector(result.Vector),
 			Metadata: cloneMetadata(result.Metadata),
+			Version:  result.Version,
 		})
 	}
 	return records

@@ -17,6 +17,7 @@ type Record struct {
 	ID       string                 `json:"id"`
 	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	Version  uint64                 `json:"version"`
 }
 
 // SearchResult represents a single search result.
@@ -28,6 +29,7 @@ type SearchResult struct {
 	Score    float32                `json:"score"`
 	Vector   []float32              `json:"vector,omitempty"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	Version  uint64                 `json:"version"`
 }
 
 // SearchResults represents the complete search response.

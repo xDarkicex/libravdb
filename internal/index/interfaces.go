@@ -33,6 +33,7 @@ type VectorEntry struct {
 	Ordinal  uint32
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 // SearchResult represents a search result (avoid circular imports)
@@ -42,6 +43,7 @@ type SearchResult struct {
 	Score    float32
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 // NEW: PersistenceMetadata holds metadata about persisted index
@@ -129,6 +131,7 @@ func (w *hnswWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 		Ordinal:  entry.Ordinal,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
+		Version:  entry.Version,
 	}
 	return w.index.Insert(ctx, hnswEntry)
 }
@@ -142,6 +145,7 @@ func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 			Ordinal:  entry.Ordinal,
 			Vector:   entry.Vector,
 			Metadata: entry.Metadata,
+			Version:  entry.Version,
 		}
 	}
 	return w.index.BatchInsert(ctx, hnswEntries)
@@ -162,6 +166,7 @@ func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int) ([]*Se
 			Score:    r.Score,
 			Vector:   r.Vector,
 			Metadata: r.Metadata,
+			Version:  r.Version,
 		}
 	}
 	return results, nil
@@ -261,6 +266,7 @@ func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 		ID:       entry.ID,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
+		Version:  entry.Version,
 	}
 	return w.index.Insert(ctx, ivfpqEntry)
 }
@@ -289,6 +295,7 @@ func (w *ivfpqWrapper) Search(ctx context.Context, query []float32, k int) ([]*S
 			Score:    r.Score,
 			Vector:   r.Vector,
 			Metadata: r.Metadata,
+			Version:  r.Version,
 		}
 	}
 	return results, nil
@@ -378,6 +385,7 @@ func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 		ID:       entry.ID,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
+		Version:  entry.Version,
 	}
 	return w.index.Insert(ctx, flatEntry)
 }
@@ -406,6 +414,7 @@ func (w *flatWrapper) Search(ctx context.Context, query []float32, k int) ([]*Se
 			Score:    r.Score,
 			Vector:   r.Vector,
 			Metadata: r.Metadata,
+			Version:  r.Version,
 		}
 	}
 	return results, nil

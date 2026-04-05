@@ -1072,12 +1072,14 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 		}
 
 		prepared[i] = storage.TxOperation{
-			Type:       op.Type,
-			Collection: op.Collection,
-			ID:         op.ID,
-			Ordinal:    op.Ordinal,
-			Vector:     append([]float32(nil), op.Vector...),
-			Metadata:   cloneMetadata(op.Metadata),
+			Type:               op.Type,
+			Collection:         op.Collection,
+			ID:                 op.ID,
+			Ordinal:            op.Ordinal,
+			Vector:             append([]float32(nil), op.Vector...),
+			Metadata:           cloneMetadata(op.Metadata),
+			ExpectedVersion:    op.ExpectedVersion,
+			HasExpectedVersion: op.HasExpectedVersion,
 		}
 
 		if op.Type != storage.TxOperationPut {
@@ -1353,6 +1355,7 @@ func cloneEntry(record *recordValue) *index.VectorEntry {
 		Ordinal:  record.Ordinal,
 		Vector:   append([]float32(nil), record.Vector...),
 		Metadata: cloneMetadata(record.Metadata),
+		Version:  record.Version,
 	}
 }
 

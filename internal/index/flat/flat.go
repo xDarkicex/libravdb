@@ -17,6 +17,7 @@ type VectorEntry struct {
 	ID       string                 `json:"id"`
 	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata"`
+	Version  uint64                 `json:"version"`
 }
 
 // SearchResult represents a search result from the flat index
@@ -25,6 +26,7 @@ type SearchResult struct {
 	Score    float32                `json:"score"`
 	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata"`
+	Version  uint64                 `json:"version"`
 }
 
 // Config holds configuration for the flat index

@@ -31,6 +31,7 @@ type VectorEntry struct {
 	ID       string
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 // SearchResult represents a search result
@@ -39,6 +40,7 @@ type SearchResult struct {
 	Score    float32
 	Vector   []float32
 	Metadata map[string]interface{}
+	Version  uint64
 }
 
 // DefaultConfig returns a default IVF-PQ configuration

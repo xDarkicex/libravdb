@@ -19,6 +19,7 @@ import (
 // Collection represents a named collection of vectors with a specific schema
 type Collection struct {
 	mu            sync.RWMutex
+	db            *Database
 	name          string
 	config        *CollectionConfig
 	index         index.Index
@@ -798,6 +799,46 @@ func (c *Collection) DeleteBatch(ctx context.Context, ids []string) error {
 	return nil
 }
 
+// Get returns a persisted record by ID.
+func (c *Collection) Get(ctx context.Context, id string) (Record, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return Record{}, ErrCollectionClosed
+	}
+	c.mu.RUnlock()
+
+	entry, err := c.storage.Get(ctx, id)
+	if err != nil {
+		return Record{}, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
+	}
+	return recordFromIndexEntry(entry), nil
+}
+
+// UpdateIfVersion updates a record only if its current committed version matches expectedVersion.
+func (c *Collection) UpdateIfVersion(ctx context.Context, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
+	return c.withCAS(ctx, func(tx Tx) error {
+		return tx.UpdateIfVersion(ctx, c.name, id, vector, metadata, expectedVersion)
+	})
+}
+
+// DeleteIfVersion deletes a record only if its current committed version matches expectedVersion.
+func (c *Collection) DeleteIfVersion(ctx context.Context, id string, expectedVersion uint64) error {
+	return c.withCAS(ctx, func(tx Tx) error {
+		return tx.DeleteIfVersion(ctx, c.name, id, expectedVersion)
+	})
+}
+
+func (c *Collection) withCAS(ctx context.Context, fn func(tx Tx) error) error {
+	if c == nil {
+		return ErrCollectionClosed
+	}
+	if c.db == nil {
+		return ErrTxEngineUnsupported
+	}
+	return c.db.WithTx(ctx, fn)
+}
+
 // Iterate walks all persisted records in the collection.
 func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
 	c.mu.RLock()
@@ -923,8 +964,9 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 	results := make([]*SearchResult, len(indexResults))
 	for i, r := range indexResults {
 		result := &SearchResult{
-			ID:    r.ID,
-			Score: r.Score,
+			ID:      r.ID,
+			Score:   r.Score,
+			Version: r.Version,
 		}
 		if len(r.Vector) > 0 {
 			result.Vector = cloneVector(r.Vector)
@@ -941,10 +983,11 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				}
 			}
 		}
-		if result.Vector == nil || result.Metadata == nil {
+		if result.Vector == nil || result.Metadata == nil || result.Version == 0 {
 			entry, getErr := c.storage.Get(ctx, result.ID)
 			if getErr == nil {
 				result.ID = entry.ID
+				result.Version = entry.Version
 				if result.Vector == nil {
 					result.Vector = cloneVector(entry.Vector)
 				}
@@ -1502,6 +1545,7 @@ func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, e
 			Ordinal:  entry.Ordinal,
 			Vector:   make([]float32, len(entry.Vector)),
 			Metadata: make(map[string]interface{}),
+			Version:  entry.Version,
 		}
 		copy(vectorCopy.Vector, entry.Vector)
 		for k, v := range entry.Metadata {
@@ -1527,6 +1571,7 @@ func recordFromIndexEntry(entry *index.VectorEntry) Record {
 		ID:       entry.ID,
 		Vector:   cloneVector(entry.Vector),
 		Metadata: cloneMetadata(entry.Metadata),
+		Version:  entry.Version,
 	}
 }
 

@@ -41,12 +41,14 @@ const (
 
 // TxOperation represents one row-level mutation in a transactional batch.
 type TxOperation struct {
-	Type       TxOperationType
-	Collection string
-	ID         string
-	Ordinal    uint32
-	Vector     []float32
-	Metadata   map[string]interface{}
+	Type               TxOperationType
+	Collection         string
+	ID                 string
+	Ordinal            uint32
+	Vector             []float32
+	Metadata           map[string]interface{}
+	ExpectedVersion    uint64
+	HasExpectedVersion bool
 }
 
 // TransactionalEngine extends Engine with atomic multi-collection commit support.
