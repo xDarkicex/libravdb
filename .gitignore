@@ -233,3 +233,4 @@ examples/*/
 
 # Claude Code
 CLAUDE.md
+.claude/
