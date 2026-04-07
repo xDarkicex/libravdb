@@ -42,12 +42,15 @@ const (
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 const (
-	checkpointThresholdBytes = 64 << 20
-	checkpointThresholdOps   = 16384
-	// Batch WAL buffer settings: entries are buffered and flushed together
-	// to reduce fsync overhead. A batch is flushed when it reaches batchSize
-	// entries or after batchFlushInterval elapses.
-	batchSize          = 64                                      // flush when buffer reaches this many entries
+	// Checkpoints are recovery accelerators, not the durability boundary.
+	// Keeping them less frequent reduces sync pressure while WAL fsync still
+	// preserves crash safety for acknowledged writes.
+	checkpointThresholdBytes = 256 << 20
+	checkpointThresholdOps   = 65536
+	// Batch WAL buffer settings: vector entries are buffered and flushed together
+	// to reduce fsync overhead. A batch is flushed when the buffered entry count
+	// reaches batchSize or after batchFlushInterval elapses.
+	batchSize          = 256                                     // flush when buffer reaches this many vector entries
 	batchFlushInterval = 10 * time.Millisecond                    // flush periodically if buffer not full
 )
 
@@ -169,6 +172,11 @@ type Engine struct {
 	dirty          bool
 	dirtyBytes     uint64
 	dirtyOps       int
+	walTransactions uint64
+	walBytes        uint64
+	batchFlushes    uint64
+	batchedEntries  uint64
+	checkpoints     uint64
 	replayedTxs    uint64
 	discardedTxs   uint64
 	closed         bool
@@ -834,6 +842,7 @@ func (e *Engine) checkpointLocked() error {
 	e.dirty = false
 	e.dirtyBytes = 0
 	e.dirtyOps = 0
+	e.checkpoints++
 	return e.file.Sync()
 }
 
@@ -880,6 +889,17 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 			}
 		}
 	}()
+	offset, err := e.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+
+	totalSize := 0
+	for _, record := range records {
+		totalSize += 16 + 40 + len(record.Payload)
+	}
+
+	buf := make([]byte, 0, totalSize)
 	var written uint64
 	for _, record := range records {
 		var frameHeader [40]byte
@@ -891,14 +911,33 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 		binary.LittleEndian.PutUint64(frameHeader[24:32], record.Header.PrevLSN)
 		binary.LittleEndian.PutUint32(frameHeader[32:36], record.Header.PayloadLen)
 		binary.LittleEndian.PutUint32(frameHeader[36:40], record.Header.Checksum)
-		if _, err := e.appendChunkHeaderPayloadLocked(chunkTypeWAL, frameHeader[:], record.Payload); err != nil {
-			return written, err
-		}
+
+		payloadLen := uint32(len(frameHeader) + len(record.Payload))
+		checksum := crc32.Update(0, castagnoli, frameHeader[:])
+		checksum = crc32.Update(checksum, castagnoli, record.Payload)
+
+		var chunkHeader [16]byte
+		binary.LittleEndian.PutUint32(chunkHeader[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(chunkHeader[4:6], chunkTypeWAL)
+		binary.LittleEndian.PutUint16(chunkHeader[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(chunkHeader[8:12], payloadLen)
+		binary.LittleEndian.PutUint32(chunkHeader[12:16], checksum)
+
+		buf = append(buf, chunkHeader[:]...)
+		buf = append(buf, frameHeader[:]...)
+		buf = append(buf, record.Payload...)
 		written += uint64(16 + len(frameHeader) + len(record.Payload))
+	}
+
+	if _, err := e.file.Write(buf); err != nil {
+		return written, err
 	}
 	if err := e.file.Sync(); err != nil {
 		return written, err
 	}
+	e.walTransactions++
+	e.walBytes += written
+	_ = offset
 	return written, nil
 }
 
@@ -1044,12 +1083,31 @@ func (e *Engine) flushBatch() error {
 		return fmt.Errorf("database is closed")
 	}
 
+	// Merge contiguous runs for the same collection so one flush can cover more
+	// buffered work without changing the original ordering of distinct collections.
+	merged := make([]batchEntry, 0, len(entries))
+	for _, batch := range entries {
+		if len(merged) > 0 && merged[len(merged)-1].collection == batch.collection {
+			merged[len(merged)-1].entries = append(merged[len(merged)-1].entries, batch.entries...)
+			continue
+		}
+		merged = append(merged, batchEntry{
+			collection: batch.collection,
+			entries:    batch.entries,
+		})
+	}
+
+	batchedEntries := 0
+	for _, batch := range merged {
+		batchedEntries += len(batch.entries)
+	}
+
 	// Write all entries to WAL - inline the put logic to avoid lock issues
-	for i, batch := range entries {
+	for i, batch := range merged {
 		if err := e.putRecordsInlocked(batch.collection, batch.entries); err != nil {
-			// On error, re-queue only the failed suffix (entries[i:] onwards).
-			// Do NOT re-queue entries[:i] because they were already committed.
-			failedSuffix := entries[i:]
+			// On error, re-queue only the failed suffix (merged[i:] onwards).
+			// Do NOT re-queue merged[:i] because they were already committed.
+			failedSuffix := merged[i:]
 			e.batchBuffer.mu.Lock()
 			e.batchBuffer.entries = append(failedSuffix, e.batchBuffer.entries...)
 			e.batchBuffer.mu.Unlock()
@@ -1059,6 +1117,8 @@ func (e *Engine) flushBatch() error {
 	}
 
 	// Signal all waiting foreground flush completions with success
+	e.batchFlushes++
+	e.batchedEntries += uint64(batchedEntries)
 	signalErr(nil)
 	return nil
 }
@@ -1132,14 +1192,18 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) e
 	return nil
 }
 
-func (e *Engine) putRecords(name string, entries []*index.VectorEntry) error {
+func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, error) {
 	if e.closed {
-		return fmt.Errorf("database is closed")
+		return false, fmt.Errorf("database is closed")
 	}
 
 	// Add entries to batch buffer
 	e.batchBuffer.mu.Lock()
-	shouldFlush := len(e.batchBuffer.entries)+1 >= batchSize
+	bufferedEntries := 0
+	for _, batch := range e.batchBuffer.entries {
+		bufferedEntries += len(batch.entries)
+	}
+	shouldFlush := bufferedEntries+len(entries) >= batchSize
 	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
 		collection: name,
 		entries:    entries,
@@ -1155,10 +1219,10 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) error {
 	// If we've reached batch size, do a synchronous flush before returning.
 	// This ensures durability for this caller's data.
 	if shouldFlush {
-		return e.flushBatch()
+		return true, e.flushBatch()
 	}
 
-	return nil
+	return false, nil
 }
 
 // flushNow forces an immediate flush of the batch buffer and waits for completion.
@@ -1513,6 +1577,19 @@ func (e *Engine) RecoveryStats() RecoveryStats {
 	}
 }
 
+// WriteStats returns coarse write-path counters for benchmarking and profiling.
+func (e *Engine) WriteStats() storage.WriteStats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return storage.WriteStats{
+		WALTransactions:       e.walTransactions,
+		WALBytes:              e.walBytes,
+		BatchFlushes:          e.batchFlushes,
+		BufferedVectorEntries: e.batchedEntries,
+		Checkpoints:           e.checkpoints,
+	}
+}
+
 func (e *Engine) visibleCollectionCountLocked() int {
 	count := 0
 	for _, collection := range e.state.Collections {
@@ -1586,8 +1663,12 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 // It ensures immediate durability by forcing a flush before returning.
 func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error {
 	_ = ctx
-	if err := c.engine.putRecords(c.name, []*index.VectorEntry{entry}); err != nil {
+	flushed, err := c.engine.putRecords(c.name, []*index.VectorEntry{entry})
+	if err != nil {
 		return err
+	}
+	if flushed {
+		return nil
 	}
 	return c.engine.flushNow()
 }
@@ -1597,8 +1678,12 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 // before returning so callers can immediately see the inserted data.
 func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEntry) error {
 	_ = ctx
-	if err := c.engine.putRecords(c.name, entries); err != nil {
+	flushed, err := c.engine.putRecords(c.name, entries)
+	if err != nil {
 		return err
+	}
+	if flushed {
+		return nil
 	}
 	return c.engine.flushNow()
 }

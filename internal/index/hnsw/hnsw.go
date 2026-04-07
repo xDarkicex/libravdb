@@ -207,9 +207,7 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 
 	if entry.ID != "" {
 		h.idToIndex[entry.ID] = nodeID
-		if h.provider == nil {
-			h.ordinalToID[nodeID] = entry.ID
-		}
+		h.ordinalToID[nodeID] = entry.ID
 	}
 
 	// Add to entry point candidates if level is high enough

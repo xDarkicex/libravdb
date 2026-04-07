@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -496,4 +497,235 @@ func TestQueryBuilderListHonorsThresholdWithVectorQuery(t *testing.T) {
 	}
 
 	checkMatches(reloaded)
+}
+
+func TestShardedCollectionReopen(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	collection, err := db.CreateCollection(ctx, "sharded_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	entries := []VectorEntry{
+		{ID: "a", Vector: []float32{1, 0, 0}},
+		{ID: "b", Vector: []float32{0, 1, 0}},
+		{ID: "c", Vector: []float32{0, 0, 1}},
+	}
+	if err := collection.InsertBatch(ctx, entries); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	results, err := collection.Search(ctx, []float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("search before close: %v", err)
+	}
+	if len(results.Results) == 0 {
+		t.Fatal("expected search results before close")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	reloaded, err := reopened.GetCollection("sharded_test")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+
+	results, err = reloaded.Search(ctx, []float32{1, 0, 0}, 2)
+	if err != nil {
+		t.Fatalf("search after reopen: %v", err)
+	}
+	if len(results.Results) == 0 {
+		t.Fatal("expected search results after reopen")
+	}
+
+	count, err := reloaded.Count(ctx)
+	if err != nil {
+		t.Fatalf("count after reopen: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected count 3, got %d", count)
+	}
+}
+
+func TestShardedCollectionListHidesShardNames(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	_, err = db.CreateCollection(ctx, "sharded_parent", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	_, err = db.CreateCollection(ctx, "normal_collection", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create normal collection: %v", err)
+	}
+
+	got := db.ListCollections()
+	hasShardName := false
+	for _, name := range got {
+		if strings.Contains(name, "__shard__") {
+			hasShardName = true
+			break
+		}
+	}
+	if hasShardName {
+		t.Fatalf("ListCollections should not expose shard names, got %v", got)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	got = reopened.ListCollections()
+	hasShardName = false
+	for _, name := range got {
+		if strings.Contains(name, "__shard__") {
+			hasShardName = true
+			break
+		}
+	}
+	if hasShardName {
+		t.Fatalf("ListCollections after reopen should not expose shard names, got %v", got)
+	}
+}
+
+func TestShardedCollectionDeleteRemovesAllShards(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	_, err = db.CreateCollection(ctx, "sharded_to_delete", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	if err := db.DeleteCollection(ctx, "sharded_to_delete"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	got := db.ListCollections()
+	for _, name := range got {
+		if name == "sharded_to_delete" {
+			t.Fatal("deleted collection should not appear in list")
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	_, err = reopened.GetCollection("sharded_to_delete")
+	if err == nil {
+		t.Fatal("expected error when getting deleted collection after reopen")
+	}
+}
+
+func TestShardedCollectionCloseCleansUpResources(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+
+	collection, err := db.CreateCollection(ctx, "sharded_close_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	entries := []VectorEntry{
+		{ID: "x", Vector: []float32{1, 0, 0}},
+		{ID: "y", Vector: []float32{0, 1, 0}},
+	}
+	if err := collection.InsertBatch(ctx, entries); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	// Close the collection (in-memory resources only, not persisted data)
+	if err := collection.Close(); err != nil {
+		t.Fatalf("close collection: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	// Reopen - collection should still exist since we didn't delete it
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	// Verify collection can still be accessed after just Close()
+	reloaded, err := reopened.GetCollection("sharded_close_test")
+	if err != nil {
+		t.Fatalf("expected collection to exist after close, got: %v", err)
+	}
+
+	count, err := reloaded.Count(ctx)
+	if err != nil {
+		t.Fatalf("count after reopen: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected count 2, got %d", count)
+	}
+
+	// Now delete it and verify it's gone
+	if err := reopened.DeleteCollection(ctx, "sharded_close_test"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	reopened2, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database after delete: %v", err)
+	}
+	defer reopened2.Close()
+
+	_, err = reopened2.GetCollection("sharded_close_test")
+	if err == nil {
+		t.Fatal("expected error getting deleted collection after reopen")
+	}
 }

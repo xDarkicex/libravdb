@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -130,9 +129,7 @@ func TestRollbackEdgeCases(t *testing.T) {
 
 // TestRollbackStress tests rollback under stress conditions
 func TestRollbackStress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping stress test in short mode")
-	}
+	requireStressMode(t)
 
 	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {
@@ -468,12 +465,7 @@ func TestRollbackDataConsistency(t *testing.T) {
 
 // TestRollbackPerformance benchmarks rollback performance
 func TestRollbackPerformance(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping performance test in short mode")
-	}
-	if os.Getenv("LIBRAVDB_RUN_PERF") != "1" {
-		t.Skip("Skipping rollback performance benchmark; set LIBRAVDB_RUN_PERF=1 to run")
-	}
+	requireStressMode(t)
 
 	db, err := New(WithStoragePath(testDBPath(t)))
 	if err != nil {

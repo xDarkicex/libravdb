@@ -31,6 +31,20 @@ type Engine interface {
 	Close() error
 }
 
+// WriteStats captures coarse write-path instrumentation for benchmarking.
+type WriteStats struct {
+	WALTransactions       uint64
+	WALBytes              uint64
+	BatchFlushes          uint64
+	BufferedVectorEntries uint64
+	Checkpoints           uint64
+}
+
+// WriteStatsProvider is an optional interface for engines that expose write-path counters.
+type WriteStatsProvider interface {
+	WriteStats() WriteStats
+}
+
 // TxOperationType describes a transactional row mutation.
 type TxOperationType uint8
 

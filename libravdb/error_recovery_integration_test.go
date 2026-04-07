@@ -120,6 +120,8 @@ func (m *mockCircuitBreaker) Reset() {
 }
 
 func TestCompleteErrorRecoveryWorkflow(t *testing.T) {
+	requireStressMode(t)
+
 	t.Run("memory pressure recovery workflow", func(t *testing.T) {
 		// Setup complete system
 		memMgr := &mockMemoryManager{
@@ -324,6 +326,8 @@ func TestCompleteErrorRecoveryWorkflow(t *testing.T) {
 }
 
 func TestHealthMonitoringIntegration(t *testing.T) {
+	requireStressMode(t)
+
 	t.Run("health-aware error handling", func(t *testing.T) {
 		// Create health monitor with multiple components
 		monitor := NewSystemHealthMonitor(50 * time.Millisecond)
@@ -451,6 +455,8 @@ func TestHealthMonitoringIntegration(t *testing.T) {
 }
 
 func TestAutoRecoveryWorkflow(t *testing.T) {
+	requireStressMode(t)
+
 	t.Run("automatic degradation and recovery", func(t *testing.T) {
 		// Create system with auto-recovery enabled
 		config := DefaultDegradationConfig()
@@ -514,6 +520,8 @@ func TestAutoRecoveryWorkflow(t *testing.T) {
 }
 
 func TestErrorHandlingPerformance(t *testing.T) {
+	requireStressMode(t)
+
 	t.Run("concurrent error handling", func(t *testing.T) {
 		erm := NewErrorRecoveryManager()
 

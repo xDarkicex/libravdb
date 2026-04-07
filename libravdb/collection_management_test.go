@@ -395,3 +395,67 @@ func TestCollectionLifecycleWithMemoryManagement(t *testing.T) {
 		t.Error("Expected search results after optimization")
 	}
 }
+
+func TestShardedCollectionUnsupportedMethods(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "unsupported_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	// OptimizeCollection should return explicit unsupported error
+	err = collection.OptimizeCollection(ctx, &OptimizationOptions{RebuildIndex: true})
+	if err == nil {
+		t.Error("Expected error from OptimizeCollection for sharded collection, got nil")
+	} else if str := err.Error(); str != "OptimizeCollection is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// SetMemoryLimit should return explicit unsupported error
+	err = collection.SetMemoryLimit(1024 * 1024 * 1024)
+	if err == nil {
+		t.Error("Expected error from SetMemoryLimit for sharded collection, got nil")
+	} else if str := err.Error(); str != "SetMemoryLimit is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// EnableMemoryMapping should return explicit unsupported error
+	err = collection.EnableMemoryMapping("/tmp/test")
+	if err == nil {
+		t.Error("Expected error from EnableMemoryMapping for sharded collection, got nil")
+	} else if str := err.Error(); str != "EnableMemoryMapping is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// DisableMemoryMapping should return explicit unsupported error
+	err = collection.DisableMemoryMapping()
+	if err == nil {
+		t.Error("Expected error from DisableMemoryMapping for sharded collection, got nil")
+	} else if str := err.Error(); str != "DisableMemoryMapping is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// SaveIndex should return explicit unsupported error
+	err = collection.SaveIndex(ctx, "/tmp/test_index")
+	if err == nil {
+		t.Error("Expected error from SaveIndex for sharded collection, got nil")
+	} else if str := err.Error(); str != "SaveIndex is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+
+	// LoadIndex should return explicit unsupported error
+	err = collection.LoadIndex(ctx, "/tmp/test_index")
+	if err == nil {
+		t.Error("Expected error from LoadIndex for sharded collection, got nil")
+	} else if str := err.Error(); str != "LoadIndex is not supported for sharded collections" {
+		t.Errorf("Unexpected error message: %v", err)
+	}
+}

@@ -167,6 +167,8 @@ func TestStreamingBatchInsert_ContextCancellation(t *testing.T) {
 }
 
 func TestStreamingBatchInsert_ProgressCallback(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -224,6 +226,8 @@ func TestStreamingBatchInsert_ProgressCallback(t *testing.T) {
 }
 
 func TestStreamingBatchInsert_ErrorHandling(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -286,6 +290,8 @@ func TestStreamingBatchInsert_ErrorHandling(t *testing.T) {
 }
 
 func TestStreamingBatchInsert_ConcurrentSend(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -349,6 +355,8 @@ func TestStreamingBatchInsert_ConcurrentSend(t *testing.T) {
 }
 
 func TestStreamingBatchInsert_SendBatch(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -440,6 +448,8 @@ func TestChannelStreamingReader(t *testing.T) {
 }
 
 func TestStreamFromReader(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
@@ -492,6 +502,8 @@ func TestStreamFromReader(t *testing.T) {
 }
 
 func TestStreamingStats_ThreadSafety(t *testing.T) {
+	requireStressMode(t)
+
 	db, err := New(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)

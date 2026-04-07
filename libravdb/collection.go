@@ -1,10 +1,10 @@
 package libravdb
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1315,8 +1315,8 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 			wg.Add(1)
 			go func(shardIdx int) {
 				defer wg.Done()
-				// Over-fetch to account for shard fan-out
-				shardK := k * len(c.shards)
+				// Each shard only needs its local top-k; the parent merges all shard results.
+				shardK := k
 				results, err := c.shards[shardIdx].index.Search(ctx, vector, shardK)
 				resultsCh <- shardResult{results: results, err: err}
 			}(i)
@@ -1353,10 +1353,11 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		allResults = append(allResults, sr.results...)
 	}
 
-	// Convert and merge results
-	// First pass: resolve IDs and fill metadata from storage
-	publicResults := make([]*SearchResult, 0, len(allResults))
-	for _, r := range allResults {
+	// Convert and merge results.
+	// For sharded collections, parallelize the storage hydration step so the
+	// merge phase does not become a sequential bottleneck.
+	publicResults := make([]*SearchResult, len(allResults))
+	hydrateResult := func(i int, r *index.SearchResult) {
 		result := &SearchResult{
 			ID:      r.ID,
 			Score:   r.Score,
@@ -1368,9 +1369,9 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		if r.Metadata != nil {
 			result.Metadata = cloneMetadata(r.Metadata)
 		}
-		// Get full record from storage if needed
+
+		// Get full record from storage if needed.
 		if result.Vector == nil || result.Metadata == nil || result.Version == 0 {
-			// Find which shard has this entry
 			shardIdx := shardForID(r.ID)
 			var entry *index.VectorEntry
 			var getErr error
@@ -1388,24 +1389,43 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				if result.Metadata == nil {
 					result.Metadata = cloneMetadata(entry.Metadata)
 				}
-			} else {
-				if result.Metadata == nil {
-					result.Metadata = map[string]interface{}{}
-				}
+			} else if result.Metadata == nil {
+				result.Metadata = map[string]interface{}{}
 			}
 		}
-		publicResults = append(publicResults, result)
+		publicResults[i] = result
+	}
+
+	if c.shards != nil && len(allResults) > 0 {
+		workerCount := len(c.shards)
+		if workerCount > len(allResults) {
+			workerCount = len(allResults)
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+
+		var hydrateWG sync.WaitGroup
+		sem := make(chan struct{}, workerCount)
+		for i, r := range allResults {
+			i, r := i, r
+			hydrateWG.Add(1)
+			go func() {
+				defer hydrateWG.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				hydrateResult(i, r)
+			}()
+		}
+		hydrateWG.Wait()
+	} else {
+		for i, r := range allResults {
+			hydrateResult(i, r)
+		}
 	}
 
 	normalizePublicSearchResults(c.config.Metric, publicResults)
-
-	// Sort by score descending and take top k
-	sort.Slice(publicResults, func(i, j int) bool {
-		return publicResults[i].Score > publicResults[j].Score
-	})
-	if len(publicResults) > k {
-		publicResults = publicResults[:k]
-	}
+	publicResults = selectTopKSearchResults(publicResults, k)
 
 	// Update metrics
 	if c.metrics != nil {
@@ -1418,6 +1438,57 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		Took:    time.Since(start),
 		Total:   len(publicResults),
 	}, nil
+}
+
+type searchResultMinHeap []*SearchResult
+
+func (h searchResultMinHeap) Len() int { return len(h) }
+
+func (h searchResultMinHeap) Less(i, j int) bool {
+	return h[i].Score < h[j].Score
+}
+
+func (h searchResultMinHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *searchResultMinHeap) Push(x interface{}) {
+	*h = append(*h, x.(*SearchResult))
+}
+
+func (h *searchResultMinHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+func selectTopKSearchResults(results []*SearchResult, k int) []*SearchResult {
+	if len(results) == 0 || k <= 0 {
+		return nil
+	}
+
+	h := &searchResultMinHeap{}
+	heap.Init(h)
+
+	for _, r := range results {
+		if h.Len() < k {
+			heap.Push(h, r)
+			continue
+		}
+		if r.Score <= (*h)[0].Score {
+			continue
+		}
+		heap.Pop(h)
+		heap.Push(h, r)
+	}
+
+	selected := make([]*SearchResult, h.Len())
+	for i := len(selected) - 1; i >= 0; i-- {
+		selected[i] = heap.Pop(h).(*SearchResult)
+	}
+	return selected
 }
 
 // Query returns a new query builder for this collection

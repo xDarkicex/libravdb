@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -241,4 +242,190 @@ func TestConfigurationValidationIntegration(t *testing.T) {
 	}
 
 	t.Log("Configuration validation integration test passed")
+}
+
+func TestShardedCollectionStatsAggregation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir()
+
+	db, err := New(WithStoragePath(filepath.Join(dbPath, "stats_test")))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "stats_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	entries := []VectorEntry{
+		{ID: "a", Vector: []float32{1, 0, 0}},
+		{ID: "b", Vector: []float32{0, 1, 0}},
+		{ID: "c", Vector: []float32{0, 0, 1}},
+	}
+	if err := collection.InsertBatch(ctx, entries); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	// Stats should not panic and should return aggregated values
+	stats := collection.Stats()
+	if stats == nil {
+		t.Fatal("Stats() returned nil")
+	}
+	if stats.VectorCount != 3 {
+		t.Fatalf("expected VectorCount 3, got %d", stats.VectorCount)
+	}
+	if stats.Dimension != 3 {
+		t.Fatalf("expected Dimension 3, got %d", stats.Dimension)
+	}
+	if stats.Name != "stats_test" {
+		t.Fatalf("expected Name 'stats_test', got %q", stats.Name)
+	}
+	if stats.MemoryUsage == 0 {
+		t.Log("Warning: MemoryUsage is 0 (may be expected for empty shards)")
+	}
+}
+
+func TestShardedCollectionGetMemoryUsage(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir()
+
+	db, err := New(WithStoragePath(filepath.Join(dbPath, "mem_test")))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "mem_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	entries := []VectorEntry{
+		{ID: "a", Vector: []float32{1, 0, 0}},
+		{ID: "b", Vector: []float32{0, 1, 0}},
+	}
+	if err := collection.InsertBatch(ctx, entries); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	// GetMemoryUsage should not panic and should return aggregate usage
+	usage, err := collection.GetMemoryUsage()
+	if err != nil {
+		t.Fatalf("GetMemoryUsage failed: %v", err)
+	}
+	if usage == nil {
+		t.Fatal("GetMemoryUsage() returned nil")
+	}
+	if usage.Total == 0 {
+		t.Log("Warning: Total memory usage is 0 (may be expected for small collections)")
+	}
+}
+
+func TestShardedCollectionTriggerGC(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir()
+
+	db, err := New(WithStoragePath(filepath.Join(dbPath, "gc_test")))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "gc_test", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	// TriggerGC should succeed for sharded collections
+	err = collection.TriggerGC()
+	if err != nil {
+		t.Fatalf("TriggerGC failed for sharded collection: %v", err)
+	}
+}
+
+func TestShardedSearchUsesPerShardK(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir()
+
+	db, err := New(WithStoragePath(filepath.Join(dbPath, "search_test")))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "search_test", WithDimension(3), WithMetric(L2Distance), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	for i := 0; i < 16; i++ {
+		vector := []float32{float32(i), float32(i + 1), float32(i + 2)}
+		if err := collection.Insert(ctx, fmt.Sprintf("vec_%d", i), vector, map[string]interface{}{"index": i}); err != nil {
+			t.Fatalf("insert vec_%d: %v", i, err)
+		}
+	}
+
+	results, err := collection.Search(ctx, []float32{4, 5, 6}, 3)
+	if err != nil {
+		t.Fatalf("search sharded collection: %v", err)
+	}
+	if len(results.Results) != 3 {
+		t.Fatalf("expected 3 search results, got %d", len(results.Results))
+	}
+	if results.Results[0].ID != "vec_4" {
+		t.Fatalf("expected vec_4 as top result, got %s", results.Results[0].ID)
+	}
+	if results.Results[0].Metadata == nil {
+		t.Fatal("expected hydrated metadata in sharded search result")
+	}
+	if len(results.Results[0].Vector) != 3 {
+		t.Fatalf("expected hydrated vector in sharded search result, got len=%d", len(results.Results[0].Vector))
+	}
+	if results.Results[0].Version == 0 {
+		t.Fatal("expected hydrated version in sharded search result")
+	}
+}
+
+func TestShardedSearchUsesBoundedTopKMerge(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir()
+
+	db, err := New(WithStoragePath(filepath.Join(dbPath, "merge_test")))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "merge_test", WithDimension(3), WithMetric(L2Distance), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+
+	for i := 0; i < 64; i++ {
+		vector := []float32{float32(i), float32(i + 1), float32(i + 2)}
+		if err := collection.Insert(ctx, fmt.Sprintf("vec_%d", i), vector, map[string]interface{}{"index": i}); err != nil {
+			t.Fatalf("insert vec_%d: %v", i, err)
+		}
+	}
+
+	results, err := collection.Search(ctx, []float32{31, 32, 33}, 5)
+	if err != nil {
+		t.Fatalf("search sharded collection: %v", err)
+	}
+	if results.Total != 5 {
+		t.Fatalf("expected 5 total results, got %d", results.Total)
+	}
+	if len(results.Results) != 5 {
+		t.Fatalf("expected 5 results, got %d", len(results.Results))
+	}
+	if results.Results[0].ID != "vec_31" {
+		t.Fatalf("expected vec_31 as top result, got %s", results.Results[0].ID)
+	}
+	for i := 1; i < len(results.Results); i++ {
+		if results.Results[i-1].Score < results.Results[i].Score {
+			t.Fatalf("results not sorted descending by score at positions %d and %d", i-1, i)
+		}
+	}
 }

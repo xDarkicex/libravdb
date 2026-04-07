@@ -374,3 +374,14 @@ func WithBatchConcurrency(concurrency int) CollectionOption {
 		return nil
 	}
 }
+
+// WithSharding enables sharding for the collection.
+// Sharding splits the collection into multiple shards for parallel writes.
+// Only HNSW and Flat index types support sharding.
+// IVFPQ and AutoIndexSelection do not support sharding.
+func WithSharding(enabled bool) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.Sharded = enabled
+		return nil
+	}
+}
