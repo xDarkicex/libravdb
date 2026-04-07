@@ -392,12 +392,16 @@ func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 
 // BatchInsert provides batch insertion for Flat (fallback to individual inserts for now)
 func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	for _, entry := range entries {
-		if err := w.Insert(ctx, entry); err != nil {
-			return err
+	flatEntries := make([]*flat.VectorEntry, len(entries))
+	for i, entry := range entries {
+		flatEntries[i] = &flat.VectorEntry{
+			ID:       entry.ID,
+			Vector:   entry.Vector,
+			Metadata: entry.Metadata,
+			Version:  entry.Version,
 		}
 	}
-	return nil
+	return w.index.BatchInsert(ctx, flatEntries)
 }
 
 // Search adapts the search results from Flat to interface types

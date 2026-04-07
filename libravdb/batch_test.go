@@ -871,8 +871,8 @@ func TestHNSWBatchInsert_Regression(t *testing.T) {
 	}
 
 	batch := collection.NewBatchInsert(entries, &BatchOptions{
-		ChunkSize:      5,  // Intentionally small to force multi-chunk execution
-		MaxConcurrency: 4,  // Enables concurrent chunk processing
+		ChunkSize:      5, // Intentionally small to force multi-chunk execution
+		MaxConcurrency: 4, // Enables concurrent chunk processing
 	})
 
 	result, err := batch.Execute(context.Background())
@@ -1151,5 +1151,58 @@ func TestShardedBatchInsertParallelizesAcrossShards(t *testing.T) {
 	stats := collection.Stats()
 	if stats.VectorCount != entryCount*2 {
 		t.Errorf("Expected collection count %d, got %d", entryCount*2, stats.VectorCount)
+	}
+}
+
+func TestShardedConcurrentSingleInserts(t *testing.T) {
+	db := createTestDB(t)
+
+	collection, err := db.CreateCollection(context.Background(), "test_shard_single_insert", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("Failed to create sharded collection: %v", err)
+	}
+
+	const inserts = 16
+	start := make(chan struct{})
+	errCh := make(chan error, inserts)
+	var wg sync.WaitGroup
+
+	for i := 0; i < inserts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			vec := []float32{float32(i), float32(i + 1), float32(i + 2)}
+			if err := collection.Insert(context.Background(), fmt.Sprintf("single_%d", i), vec, map[string]interface{}{"index": i}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent sharded inserts")
+	}
+
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent sharded insert failed: %v", err)
+	}
+
+	count, err := collection.Count(context.Background())
+	if err != nil {
+		t.Fatalf("count sharded collection: %v", err)
+	}
+	if count != inserts {
+		t.Fatalf("expected %d inserted vectors, got %d", inserts, count)
 	}
 }

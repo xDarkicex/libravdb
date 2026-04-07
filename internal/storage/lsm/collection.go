@@ -66,6 +66,13 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 
+	if current, ok := c.cache[entry.ID]; ok {
+		entry.Ordinal = current.Ordinal
+	} else {
+		entry.Ordinal = c.nextOrdinal
+		c.nextOrdinal++
+	}
+
 	// Create WAL entry for persistence
 	walEntry := &wal.Entry{
 		Operation: wal.OpInsert,
@@ -115,6 +122,12 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 	for _, entry := range entries {
 		if entry == nil {
 			return fmt.Errorf("entry cannot be nil")
+		}
+		if current, ok := c.cache[entry.ID]; ok {
+			entry.Ordinal = current.Ordinal
+		} else {
+			entry.Ordinal = c.nextOrdinal
+			c.nextOrdinal++
 		}
 
 		walEntries = append(walEntries, &wal.Entry{

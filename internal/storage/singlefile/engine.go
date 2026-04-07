@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
@@ -50,9 +51,15 @@ const (
 	// Batch WAL buffer settings: vector entries are buffered and flushed together
 	// to reduce fsync overhead. A batch is flushed when the buffered entry count
 	// reaches batchSize or after batchFlushInterval elapses.
-	batchSize          = 256                                     // flush when buffer reaches this many vector entries
-	batchFlushInterval = 10 * time.Millisecond                    // flush periodically if buffer not full
+	batchSize          = 256                   // flush when buffer reaches this many vector entries
+	batchFlushInterval = 10 * time.Millisecond // flush periodically if buffer not full
 )
+
+// groupCommitWindow is the short delay used to coalesce flushNow requests
+// into a single durable WAL commit. Tests may temporarily override this.
+var groupCommitWindow = 1 * time.Millisecond
+var groupCommitMaxWindow = 5 * time.Millisecond
+var groupCommitStepWindow = 500 * time.Microsecond
 
 type fileHeader struct {
 	Magic             [8]byte
@@ -159,36 +166,38 @@ type recordDeletePayload struct {
 
 // Engine is the single-file storage engine.
 type Engine struct {
-	mu             sync.RWMutex
-	path           string
-	file           *os.File
-	state          *persistedState
-	collections    map[string]*Collection
-	fileID         uint64
-	metaEpoch      uint64
-	activeMetaPage uint64
-	lastLSN        uint64
-	lastTxID       uint64
-	dirty          bool
-	dirtyBytes     uint64
-	dirtyOps       int
+	mu              sync.RWMutex
+	path            string
+	file            *os.File
+	state           *persistedState
+	collections     map[string]*Collection
+	fileID          uint64
+	metaEpoch       uint64
+	activeMetaPage  uint64
+	lastLSN         uint64
+	lastTxID        uint64
+	dirty           bool
+	dirtyBytes      uint64
+	dirtyOps        int
 	walTransactions uint64
 	walBytes        uint64
 	batchFlushes    uint64
 	batchedEntries  uint64
 	checkpoints     uint64
-	replayedTxs    uint64
-	discardedTxs   uint64
-	closed         bool
+	replayedTxs     uint64
+	discardedTxs    uint64
+	closed          bool
 
 	// WAL batch buffer: accumulates entries across multiple putRecords calls
 	// and flushes them together to reduce fsync overhead.
 	batchBuffer struct {
-		mu        sync.Mutex
-		entries   []batchEntry // accumulated entries awaiting flush
-		flusher   chan struct{} // signal to wake up flusher
-		closed    bool
-		flushNow  []chan error // completion channels for foreground flushes
+		mu                 sync.Mutex
+		entries            []batchEntry  // accumulated entries awaiting flush
+		flusher            chan struct{} // signal to wake up flusher
+		closed             bool
+		flushNow           []chan error // completion channels for foreground flushes
+		flushSignalPending int32
+		pendingWaiters     int32
 	}
 }
 
@@ -1023,6 +1032,10 @@ func (e *Engine) batchFlusher() {
 		case <-ticker.C:
 			e.flushBatch()
 		case <-e.batchBuffer.flusher:
+			delay := adaptiveGroupCommitWindow(atomic.LoadInt32(&e.batchBuffer.pendingWaiters))
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			e.flushBatch()
 		case <-time.After(batchFlushInterval):
 			// Double-check after timeout
@@ -1038,6 +1051,30 @@ func (e *Engine) batchFlusher() {
 	}
 }
 
+func adaptiveGroupCommitWindow(waiters int32) time.Duration {
+	if groupCommitWindow <= 0 {
+		return 0
+	}
+	if waiters <= 1 {
+		return groupCommitWindow
+	}
+	delay := groupCommitWindow + time.Duration(waiters-1)*groupCommitStepWindow
+	if delay > groupCommitMaxWindow {
+		return groupCommitMaxWindow
+	}
+	return delay
+}
+
+func (e *Engine) requestBatchFlush() {
+	if !atomic.CompareAndSwapInt32(&e.batchBuffer.flushSignalPending, 0, 1) {
+		return
+	}
+	select {
+	case e.batchBuffer.flusher <- struct{}{}:
+	default:
+	}
+}
+
 // flushBatch flushes all accumulated entries in the batch buffer to WAL.
 // It acquires the engine mutex and writes all buffered entries as a single transaction.
 // If the buffer is empty, this is a no-op.
@@ -1047,6 +1084,7 @@ func (e *Engine) flushBatch() error {
 	e.batchBuffer.mu.Lock()
 	if len(e.batchBuffer.entries) == 0 && len(e.batchBuffer.flushNow) == 0 {
 		e.batchBuffer.mu.Unlock()
+		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return nil
 	}
 	// Take ownership of the buffer and reset
@@ -1056,6 +1094,7 @@ func (e *Engine) flushBatch() error {
 	pendingFlushes := e.batchBuffer.flushNow
 	e.batchBuffer.flushNow = nil
 	e.batchBuffer.mu.Unlock()
+	atomic.AddInt32(&e.batchBuffer.pendingWaiters, -int32(len(pendingFlushes)))
 
 	// Nothing to flush and no one waiting
 	if len(entries) == 0 && len(pendingFlushes) == 0 {
@@ -1080,6 +1119,7 @@ func (e *Engine) flushBatch() error {
 	if e.closed {
 		// Signal any waiting flushes with error
 		signalErr(fmt.Errorf("database is closed"))
+		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return fmt.Errorf("database is closed")
 	}
 
@@ -1112,6 +1152,8 @@ func (e *Engine) flushBatch() error {
 			e.batchBuffer.entries = append(failedSuffix, e.batchBuffer.entries...)
 			e.batchBuffer.mu.Unlock()
 			signalErr(err)
+			atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+			e.requestBatchFlush()
 			return err
 		}
 	}
@@ -1120,6 +1162,14 @@ func (e *Engine) flushBatch() error {
 	e.batchFlushes++
 	e.batchedEntries += uint64(batchedEntries)
 	signalErr(nil)
+	atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+
+	e.batchBuffer.mu.Lock()
+	pendingAgain := len(e.batchBuffer.entries) > 0 || len(e.batchBuffer.flushNow) > 0
+	e.batchBuffer.mu.Unlock()
+	if pendingAgain {
+		e.requestBatchFlush()
+	}
 	return nil
 }
 
@@ -1210,11 +1260,8 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 	})
 	e.batchBuffer.mu.Unlock()
 
-	// Signal the flusher and return immediately
-	select {
-	case e.batchBuffer.flusher <- struct{}{}:
-	default:
-	}
+	// Signal the flusher once for the current commit window and return immediately.
+	e.requestBatchFlush()
 
 	// If we've reached batch size, do a synchronous flush before returning.
 	// This ensures durability for this caller's data.
@@ -1235,12 +1282,10 @@ func (e *Engine) flushNow() error {
 	// or if we want to ensure any in-progress flush completes
 	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
 	e.batchBuffer.mu.Unlock()
+	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 
-	// Signal the flusher
-	select {
-	case e.batchBuffer.flusher <- struct{}{}:
-	default:
-	}
+	// Signal the flusher once for the current commit window.
+	e.requestBatchFlush()
 
 	// Wait for flush to complete and return the error
 	return <-done
@@ -1663,6 +1708,9 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 // It ensures immediate durability by forcing a flush before returning.
 func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error {
 	_ = ctx
+	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
+		return err
+	}
 	flushed, err := c.engine.putRecords(c.name, []*index.VectorEntry{entry})
 	if err != nil {
 		return err
@@ -1678,6 +1726,9 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 // before returning so callers can immediately see the inserted data.
 func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEntry) error {
 	_ = ctx
+	if err := c.assignOrdinals(entries); err != nil {
+		return err
+	}
 	flushed, err := c.engine.putRecords(c.name, entries)
 	if err != nil {
 		return err
@@ -1838,5 +1889,29 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 // Close releases the collection handle.
 func (c *Collection) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
+	c.engine.mu.Lock()
+	defer c.engine.mu.Unlock()
+	if c.closed || c.engine.closed {
+		return fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return fmt.Errorf("collection %s not found", c.name)
+	}
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		if current := persisted.Records[entry.ID]; current != nil {
+			entry.Ordinal = current.Ordinal
+			continue
+		}
+		entry.Ordinal = persisted.NextOrdinal
+		persisted.NextOrdinal++
+	}
 	return nil
 }

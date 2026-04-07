@@ -3,6 +3,8 @@ package libravdb
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -92,5 +94,55 @@ func TestCollectionWriteWaitRespectsContextCancellation(t *testing.T) {
 	err = collection.Insert(ctx, "timed_out", []float32{1, 2, 3}, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context deadline exceeded, got %v", err)
+	}
+}
+
+func TestNonShardedConcurrentSingleInserts(t *testing.T) {
+	db, err := New(
+		WithStoragePath(testDBPath(t)),
+		WithMaxConcurrentWrites(16),
+		WithMaxWriteQueueDepth(16),
+	)
+	if err != nil {
+		t.Fatalf("new db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	collection, err := db.CreateCollection(context.Background(), "queue_nonsharded", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	const inserts = 16
+	start := make(chan struct{})
+	errCh := make(chan error, inserts)
+	var wg sync.WaitGroup
+
+	for i := 0; i < inserts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			vec := []float32{float32(i), float32(i + 1), float32(i + 2)}
+			if err := collection.Insert(context.Background(), fmt.Sprintf("vec_%d", i), vec, nil); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent insert failed: %v", err)
+	}
+
+	count, err := collection.Count(context.Background())
+	if err != nil {
+		t.Fatalf("count collection: %v", err)
+	}
+	if count != inserts {
+		t.Fatalf("expected %d inserted vectors, got %d", inserts, count)
 	}
 }

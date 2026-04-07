@@ -91,6 +91,39 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	return idx.insertLocked(entry)
+}
+
+// BatchInsert adds multiple vectors to the index under a single lock.
+func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	for i, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("entry at index %d is nil", i)
+		}
+		if len(entry.Vector) != idx.config.Dimension {
+			return fmt.Errorf("vector dimension mismatch: expected %d, got %d",
+				idx.config.Dimension, len(entry.Vector))
+		}
+	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	for _, entry := range entries {
+		if err := idx.insertLocked(entry); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// insertLocked inserts or updates an entry. The caller must hold idx.mu.
+func (idx *Index) insertLocked(entry *VectorEntry) error {
 	// Check if ID already exists
 	if existingIndex, exists := idx.idToIndex[entry.ID]; exists {
 		// Update existing entry

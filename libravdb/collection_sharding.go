@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strings"
+	"sync"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
@@ -19,6 +20,7 @@ const shardSeparator = "__shard__"
 // shard represents one independent write lane with its own storage and index.
 // Each shard owns its own storage collection and index, providing true parallelism.
 type shard struct {
+	mu      sync.Mutex
 	name    string
 	storage storage.Collection
 	index   index.Index

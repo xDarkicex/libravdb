@@ -34,8 +34,8 @@ func testFunctionalityMetrics(t *testing.T, ctx context.Context) {
 
 	// ✅ Save/load indices up to 1M vectors
 	t.Run("Save_Load_1M_Vectors", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("Skipping 1M vector test in short mode")
+		if testing.Short() || os.Getenv("LIBRAVDB_RUN_STRESS") != "1" {
+			t.Skip("Skipping 1M vector test; set LIBRAVDB_RUN_STRESS=1 to run")
 		}
 
 		t.Log("Creating 1M vector index...")
@@ -316,7 +316,7 @@ func testPerformanceMetrics(t *testing.T, ctx context.Context) {
 		index, _ := createValidationTestIndex(t, 500)
 
 		// Create query vector
-		queryVector := make([]float32, 4) // Use fixed dimension 4
+		queryVector := make([]float32, Dimension)
 		for i := range queryVector {
 			queryVector[i] = rand.Float32()
 		}
@@ -511,7 +511,7 @@ func testReliabilityMetrics(t *testing.T, ctx context.Context) {
 // Helper function for tests (similar to benchmark helper but for testing.T)
 func createValidationTestIndex(t testing.TB, vectorCount int) (*hnsw.Index, string) {
 	config := &hnsw.Config{
-		Dimension:      4,  // Smaller dimension for faster tests
+		Dimension:      Dimension,
 		M:              8,  // Smaller M for faster tests
 		EfConstruction: 50, // Smaller EfConstruction for faster tests
 		EfSearch:       20, // Smaller EfSearch for faster tests
@@ -530,7 +530,7 @@ func createValidationTestIndex(t testing.TB, vectorCount int) (*hnsw.Index, stri
 	rng := rand.New(rand.NewSource(42))
 
 	for i := 0; i < vectorCount; i++ {
-		vector := make([]float32, 4) // Use fixed dimension 4
+		vector := make([]float32, Dimension)
 		for j := range vector {
 			vector[j] = rng.Float32()*2 - 1
 		}

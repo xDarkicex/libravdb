@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
@@ -320,6 +322,184 @@ func TestBatchWALCommitMultipleRecordsInOneTransaction(t *testing.T) {
 		if got.ID != want.ID {
 			t.Errorf("got ID %s, want %s", got.ID, want.ID)
 		}
+	}
+}
+
+func TestConcurrentSingleInsertsCoalesceIntoFewerTransactions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "group_commit.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	origWindow := groupCommitWindow
+	groupCommitWindow = 20 * time.Millisecond
+	defer func() { groupCommitWindow = origWindow }()
+
+	before := engine.WriteStats()
+
+	const numInserts = 32
+	start := make(chan struct{})
+	errCh := make(chan error, numInserts)
+	var wg sync.WaitGroup
+	for i := 0; i < numInserts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			col, err := engine.GetCollection("test")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := col.Insert(context.Background(), &index.VectorEntry{
+				ID:     fmt.Sprintf("vec_%d", i),
+				Vector: []float32{float32(i), 0, 0},
+			}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("insert failed: %v", err)
+		}
+	}
+
+	after := engine.WriteStats()
+	txDelta := after.WALTransactions - before.WALTransactions
+	if txDelta == 0 {
+		t.Fatal("expected at least one WAL transaction for concurrent inserts")
+	}
+	if txDelta >= numInserts {
+		t.Fatalf("expected concurrent inserts to coalesce, got %d WAL transactions for %d inserts", txDelta, numInserts)
+	}
+	if txDelta > 4 {
+		t.Fatalf("expected group commit to keep WAL transactions small, got %d for %d inserts", txDelta, numInserts)
+	}
+}
+
+func TestConcurrentSingleInsertsGroupCommitWindowSweep(t *testing.T) {
+	cases := []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "disabled", window: 0},
+		{name: "default", window: 1 * time.Millisecond},
+		{name: "larger", window: 5 * time.Millisecond},
+	}
+
+	const numInserts = 256
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "group_commit_sweep.libravdb")
+
+			engineIface, err := New(path)
+			if err != nil {
+				t.Fatalf("new engine: %v", err)
+			}
+			engine := engineIface.(*Engine)
+			defer engine.Close()
+
+			_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+				Dimension:      3,
+				Metric:         2,
+				IndexType:      0,
+				M:              16,
+				EfConstruction: 100,
+				EfSearch:       50,
+				ML:             1.0,
+				Version:        1,
+				RawVectorStore: "memory",
+				RawStoreCap:    1024,
+			})
+			if err != nil {
+				t.Fatalf("create collection: %v", err)
+			}
+
+			origWindow := groupCommitWindow
+			groupCommitWindow = tc.window
+			defer func() { groupCommitWindow = origWindow }()
+
+			before := engine.WriteStats()
+
+			start := make(chan struct{})
+			errCh := make(chan error, numInserts)
+			var wg sync.WaitGroup
+			begin := time.Now()
+			for i := 0; i < numInserts; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					col, err := engine.GetCollection("test")
+					if err != nil {
+						errCh <- err
+						return
+					}
+					if err := col.Insert(context.Background(), &index.VectorEntry{
+						ID:     fmt.Sprintf("vec_%d", i),
+						Vector: []float32{float32(i), 0, 0},
+					}); err != nil {
+						errCh <- err
+					}
+				}(i)
+			}
+
+			close(start)
+			wg.Wait()
+			close(errCh)
+			for err := range errCh {
+				if err != nil {
+					t.Fatalf("insert failed: %v", err)
+				}
+			}
+
+			elapsed := time.Since(begin)
+			after := engine.WriteStats()
+			txDelta := after.WALTransactions - before.WALTransactions
+			flushDelta := after.BatchFlushes - before.BatchFlushes
+			entryDelta := after.BufferedVectorEntries - before.BufferedVectorEntries
+			t.Logf("window=%s tx_delta=%d flush_delta=%d entry_delta=%d wal_bytes=%d elapsed=%s",
+				tc.window,
+				txDelta,
+				flushDelta,
+				entryDelta,
+				after.WALBytes-before.WALBytes,
+				elapsed,
+			)
+
+			if txDelta == 0 {
+				t.Fatal("expected at least one WAL transaction")
+			}
+			if txDelta > numInserts {
+				t.Fatalf("expected coalescing, got %d WAL transactions for %d inserts", txDelta, numInserts)
+			}
+		})
 	}
 }
 

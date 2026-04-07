@@ -124,6 +124,45 @@ func TestFlatInsert(t *testing.T) {
 	}
 }
 
+func TestFlatBatchInsert(t *testing.T) {
+	config := &Config{
+		Dimension: 3,
+		Metric:    util.CosineDistance,
+	}
+	idx, err := NewFlat(config)
+	if err != nil {
+		t.Fatalf("failed to create index: %v", err)
+	}
+	defer idx.Close()
+
+	ctx := context.Background()
+	entries := []*VectorEntry{
+		{ID: "batch-1", Vector: []float32{1.0, 0.0, 0.0}},
+		{ID: "batch-2", Vector: []float32{0.0, 1.0, 0.0}},
+		{ID: "batch-3", Vector: []float32{0.0, 0.0, 1.0}},
+		{ID: "batch-4", Vector: []float32{1.0, 1.0, 0.0}},
+	}
+
+	if err := idx.BatchInsert(ctx, entries); err != nil {
+		t.Fatalf("batch insert failed: %v", err)
+	}
+
+	if idx.Size() != len(entries) {
+		t.Fatalf("expected size %d, got %d", len(entries), idx.Size())
+	}
+
+	results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 2)
+	if err != nil {
+		t.Fatalf("search after batch insert failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].ID != "batch-1" {
+		t.Fatalf("expected best match batch-1, got %s", results[0].ID)
+	}
+}
+
 func TestFlatSearch(t *testing.T) {
 	config := &Config{
 		Dimension: 3,

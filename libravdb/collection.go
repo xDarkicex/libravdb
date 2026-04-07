@@ -4,7 +4,9 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +26,9 @@ type Collection struct {
 	db            *Database
 	name          string
 	config        *CollectionConfig
-	index         index.Index  // used for non-sharded collections only
+	index         index.Index        // used for non-sharded collections only
 	storage       storage.Collection // used for non-sharded collections only
-	shards        []shard // nil for non-sharded collections (IVFPQ not supported for sharding)
+	shards        []shard            // nil for non-sharded collections (IVFPQ not supported for sharding)
 	writes        *writeController
 	metrics       *obs.Metrics
 	memoryManager memory.MemoryManager
@@ -35,6 +37,9 @@ type Collection struct {
 	// Runtime optimization state
 	optimizationInProgress bool
 	lastOptimization       time.Time
+
+	// Non-sharded mutation stripes reduce contention while preserving same-ID serialization.
+	mutationStripes [64]sync.Mutex
 }
 
 // CollectionConfig holds collection-specific configuration
@@ -98,6 +103,46 @@ type trainableIndex interface {
 	IsTrained() bool
 }
 
+func (c *Collection) mutationStripe(id string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return &c.mutationStripes[h.Sum32()%uint32(len(c.mutationStripes))]
+}
+
+func (c *Collection) lockMutationIDs(ids []string) func() {
+	if len(ids) == 0 {
+		return func() {}
+	}
+
+	seen := make(map[int]struct{}, len(ids))
+	stripes := make([]int, 0, len(ids))
+	for _, id := range ids {
+		idx := int(fnv32a(id) % uint32(len(c.mutationStripes)))
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		stripes = append(stripes, idx)
+	}
+
+	sort.Ints(stripes)
+	for _, idx := range stripes {
+		c.mutationStripes[idx].Lock()
+	}
+
+	return func() {
+		for i := len(stripes) - 1; i >= 0; i-- {
+			c.mutationStripes[stripes[i]].Unlock()
+		}
+	}
+}
+
+func fnv32a(id string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return h.Sum32()
+}
+
 func trainingIndexState(idx index.Index) (trainableIndex, bool) {
 	trainable, ok := idx.(trainableIndex)
 	if !ok || trainable.IsTrained() {
@@ -157,14 +202,8 @@ func insertEntriesIntoIndex(ctx context.Context, idx index.Index, entries []*ind
 		return nil
 	}
 
-	if _, ok := idx.(trainableIndex); ok {
-		return idx.BatchInsert(ctx, entries)
-	}
-
-	for _, entry := range entries {
-		if err := idx.Insert(ctx, entry); err != nil {
-			return err
-		}
+	if err := idx.BatchInsert(ctx, entries); err != nil {
+		return fmt.Errorf("failed to batch insert into index: %w", err)
 	}
 	return nil
 }
@@ -291,6 +330,18 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 	// Validate configuration
 	if err := config.validate(); err != nil {
 		return nil, fmt.Errorf("invalid collection config: %w", err)
+	}
+
+	if config.AutoIndexSelection {
+		hnswThreshold := config.AutoIndexThresholds.HNSWThreshold
+		if hnswThreshold == 0 {
+			hnswThreshold = DefaultHNSWThreshold
+		}
+		ivfpqThreshold := config.AutoIndexThresholds.IVFPQThreshold
+		if ivfpqThreshold == 0 {
+			ivfpqThreshold = DefaultIVFPQThreshold
+		}
+		config.IndexType = selectOptimalIndexType(0, hnswThreshold, ivfpqThreshold)
 	}
 
 	// Sharded collections require explicit opt-in and have restrictions
@@ -597,23 +648,22 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	}
 	defer release()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	if c.closed {
+		c.mu.RUnlock()
 		return ErrCollectionClosed
 	}
 
 	// Non-sharded path: use single storage and index
 	if c.shards == nil {
+		unlock := c.lockMutationIDs([]string{id})
+		defer unlock()
+		defer c.mu.RUnlock()
+
 		if exists, err := c.storage.Exists(ctx, id); err != nil {
 			return fmt.Errorf("failed to check existing vector: %w", err)
 		} else if exists {
 			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
-		}
-
-		if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
-			return fmt.Errorf("failed to assign ordinal: %w", err)
 		}
 
 		if err := c.storage.Insert(ctx, storageEntry); err != nil {
@@ -633,15 +683,14 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 
 	// Sharded path: route to the correct shard for this ID
 	shard := c.getShard(id)
+	shard.mu.Lock()
+	defer c.mu.RUnlock()
+	defer shard.mu.Unlock()
 
 	if exists, err := shard.storage.Exists(ctx, id); err != nil {
 		return fmt.Errorf("failed to check existing vector: %w", err)
 	} else if exists {
 		return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
-	}
-
-	if err := shard.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
-		return fmt.Errorf("failed to assign ordinal: %w", err)
 	}
 
 	if err := shard.storage.Insert(ctx, storageEntry); err != nil {
@@ -697,20 +746,37 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	}
 	defer release()
 
-	c.mu.Lock()
+	c.mu.RLock()
 	closed := c.closed
 	shards := c.shards
-	c.mu.Unlock()
-
 	if closed {
+		c.mu.RUnlock()
 		return ErrCollectionClosed
 	}
 
 	if shards != nil {
+		unlock := c.lockMutationIDs(func() []string {
+			ids := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				ids = append(ids, entry.ID)
+			}
+			return ids
+		}())
+		defer unlock()
+		defer c.mu.RUnlock()
 		return c.insertBatchSharded(ctx, entries, shards)
 	}
+	c.mu.RUnlock()
 
 	// Non-sharded path (fallback - should not reach here for supported indexes)
+	unlock := c.lockMutationIDs(func() []string {
+		ids := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			ids = append(ids, entry.ID)
+		}
+		return ids
+	}())
+	defer unlock()
 	// Check existence against persisted storage
 	for _, entry := range entries {
 		exists, err := c.storage.Exists(ctx, entry.ID)
@@ -722,14 +788,16 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		}
 	}
 
-	if err := c.storage.AssignOrdinals(ctx, entries); err != nil {
-		return fmt.Errorf("failed to assign ordinals: %w", err)
-	}
-
 	if err := c.storage.InsertBatch(ctx, entries); err != nil {
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
-	if err := c.index.BatchInsert(ctx, entries); err != nil {
+	if err := prepareIndexForEntries(ctx, c.index, entries); err != nil {
+		for _, storedEntry := range entries {
+			_ = c.storage.Delete(ctx, storedEntry.ID)
+		}
+		return fmt.Errorf("failed to prepare index for batch insert: %w", err)
+	}
+	if err := insertEntriesIntoIndex(ctx, c.index, entries); err != nil {
 		for _, storedEntry := range entries {
 			_ = c.storage.Delete(ctx, storedEntry.ID)
 		}
@@ -765,6 +833,8 @@ func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.Ve
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			s.mu.Lock()
+			defer s.mu.Unlock()
 
 			// Check existence in this shard's storage
 			for _, entry := range shardEntries {
@@ -779,16 +849,18 @@ func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.Ve
 				}
 			}
 
-			if err := s.storage.AssignOrdinals(ctx, shardEntries); err != nil {
-				errCh <- fmt.Errorf("failed to assign ordinals: %w", err)
-				return
-			}
-
 			if err := s.storage.InsertBatch(ctx, shardEntries); err != nil {
 				errCh <- fmt.Errorf("failed to write batch to storage: %w", err)
 				return
 			}
-			if err := s.index.BatchInsert(ctx, shardEntries); err != nil {
+			if err := prepareIndexForEntries(ctx, s.index, shardEntries); err != nil {
+				for _, storedEntry := range shardEntries {
+					_ = s.storage.Delete(ctx, storedEntry.ID)
+				}
+				errCh <- fmt.Errorf("failed to prepare shard %d index for batch insert: %w", shardIdx, err)
+				return
+			}
+			if err := insertEntriesIntoIndex(ctx, s.index, shardEntries); err != nil {
 				for _, storedEntry := range shardEntries {
 					_ = s.storage.Delete(ctx, storedEntry.ID)
 				}
@@ -828,56 +900,41 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 	}
 	defer release()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	if c.closed {
+		c.mu.RUnlock()
 		return ErrCollectionClosed
 	}
 
 	// Validate input
 	if id == "" {
+		c.mu.RUnlock()
 		return fmt.Errorf("vector ID cannot be empty")
 	}
 
 	if vector != nil && len(vector) != c.config.Dimension {
+		c.mu.RUnlock()
 		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 			len(vector), c.config.Dimension)
 	}
 
 	// Non-sharded path
 	if c.shards == nil {
+		unlock := c.lockMutationIDs([]string{id})
+		defer unlock()
+		defer c.mu.RUnlock()
 		return c.updateNonSharded(ctx, id, vector, metadata)
 	}
 
 	// Sharded path: route to the correct shard for this ID
+	defer c.mu.RUnlock()
 	return c.updateSharded(ctx, id, vector, metadata)
 }
 
 func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
-	// First, try to get the existing entry for partial updates
-	var existingEntry *index.VectorEntry
-	if vector == nil || metadata == nil {
-		// Need to retrieve existing data for partial update
-		_ = c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-			if entry.ID == id {
-				existingEntry = &index.VectorEntry{
-					ID:       entry.ID,
-					Vector:   make([]float32, len(entry.Vector)),
-					Metadata: make(map[string]interface{}),
-				}
-				copy(existingEntry.Vector, entry.Vector)
-				for k, v := range entry.Metadata {
-					existingEntry.Metadata[k] = v
-				}
-				return fmt.Errorf("found") // Use error to break iteration
-			}
-			return nil
-		})
-
-		if existingEntry == nil {
-			return fmt.Errorf("vector with ID %s not found", id)
-		}
+	existingEntry, err := c.storage.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("vector with ID %s not found", id)
 	}
 
 	// Prepare the updated entry
@@ -906,10 +963,7 @@ func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []f
 			updatedEntry.Metadata = mergedMetadata
 		}
 	}
-
-	if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{updatedEntry}); err != nil {
-		return fmt.Errorf("failed to assign ordinal: %w", err)
-	}
+	updatedEntry.Ordinal = existingEntry.Ordinal
 	if deleter, ok := c.index.(interface {
 		DeleteByOrdinal(context.Context, uint32) error
 	}); ok {
@@ -937,30 +991,12 @@ func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []f
 
 func (c *Collection) updateSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
 	shard := c.getShard(id)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	// First, try to get the existing entry for partial updates
-	var existingEntry *index.VectorEntry
-	if vector == nil || metadata == nil {
-		// Need to retrieve existing data for partial update
-		_ = shard.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-			if entry.ID == id {
-				existingEntry = &index.VectorEntry{
-					ID:       entry.ID,
-					Vector:   make([]float32, len(entry.Vector)),
-					Metadata: make(map[string]interface{}),
-				}
-				copy(existingEntry.Vector, entry.Vector)
-				for k, v := range entry.Metadata {
-					existingEntry.Metadata[k] = v
-				}
-				return fmt.Errorf("found") // Use error to break iteration
-			}
-			return nil
-		})
-
-		if existingEntry == nil {
-			return fmt.Errorf("vector with ID %s not found", id)
-		}
+	existingEntry, err := shard.storage.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("vector with ID %s not found", id)
 	}
 
 	// Prepare the updated entry
@@ -989,10 +1025,7 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 			updatedEntry.Metadata = mergedMetadata
 		}
 	}
-
-	if err := shard.storage.AssignOrdinals(ctx, []*index.VectorEntry{updatedEntry}); err != nil {
-		return fmt.Errorf("failed to assign ordinal: %w", err)
-	}
+	updatedEntry.Ordinal = existingEntry.Ordinal
 	if deleter, ok := shard.index.(interface {
 		DeleteByOrdinal(context.Context, uint32) error
 	}); ok {
@@ -1026,20 +1059,23 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	}
 	defer release()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	if c.closed {
+		c.mu.RUnlock()
 		return ErrCollectionClosed
 	}
 
 	// Validate input
 	if id == "" {
+		c.mu.RUnlock()
 		return fmt.Errorf("vector ID cannot be empty")
 	}
 
 	// Non-sharded path
 	if c.shards == nil {
+		unlock := c.lockMutationIDs([]string{id})
+		defer unlock()
+		defer c.mu.RUnlock()
 		if entry, err := c.storage.Get(ctx, id); err == nil {
 			if deleter, ok := c.index.(interface {
 				DeleteByOrdinal(context.Context, uint32) error
@@ -1067,6 +1103,9 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 	// Sharded path: route to the correct shard for this ID
 	shard := c.getShard(id)
+	shard.mu.Lock()
+	defer c.mu.RUnlock()
+	defer shard.mu.Unlock()
 
 	if entry, err := shard.storage.Get(ctx, id); err == nil {
 		if deleter, ok := shard.index.(interface {
@@ -1302,7 +1341,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 	// Search all shards in parallel and collect results
 	type shardResult struct {
 		results []*index.SearchResult
-		err    error
+		err     error
 	}
 
 	var resultsCh chan shardResult
@@ -1974,6 +2013,7 @@ func (c *Collection) Close() error {
 	// Close shards if sharded collection
 	if c.shards != nil {
 		for i := range c.shards {
+			c.shards[i].mu.Lock()
 			if c.shards[i].index != nil {
 				if err := c.shards[i].index.Close(); err != nil {
 					errors = append(errors, fmt.Errorf("shard %d index close: %w", i, err))
@@ -1984,6 +2024,7 @@ func (c *Collection) Close() error {
 					errors = append(errors, fmt.Errorf("shard %d storage close: %w", i, err))
 				}
 			}
+			c.shards[i].mu.Unlock()
 		}
 	} else {
 		// Non-sharded collection
