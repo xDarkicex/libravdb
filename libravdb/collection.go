@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,8 +24,9 @@ type Collection struct {
 	db            *Database
 	name          string
 	config        *CollectionConfig
-	index         index.Index
-	storage       storage.Collection
+	index         index.Index  // used for non-sharded collections only
+	storage       storage.Collection // used for non-sharded collections only
+	shards        []shard // nil for non-sharded collections (IVFPQ not supported for sharding)
 	writes        *writeController
 	metrics       *obs.Metrics
 	memoryManager memory.MemoryManager
@@ -69,6 +72,9 @@ type CollectionConfig struct {
 	CachePolicy    CachePolicy          `json:"cache_policy,omitempty"`    // Cache eviction policy
 	EnableMMapping bool                 `json:"enable_mmapping,omitempty"` // Enable memory mapping for large indices
 	MemoryConfig   *memory.MemoryConfig `json:"memory_config,omitempty"`   // Advanced memory management settings
+
+	// Sharding configuration - must be explicitly enabled
+	Sharded bool `json:"sharded,omitempty"` // Enable sharding for this collection
 
 	// NEW: Metadata schema and filtering configuration
 	MetadataSchema MetadataSchema `json:"metadata_schema,omitempty"` // Schema definition for metadata fields
@@ -287,17 +293,17 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		return nil, fmt.Errorf("invalid collection config: %w", err)
 	}
 
-	// Apply automatic index selection if enabled
-	if config.AutoIndexSelection {
-		hnswThreshold := config.AutoIndexThresholds.HNSWThreshold
-		if hnswThreshold == 0 {
-			hnswThreshold = DefaultHNSWThreshold
+	// Sharded collections require explicit opt-in and have restrictions
+	if config.Sharded {
+		// AutoIndexSelection can switch to IVFPQ which is not supported for sharding
+		if config.AutoIndexSelection {
+			return nil, fmt.Errorf("sharding is not supported with AutoIndexSelection: automatic index selection can switch to IVFPQ which does not support sharding")
 		}
-		ivfpqThreshold := config.AutoIndexThresholds.IVFPQThreshold
-		if ivfpqThreshold == 0 {
-			ivfpqThreshold = DefaultIVFPQThreshold
+
+		// Only HNSW and Flat support sharding
+		if config.IndexType != HNSW && config.IndexType != Flat {
+			return nil, fmt.Errorf("sharding is only supported for HNSW and Flat index types, got: %v", config.IndexType)
 		}
-		config.IndexType = selectOptimalIndexType(0, hnswThreshold, ivfpqThreshold) // Start with 0 vectors
 	}
 
 	// Convert to LSM config format
@@ -316,23 +322,6 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		RawStoreCap:    config.RawStoreCap,
 	}
 
-	// Create storage for this collection - PASS THE CONFIG
-	collectionStorage, err := storageEngine.CreateCollection(name, engineConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create collection storage: %w", err)
-	}
-
-	// Create index
-	provider, _ := collectionStorage.(interface {
-		GetByOrdinal(uint32) ([]float32, error)
-		Distance([]float32, uint32) (float32, error)
-	})
-	idx, err := createIndexForCollection(config, provider)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create index: %w", err)
-	}
-
 	// Initialize memory manager if memory management is configured
 	var memManager memory.MemoryManager
 	if config.MemoryLimit > 0 || config.MemoryConfig != nil {
@@ -347,28 +336,60 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 
 		memManager = memory.NewManager(memConfig)
 
-		// Register the index as a memory-mappable component if supported
-		if mappable, ok := idx.(memory.MemoryMappable); ok {
-			if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", name), mappable); err != nil {
-				return nil, fmt.Errorf("failed to register index for memory management: %w", err)
-			}
-		}
-
 		// Start memory monitoring
 		if err := memManager.Start(context.Background()); err != nil {
 			return nil, fmt.Errorf("failed to start memory manager: %w", err)
 		}
 	}
 
-	return &Collection{
+	// Create the collection
+	c := &Collection{
 		name:          name,
 		config:        config,
-		index:         idx,
-		storage:       collectionStorage,
 		writes:        writes,
 		metrics:       metrics,
 		memoryManager: memManager,
-	}, nil
+	}
+
+	// Initialize storage and index based on sharding mode
+	if config.Sharded {
+		// Sharded path: create multiple shard storage collections and indexes
+		shardNames := shardStorageNames(name)
+		if err := c.initShards(storageEngine, shardNames, engineConfig); err != nil {
+			return nil, fmt.Errorf("failed to initialize shards: %w", err)
+		}
+	} else {
+		// Non-sharded path: create single storage collection and index
+		var err error
+		c.storage, err = storageEngine.CreateCollection(name, engineConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create collection storage: %w", err)
+		}
+
+		provider, _ := c.storage.(interface {
+			GetByOrdinal(uint32) ([]float32, error)
+			Distance([]float32, uint32) (float32, error)
+		})
+
+		c.index, err = createIndexForCollection(config, provider)
+		if err != nil {
+			c.storage.Close()
+			return nil, fmt.Errorf("failed to create index: %w", err)
+		}
+
+		// Register the index as a memory-mappable component if supported
+		if memManager != nil {
+			if mappable, ok := c.index.(memory.MemoryMappable); ok {
+				if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", name), mappable); err != nil {
+					c.index.Close()
+					c.storage.Close()
+					return nil, fmt.Errorf("failed to register index for memory management: %w", err)
+				}
+			}
+		}
+	}
+
+	return c, nil
 }
 
 // newCollectionFromStorage creates a collection instance from existing storage
@@ -450,6 +471,99 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 	return collection, nil
 }
 
+// newShardedCollectionFromStorage creates a sharded collection from existing shard storages
+func newShardedCollectionFromStorage(name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController) (*Collection, error) {
+	// Convert LSM config to libravdb config
+	config := &CollectionConfig{
+		Dimension:      engineConfig.Dimension,
+		Metric:         DistanceMetric(engineConfig.Metric),
+		IndexType:      IndexType(engineConfig.IndexType),
+		M:              engineConfig.M,
+		EfConstruction: engineConfig.EfConstruction,
+		EfSearch:       engineConfig.EfSearch,
+		NClusters:      engineConfig.NClusters,
+		NProbes:        engineConfig.NProbes,
+		ML:             engineConfig.ML,
+		Version:        engineConfig.Version,
+		RawVectorStore: engineConfig.RawVectorStore,
+		RawStoreCap:    engineConfig.RawStoreCap,
+		Sharded:        true, // Mark as sharded so lifecycle methods work correctly
+	}
+	if config.NClusters <= 0 {
+		config.NClusters = 100
+	}
+	if config.NProbes <= 0 {
+		config.NProbes = min(config.NClusters, 10)
+	}
+
+	// Create the collection and initialize shards
+	c := &Collection{
+		name:    name,
+		config:  config,
+		writes:  writes,
+		metrics: metrics,
+	}
+
+	// Initialize shards from loaded storages
+	c.shards = make([]shard, shardCount)
+	for i := 0; i < shardCount; i++ {
+		provider, _ := shardStorages[i].(interface {
+			GetByOrdinal(uint32) ([]float32, error)
+			Distance([]float32, uint32) (float32, error)
+		})
+
+		idx, err := createIndexForCollection(config, provider)
+		if err != nil {
+			// Close already-opened shards
+			for j := 0; j < i; j++ {
+				shardStorages[j].Close()
+			}
+			return nil, fmt.Errorf("failed to create shard %d index: %w", i, err)
+		}
+
+		c.shards[i] = shard{
+			name:    shardStorageNames(name)[i],
+			storage: shardStorages[i],
+			index:   idx,
+		}
+	}
+
+	// Rebuild each shard's index from its storage
+	for i := range c.shards {
+		if err := c.rebuildShardIndex(context.Background(), i); err != nil {
+			return nil, fmt.Errorf("failed to rebuild shard %d index: %w", i, err)
+		}
+	}
+
+	return c, nil
+}
+
+// rebuildShardIndex rebuilds a single shard's index from its storage
+func (c *Collection) rebuildShardIndex(ctx context.Context, shardIdx int) error {
+	shard := &c.shards[shardIdx]
+	vectors, err := c.getAllVectorsFromShard(ctx, shardIdx)
+	if err != nil {
+		return err
+	}
+	if err := prepareIndexForEntries(ctx, shard.index, vectors); err != nil {
+		return err
+	}
+	return insertEntriesIntoIndex(ctx, shard.index, vectors)
+}
+
+// getAllVectorsFromShard returns all vectors from a specific shard's storage
+func (c *Collection) getAllVectorsFromShard(ctx context.Context, shardIdx int) ([]*index.VectorEntry, error) {
+	var entries []*index.VectorEntry
+	err := c.shards[shardIdx].storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to iterate shard storage: %w", err)
+	}
+	return entries, nil
+}
+
 // rebuildIndex rebuilds the index from storage data
 func (c *Collection) rebuildIndex(ctx context.Context) error {
 	vectors, err := c.getAllVectors(ctx)
@@ -490,47 +604,57 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		return ErrCollectionClosed
 	}
 
-	if exists, err := c.storage.Exists(ctx, id); err != nil {
+	// Non-sharded path: use single storage and index
+	if c.shards == nil {
+		if exists, err := c.storage.Exists(ctx, id); err != nil {
+			return fmt.Errorf("failed to check existing vector: %w", err)
+		} else if exists {
+			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
+		}
+
+		if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
+			return fmt.Errorf("failed to assign ordinal: %w", err)
+		}
+
+		if err := c.storage.Insert(ctx, storageEntry); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+		if err := c.index.Insert(ctx, storageEntry); err != nil {
+			_ = c.storage.Delete(ctx, id)
+			return fmt.Errorf("failed to insert into index: %w", err)
+		}
+
+		// Update metrics after unlock (Prometheus counters are concurrency-safe)
+		if c.metrics != nil {
+			c.metrics.VectorInserts.Inc()
+		}
+		return nil
+	}
+
+	// Sharded path: route to the correct shard for this ID
+	shard := c.getShard(id)
+
+	if exists, err := shard.storage.Exists(ctx, id); err != nil {
 		return fmt.Errorf("failed to check existing vector: %w", err)
 	} else if exists {
 		return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
 	}
 
-	if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
+	if err := shard.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
 		return fmt.Errorf("failed to assign ordinal: %w", err)
 	}
 
-	if _, needsTraining := trainingIndexState(c.index); needsTraining {
-		existingVectors, err := c.getAllVectors(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to prepare index training set: %w", err)
-		}
-		if err := prepareIndexForEntries(ctx, c.index, append(existingVectors, storageEntry)); err != nil {
-			return err
-		}
-	}
-
-	if err := c.storage.Insert(ctx, storageEntry); err != nil {
+	if err := shard.storage.Insert(ctx, storageEntry); err != nil {
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
-	if err := c.index.Insert(ctx, storageEntry); err != nil {
-		_ = c.storage.Delete(ctx, id)
+	if err := shard.index.Insert(ctx, storageEntry); err != nil {
+		_ = shard.storage.Delete(ctx, id)
 		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
 	// Update metrics after unlock (Prometheus counters are concurrency-safe)
 	if c.metrics != nil {
 		c.metrics.VectorInserts.Inc()
-	}
-
-	// Check if we should switch index type (automatic index selection)
-	// NOTE: checkAndSwitchIndexType is left serialized because switchIndexType()
-	// rebuilds and swaps c.index/c.config.IndexType - not proven race-free yet
-	if c.config.AutoIndexSelection {
-		if err := c.checkAndSwitchIndexType(ctx); err != nil {
-			// Log the error but don't fail the insertion
-			// TODO: Add proper logging
-		}
 	}
 
 	return nil
@@ -574,13 +698,20 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	defer release()
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	closed := c.closed
+	shards := c.shards
+	c.mu.Unlock()
 
-	if c.closed {
+	if closed {
 		return ErrCollectionClosed
 	}
 
-	// Check existence against persisted storage (shared-state read)
+	if shards != nil {
+		return c.insertBatchSharded(ctx, entries, shards)
+	}
+
+	// Non-sharded path (fallback - should not reach here for supported indexes)
+	// Check existence against persisted storage
 	for _, entry := range entries {
 		exists, err := c.storage.Exists(ctx, entry.ID)
 		if err != nil {
@@ -593,16 +724,6 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 
 	if err := c.storage.AssignOrdinals(ctx, entries); err != nil {
 		return fmt.Errorf("failed to assign ordinals: %w", err)
-	}
-	if _, needsTraining := trainingIndexState(c.index); needsTraining {
-		existingVectors, err := c.getAllVectors(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to prepare index training set: %w", err)
-		}
-		trainingVectors := append(existingVectors, entries...)
-		if err := prepareIndexForEntries(ctx, c.index, trainingVectors); err != nil {
-			return err
-		}
 	}
 
 	if err := c.storage.InsertBatch(ctx, entries); err != nil {
@@ -620,13 +741,74 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		c.metrics.VectorInserts.Add(float64(len(entries)))
 	}
 
-	// Check if we should switch index type (automatic index selection)
-	// NOTE: checkAndSwitchIndexType is left serialized because switchIndexType()
-	// rebuilds and swaps c.index/c.config.IndexType - not proven race-free yet
-	if c.config.AutoIndexSelection {
-		if err := c.checkAndSwitchIndexType(ctx); err != nil {
-			// TODO: Add proper logging
+	return nil
+}
+
+func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.VectorEntry, shards []shard) error {
+	// Group entries by shard
+	shardGroups := groupEntriesByShard(entries)
+
+	// Parallelize across shards with bounded concurrency
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(shardGroups))
+	maxConcurrency := 4
+	sem := make(chan struct{}, maxConcurrency)
+
+	for shardIdx, shardEntries := range shardGroups {
+		if len(shardEntries) == 0 {
+			continue
 		}
+
+		shardRef := &shards[shardIdx]
+		wg.Add(1)
+		go func(shardIdx int, s *shard, shardEntries []*index.VectorEntry) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Check existence in this shard's storage
+			for _, entry := range shardEntries {
+				exists, err := s.storage.Exists(ctx, entry.ID)
+				if err != nil {
+					errCh <- fmt.Errorf("failed to check existing vector: %w", err)
+					return
+				}
+				if exists {
+					errCh <- fmt.Errorf("failed to insert into index: node with ID '%s' already exists", entry.ID)
+					return
+				}
+			}
+
+			if err := s.storage.AssignOrdinals(ctx, shardEntries); err != nil {
+				errCh <- fmt.Errorf("failed to assign ordinals: %w", err)
+				return
+			}
+
+			if err := s.storage.InsertBatch(ctx, shardEntries); err != nil {
+				errCh <- fmt.Errorf("failed to write batch to storage: %w", err)
+				return
+			}
+			if err := s.index.BatchInsert(ctx, shardEntries); err != nil {
+				for _, storedEntry := range shardEntries {
+					_ = s.storage.Delete(ctx, storedEntry.ID)
+				}
+				errCh <- fmt.Errorf("failed to insert into shard %d index: %w", shardIdx, err)
+				return
+			}
+		}(shardIdx, shardRef, shardEntries)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Collect errors
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("shard batch insert errors: %v", errs)
 	}
 
 	return nil
@@ -663,10 +845,16 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 			len(vector), c.config.Dimension)
 	}
 
-	// For now, implement update as delete + insert
-	// This ensures consistency across index and storage layers
-	// TODO: Optimize with native update operations when available
+	// Non-sharded path
+	if c.shards == nil {
+		return c.updateNonSharded(ctx, id, vector, metadata)
+	}
 
+	// Sharded path: route to the correct shard for this ID
+	return c.updateSharded(ctx, id, vector, metadata)
+}
+
+func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
 	// First, try to get the existing entry for partial updates
 	var existingEntry *index.VectorEntry
 	if vector == nil || metadata == nil {
@@ -747,6 +935,89 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 	return nil
 }
 
+func (c *Collection) updateSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	shard := c.getShard(id)
+
+	// First, try to get the existing entry for partial updates
+	var existingEntry *index.VectorEntry
+	if vector == nil || metadata == nil {
+		// Need to retrieve existing data for partial update
+		_ = shard.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+			if entry.ID == id {
+				existingEntry = &index.VectorEntry{
+					ID:       entry.ID,
+					Vector:   make([]float32, len(entry.Vector)),
+					Metadata: make(map[string]interface{}),
+				}
+				copy(existingEntry.Vector, entry.Vector)
+				for k, v := range entry.Metadata {
+					existingEntry.Metadata[k] = v
+				}
+				return fmt.Errorf("found") // Use error to break iteration
+			}
+			return nil
+		})
+
+		if existingEntry == nil {
+			return fmt.Errorf("vector with ID %s not found", id)
+		}
+	}
+
+	// Prepare the updated entry
+	updatedEntry := &index.VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	// Use existing data for partial updates
+	if existingEntry != nil {
+		if vector == nil {
+			updatedEntry.Vector = existingEntry.Vector
+		}
+		if metadata == nil {
+			updatedEntry.Metadata = existingEntry.Metadata
+		} else if existingEntry.Metadata != nil {
+			// Merge metadata (new values override existing ones)
+			mergedMetadata := make(map[string]interface{})
+			for k, v := range existingEntry.Metadata {
+				mergedMetadata[k] = v
+			}
+			for k, v := range metadata {
+				mergedMetadata[k] = v
+			}
+			updatedEntry.Metadata = mergedMetadata
+		}
+	}
+
+	if err := shard.storage.AssignOrdinals(ctx, []*index.VectorEntry{updatedEntry}); err != nil {
+		return fmt.Errorf("failed to assign ordinal: %w", err)
+	}
+	if deleter, ok := shard.index.(interface {
+		DeleteByOrdinal(context.Context, uint32) error
+	}); ok {
+		if err := deleter.DeleteByOrdinal(ctx, updatedEntry.Ordinal); err != nil {
+			return fmt.Errorf("failed to delete existing vector from index: %w", err)
+		}
+	} else if err := shard.index.Delete(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete existing vector from index: %w", err)
+	}
+
+	if err := shard.storage.Insert(ctx, updatedEntry); err != nil {
+		return fmt.Errorf("failed to write update to storage: %w", err)
+	}
+	if err := shard.index.Insert(ctx, updatedEntry); err != nil {
+		return fmt.Errorf("failed to insert updated vector into index: %w", err)
+	}
+
+	// Update metrics
+	if c.metrics != nil {
+		c.metrics.VectorUpdates.Inc()
+	}
+
+	return nil
+}
+
 // Delete removes a vector from the collection
 func (c *Collection) Delete(ctx context.Context, id string) error {
 	release, err := c.acquireWrite(ctx)
@@ -767,22 +1038,51 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("vector ID cannot be empty")
 	}
 
-	if entry, err := c.storage.Get(ctx, id); err == nil {
-		if deleter, ok := c.index.(interface {
-			DeleteByOrdinal(context.Context, uint32) error
-		}); ok {
-			if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+	// Non-sharded path
+	if c.shards == nil {
+		if entry, err := c.storage.Get(ctx, id); err == nil {
+			if deleter, ok := c.index.(interface {
+				DeleteByOrdinal(context.Context, uint32) error
+			}); ok {
+				if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+					return fmt.Errorf("failed to delete vector from index: %w", err)
+				}
+			} else if err := c.index.Delete(ctx, id); err != nil {
 				return fmt.Errorf("failed to delete vector from index: %w", err)
 			}
 		} else if err := c.index.Delete(ctx, id); err != nil {
 			return fmt.Errorf("failed to delete vector from index: %w", err)
 		}
-	} else if err := c.index.Delete(ctx, id); err != nil {
+
+		if err := c.storage.Delete(ctx, id); err != nil {
+			return fmt.Errorf("failed to write deletion to storage: %w", err)
+		}
+
+		// Update metrics
+		if c.metrics != nil {
+			c.metrics.VectorDeletes.Inc()
+		}
+		return nil
+	}
+
+	// Sharded path: route to the correct shard for this ID
+	shard := c.getShard(id)
+
+	if entry, err := shard.storage.Get(ctx, id); err == nil {
+		if deleter, ok := shard.index.(interface {
+			DeleteByOrdinal(context.Context, uint32) error
+		}); ok {
+			if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+				return fmt.Errorf("failed to delete vector from index: %w", err)
+			}
+		} else if err := shard.index.Delete(ctx, id); err != nil {
+			return fmt.Errorf("failed to delete vector from index: %w", err)
+		}
+	} else if err := shard.index.Delete(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete vector from index: %w", err)
 	}
 
-	if err := c.storage.Delete(ctx, id); err != nil {
-		// TODO: Rollback index deletion
+	if err := shard.storage.Delete(ctx, id); err != nil {
 		return fmt.Errorf("failed to write deletion to storage: %w", err)
 	}
 
@@ -826,6 +1126,16 @@ func (c *Collection) Get(ctx context.Context, id string) (Record, error) {
 	}
 	c.mu.RUnlock()
 
+	// Route to the correct shard for this ID
+	if c.shards != nil {
+		shard := c.getShard(id)
+		entry, err := shard.storage.Get(ctx, id)
+		if err != nil {
+			return Record{}, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
+		}
+		return recordFromIndexEntry(entry), nil
+	}
+
 	entry, err := c.storage.Get(ctx, id)
 	if err != nil {
 		return Record{}, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
@@ -865,6 +1175,19 @@ func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
 		return ErrCollectionClosed
 	}
 	c.mu.RUnlock()
+
+	// Sharded path: iterate over all shards
+	if c.shards != nil {
+		for i := range c.shards {
+			err := c.shards[i].storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+				return fn(recordFromIndexEntry(entry))
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	return c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
 		return fn(recordFromIndexEntry(entry))
@@ -915,6 +1238,19 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	}
 	c.mu.RUnlock()
 
+	// Sharded path: sum counts from all shards
+	if c.shards != nil {
+		total := 0
+		for i := range c.shards {
+			count, err := c.shards[i].storage.Count(ctx)
+			if err != nil {
+				return 0, fmt.Errorf("shard %d count: %w", i, err)
+			}
+			total += count
+		}
+		return total, nil
+	}
+
 	return c.storage.Count(ctx)
 }
 
@@ -944,11 +1280,11 @@ func (c *Collection) effectiveWriteConcurrency(requested int) int {
 // Search performs a vector similarity search
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	if c.closed {
+		c.mu.RUnlock()
 		return nil, ErrCollectionClosed
 	}
+	c.mu.RUnlock()
 
 	// Validate input
 	if len(vector) != c.config.Dimension {
@@ -962,25 +1298,65 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 
 	// Start timing
 	start := time.Now()
-	defer func() {
-		if c.metrics != nil {
-			c.metrics.SearchLatency.Observe(time.Since(start).Seconds())
-		}
-	}()
 
-	// Search index
-	indexResults, err := c.index.Search(ctx, vector, k)
-	if err != nil {
-		if c.metrics != nil {
-			c.metrics.SearchErrors.Inc()
-		}
-		return nil, fmt.Errorf("index search failed: %w", err)
+	// Search all shards in parallel and collect results
+	type shardResult struct {
+		results []*index.SearchResult
+		err    error
 	}
 
-	// Convert from index.SearchResult to libravdb.SearchResult.
-	// Public API scores are normalized to consumer-facing relevance semantics.
-	results := make([]*SearchResult, len(indexResults))
-	for i, r := range indexResults {
+	var resultsCh chan shardResult
+	var wg sync.WaitGroup
+
+	if c.shards != nil {
+		// Sharded search: query all shards in parallel
+		resultsCh = make(chan shardResult, len(c.shards))
+		for i := range c.shards {
+			wg.Add(1)
+			go func(shardIdx int) {
+				defer wg.Done()
+				// Over-fetch to account for shard fan-out
+				shardK := k * len(c.shards)
+				results, err := c.shards[shardIdx].index.Search(ctx, vector, shardK)
+				resultsCh <- shardResult{results: results, err: err}
+			}(i)
+		}
+	} else {
+		// Non-sharded search
+		resultsCh = make(chan shardResult, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results, err := c.index.Search(ctx, vector, k)
+			resultsCh <- shardResult{results: results, err: err}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	// Collect all shard results
+	var allResults []*index.SearchResult
+	for sr := range resultsCh {
+		if sr.err != nil {
+			// Handle empty index gracefully - just means no results from this shard
+			if strings.Contains(sr.err.Error(), "index is empty") {
+				continue
+			}
+			if c.metrics != nil {
+				c.metrics.SearchErrors.Inc()
+			}
+			return nil, fmt.Errorf("shard search failed: %w", sr.err)
+		}
+		allResults = append(allResults, sr.results...)
+	}
+
+	// Convert and merge results
+	// First pass: resolve IDs and fill metadata from storage
+	publicResults := make([]*SearchResult, 0, len(allResults))
+	for _, r := range allResults {
 		result := &SearchResult{
 			ID:      r.ID,
 			Score:   r.Score,
@@ -992,17 +1368,17 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		if r.Metadata != nil {
 			result.Metadata = cloneMetadata(r.Metadata)
 		}
-		if result.ID == "" {
-			if idGetter, ok := c.storage.(interface {
-				GetIDByOrdinal(context.Context, uint32) (string, error)
-			}); ok {
-				if resolvedID, idErr := idGetter.GetIDByOrdinal(ctx, r.Ordinal); idErr == nil {
-					result.ID = resolvedID
-				}
-			}
-		}
+		// Get full record from storage if needed
 		if result.Vector == nil || result.Metadata == nil || result.Version == 0 {
-			entry, getErr := c.storage.Get(ctx, result.ID)
+			// Find which shard has this entry
+			shardIdx := shardForID(r.ID)
+			var entry *index.VectorEntry
+			var getErr error
+			if c.shards != nil {
+				entry, getErr = c.shards[shardIdx].storage.Get(ctx, r.ID)
+			} else {
+				entry, getErr = c.storage.Get(ctx, r.ID)
+			}
 			if getErr == nil {
 				result.ID = entry.ID
 				result.Version = entry.Version
@@ -1018,20 +1394,29 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				}
 			}
 		}
-		results[i] = result
+		publicResults = append(publicResults, result)
 	}
 
-	normalizePublicSearchResults(c.config.Metric, results)
+	normalizePublicSearchResults(c.config.Metric, publicResults)
+
+	// Sort by score descending and take top k
+	sort.Slice(publicResults, func(i, j int) bool {
+		return publicResults[i].Score > publicResults[j].Score
+	})
+	if len(publicResults) > k {
+		publicResults = publicResults[:k]
+	}
 
 	// Update metrics
 	if c.metrics != nil {
 		c.metrics.SearchQueries.Inc()
+		c.metrics.SearchLatency.Observe(time.Since(start).Seconds())
 	}
 
 	return &SearchResults{
-		Results: results,
+		Results: publicResults,
 		Took:    time.Since(start),
-		Total:   len(results),
+		Total:   len(publicResults),
 	}, nil
 }
 
@@ -1049,11 +1434,28 @@ func (c *Collection) Stats() *CollectionStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	storageUsage := c.storageMemoryUsageLocked()
-	indexUsage := c.index.MemoryUsage()
+	var storageUsage int64
+	var indexUsage int64
+	var vectorCount int
+
+	if c.shards != nil {
+		// Aggregate stats from all shards
+		for i := range c.shards {
+			if su, err := c.shards[i].storage.MemoryUsage(context.Background()); err == nil {
+				storageUsage += su
+			}
+			indexUsage += c.shards[i].index.MemoryUsage()
+			vectorCount += c.shards[i].index.Size()
+		}
+	} else {
+		storageUsage = c.storageMemoryUsageLocked()
+		indexUsage = c.index.MemoryUsage()
+		vectorCount = c.index.Size()
+	}
+
 	stats := &CollectionStats{
 		Name:                 c.name,
-		VectorCount:          c.index.Size(),
+		VectorCount:          vectorCount,
 		Dimension:            c.config.Dimension,
 		IndexType:            c.config.IndexType.String(),
 		MemoryUsage:          storageUsage + indexUsage,
@@ -1122,20 +1524,36 @@ func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
 		return nil, ErrCollectionClosed
 	}
 
-	storageUsage := c.storageMemoryUsageLocked()
+	var totalStorage int64
+	var totalIndex int64
+
+	if c.shards != nil {
+		// Aggregate memory usage from all shards
+		for i := range c.shards {
+			if su, err := c.shards[i].storage.MemoryUsage(context.Background()); err == nil {
+				totalStorage += su
+			}
+			totalIndex += c.shards[i].index.MemoryUsage()
+		}
+	} else {
+		totalStorage = c.storageMemoryUsageLocked()
+		totalIndex = c.index.MemoryUsage()
+	}
+
 	if c.memoryManager == nil {
 		usage := &memory.MemoryUsage{
-			Total:     storageUsage + c.index.MemoryUsage(),
-			Indices:   c.index.MemoryUsage(),
-			Caches:    storageUsage,
+			Total:     totalStorage + totalIndex,
+			Indices:   totalIndex,
+			Caches:    totalStorage,
 			Timestamp: time.Now(),
 		}
 		return usage, nil
 	}
 
 	usage := c.memoryManager.GetUsage()
-	usage.Total += storageUsage
-	usage.Caches += storageUsage
+	usage.Total += totalStorage
+	usage.Caches += totalStorage
+	usage.Indices = totalIndex
 	return &usage, nil
 }
 
@@ -1156,6 +1574,11 @@ func (c *Collection) DebugRawVectorStoreProfile() map[string]any {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	if c.shards != nil {
+		// Sharded collections do not support single-profile debugging
+		return nil
+	}
+
 	if profiler, ok := c.index.(interface{ RawVectorStoreProfile() map[string]any }); ok {
 		return profiler.RawVectorStoreProfile()
 	}
@@ -1169,6 +1592,11 @@ func (c *Collection) SetMemoryLimit(bytes int64) error {
 
 	if c.closed {
 		return ErrCollectionClosed
+	}
+
+	// Sharded collections do not yet support per-shard memory limit management
+	if c.shards != nil {
+		return fmt.Errorf("SetMemoryLimit is not supported for sharded collections")
 	}
 
 	// Update config
@@ -1219,6 +1647,13 @@ func (c *Collection) TriggerGC() error {
 		return ErrCollectionClosed
 	}
 
+	// Sharded collections do not yet support per-shard memory manager GC
+	if c.shards != nil {
+		// Fallback to runtime GC if no memory manager or for sharded collections
+		memory.ForceGC()
+		return nil
+	}
+
 	if memManager != nil {
 		return memManager.TriggerGC()
 	}
@@ -1240,6 +1675,12 @@ func (c *Collection) OptimizeCollection(ctx context.Context, options *Optimizati
 	if c.optimizationInProgress {
 		c.mu.Unlock()
 		return fmt.Errorf("optimization already in progress")
+	}
+
+	// Sharded collections do not support OptimizeCollection
+	if c.shards != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("OptimizeCollection is not supported for sharded collections")
 	}
 
 	// Set default options if not provided
@@ -1301,7 +1742,10 @@ func (c *Collection) OptimizeCollection(ctx context.Context, options *Optimizati
 // rebuildIndexOptimized rebuilds the index with optimization considerations
 func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *OptimizationOptions) error {
 	c.mu.Lock()
-	currentSize := c.index.Size()
+	if c.shards != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("rebuildIndexOptimized is not supported for sharded collections")
+	}
 	autoIndexSelection := c.config.AutoIndexSelection
 	currentType := c.config.IndexType
 	hnswThreshold := c.config.AutoIndexThresholds.HNSWThreshold
@@ -1312,6 +1756,7 @@ func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *Optimiz
 	if ivfpqThreshold == 0 {
 		ivfpqThreshold = DefaultIVFPQThreshold
 	}
+	currentSize := c.index.Size()
 	c.mu.Unlock()
 
 	if autoIndexSelection {
@@ -1324,7 +1769,6 @@ func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *Optimiz
 	// For optimization, we don't need to rebuild if the index is already populated
 	// and we're not switching types. This avoids the duplicate insertion issue.
 	if currentSize > 0 {
-		// Index is already built, no need to rebuild unless switching types
 		return nil
 	}
 
@@ -1334,6 +1778,10 @@ func (c *Collection) rebuildIndexOptimized(ctx context.Context, options *Optimiz
 
 // updateQuantization retrains quantization parameters with current data
 func (c *Collection) updateQuantization(ctx context.Context) error {
+	if c.shards != nil {
+		return fmt.Errorf("updateQuantization is not supported for sharded collections")
+	}
+
 	if c.config.Quantization == nil {
 		return fmt.Errorf("no quantization configured")
 	}
@@ -1365,8 +1813,6 @@ func (c *Collection) updateQuantization(ctx context.Context) error {
 	}
 
 	// Update the index with the new quantizer
-	// Note: This would require index-specific support for quantizer updates
-	// For now, we'll rebuild the index with the new quantizer
 	return c.rebuildIndex(ctx)
 }
 
@@ -1391,6 +1837,11 @@ func (c *Collection) EnableMemoryMapping(path string) error {
 		return ErrCollectionClosed
 	}
 
+	// Sharded collections do not support memory mapping
+	if c.shards != nil {
+		return fmt.Errorf("EnableMemoryMapping is not supported for sharded collections")
+	}
+
 	// Update config
 	c.config.EnableMMapping = true
 
@@ -1411,6 +1862,11 @@ func (c *Collection) DisableMemoryMapping() error {
 
 	if c.closed {
 		return ErrCollectionClosed
+	}
+
+	// Sharded collections do not support memory mapping
+	if c.shards != nil {
+		return fmt.Errorf("DisableMemoryMapping is not supported for sharded collections")
 	}
 
 	// Update config
@@ -1444,12 +1900,32 @@ func (c *Collection) Close() error {
 		}
 	}
 
-	if err := c.index.Close(); err != nil {
-		errors = append(errors, err)
-	}
-
-	if err := c.storage.Close(); err != nil {
-		errors = append(errors, err)
+	// Close shards if sharded collection
+	if c.shards != nil {
+		for i := range c.shards {
+			if c.shards[i].index != nil {
+				if err := c.shards[i].index.Close(); err != nil {
+					errors = append(errors, fmt.Errorf("shard %d index close: %w", i, err))
+				}
+			}
+			if c.shards[i].storage != nil {
+				if err := c.shards[i].storage.Close(); err != nil {
+					errors = append(errors, fmt.Errorf("shard %d storage close: %w", i, err))
+				}
+			}
+		}
+	} else {
+		// Non-sharded collection
+		if c.index != nil {
+			if err := c.index.Close(); err != nil {
+				errors = append(errors, err)
+			}
+		}
+		if c.storage != nil {
+			if err := c.storage.Close(); err != nil {
+				errors = append(errors, err)
+			}
+		}
 	}
 
 	c.closed = true
@@ -1470,6 +1946,11 @@ func (c *Collection) SaveIndex(ctx context.Context, path string) error {
 		return fmt.Errorf("collection is closed")
 	}
 
+	// Sharded collections do not support SaveIndex
+	if c.shards != nil {
+		return fmt.Errorf("SaveIndex is not supported for sharded collections")
+	}
+
 	return c.index.SaveToDisk(ctx, path)
 }
 
@@ -1482,6 +1963,11 @@ func (c *Collection) LoadIndex(ctx context.Context, path string) error {
 		return fmt.Errorf("collection is closed")
 	}
 
+	// Sharded collections do not support LoadIndex
+	if c.shards != nil {
+		return fmt.Errorf("LoadIndex is not supported for sharded collections")
+	}
+
 	return c.index.LoadFromDisk(ctx, path)
 }
 
@@ -1491,6 +1977,11 @@ func (c *Collection) GetIndexMetadata() *index.PersistenceMetadata {
 	defer c.mu.RUnlock()
 
 	if c.closed {
+		return nil
+	}
+
+	// Sharded collections do not support GetIndexMetadata
+	if c.shards != nil {
 		return nil
 	}
 
@@ -1506,6 +1997,11 @@ func (c *Collection) GetIndexMetadata() *index.PersistenceMetadata {
 
 // checkAndSwitchIndexType checks if the index type should be changed based on collection size
 func (c *Collection) checkAndSwitchIndexType(ctx context.Context) error {
+	// Sharded collections do not support auto index switching
+	if c.shards != nil {
+		return fmt.Errorf("checkAndSwitchIndexType is not supported for sharded collections")
+	}
+
 	currentSize := c.index.Size()
 	hnswThreshold := c.config.AutoIndexThresholds.HNSWThreshold
 	if hnswThreshold == 0 {
@@ -1527,6 +2023,11 @@ func (c *Collection) checkAndSwitchIndexType(ctx context.Context) error {
 
 // switchIndexType rebuilds the index with a new type
 func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) error {
+	// Sharded collections do not support index type switching
+	if c.shards != nil {
+		return fmt.Errorf("switchIndexType is not supported for sharded collections")
+	}
+
 	// Get all vectors from current index
 	vectors, err := c.getAllVectors(ctx)
 	if err != nil {
@@ -1556,25 +2057,49 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, error) {
 	var vectors []*index.VectorEntry
 
-	err := c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-		// Create a copy to avoid reference issues
-		vectorCopy := &index.VectorEntry{
-			ID:       entry.ID,
-			Ordinal:  entry.Ordinal,
-			Vector:   make([]float32, len(entry.Vector)),
-			Metadata: make(map[string]interface{}),
-			Version:  entry.Version,
+	// Iterate over all shards if sharded, otherwise iterate over single storage
+	if c.shards != nil {
+		for i := range c.shards {
+			err := c.shards[i].storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+				// Create a copy to avoid reference issues
+				vectorCopy := &index.VectorEntry{
+					ID:       entry.ID,
+					Ordinal:  entry.Ordinal,
+					Vector:   make([]float32, len(entry.Vector)),
+					Metadata: make(map[string]interface{}),
+					Version:  entry.Version,
+				}
+				copy(vectorCopy.Vector, entry.Vector)
+				for k, v := range entry.Metadata {
+					vectorCopy.Metadata[k] = v
+				}
+				vectors = append(vectors, vectorCopy)
+				return nil
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to iterate shard %d storage: %w", i, err)
+			}
 		}
-		copy(vectorCopy.Vector, entry.Vector)
-		for k, v := range entry.Metadata {
-			vectorCopy.Metadata[k] = v
+	} else {
+		err := c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+			// Create a copy to avoid reference issues
+			vectorCopy := &index.VectorEntry{
+				ID:       entry.ID,
+				Ordinal:  entry.Ordinal,
+				Vector:   make([]float32, len(entry.Vector)),
+				Metadata: make(map[string]interface{}),
+				Version:  entry.Version,
+			}
+			copy(vectorCopy.Vector, entry.Vector)
+			for k, v := range entry.Metadata {
+				vectorCopy.Metadata[k] = v
+			}
+			vectors = append(vectors, vectorCopy)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to iterate storage: %w", err)
 		}
-		vectors = append(vectors, vectorCopy)
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to iterate storage: %w", err)
 	}
 
 	return vectors, nil

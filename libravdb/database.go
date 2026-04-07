@@ -174,7 +174,10 @@ func (db *Database) ListCollectionsWithContext(ctx context.Context) ([]string, e
 		return nil, err
 	}
 	for _, name := range names {
-		namesMap[name] = struct{}{}
+		// Filter out shard collection names - only return parent collection names
+		if _, _, ok := parseShardName(name); !ok {
+			namesMap[name] = struct{}{}
+		}
 	}
 
 	result := make([]string, 0, len(namesMap))
@@ -194,6 +197,7 @@ func (db *Database) DeleteCollection(ctx context.Context, name string) error {
 	}
 
 	collection := db.collections[name]
+	isSharded := collection != nil && collection.config.Sharded
 	delete(db.collections, name)
 	db.mu.Unlock()
 
@@ -203,11 +207,22 @@ func (db *Database) DeleteCollection(ctx context.Context, name string) error {
 		}
 	}
 
+	// For sharded collections, the parent collection doesn't exist in storage.
+	// Only the hidden shard children exist. Delete all shard children.
+	if isSharded {
+		for _, shardName := range shardStorageNames(name) {
+			if err := db.storage.DeleteCollection(shardName); err != nil {
+				return fmt.Errorf("failed to delete shard %s: %w", shardName, err)
+			}
+		}
+		return nil
+	}
+
+	// Non-sharded collection: delete the normal parent storage collection.
 	if err := db.storage.DeleteCollection(name); err != nil {
 		return err
 	}
 
-	_ = ctx
 	return nil
 }
 
@@ -397,13 +412,35 @@ func (db *Database) loadExistingCollections(ctx context.Context) error {
 		return fmt.Errorf("failed to list collections: %w", err)
 	}
 
+	// Track which parent collections we've loaded (to avoid loading shards as separate collections)
+	loadedParents := make(map[string]bool)
+	loadedCollections := make(map[string]*Collection)
+
 	for _, name := range names {
+		// Skip shard collection names - they are loaded as part of the parent
+		if _, _, ok := parseShardName(name); ok {
+			continue
+		}
+
+		// Skip if already loaded as a parent (from a previous shard entry)
+		if loadedParents[name] {
+			continue
+		}
+
 		collection, err := db.loadCollectionFromStorage(name, fileEngine)
 		if err != nil {
 			return err
 		}
+
+		loadedCollections[name] = collection
+		loadedParents[name] = true
+	}
+
+	db.mu.Lock()
+	for name, collection := range loadedCollections {
 		db.collections[name] = collection
 	}
+	db.mu.Unlock()
 
 	_ = ctx
 	return nil
@@ -412,6 +449,36 @@ func (db *Database) loadExistingCollections(ctx context.Context) error {
 func (db *Database) loadCollectionFromStorage(name string, engine interface {
 	GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 }) (*Collection, error) {
+	// Check if this is a shard collection name - if so, skip it
+	if _, _, ok := parseShardName(name); ok {
+		return nil, fmt.Errorf("cannot load shard collection %s directly, load parent collection instead", name)
+	}
+
+	// Check if this collection has shards (sharded collection)
+	shardNames := shardStorageNames(name)
+	firstShardStorage, config, err := engine.GetCollectionWithConfig(shardNames[0])
+	if err == nil {
+		// Shard 0 exists - this is a sharded collection
+		// Load all shards
+		shardStorages := make([]storage.Collection, shardCount)
+		shardStorages[0] = firstShardStorage
+
+		for i := 1; i < shardCount; i++ {
+			shardStorages[i], _, err = engine.GetCollectionWithConfig(shardNames[i])
+			if err != nil {
+				return nil, fmt.Errorf("collection %s is missing shard %d: %w", name, i, err)
+			}
+		}
+
+		collection, err := newShardedCollectionFromStorage(name, shardStorages, config, db.metrics, db.newWriteController())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
+		}
+		collection.db = db
+		return collection, nil
+	}
+
+	// Not a sharded collection - load as single collection
 	storageCollection, config, err := engine.GetCollectionWithConfig(name)
 	if err != nil {
 		return nil, fmt.Errorf("collection %s not found", name)

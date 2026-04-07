@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1054,4 +1055,101 @@ func TestBatchOperations_ComprehensiveIntegration(t *testing.T) {
 	t.Logf("  - %d error callbacks received", len(errorCallbacks))
 	t.Logf("  - Duration: %v", result.Duration)
 	t.Logf("  - Rollback required: %t", result.RollbackRequired)
+}
+
+func TestShardedBatchInsertParallelizesAcrossShards(t *testing.T) {
+	db := createTestDB(t)
+
+	collection, err := db.CreateCollection(context.Background(), "test_shard_parallel", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("Failed to create sharded collection: %v", err)
+	}
+
+	// Create enough entries to span multiple shards (shardCount=4)
+	// With FNV-1a routing, IDs starting with "a", "e", "i", "m" should go to different shards
+	entryCount := 200
+	entries := make([]*VectorEntry, entryCount)
+	prefixes := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	for i := 0; i < entryCount; i++ {
+		prefix := prefixes[i%len(prefixes)]
+		entries[i] = &VectorEntry{
+			ID:       fmt.Sprintf("%s_item_%d", prefix, i),
+			Vector:   []float32{float32(i), float32(i + 1), float32(i + 2)},
+			Metadata: map[string]interface{}{"index": i, "sharded": true},
+		}
+	}
+
+	// Run two concurrent batch inserts with distinct entry sets
+	var wg sync.WaitGroup
+	results := make([]*BatchResult, 2)
+	errs := make([]error, 2)
+
+	batchEntries := make([][]*VectorEntry, 2)
+	for batchIdx := 0; batchIdx < 2; batchIdx++ {
+		entries := make([]*VectorEntry, entryCount)
+		for i := 0; i < entryCount; i++ {
+			prefix := prefixes[i%len(prefixes)]
+			entries[i] = &VectorEntry{
+				ID:       fmt.Sprintf("%s_batch%d_item_%d", prefix, batchIdx, i),
+				Vector:   []float32{float32(i), float32(i + 1), float32(i + 2)},
+				Metadata: map[string]interface{}{"index": i, "sharded": true, "batch": batchIdx},
+			}
+		}
+		batchEntries[batchIdx] = entries
+	}
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(batchIdx int) {
+			defer wg.Done()
+			batch := collection.NewBatchInsert(batchEntries[batchIdx], &BatchOptions{
+				MaxConcurrency: 4,
+				ChunkSize:      50,
+			})
+			result, err := batch.Execute(context.Background())
+			results[batchIdx] = result
+			errs[batchIdx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify no errors
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Batch %d returned error: %v", i, err)
+		}
+	}
+
+	// Verify all entries succeeded in both batches
+	for batchIdx, result := range results {
+		if result == nil {
+			t.Fatalf("Batch %d result is nil", batchIdx)
+		}
+		if result.Successful != entryCount {
+			t.Errorf("Batch %d: expected %d successful inserts, got %d", batchIdx, entryCount, result.Successful)
+		}
+		if result.Failed != 0 {
+			t.Errorf("Batch %d: expected 0 failed inserts, got %d", batchIdx, result.Failed)
+		}
+	}
+
+	// Verify all entries are retrievable
+	for batchIdx := 0; batchIdx < 2; batchIdx++ {
+		for i := 0; i < entryCount; i++ {
+			prefix := prefixes[i%len(prefixes)]
+			id := fmt.Sprintf("%s_batch%d_item_%d", prefix, batchIdx, i)
+			record, err := collection.Get(context.Background(), id)
+			if err != nil {
+				t.Errorf("Batch %d: Get failed for %s: %v", batchIdx, id, err)
+			} else if record.ID == "" {
+				t.Errorf("Batch %d: record has empty ID for %s", batchIdx, id)
+			}
+		}
+	}
+
+	// Verify collection has the expected total count (200 entries * 2 batches)
+	stats := collection.Stats()
+	if stats.VectorCount != entryCount*2 {
+		t.Errorf("Expected collection count %d, got %d", entryCount*2, stats.VectorCount)
+	}
 }
