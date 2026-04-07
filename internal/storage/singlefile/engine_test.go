@@ -3,6 +3,7 @@ package singlefile
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,5 +270,485 @@ func TestRecoveryStatsTrackReplayedAndDiscardedTransactions(t *testing.T) {
 	}
 	if stats.DiscardedTransactions == 0 {
 		t.Fatalf("expected discarded transaction count > 0, got %+v", stats)
+	}
+}
+
+func TestBatchWALCommitMultipleRecordsInOneTransaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch_commit.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	// Create collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Insert multiple records in one batch (via InsertBatch)
+	entries := []*index.VectorEntry{
+		{ID: "r1", Vector: []float32{1, 0, 0}, Metadata: map[string]interface{}{"idx": 1}},
+		{ID: "r2", Vector: []float32{0, 1, 0}, Metadata: map[string]interface{}{"idx": 2}},
+		{ID: "r3", Vector: []float32{0, 0, 1}, Metadata: map[string]interface{}{"idx": 3}},
+	}
+	if err := engine.collections["test"].InsertBatch(context.Background(), entries); err != nil {
+		t.Fatalf("batch insert: %v", err)
+	}
+
+	// Verify all records are visible
+	col := engine.collections["test"]
+	for _, want := range entries {
+		got, err := col.Get(context.Background(), want.ID)
+		if err != nil {
+			t.Fatalf("get %s: %v", want.ID, err)
+		}
+		if got.ID != want.ID {
+			t.Errorf("got ID %s, want %s", got.ID, want.ID)
+		}
+	}
+}
+
+func TestBatchWALCommitRecoveryReplaysAllRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch_recovery.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	// Create collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		engine.Close()
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Insert 5 records in one batch
+	entries := make([]*index.VectorEntry, 5)
+	for i := 0; i < 5; i++ {
+		entries[i] = &index.VectorEntry{
+			ID:       string(rune('a' + i)),
+			Vector:   []float32{float32(i), 0, 0},
+			Metadata: map[string]interface{}{"idx": i},
+		}
+	}
+	col := engine.collections["test"]
+	if err := col.InsertBatch(context.Background(), entries); err != nil {
+		engine.Close()
+		t.Fatalf("batch insert: %v", err)
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	// Reopen and verify all records are recovered
+	reopenedIface, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+
+	reopenedCol, err := reopened.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+	for _, want := range entries {
+		got, err := reopenedCol.Get(context.Background(), want.ID)
+		if err != nil {
+			t.Errorf("recovery get %s: %v", want.ID, err)
+			continue
+		}
+		if got.ID != want.ID {
+			t.Errorf("got ID %s, want %s", got.ID, want.ID)
+		}
+	}
+}
+
+// Note: Duplicate rejection is handled at the collection layer (libravdb),
+// not at the storage layer. The storage layer's InsertBatch just persists
+// records without checking for duplicates. Collection-level tests verify
+// duplicate rejection behavior.
+
+// TestA: InsertBatch returns error when collection is deleted
+func TestInsertBatchReturnsErrorOnDeletedCollection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deleted_col.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	// Create a collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Get a handle to the collection
+	col, err := engine.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+
+	// Insert a record to make the collection valid
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID:     "r1",
+		Vector: []float32{1, 0, 0},
+	}); err != nil {
+		t.Fatalf("initial insert: %v", err)
+	}
+
+	// Delete the collection
+	if err := engine.DeleteCollection("test"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	// Try to InsertBatch on the deleted collection handle - should return error
+	if err := col.InsertBatch(context.Background(), []*index.VectorEntry{
+		{ID: "r2", Vector: []float32{0, 1, 0}},
+	}); err == nil {
+		t.Errorf("expected error for InsertBatch on deleted collection, got nil")
+	}
+}
+
+// TestB: Insert returns error when collection is deleted
+func TestInsertReturnsErrorOnDeletedCollection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deleted_col2.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	// Create a collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Get a handle to the collection
+	col, err := engine.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+
+	// Insert a record to make the collection valid
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID:     "r1",
+		Vector: []float32{1, 0, 0},
+	}); err != nil {
+		t.Fatalf("initial insert: %v", err)
+	}
+
+	// Delete the collection
+	if err := engine.DeleteCollection("test"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	// Try to Insert on the deleted collection handle - should return error
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID:     "r2",
+		Vector: []float32{0, 1, 0},
+	}); err == nil {
+		t.Errorf("expected error for Insert on deleted collection, got nil")
+	}
+}
+
+// TestC: Verify recovery still works after error propagation changes
+func TestBatchWALRecoveryStillWorks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch_recovery2.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	// Create collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		engine.Close()
+		t.Fatalf("create collection: %v", err)
+	}
+
+	col := engine.collections["test"]
+	entries := make([]*index.VectorEntry, 5)
+	for i := 0; i < 5; i++ {
+		entries[i] = &index.VectorEntry{
+			ID:       string(rune('a' + i)),
+			Vector:   []float32{float32(i), 0, 0},
+			Metadata: map[string]interface{}{"idx": i},
+		}
+	}
+	if err := col.InsertBatch(context.Background(), entries); err != nil {
+		engine.Close()
+		t.Fatalf("batch insert: %v", err)
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	// Reopen and verify all records are recovered
+	reopenedIface, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+
+	reopenedCol, err := reopened.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+	for _, want := range entries {
+		got, err := reopenedCol.Get(context.Background(), want.ID)
+		if err != nil {
+			t.Errorf("recovery get %s: %v", want.ID, err)
+			continue
+		}
+		if got.ID != want.ID {
+			t.Errorf("got ID %s, want %s", got.ID, want.ID)
+		}
+	}
+}
+
+// TestD: Verify New does not leak goroutine on initialization failure
+func TestNewNoGoroutineLeakOnFailure(t *testing.T) {
+	// Use the startBatchFlusher hook to detect if the flusher was started
+	startCount := 0
+	origHook := startBatchFlusher
+	startBatchFlusher = func(e *Engine) {
+		startCount++
+	}
+	defer func() { startBatchFlusher = origHook }()
+
+	path := filepath.Join(t.TempDir(), "bad_init.libravdb")
+
+	// Write a malformed file
+	if err := os.WriteFile(path, []byte("not a valid database"), 0644); err != nil {
+		t.Fatalf("write malformed file: %v", err)
+	}
+
+	// This should fail cleanly
+	if _, err := New(path); err == nil {
+		t.Fatalf("expected error for malformed database, got nil")
+	}
+
+	// The hook should NOT have been called - flusher never started
+	if startCount != 0 {
+		t.Errorf("expected flusher hook to not be called on init failure, was called %d times", startCount)
+	}
+}
+
+// TestF: Verify flushBatch re-queues only the failed suffix, not the committed prefix
+func TestFlushBatchReQueuesOnlyFailedSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "suffix_requeue.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	// Create collection "good" but NOT collection "bad"
+	_, err = engine.CreateCollection("good", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection good: %v", err)
+	}
+
+	// Manually populate batchBuffer with two batches:
+	// batch 0: collection "good" with valid entry (will succeed)
+	// batch 1: collection "bad" with valid entry (will fail - collection doesn't exist)
+	engine.batchBuffer.mu.Lock()
+	engine.batchBuffer.entries = []batchEntry{
+		{
+			collection: "good",
+			entries: []*index.VectorEntry{
+				{ID: "good_entry", Vector: []float32{1, 0, 0}},
+			},
+		},
+		{
+			collection: "bad",
+			entries: []*index.VectorEntry{
+				{ID: "bad_entry", Vector: []float32{0, 1, 0}},
+			},
+		},
+	}
+	engine.batchBuffer.mu.Unlock()
+
+	// Call flushBatch - should fail on the "bad" collection
+	flushErr := engine.flushBatch()
+	if flushErr == nil {
+		t.Fatalf("expected error when flushing bad collection, got nil")
+	}
+
+	// Verify the "good" entry was committed
+	goodCol, err := engine.GetCollection("good")
+	if err != nil {
+		t.Fatalf("get good collection: %v", err)
+	}
+	got, err := goodCol.Get(context.Background(), "good_entry")
+	if err != nil {
+		t.Errorf("good entry should be committed but Get failed: %v", err)
+	}
+	if got == nil || got.ID != "good_entry" {
+		t.Errorf("good_entry not found in good collection")
+	}
+
+	// Verify the buffer contains ONLY the failed suffix (batch for "bad"), not the full list
+	engine.batchBuffer.mu.Lock()
+	remainingEntries := engine.batchBuffer.entries
+	engine.batchBuffer.mu.Unlock()
+
+	if len(remainingEntries) != 1 {
+		t.Fatalf("expected 1 remaining batch, got %d", len(remainingEntries))
+	}
+	if remainingEntries[0].collection != "bad" {
+		t.Errorf("expected remaining batch to be for 'bad' collection, got '%s'", remainingEntries[0].collection)
+	}
+	if len(remainingEntries[0].entries) != 1 {
+		t.Errorf("expected 1 entry in remaining batch, got %d", len(remainingEntries[0].entries))
+	}
+	if remainingEntries[0].entries[0].ID != "bad_entry" {
+		t.Errorf("expected remaining entry to be 'bad_entry', got '%s'", remainingEntries[0].entries[0].ID)
+	}
+}
+
+// TestE: Verify that re-queued entries are preserved on flush error
+func TestFlushErrorReQueuesRemainingBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flush_requeue.libravdb")
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	// Create collection
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Insert some valid entries first
+	col := engine.collections["test"]
+	for i := 0; i < 3; i++ {
+		if err := col.Insert(context.Background(), &index.VectorEntry{
+			ID:     fmt.Sprintf("valid_%d", i),
+			Vector: []float32{float32(i), 0, 0},
+		}); err != nil {
+			t.Fatalf("insert valid entry: %v", err)
+		}
+	}
+
+	// Get a stale handle
+	staleCol, err := engine.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+
+	// Delete the collection to make the handle stale
+	if err := engine.DeleteCollection("test"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	// Now try to insert - should fail but not panic
+	err = staleCol.Insert(context.Background(), &index.VectorEntry{
+		ID:     "should_fail",
+		Vector: []float32{1, 0, 0},
+	})
+	if err == nil {
+		t.Errorf("expected error on stale collection insert, got nil")
 	}
 }

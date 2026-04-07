@@ -381,3 +381,159 @@ func TestStreamingDeleteOperations(t *testing.T) {
 		t.Errorf("Expected 5 remaining vectors, got %d", len(results.Results))
 	}
 }
+
+// TestInsertPreflightNoPartialWrite verifies that Insert with an invalid-dimension
+// vector does not produce a partial write: the collection must not contain the entry.
+func TestInsertPreflightNoPartialWrite(t *testing.T) {
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	collection, err := db.CreateCollection(ctx, "preflight_test", WithDimension(3))
+	if err != nil {
+		t.Fatalf("Failed to create collection: %v", err)
+	}
+
+	// Insert a valid entry first
+	validVector := []float32{1.0, 2.0, 3.0}
+	err = collection.Insert(ctx, "valid_entry", validVector, map[string]interface{}{"type": "valid"})
+	if err != nil {
+		t.Fatalf("Failed to insert valid entry: %v", err)
+	}
+
+	// Attempt to insert an entry with wrong dimension - should fail preflight
+	badVector := []float32{1.0, 2.0} // dimension 2, not 3
+	err = collection.Insert(ctx, "bad_dimension_entry", badVector, nil)
+	if err == nil {
+		t.Fatal("Expected error for wrong dimension, got nil")
+	}
+
+	// Verify no partial commit: "bad_dimension_entry" must not exist
+	_, err = collection.Get(ctx, "bad_dimension_entry")
+	if err == nil {
+		t.Error("Expected error when getting non-existent entry, got nil - partial write may have occurred")
+	}
+
+	// Verify the valid entry is still there
+	validRecord, err := collection.Get(ctx, "valid_entry")
+	if err != nil {
+		t.Fatalf("Valid entry should still exist: %v", err)
+	}
+	if validRecord.ID != "valid_entry" {
+		t.Errorf("Expected valid_entry, got %s", validRecord.ID)
+	}
+}
+
+// TestBatchInsertPreflightNoPartialWrite verifies that InsertBatch with a bad
+// dimension entry records the failure per-item but does not commit partial work
+// for the invalid entry; the valid entry should still be committed.
+func TestBatchInsertPreflightNoPartialWrite(t *testing.T) {
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	collection, err := db.CreateCollection(ctx, "batch_preflight_test", WithDimension(3))
+	if err != nil {
+		t.Fatalf("Failed to create collection: %v", err)
+	}
+
+	// Batch with one valid entry and one invalid-dimension entry
+	entries := []*VectorEntry{
+		{ID: "batch_valid", Vector: []float32{1.0, 2.0, 3.0}, Metadata: map[string]interface{}{"type": "valid"}},
+		{ID: "batch_bad", Vector: []float32{4.0, 5.0}, Metadata: nil}, // wrong dimension
+	}
+
+	batch := collection.NewBatchInsert(entries)
+	result, err := batch.Execute(ctx)
+	if err != nil {
+		t.Fatalf("Batch execute returned unexpected error: %v", err)
+	}
+
+	// The batch itself succeeds (items processed), but the bad entry is marked failed
+	if result.Successful != 1 {
+		t.Errorf("Expected 1 successful insert, got %d", result.Successful)
+	}
+	if result.Failed != 1 {
+		t.Errorf("Expected 1 failed insert, got %d", result.Failed)
+	}
+
+	// The bad entry should be recorded as failed
+	badItemFailed := false
+	for _, item := range result.Items {
+		if item.ID == "batch_bad" && !item.Success {
+			badItemFailed = true
+		}
+	}
+	if !badItemFailed {
+		t.Error("batch_bad should be marked as failed")
+	}
+
+	// Verify the valid entry was committed
+	validRecord, err := collection.Get(ctx, "batch_valid")
+	if err != nil {
+		t.Fatalf("Valid entry batch_valid should exist: %v", err)
+	}
+	if validRecord.ID != "batch_valid" {
+		t.Errorf("Expected batch_valid, got %s", validRecord.ID)
+	}
+
+	// The bad entry should not exist
+	_, err = collection.Get(ctx, "batch_bad")
+	if err == nil {
+		t.Error("batch_bad should not exist after failed insert")
+	}
+}
+
+// TestBatchInsertDuplicateIDPreflight verifies that InsertBatch with duplicate IDs
+// correctly handles the conflict: the first entry may succeed at the storage layer
+// while the second entry fails with a duplicate-ID error from storage.
+// The key invariant is: after the batch, we must not have MORE than one entry
+// with that ID committed (no ghost entries).
+func TestBatchInsertDuplicateIDPreflight(t *testing.T) {
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	collection, err := db.CreateCollection(ctx, "dup_id_preflight_test", WithDimension(3))
+	if err != nil {
+		t.Fatalf("Failed to create collection: %v", err)
+	}
+
+	// Batch with duplicate IDs - first one succeeds, second fails at storage layer
+	entries := []*VectorEntry{
+		{ID: "dup_id", Vector: []float32{1.0, 2.0, 3.0}},
+		{ID: "dup_id", Vector: []float32{4.0, 5.0, 6.0}}, // same ID
+	}
+
+	batch := collection.NewBatchInsert(entries)
+	result, err := batch.Execute(ctx)
+	if err != nil {
+		t.Fatalf("Batch execute returned unexpected error: %v", err)
+	}
+
+	// One should succeed, one should fail
+	if result.Successful+result.Failed != 2 {
+		t.Errorf("Expected 2 items total, got %d", result.Successful+result.Failed)
+	}
+
+	// Verify at most one entry with dup_id exists (no ghost entries)
+	count := 0
+	_ = collection.Iterate(ctx, func(r Record) error {
+		if r.ID == "dup_id" {
+			count++
+		}
+		return nil
+	})
+	if count > 1 {
+		t.Errorf("Expected at most 1 dup_id entry, got %d", count)
+	}
+}

@@ -464,6 +464,19 @@ func (c *Collection) rebuildIndex(ctx context.Context) error {
 
 // Insert adds or updates a vector in the collection
 func (c *Collection) Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	// Preflight: validate dimension before acquiring write permit or mutex
+	if len(vector) != c.config.Dimension {
+		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+			len(vector), c.config.Dimension)
+	}
+
+	// Stage entry before acquiring lock (no shared state accessed yet)
+	storageEntry := &index.VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -475,19 +488,6 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 
 	if c.closed {
 		return ErrCollectionClosed
-	}
-
-	// Validate input
-	if len(vector) != c.config.Dimension {
-		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
-			len(vector), c.config.Dimension)
-	}
-
-	// Create vector entry for storage (avoiding circular imports)
-	storageEntry := &index.VectorEntry{
-		ID:       id,
-		Vector:   vector,
-		Metadata: metadata,
 	}
 
 	if exists, err := c.storage.Exists(ctx, id); err != nil {
@@ -518,12 +518,14 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
-	// Update metrics
+	// Update metrics after unlock (Prometheus counters are concurrency-safe)
 	if c.metrics != nil {
 		c.metrics.VectorInserts.Inc()
 	}
 
 	// Check if we should switch index type (automatic index selection)
+	// NOTE: checkAndSwitchIndexType is left serialized because switchIndexType()
+	// rebuilds and swaps c.index/c.config.IndexType - not proven race-free yet
 	if c.config.AutoIndexSelection {
 		if err := c.checkAndSwitchIndexType(ctx); err != nil {
 			// Log the error but don't fail the insertion
@@ -535,6 +537,36 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 }
 
 func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEntry) error {
+	// Preflight: reject nil/empty batch before acquiring write permit
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Preflight: check for nil entries
+	for i, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("entry at index %d is nil", i)
+		}
+	}
+
+	// Preflight: duplicate IDs within this batch (pure CPU, no shared state)
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, ok := seen[entry.ID]; ok {
+			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", entry.ID)
+		}
+		seen[entry.ID] = struct{}{}
+	}
+
+	// Preflight: vector dimension validation (pure CPU, no shared state)
+	dimension := c.config.Dimension
+	for _, entry := range entries {
+		if len(entry.Vector) != dimension {
+			return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+				len(entry.Vector), dimension)
+		}
+	}
+
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -548,16 +580,8 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		return ErrCollectionClosed
 	}
 
-	if len(entries) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(entries))
+	// Check existence against persisted storage (shared-state read)
 	for _, entry := range entries {
-		if _, ok := seen[entry.ID]; ok {
-			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", entry.ID)
-		}
-		seen[entry.ID] = struct{}{}
 		exists, err := c.storage.Exists(ctx, entry.ID)
 		if err != nil {
 			return fmt.Errorf("failed to check existing vector: %w", err)
@@ -580,31 +604,25 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 			return err
 		}
 	}
-	insertedIDs := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if len(entry.Vector) != c.config.Dimension {
-			return fmt.Errorf("vector dimension %d does not match collection dimension %d",
-				len(entry.Vector), c.config.Dimension)
-		}
-	}
 
 	if err := c.storage.InsertBatch(ctx, entries); err != nil {
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
-	for _, entry := range entries {
-		if err := c.index.Insert(ctx, entry); err != nil {
-			for _, storedEntry := range entries {
-				_ = c.storage.Delete(ctx, storedEntry.ID)
-			}
-			return fmt.Errorf("failed to insert into index: %w", err)
+	if err := c.index.BatchInsert(ctx, entries); err != nil {
+		for _, storedEntry := range entries {
+			_ = c.storage.Delete(ctx, storedEntry.ID)
 		}
-		insertedIDs = append(insertedIDs, entry.ID)
+		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
+	// Update metrics after unlock (Prometheus counters are concurrency-safe)
 	if c.metrics != nil {
 		c.metrics.VectorInserts.Add(float64(len(entries)))
 	}
 
+	// Check if we should switch index type (automatic index selection)
+	// NOTE: checkAndSwitchIndexType is left serialized because switchIndexType()
+	// rebuilds and swaps c.index/c.config.IndexType - not proven race-free yet
 	if c.config.AutoIndexSelection {
 		if err := c.checkAndSwitchIndexType(ctx); err != nil {
 			// TODO: Add proper logging

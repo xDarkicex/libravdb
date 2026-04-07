@@ -850,6 +850,78 @@ func TestProgressTracker(t *testing.T) {
 }
 
 // TestBatchOperations_ComprehensiveIntegration tests all enhanced features together
+func TestHNSWBatchInsert_Regression(t *testing.T) {
+	db := createTestDB(t)
+
+	// Create HNSW collection with specific parameters
+	collection, err := db.CreateCollection(context.Background(), "test_hnsw_batch", WithDimension(3), WithHNSW(16, 200, 100))
+	if err != nil {
+		t.Fatalf("Failed to create HNSW collection: %v", err)
+	}
+
+	// Create batch of 25 entries with small chunk size to force multi-chunk execution
+	entries := make([]*VectorEntry, 25)
+	for i := 0; i < 25; i++ {
+		entries[i] = &VectorEntry{
+			ID:       fmt.Sprintf("hnsw_item_%d", i),
+			Vector:   []float32{float32(i), float32(i + 1), float32(i + 2)},
+			Metadata: map[string]interface{}{"index": i, "type": "hnsw_batch_test"},
+		}
+	}
+
+	batch := collection.NewBatchInsert(entries, &BatchOptions{
+		ChunkSize:      5,  // Intentionally small to force multi-chunk execution
+		MaxConcurrency: 4,  // Enables concurrent chunk processing
+	})
+
+	result, err := batch.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("HNSW batch insert failed: %v", err)
+	}
+
+	// Verify all 25 entries succeeded
+	if result.Successful != 25 {
+		t.Fatalf("Expected 25 successful inserts, got %d", result.Successful)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("Expected 0 failed inserts, got %d", result.Failed)
+	}
+
+	// Verify all items are marked successful
+	for i, item := range result.Items {
+		if !item.Success {
+			t.Errorf("Item %d should be successful", i)
+		}
+		if item.Error != nil {
+			t.Errorf("Item %d should not have error: %v", i, item.Error)
+		}
+	}
+
+	// Verify inserted data can be retrieved via Search
+	queryVector := []float32{12.0, 13.0, 14.0}
+	searchResults, err := collection.Search(context.Background(), queryVector, 5)
+	if err != nil {
+		t.Fatalf("Search after HNSW batch insert failed: %v", err)
+	}
+
+	// Should find the nearest neighbors
+	if len(searchResults.Results) == 0 {
+		t.Fatal("Search returned no results after HNSW batch insert")
+	}
+
+	// Verify we can retrieve specific entries by ID
+	for i := 0; i < 25; i++ {
+		id := fmt.Sprintf("hnsw_item_%d", i)
+		record, err := collection.Get(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Get failed for %s: %v", id, err)
+		}
+		if record.ID != id {
+			t.Errorf("Expected ID %s, got %s", id, record.ID)
+		}
+	}
+}
+
 func TestBatchOperations_ComprehensiveIntegration(t *testing.T) {
 	db := createTestDB(t)
 

@@ -44,6 +44,11 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 const (
 	checkpointThresholdBytes = 64 << 20
 	checkpointThresholdOps   = 16384
+	// Batch WAL buffer settings: entries are buffered and flushed together
+	// to reduce fsync overhead. A batch is flushed when it reaches batchSize
+	// entries or after batchFlushInterval elapses.
+	batchSize          = 64                                      // flush when buffer reaches this many entries
+	batchFlushInterval = 10 * time.Millisecond                    // flush periodically if buffer not full
 )
 
 type fileHeader struct {
@@ -167,6 +172,28 @@ type Engine struct {
 	replayedTxs    uint64
 	discardedTxs   uint64
 	closed         bool
+
+	// WAL batch buffer: accumulates entries across multiple putRecords calls
+	// and flushes them together to reduce fsync overhead.
+	batchBuffer struct {
+		mu        sync.Mutex
+		entries   []batchEntry // accumulated entries awaiting flush
+		flusher   chan struct{} // signal to wake up flusher
+		closed    bool
+		flushNow  []chan error // completion channels for foreground flushes
+	}
+}
+
+// batchEntry holds a buffered record pending WAL flush.
+type batchEntry struct {
+	collection string
+	entries    []*index.VectorEntry
+}
+
+// startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
+// Defaults to launching the goroutine directly; can be overridden in tests.
+var startBatchFlusher = func(e *Engine) {
+	go e.batchFlusher()
 }
 
 // RecoveryStats exposes WAL replay outcomes for debugging and tests.
@@ -201,6 +228,10 @@ func New(path string) (storage.Engine, error) {
 		collections: make(map[string]*Collection),
 	}
 
+	// Initialize WAL batch buffer channels (flusher goroutine started after init succeeds)
+	engine.batchBuffer.flusher = make(chan struct{})
+	engine.batchBuffer.entries = nil
+
 	stat, err := file.Stat()
 	if err != nil {
 		file.Close()
@@ -212,6 +243,8 @@ func New(path string) (storage.Engine, error) {
 			file.Close()
 			return nil, err
 		}
+		// Start background flusher only after successful initialization
+		startBatchFlusher(engine)
 		return engine, nil
 	}
 
@@ -220,6 +253,8 @@ func New(path string) (storage.Engine, error) {
 		return nil, err
 	}
 
+	// Start background flusher only after successful open
+	startBatchFlusher(engine)
 	return engine, nil
 }
 
@@ -938,13 +973,99 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	return e.maybeCheckpointLocked()
 }
 
-func (e *Engine) putRecords(name string, entries []*index.VectorEntry) error {
+// batchFlusher is a background goroutine that periodically flushes the WAL batch buffer.
+// It wakes up every batchFlushInterval and flushes any accumulated entries.
+func (e *Engine) batchFlusher() {
+	ticker := time.NewTicker(batchFlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			e.flushBatch()
+		case <-e.batchBuffer.flusher:
+			e.flushBatch()
+		case <-time.After(batchFlushInterval):
+			// Double-check after timeout
+			e.flushBatch()
+		}
+		// Check if the engine is closed
+		e.batchBuffer.mu.Lock()
+		closed := e.batchBuffer.closed
+		e.batchBuffer.mu.Unlock()
+		if closed {
+			return
+		}
+	}
+}
+
+// flushBatch flushes all accumulated entries in the batch buffer to WAL.
+// It acquires the engine mutex and writes all buffered entries as a single transaction.
+// If the buffer is empty, this is a no-op.
+// After flushing, it signals any waiting foreground flush completions.
+// Returns the first error encountered during flush, or nil on success.
+func (e *Engine) flushBatch() error {
+	e.batchBuffer.mu.Lock()
+	if len(e.batchBuffer.entries) == 0 && len(e.batchBuffer.flushNow) == 0 {
+		e.batchBuffer.mu.Unlock()
+		return nil
+	}
+	// Take ownership of the buffer and reset
+	entries := e.batchBuffer.entries
+	e.batchBuffer.entries = nil
+	// Take ownership of pending flush completions
+	pendingFlushes := e.batchBuffer.flushNow
+	e.batchBuffer.flushNow = nil
+	e.batchBuffer.mu.Unlock()
+
+	// Nothing to flush and no one waiting
+	if len(entries) == 0 && len(pendingFlushes) == 0 {
+		return nil
+	}
+
+	// Acquire engine lock for state modifications
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Signal all waiters with the result
+	var firstErr error
+	signalErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		for _, done := range pendingFlushes {
+			done <- err
+		}
+	}
+
 	if e.closed {
+		// Signal any waiting flushes with error
+		signalErr(fmt.Errorf("database is closed"))
 		return fmt.Errorf("database is closed")
 	}
+
+	// Write all entries to WAL - inline the put logic to avoid lock issues
+	for i, batch := range entries {
+		if err := e.putRecordsInlocked(batch.collection, batch.entries); err != nil {
+			// On error, re-queue only the failed suffix (entries[i:] onwards).
+			// Do NOT re-queue entries[:i] because they were already committed.
+			failedSuffix := entries[i:]
+			e.batchBuffer.mu.Lock()
+			e.batchBuffer.entries = append(failedSuffix, e.batchBuffer.entries...)
+			e.batchBuffer.mu.Unlock()
+			signalErr(err)
+			return err
+		}
+	}
+
+	// Signal all waiting foreground flush completions with success
+	signalErr(nil)
+	return nil
+}
+
+// putRecordsInlocked writes records to WAL and applies them to memory.
+// Caller must hold e.mu. This is the internal batch-friendly variant.
+func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) error {
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
@@ -1005,7 +1126,60 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) error {
 		}
 	}
 	e.markDirtyLocked(written, len(ownedVectors))
-	return e.maybeCheckpointLocked()
+	if err := e.maybeCheckpointLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) putRecords(name string, entries []*index.VectorEntry) error {
+	if e.closed {
+		return fmt.Errorf("database is closed")
+	}
+
+	// Add entries to batch buffer
+	e.batchBuffer.mu.Lock()
+	shouldFlush := len(e.batchBuffer.entries)+1 >= batchSize
+	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
+		collection: name,
+		entries:    entries,
+	})
+	e.batchBuffer.mu.Unlock()
+
+	// Signal the flusher and return immediately
+	select {
+	case e.batchBuffer.flusher <- struct{}{}:
+	default:
+	}
+
+	// If we've reached batch size, do a synchronous flush before returning.
+	// This ensures durability for this caller's data.
+	if shouldFlush {
+		return e.flushBatch()
+	}
+
+	return nil
+}
+
+// flushNow forces an immediate flush of the batch buffer and waits for completion.
+// This is used by single-record Insert to ensure immediate durability.
+// Returns the error from the flush operation, or nil on success.
+func (e *Engine) flushNow() error {
+	done := make(chan error)
+	e.batchBuffer.mu.Lock()
+	// Only add to pending flushes if there's actually something to flush
+	// or if we want to ensure any in-progress flush completes
+	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
+	e.batchBuffer.mu.Unlock()
+
+	// Signal the flusher
+	select {
+	case e.batchBuffer.flusher <- struct{}{}:
+	default:
+	}
+
+	// Wait for flush to complete and return the error
+	return <-done
 }
 
 func (e *Engine) deleteRecord(name, id string) error {
@@ -1291,6 +1465,17 @@ func (e *Engine) DeleteCollection(name string) error {
 
 // Close checkpoints and closes the database file.
 func (e *Engine) Close() error {
+	// Signal the batch flusher to stop and flush remaining entries.
+	e.batchBuffer.mu.Lock()
+	if !e.batchBuffer.closed {
+		e.batchBuffer.closed = true
+		close(e.batchBuffer.flusher)
+	}
+	e.batchBuffer.mu.Unlock()
+
+	// Flush any remaining buffered entries before close.
+	e.flushBatch()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
@@ -1398,15 +1583,24 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 }
 
 // Insert persists a single vector entry.
+// It ensures immediate durability by forcing a flush before returning.
 func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error {
 	_ = ctx
-	return c.engine.putRecords(c.name, []*index.VectorEntry{entry})
+	if err := c.engine.putRecords(c.name, []*index.VectorEntry{entry}); err != nil {
+		return err
+	}
+	return c.engine.flushNow()
 }
 
 // InsertBatch persists multiple vector entries.
+// It uses buffered batching for better throughput, but ensures data is flushed
+// before returning so callers can immediately see the inserted data.
 func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEntry) error {
 	_ = ctx
-	return c.engine.putRecords(c.name, entries)
+	if err := c.engine.putRecords(c.name, entries); err != nil {
+		return err
+	}
+	return c.engine.flushNow()
 }
 
 // Get returns a persisted entry by ID.
