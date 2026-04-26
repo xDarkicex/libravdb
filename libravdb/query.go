@@ -500,8 +500,8 @@ func (qb *QueryBuilder) applyFiltersToRecords(records []Record, filters []filter
 	for _, entry := range filteredEntries {
 		filteredRecords = append(filteredRecords, Record{
 			ID:       entry.ID,
-			Vector:   cloneVector(entry.Vector),
-			Metadata: cloneMetadata(entry.Metadata),
+			Vector:   entry.Vector,
+			Metadata: entry.Metadata,
 		})
 	}
 
@@ -554,8 +554,8 @@ func recordsFromSearchResults(results []*SearchResult) []Record {
 	for _, result := range results {
 		records = append(records, Record{
 			ID:       result.ID,
-			Vector:   cloneVector(result.Vector),
-			Metadata: cloneMetadata(result.Metadata),
+			Vector:   result.Vector,
+			Metadata: result.Metadata,
 			Version:  result.Version,
 		})
 	}
