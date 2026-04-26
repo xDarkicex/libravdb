@@ -211,9 +211,37 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		k = len(allResults)
 	}
 	results := make([]*SearchResult, k)
-	copy(results, allResults[:k])
+	for i := range k {
+		r := allResults[i]
+		entry := idx.vectors[idx.idToIndex[r.ID]]
+		results[i] = &SearchResult{
+			ID:       r.ID,
+			Score:    r.Score,
+			Vector:   cloneFloat32(entry.Vector),
+			Metadata: cloneMetadata(entry.Metadata),
+			Version:  entry.Version,
+		}
+	}
 
 	return results, nil
+}
+
+func cloneFloat32(v []float32) []float32 {
+	if v == nil {
+		return nil
+	}
+	return append([]float32(nil), v...)
+}
+
+func cloneMetadata(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
 }
 
 // Delete removes a vector from the index

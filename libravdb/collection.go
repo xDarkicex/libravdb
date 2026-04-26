@@ -2235,8 +2235,8 @@ func filterEntriesFromRecords(records []Record) []*filter.VectorEntry {
 	for _, record := range records {
 		entries = append(entries, &filter.VectorEntry{
 			ID:       record.ID,
-			Vector:   cloneVector(record.Vector),
-			Metadata: cloneMetadata(record.Metadata),
+			Vector:   record.Vector,
+			Metadata: record.Metadata,
 		})
 	}
 	return entries

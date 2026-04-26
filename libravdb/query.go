@@ -488,15 +488,7 @@ func (qb *QueryBuilder) applyThreshold(results []*SearchResult) []*SearchResult 
 
 func (qb *QueryBuilder) applyFiltersToRecords(records []Record, filters []filter.Filter) ([]Record, error) {
 	if len(filters) == 0 {
-		copied := make([]Record, 0, len(records))
-		for _, record := range records {
-			copied = append(copied, Record{
-				ID:       record.ID,
-				Vector:   cloneVector(record.Vector),
-				Metadata: cloneMetadata(record.Metadata),
-			})
-		}
-		return copied, nil
+		return records, nil
 	}
 
 	filteredEntries, err := qb.applyFilterEntries(filterEntriesFromRecords(records), filters)
