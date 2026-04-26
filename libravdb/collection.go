@@ -1139,8 +1139,8 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []VectorEntry) err
 	for _, entry := range entries {
 		indexEntries = append(indexEntries, &index.VectorEntry{
 			ID:       entry.ID,
-			Vector:   cloneVector(entry.Vector),
-			Metadata: cloneMetadata(entry.Metadata),
+			Vector:   entry.Vector,
+			Metadata: entry.Metadata,
 		})
 	}
 	return c.insertBatch(ctx, indexEntries)
@@ -2169,23 +2169,10 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, error) {
 	var vectors []*index.VectorEntry
 
-	// Iterate over all shards if sharded, otherwise iterate over single storage
 	if c.shards != nil {
 		for i := range c.shards {
 			err := c.shards[i].storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-				// Create a copy to avoid reference issues
-				vectorCopy := &index.VectorEntry{
-					ID:       entry.ID,
-					Ordinal:  entry.Ordinal,
-					Vector:   make([]float32, len(entry.Vector)),
-					Metadata: make(map[string]interface{}),
-					Version:  entry.Version,
-				}
-				copy(vectorCopy.Vector, entry.Vector)
-				for k, v := range entry.Metadata {
-					vectorCopy.Metadata[k] = v
-				}
-				vectors = append(vectors, vectorCopy)
+				vectors = append(vectors, entry)
 				return nil
 			})
 			if err != nil {
@@ -2194,19 +2181,7 @@ func (c *Collection) getAllVectors(ctx context.Context) ([]*index.VectorEntry, e
 		}
 	} else {
 		err := c.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
-			// Create a copy to avoid reference issues
-			vectorCopy := &index.VectorEntry{
-				ID:       entry.ID,
-				Ordinal:  entry.Ordinal,
-				Vector:   make([]float32, len(entry.Vector)),
-				Metadata: make(map[string]interface{}),
-				Version:  entry.Version,
-			}
-			copy(vectorCopy.Vector, entry.Vector)
-			for k, v := range entry.Metadata {
-				vectorCopy.Metadata[k] = v
-			}
-			vectors = append(vectors, vectorCopy)
+			vectors = append(vectors, entry)
 			return nil
 		})
 		if err != nil {
@@ -2224,8 +2199,8 @@ func recordFromIndexEntry(entry *index.VectorEntry) Record {
 
 	return Record{
 		ID:       entry.ID,
-		Vector:   cloneVector(entry.Vector),
-		Metadata: cloneMetadata(entry.Metadata),
+		Vector:   entry.Vector,
+		Metadata: entry.Metadata,
 		Version:  entry.Version,
 	}
 }

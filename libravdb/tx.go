@@ -47,6 +47,12 @@ type Tx interface {
 	UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error
 	DeleteIfVersion(ctx context.Context, collection, id string, expectedVersion uint64) error
 	DeleteBatch(ctx context.Context, collection string, ids []string) error
+	// InsertOwned is like Insert but takes ownership of vector and metadata slices/maps.
+	// The caller must not read or write them after the call returns.
+	InsertOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
+	// UpdateOwned is like Update but takes ownership of vector and metadata slices/maps.
+	// The caller must not read or write them after the call returns.
+	UpdateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
 }
@@ -126,8 +132,25 @@ func (tx *transaction) Insert(ctx context.Context, collection, id string, vector
 	})
 }
 
+func (tx *transaction) InsertOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	if err := tx.validateStage(ctx, collection, id, vector, true); err != nil {
+		return err
+	}
+	return tx.append(txMutation{
+		kind:       txMutationInsert,
+		collection: collection,
+		id:         id,
+		vector:     vector,
+		metadata:   metadata,
+	})
+}
+
 func (tx *transaction) Update(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
 	return tx.update(ctx, collection, id, vector, metadata, 0, false)
+}
+
+func (tx *transaction) UpdateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	return tx.updateOwned(ctx, collection, id, vector, metadata, 0, false)
 }
 
 func (tx *transaction) UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
@@ -144,6 +167,21 @@ func (tx *transaction) update(ctx context.Context, collection, id string, vector
 		id:                 id,
 		vector:             cloneVector(vector),
 		metadata:           cloneMetadata(metadata),
+		hasExpectedVersion: hasExpectedVersion,
+		expectedVersion:    expectedVersion,
+	})
+}
+
+func (tx *transaction) updateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64, hasExpectedVersion bool) error {
+	if err := tx.validateStage(ctx, collection, id, vector, false); err != nil {
+		return err
+	}
+	return tx.append(txMutation{
+		kind:               txMutationUpdate,
+		collection:         collection,
+		id:                 id,
+		vector:             vector,
+		metadata:           metadata,
 		hasExpectedVersion: hasExpectedVersion,
 		expectedVersion:    expectedVersion,
 	})
@@ -430,8 +468,8 @@ func buildTransactionState(ctx context.Context, collections map[string]*Collecti
 		base := make(map[string]*index.VectorEntry, len(entries))
 		working := make(map[string]*index.VectorEntry, len(entries))
 		for _, entry := range entries {
-			base[entry.ID] = cloneIndexEntry(entry)
-			working[entry.ID] = cloneIndexEntry(entry)
+			base[entry.ID] = entry
+			working[entry.ID] = entry
 		}
 
 		state.collections[name] = &txCollectionState{
@@ -472,8 +510,8 @@ func (s *txCommitState) apply(ops []txMutation) error {
 
 			replacement := &index.VectorEntry{
 				ID:       op.id,
-				Vector:   cloneVector(op.vector),
-				Metadata: cloneMetadata(op.metadata),
+				Vector:   op.vector,
+				Metadata: op.metadata,
 			}
 			if current != nil {
 				replacement.Ordinal = current.Ordinal
@@ -552,8 +590,8 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 					Collection:         collectionName,
 					ID:                 id,
 					Ordinal:            after.Ordinal,
-					Vector:             cloneVector(after.Vector),
-					Metadata:           cloneMetadata(after.Metadata),
+					Vector:             after.Vector,
+					Metadata:           after.Metadata,
 					ExpectedVersion:    expectedVersion,
 					HasExpectedVersion: hasExpectedVersion,
 				})
@@ -606,7 +644,7 @@ func (s *txCommitState) buildIndexes(ctx context.Context, names []string) (map[s
 		state := s.collections[name]
 		entries := make([]*index.VectorEntry, 0, len(state.working))
 		for _, entry := range state.working {
-			entries = append(entries, cloneIndexEntry(entry))
+			entries = append(entries, entry)
 		}
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].ID < entries[j].ID

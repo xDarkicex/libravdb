@@ -1027,6 +1027,9 @@ func (e *Engine) batchFlusher() {
 	ticker := time.NewTicker(batchFlushInterval)
 	defer ticker.Stop()
 
+	timer := time.NewTimer(batchFlushInterval)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
@@ -1037,10 +1040,18 @@ func (e *Engine) batchFlusher() {
 				time.Sleep(delay)
 			}
 			e.flushBatch()
-		case <-time.After(batchFlushInterval):
-			// Double-check after timeout
+		case <-timer.C:
 			e.flushBatch()
 		}
+		// Reset timer for next iteration
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(batchFlushInterval)
+
 		// Check if the engine is closed
 		e.batchBuffer.mu.Lock()
 		closed := e.batchBuffer.closed
@@ -1578,9 +1589,14 @@ func (e *Engine) Close() error {
 	e.batchBuffer.mu.Lock()
 	if !e.batchBuffer.closed {
 		e.batchBuffer.closed = true
-		close(e.batchBuffer.flusher)
 	}
 	e.batchBuffer.mu.Unlock()
+
+	// Wake the flusher so it checks the closed flag promptly.
+	select {
+	case e.batchBuffer.flusher <- struct{}{}:
+	default:
+	}
 
 	// Flush any remaining buffered entries before close.
 	e.flushBatch()
