@@ -103,6 +103,10 @@ type trainableIndex interface {
 	IsTrained() bool
 }
 
+func (c *Collection) Dimension() int {
+	return c.config.Dimension
+}
+
 func (c *Collection) mutationStripe(id string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(id))
