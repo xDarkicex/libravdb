@@ -550,7 +550,7 @@ func (s *txCommitState) apply(ops []txMutation) error {
 				if _, existed := state.base[op.id]; existed {
 					continue
 				}
-				return fmt.Errorf("%w: vector with ID %s not found", ErrTxValidation, op.id)
+				continue
 			}
 			delete(state.working, op.id)
 		default:
