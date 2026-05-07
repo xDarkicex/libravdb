@@ -14,6 +14,7 @@ import (
 var (
 	ErrDatabaseClosed     = errors.New("database is closed")
 	ErrCollectionClosed   = errors.New("collection is closed")
+	ErrCollectionExists   = errors.New("collection already exists")
 	ErrTooManyCollections = errors.New("maximum number of collections exceeded")
 	ErrCollectionNotFound = errors.New("collection not found")
 	ErrInvalidDimension   = errors.New("invalid vector dimension")

@@ -93,7 +93,7 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 	}
 
 	if _, exists := db.collections[name]; exists {
-		return nil, fmt.Errorf("collection %s already exists", name)
+		return nil, fmt.Errorf("collection %s already exists: %w", name, ErrCollectionExists)
 	}
 
 	if len(db.collections) >= db.config.MaxCollections {
