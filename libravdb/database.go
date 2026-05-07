@@ -4,6 +4,7 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -108,6 +109,95 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 
 	db.collections[name] = collection
 	return collection, nil
+}
+
+// EnsureCollection gets an existing collection, or creates it with the given options.
+// If the collection exists but its dimension differs from the requested dimension,
+// it is dropped and recreated atomically before being returned.
+// This prevents corrupted-DB scenarios where EnsureAuthoredCollections ran before
+// the embedding model loaded, creating a dim=1 collection instead of the model's
+// actual dimension.
+func (db *Database) EnsureCollection(ctx context.Context, name string, dimension int, opts ...CollectionOption) (*Collection, error) {
+	if dimension <= 0 {
+		return nil, ErrInvalidDimension
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed {
+		return nil, ErrDatabaseClosed
+	}
+
+	// Fast path: collection exists with correct dimension.
+	if col, exists := db.collections[name]; exists {
+		if col.Dimension() == dimension {
+			return col, nil
+		}
+		// Dimension mismatch — drop and recreate atomically.
+		if err := db.deleteCollectionLocked(col, name); err != nil {
+			return nil, fmt.Errorf("failed to drop mismatched collection %q: %w", name, err)
+		}
+		// Fall through to create.
+	}
+
+	col, err := db.createCollectionLocked(name, opts...)
+	if err == nil {
+		return col, nil
+	}
+	if errors.Is(err, ErrCollectionExists) {
+		// Another caller raced and created it. Use it if dimension matches.
+		if col, getErr := db.getCollectionLocked(name); getErr == nil {
+			if col.Dimension() == dimension {
+				return col, nil
+			}
+			return nil, fmt.Errorf("%w: collection %q has dimension %d, want %d", ErrDimensionMismatch, name, col.Dimension(), dimension)
+		}
+	}
+	return nil, err
+}
+
+// createCollectionLocked creates a collection. Caller must hold db.mu.
+func (db *Database) createCollectionLocked(name string, opts ...CollectionOption) (*Collection, error) {
+	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create collection: %w", err)
+	}
+	collection.db = db
+	db.collections[name] = collection
+	return collection, nil
+}
+
+// deleteCollectionLocked deletes a collection from memory and storage.
+// Caller must hold db.mu. Returns error without altering the map on failure.
+func (db *Database) deleteCollectionLocked(col *Collection, name string) error {
+	delete(db.collections, name)
+	if err := col.Close(); err != nil {
+		db.collections[name] = col
+		return fmt.Errorf("failed to close collection %s: %w", name, err)
+	}
+	isSharded := col.config.Sharded
+	if isSharded {
+		for _, shardName := range shardStorageNames(name) {
+			if err := db.storage.DeleteCollection(shardName); err != nil {
+				return fmt.Errorf("failed to delete shard %s: %w", shardName, err)
+			}
+		}
+		return nil
+	}
+	if err := db.storage.DeleteCollection(name); err != nil {
+		return err
+	}
+	return nil
+}
+
+// getCollectionLocked returns a collection from db.collections without storage lookup.
+// Caller must hold db.mu.
+func (db *Database) getCollectionLocked(name string) (*Collection, error) {
+	if col, exists := db.collections[name]; exists {
+		return col, nil
+	}
+	return nil, ErrCollectionNotFound
 }
 
 // GetCollection retrieves an existing collection by name

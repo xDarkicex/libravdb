@@ -18,6 +18,7 @@ var (
 	ErrTooManyCollections = errors.New("maximum number of collections exceeded")
 	ErrCollectionNotFound = errors.New("collection not found")
 	ErrInvalidDimension   = errors.New("invalid vector dimension")
+	ErrDimensionMismatch  = errors.New("collection dimension does not match")
 	ErrInvalidK           = errors.New("k must be positive")
 	ErrEmptyIndex         = errors.New("index is empty")
 )
