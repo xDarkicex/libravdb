@@ -21,6 +21,7 @@ const (
 	valueTypeString
 	valueTypeInt
 	valueTypeInt64
+	valueTypeUint64
 	valueTypeFloat32
 	valueTypeFloat64
 	valueTypeStringSlice
@@ -430,9 +431,33 @@ func (enc *binaryEncoder) writeValue(value interface{}) error {
 	case int:
 		enc.writeByte(valueTypeInt)
 		enc.writeUint64(uint64(typed))
+	case int8:
+		enc.writeByte(valueTypeInt64)
+		enc.writeUint64(uint64(int64(typed)))
+	case int16:
+		enc.writeByte(valueTypeInt64)
+		enc.writeUint64(uint64(int64(typed)))
+	case int32:
+		enc.writeByte(valueTypeInt64)
+		enc.writeUint64(uint64(int64(typed)))
 	case int64:
 		enc.writeByte(valueTypeInt64)
 		enc.writeUint64(uint64(typed))
+	case uint:
+		enc.writeByte(valueTypeUint64)
+		enc.writeUint64(uint64(typed))
+	case uint8:
+		enc.writeByte(valueTypeUint64)
+		enc.writeUint64(uint64(typed))
+	case uint16:
+		enc.writeByte(valueTypeUint64)
+		enc.writeUint64(uint64(typed))
+	case uint32:
+		enc.writeByte(valueTypeUint64)
+		enc.writeUint64(uint64(typed))
+	case uint64:
+		enc.writeByte(valueTypeUint64)
+		enc.writeUint64(typed)
 	case float32:
 		enc.writeByte(valueTypeFloat32)
 		enc.writeFloat32(typed)
@@ -519,7 +544,7 @@ func estimateValueSize(value interface{}) int {
 		return 2
 	case string:
 		return 1 + 4 + len(typed)
-	case int, int64:
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return 1 + 8
 	case float32:
 		return 1 + 4
@@ -853,6 +878,8 @@ func (dec *binaryDecoder) readValue() (interface{}, error) {
 	case valueTypeInt64:
 		value, err := dec.readUint64()
 		return int64(value), err
+	case valueTypeUint64:
+		return dec.readUint64()
 	case valueTypeFloat32:
 		return dec.readFloat32()
 	case valueTypeFloat64:
