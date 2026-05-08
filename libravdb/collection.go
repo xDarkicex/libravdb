@@ -1080,22 +1080,24 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		unlock := c.lockMutationIDs([]string{id})
 		defer unlock()
 		defer c.mu.RUnlock()
+		var indexErr error
 		if entry, err := c.storage.Get(ctx, id); err == nil {
-			if deleter, ok := c.index.(interface {
-				DeleteByOrdinal(context.Context, uint32) error
-			}); ok {
-				if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
-					return fmt.Errorf("failed to delete vector from index: %w", err)
-				}
-			} else if err := c.index.Delete(ctx, id); err != nil {
-				return fmt.Errorf("failed to delete vector from index: %w", err)
-			}
-		} else if err := c.index.Delete(ctx, id); err != nil {
-			return fmt.Errorf("failed to delete vector from index: %w", err)
+			indexErr = deleteIndexEntry(ctx, c.index, id, entry.Ordinal)
+		} else {
+			indexErr = c.index.Delete(ctx, id)
 		}
 
 		if err := c.storage.Delete(ctx, id); err != nil {
-			return fmt.Errorf("failed to write deletion to storage: %w", err)
+			if !isNotFoundError(err) {
+				return fmt.Errorf("failed to write deletion to storage: %w", err)
+			}
+		}
+		if indexErr != nil {
+			if !isNotFoundError(indexErr) {
+				if rebuildErr := c.rebuildIndex(ctx); rebuildErr != nil {
+					return fmt.Errorf("failed to delete vector from index: %w; rebuild after delete also failed: %v", indexErr, rebuildErr)
+				}
+			}
 		}
 
 		// Update metrics
@@ -1111,22 +1113,25 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	defer c.mu.RUnlock()
 	defer shard.mu.Unlock()
 
+	var indexErr error
 	if entry, err := shard.storage.Get(ctx, id); err == nil {
-		if deleter, ok := shard.index.(interface {
-			DeleteByOrdinal(context.Context, uint32) error
-		}); ok {
-			if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
-				return fmt.Errorf("failed to delete vector from index: %w", err)
-			}
-		} else if err := shard.index.Delete(ctx, id); err != nil {
-			return fmt.Errorf("failed to delete vector from index: %w", err)
-		}
-	} else if err := shard.index.Delete(ctx, id); err != nil {
-		return fmt.Errorf("failed to delete vector from index: %w", err)
+		indexErr = deleteIndexEntry(ctx, shard.index, id, entry.Ordinal)
+	} else {
+		indexErr = shard.index.Delete(ctx, id)
 	}
 
 	if err := shard.storage.Delete(ctx, id); err != nil {
-		return fmt.Errorf("failed to write deletion to storage: %w", err)
+		if !isNotFoundError(err) {
+			return fmt.Errorf("failed to write deletion to storage: %w", err)
+		}
+	}
+	if indexErr != nil {
+		if !isNotFoundError(indexErr) {
+			shardIdx := shardForID(id)
+			if rebuildErr := c.rebuildShardIndex(ctx, shardIdx); rebuildErr != nil {
+				return fmt.Errorf("failed to delete vector from shard index: %w; rebuild after delete also failed: %v", indexErr, rebuildErr)
+			}
+		}
 	}
 
 	// Update metrics
@@ -1135,6 +1140,28 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+func deleteIndexEntry(ctx context.Context, idx index.Index, id string, ordinal uint32) error {
+	if deleter, ok := idx.(interface {
+		DeleteByOrdinal(context.Context, uint32) error
+	}); ok {
+		if err := deleter.DeleteByOrdinal(ctx, ordinal); err == nil || !isNotFoundError(err) {
+			return err
+		}
+	}
+	return idx.Delete(ctx, id)
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "index is empty") ||
+		strings.Contains(msg, "cannot delete from empty index")
 }
 
 // InsertBatch inserts multiple vectors using the public collection API.

@@ -243,6 +243,83 @@ func TestDeleteBatchRemovesRecordsFromIterationAndSearch(t *testing.T) {
 	}
 }
 
+func TestDeleteIsIdempotentAndRepairsStaleIndexEntry(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "delete_repairs_index", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(ctx, "stale", []float32{1, 0, 0}, map[string]interface{}{"source_doc": "daily.md"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Simulate a partial cleanup that removed durable storage but left the
+	// in-memory index with a stale entry.
+	if err := collection.storage.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("direct storage delete: %v", err)
+	}
+	if err := collection.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("repairing delete should be idempotent, got %v", err)
+	}
+	if err := collection.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("second delete should remain idempotent, got %v", err)
+	}
+
+	results, err := collection.Search(ctx, []float32{1, 0, 0}, 10)
+	if err != nil {
+		t.Fatalf("search after repair delete: %v", err)
+	}
+	for _, result := range results.Results {
+		if result.ID == "stale" {
+			t.Fatalf("stale record remained searchable after repair delete: %+v", results.Results)
+		}
+	}
+}
+
+func TestShardedDeleteIsIdempotentAndRepairsStaleIndexEntry(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "sharded_delete_repairs_index", WithDimension(3), WithSharding(true))
+	if err != nil {
+		t.Fatalf("create sharded collection: %v", err)
+	}
+	if err := collection.Insert(ctx, "stale", []float32{1, 0, 0}, map[string]interface{}{"source_doc": "daily.md"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	shard := collection.getShard("stale")
+	if err := shard.storage.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("direct shard storage delete: %v", err)
+	}
+	if err := collection.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("repairing sharded delete should be idempotent, got %v", err)
+	}
+	if err := collection.Delete(ctx, "stale"); err != nil {
+		t.Fatalf("second sharded delete should remain idempotent, got %v", err)
+	}
+
+	results, err := collection.Search(ctx, []float32{1, 0, 0}, 10)
+	if err != nil {
+		t.Fatalf("sharded search after repair delete: %v", err)
+	}
+	for _, result := range results.Results {
+		if result.ID == "stale" {
+			t.Fatalf("stale sharded record remained searchable after repair delete: %+v", results.Results)
+		}
+	}
+}
+
 func TestListByMetadataWorksBeforeAndAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)

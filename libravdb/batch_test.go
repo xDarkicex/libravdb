@@ -402,12 +402,12 @@ func TestBatchDelete_Basic(t *testing.T) {
 		t.Fatalf("Batch delete failed: %v", err)
 	}
 
-	// Since delete isn't implemented yet, all should fail
-	if result.Failed != 3 {
-		t.Errorf("Expected 3 failed deletes, got %d", result.Failed)
+	// Missing IDs are idempotent deletes.
+	if result.Failed != 0 {
+		t.Errorf("Expected 0 failed deletes, got %d", result.Failed)
 	}
-	if result.Successful != 0 {
-		t.Errorf("Expected 0 successful deletes, got %d", result.Successful)
+	if result.Successful != 3 {
+		t.Errorf("Expected 3 successful deletes, got %d", result.Successful)
 	}
 }
 
@@ -430,9 +430,12 @@ func TestBatchDelete_Validation(t *testing.T) {
 		t.Fatalf("Batch delete failed: %v", err)
 	}
 
-	// All should fail - empty ID validation + missing delete implementation
-	if result.Failed != 3 {
-		t.Errorf("Expected 3 failed deletes, got %d", result.Failed)
+	// Missing IDs are idempotent deletes; only the empty ID is invalid.
+	if result.Failed != 1 {
+		t.Errorf("Expected 1 failed delete, got %d", result.Failed)
+	}
+	if result.Successful != 2 {
+		t.Errorf("Expected 2 successful deletes, got %d", result.Successful)
 	}
 
 	// Check that empty ID error is properly reported
@@ -796,14 +799,14 @@ func TestBatchDelete_EnhancedErrorHandling(t *testing.T) {
 		t.Fatalf("Batch delete failed: %v", err)
 	}
 
-	// All should fail (validation + not implemented)
-	if result.Failed != 3 {
-		t.Errorf("Expected 3 failed deletes, got %d", result.Failed)
+	// Missing IDs are idempotent deletes; only validation errors fail.
+	if result.Failed != 1 {
+		t.Errorf("Expected 1 failed delete, got %d", result.Failed)
 	}
 
 	// Verify error callbacks
-	if len(errorCallbacks) != 3 {
-		t.Errorf("Expected 3 error callbacks, got %d", len(errorCallbacks))
+	if len(errorCallbacks) != 1 {
+		t.Errorf("Expected 1 error callback, got %d", len(errorCallbacks))
 	}
 }
 

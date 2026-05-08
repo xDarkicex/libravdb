@@ -418,8 +418,9 @@ func TestRollbackDataConsistency(t *testing.T) {
 			}
 		}
 
-		// Attempt batch delete that will fail
-		idsToDelete := []string{"delete1", "delete2", "nonexistent"}
+		// Attempt batch delete that will fail validation after staging prior deletes.
+		// Missing IDs are idempotent deletes, so use an empty ID to exercise rollback.
+		idsToDelete := []string{"delete1", "delete2", ""}
 
 		batch := collection.NewBatchDelete(idsToDelete, &BatchOptions{
 			EnableRollback: true,
@@ -427,7 +428,7 @@ func TestRollbackDataConsistency(t *testing.T) {
 		})
 		result, err := batch.Execute(ctx)
 		if err == nil {
-			t.Fatal("Expected error due to nonexistent ID, but got none")
+			t.Fatal("Expected error due to empty ID, but got none")
 		}
 		if !result.RollbackRequired {
 			t.Errorf("Expected RollbackRequired to be true, got false")
