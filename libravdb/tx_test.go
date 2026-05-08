@@ -45,6 +45,56 @@ func TestCASSuccessIncrementsVersion(t *testing.T) {
 	}
 }
 
+func TestTxListByMetadataReadsStagedView(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "tx_list_meta", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(ctx, "drop", []float32{1, 0, 0}, map[string]interface{}{"source_doc": "guide.md"}); err != nil {
+		t.Fatalf("seed drop: %v", err)
+	}
+	if err := collection.Insert(ctx, "keep", []float32{0, 1, 0}, map[string]interface{}{"source_doc": "other.md"}); err != nil {
+		t.Fatalf("seed keep: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := tx.Delete(ctx, "tx_list_meta", "drop"); err != nil {
+		t.Fatalf("stage delete: %v", err)
+	}
+	if err := tx.Insert(ctx, "tx_list_meta", "new", []float32{0, 0, 1}, map[string]interface{}{"source_doc": "guide.md"}); err != nil {
+		t.Fatalf("stage insert: %v", err)
+	}
+
+	guide, err := tx.ListByMetadata(ctx, "tx_list_meta", "source_doc", "guide.md")
+	if err != nil {
+		t.Fatalf("tx list guide: %v", err)
+	}
+	if len(guide) != 1 || guide[0].ID != "new" {
+		t.Fatalf("tx staged guide records = %+v, want only new", guide)
+	}
+	other, err := tx.ListByMetadata(ctx, "tx_list_meta", "source_doc", "other.md")
+	if err != nil {
+		t.Fatalf("tx list other: %v", err)
+	}
+	if len(other) != 1 || other[0].ID != "keep" {
+		t.Fatalf("tx staged other records = %+v, want keep", other)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+}
+
 func TestCASStaleConflictLeavesRowIntact(t *testing.T) {
 	ctx := context.Background()
 	db, err := New(WithStoragePath(testDBPath(t)))

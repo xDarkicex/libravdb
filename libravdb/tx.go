@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ type Tx interface {
 	UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error
 	DeleteIfVersion(ctx context.Context, collection, id string, expectedVersion uint64) error
 	DeleteBatch(ctx context.Context, collection string, ids []string) error
+	ListByMetadata(ctx context.Context, collection, field string, value interface{}) ([]Record, error)
 	// InsertOwned is like Insert but takes ownership of vector and metadata slices/maps.
 	// The caller must not read or write them after the call returns.
 	InsertOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
@@ -224,6 +226,95 @@ func (tx *transaction) DeleteBatch(ctx context.Context, collection string, ids [
 		}
 	}
 	return nil
+}
+
+func (tx *transaction) ListByMetadata(ctx context.Context, collection, field string, value interface{}) ([]Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if collection == "" {
+		return nil, fmt.Errorf("%w: collection name cannot be empty", ErrTxValidation)
+	}
+	if field == "" {
+		return nil, fmt.Errorf("%w: metadata field cannot be empty", ErrTxValidation)
+	}
+
+	tx.mu.Lock()
+	if tx.closed {
+		tx.mu.Unlock()
+		return nil, ErrTxClosed
+	}
+	ops := append([]txMutation(nil), tx.ops...)
+	tx.mu.Unlock()
+
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCollectionNotFound, err)
+	}
+	entries, err := coll.getAllVectors(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	working := make(map[string]*index.VectorEntry, len(entries))
+	for _, entry := range entries {
+		working[entry.ID] = entry
+	}
+	for _, op := range ops {
+		if op.collection != collection {
+			continue
+		}
+		switch op.kind {
+		case txMutationInsert:
+			working[op.id] = &index.VectorEntry{
+				ID:       op.id,
+				Vector:   op.vector,
+				Metadata: op.metadata,
+			}
+		case txMutationUpdate:
+			current := working[op.id]
+			if current == nil {
+				continue
+			}
+			updated := cloneIndexEntry(current)
+			if op.vector != nil {
+				updated.Vector = cloneVector(op.vector)
+			}
+			if op.metadata != nil {
+				merged := cloneMetadata(current.Metadata)
+				if merged == nil {
+					merged = make(map[string]interface{}, len(op.metadata))
+				}
+				for k, v := range op.metadata {
+					merged[k] = v
+				}
+				updated.Metadata = merged
+			}
+			working[op.id] = updated
+		case txMutationDelete:
+			delete(working, op.id)
+		}
+	}
+
+	ids := make([]string, 0, len(working))
+	for id, entry := range working {
+		if metadataEqual(entry.Metadata, field, value) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+
+	records := make([]Record, 0, len(ids))
+	for _, id := range ids {
+		entry := working[id]
+		records = append(records, Record{
+			ID:       entry.ID,
+			Vector:   cloneVector(entry.Vector),
+			Metadata: cloneMetadata(entry.Metadata),
+			Version:  entry.Version,
+		})
+	}
+	return records, nil
 }
 
 func (tx *transaction) Commit(ctx context.Context) error {
@@ -682,4 +773,15 @@ func cloneIndexEntry(entry *index.VectorEntry) *index.VectorEntry {
 		Metadata: cloneMetadata(entry.Metadata),
 		Version:  entry.Version,
 	}
+}
+
+func metadataEqual(metadata map[string]interface{}, field string, value interface{}) bool {
+	if metadata == nil {
+		return value == nil
+	}
+	got, ok := metadata[field]
+	if !ok {
+		return value == nil
+	}
+	return reflect.DeepEqual(got, value)
 }
