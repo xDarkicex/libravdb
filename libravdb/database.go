@@ -16,6 +16,12 @@ import (
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
 
+// Logger is the logging interface accepted by the database.
+// It is compatible with the standard library's log.Printf signature.
+type Logger interface {
+	Printf(format string, v ...interface{})
+}
+
 // Database represents the main vector database instance
 type Database struct {
 	mu          sync.RWMutex
@@ -24,6 +30,7 @@ type Database struct {
 	metrics     *obs.Metrics
 	health      *obs.HealthChecker
 	config      *Config
+	logger      Logger
 	closed      bool
 }
 
@@ -35,6 +42,7 @@ type Config struct {
 	MaxCollections      int
 	MaxConcurrentWrites int
 	MaxWriteQueueDepth  int
+	Logger              Logger
 }
 
 // New creates a new Database instance with the given options
@@ -71,6 +79,7 @@ func New(opts ...Option) (*Database, error) {
 		storage:     storageEngine,
 		metrics:     metrics,
 		config:      config,
+		logger:      config.Logger,
 	}
 
 	// Initialize health checker
@@ -82,6 +91,13 @@ func New(opts ...Option) (*Database, error) {
 	}
 
 	return db, nil
+}
+
+// SetLogger configures the database logger. It is safe to call concurrently.
+func (db *Database) SetLogger(logger Logger) {
+	db.mu.Lock()
+	db.logger = logger
+	db.mu.Unlock()
 }
 
 // CreateCollection creates a new collection with the specified options

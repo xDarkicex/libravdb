@@ -777,6 +777,52 @@ func TestCASSameKeyConflictingExpectedVersionsInOneTxFails(t *testing.T) {
 	}
 }
 
+func TestTransactionDeleteThenUpsertPreservesOrdinal(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, "ord_preserve", WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	if err := collection.Insert(ctx, "r1", []float32{1, 0, 0}, map[string]interface{}{"tag": "original"}); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+	before, err := collection.storage.Get(ctx, "r1")
+	if err != nil {
+		t.Fatalf("get before: %v", err)
+	}
+	originalOrdinal := before.Ordinal
+
+	if err := db.WithTx(ctx, func(tx Tx) error {
+		if err := tx.Delete(ctx, "ord_preserve", "r1"); err != nil {
+			return err
+		}
+		return tx.Upsert(ctx, "ord_preserve", "r1", []float32{0, 1, 0}, map[string]interface{}{"tag": "replaced"})
+	}); err != nil {
+		t.Fatalf("delete then upsert tx: %v", err)
+	}
+
+	after, err := collection.storage.Get(ctx, "r1")
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.Ordinal != originalOrdinal {
+		t.Fatalf("ordinal changed from %d to %d — replace-in-place must preserve ordinal", originalOrdinal, after.Ordinal)
+	}
+	if after.Metadata["tag"] != "replaced" {
+		t.Fatalf("expected replaced metadata, got %v", after.Metadata)
+	}
+	if after.Vector[1] != 1 {
+		t.Fatalf("expected replaced vector, got %v", after.Vector)
+	}
+}
+
 func TestCASSameKeyRepeatedSameExpectedVersionInOneTxSucceeds(t *testing.T) {
 	ctx := context.Background()
 	db, err := New(WithStoragePath(testDBPath(t)))

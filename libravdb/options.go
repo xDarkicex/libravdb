@@ -375,6 +375,15 @@ func WithBatchConcurrency(concurrency int) CollectionOption {
 	}
 }
 
+// WithLogger sets the logger for the database. When set, the database emits
+// timing instrumentation for index rebuilds during transaction commits.
+func WithLogger(logger Logger) Option {
+	return func(c *Config) error {
+		c.Logger = logger
+		return nil
+	}
+}
+
 // WithSharding enables sharding for the collection.
 // Sharding splits the collection into multiple shards for parallel writes.
 // Only HNSW and Flat index types support sharding.

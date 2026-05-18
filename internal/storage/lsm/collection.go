@@ -329,6 +329,18 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	return len(c.cache), nil
 }
 
+// NextOrdinal returns the next ordinal that would be assigned to a new entry.
+func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+
+	return c.nextOrdinal, nil
+}
+
 // saveConfig saves the collection configuration to disk
 func (c *Collection) saveConfig(config *CollectionConfig) error {
 	configPath := filepath.Join(c.path, "config.json")

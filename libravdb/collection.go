@@ -993,6 +993,95 @@ func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []f
 	return nil
 }
 
+// Upsert writes a record regardless of whether it exists, replacing if it does.
+func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	if len(vector) != c.config.Dimension {
+		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+			len(vector), c.config.Dimension)
+	}
+
+	release, err := c.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return ErrCollectionClosed
+	}
+
+	if c.shards == nil {
+		unlock := c.lockMutationIDs([]string{id})
+		defer unlock()
+		defer c.mu.RUnlock()
+		return c.upsertNonSharded(ctx, id, vector, metadata)
+	}
+
+	defer c.mu.RUnlock()
+	return c.upsertSharded(ctx, id, vector, metadata)
+}
+
+func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	exists, err := c.storage.Exists(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to check existing vector: %w", err)
+	}
+
+	entry := &index.VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	if !exists {
+		if err := c.storage.Insert(ctx, entry); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+		if err := c.index.Insert(ctx, entry); err != nil {
+			_ = c.storage.Delete(ctx, id)
+			return fmt.Errorf("failed to insert into index: %w", err)
+		}
+		if c.metrics != nil {
+			c.metrics.VectorUpserts.Inc()
+		}
+		return nil
+	}
+
+	existingEntry, err := c.storage.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("vector with ID %s not found", id)
+	}
+	entry.Ordinal = existingEntry.Ordinal
+
+	if deleter, ok := c.index.(interface {
+		DeleteByOrdinal(context.Context, uint32) error
+	}); ok {
+		if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+			return fmt.Errorf("failed to delete existing vector from index: %w", err)
+		}
+	} else if err := c.index.Delete(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete existing vector from index: %w", err)
+	}
+
+	if err := c.storage.Insert(ctx, entry); err != nil {
+		return fmt.Errorf("failed to write to storage: %w", err)
+	}
+	if err := c.index.Insert(ctx, entry); err != nil {
+		if rebuildErr := c.rebuildIndex(ctx); rebuildErr != nil {
+			return fmt.Errorf("index insert failed: %w; rebuild after index insert also failed: %v", err, rebuildErr)
+		}
+		return fmt.Errorf("index insert failed, index rebuilt from storage: %w", err)
+	}
+
+	if c.metrics != nil {
+		c.metrics.VectorUpserts.Inc()
+	}
+
+	return nil
+}
+
 func (c *Collection) updateSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
 	shard := c.getShard(id)
 	shard.mu.Lock()
@@ -1050,6 +1139,70 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 	// Update metrics
 	if c.metrics != nil {
 		c.metrics.VectorUpdates.Inc()
+	}
+
+	return nil
+}
+
+func (c *Collection) upsertSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	shard := c.getShard(id)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	exists, err := shard.storage.Exists(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to check existing vector: %w", err)
+	}
+
+	entry := &index.VectorEntry{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	if !exists {
+		if err := shard.storage.Insert(ctx, entry); err != nil {
+			return fmt.Errorf("failed to write to storage: %w", err)
+		}
+		if err := shard.index.Insert(ctx, entry); err != nil {
+			_ = shard.storage.Delete(ctx, id)
+			return fmt.Errorf("failed to insert into index: %w", err)
+		}
+		if c.metrics != nil {
+			c.metrics.VectorUpserts.Inc()
+		}
+		return nil
+	}
+
+	existingEntry, err := shard.storage.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("vector with ID %s not found", id)
+	}
+	entry.Ordinal = existingEntry.Ordinal
+
+	if deleter, ok := shard.index.(interface {
+		DeleteByOrdinal(context.Context, uint32) error
+	}); ok {
+		if err := deleter.DeleteByOrdinal(ctx, entry.Ordinal); err != nil {
+			return fmt.Errorf("failed to delete existing vector from index: %w", err)
+		}
+	} else if err := shard.index.Delete(ctx, id); err != nil {
+		return fmt.Errorf("failed to delete existing vector from index: %w", err)
+	}
+
+	if err := shard.storage.Insert(ctx, entry); err != nil {
+		return fmt.Errorf("failed to write to storage: %w", err)
+	}
+	if err := shard.index.Insert(ctx, entry); err != nil {
+		shardIdx := shardForID(id)
+		if rebuildErr := c.rebuildShardIndex(ctx, shardIdx); rebuildErr != nil {
+			return fmt.Errorf("index insert failed: %w; rebuild after index insert also failed: %v", err, rebuildErr)
+		}
+		return fmt.Errorf("index insert failed, index rebuilt from storage: %w", err)
+	}
+
+	if c.metrics != nil {
+		c.metrics.VectorUpserts.Inc()
 	}
 
 	return nil
@@ -1651,6 +1804,35 @@ func (c *Collection) Stats() *CollectionStats {
 		InProgress:       c.optimizationInProgress,
 		LastOptimization: c.lastOptimization,
 		CanOptimize:      !c.closed && !c.optimizationInProgress,
+	}
+
+	// Ordinal statistics
+	if c.shards != nil {
+		var liveCount int
+		var nextOrdinal uint32
+		for i := range c.shards {
+			if cnt, err := c.shards[i].storage.Count(context.Background()); err == nil {
+				liveCount += cnt
+			}
+			if no, err := c.shards[i].storage.NextOrdinal(context.Background()); err == nil && no > nextOrdinal {
+				nextOrdinal = no
+			}
+		}
+		stats.LiveRecordCount = liveCount
+		stats.NextOrdinal = nextOrdinal
+		if nextOrdinal > 0 {
+			stats.OrdinalUtilization = float64(liveCount) / float64(nextOrdinal)
+		}
+	} else {
+		if cnt, err := c.storage.Count(context.Background()); err == nil {
+			stats.LiveRecordCount = cnt
+		}
+		if no, err := c.storage.NextOrdinal(context.Background()); err == nil {
+			stats.NextOrdinal = no
+			if no > 0 {
+				stats.OrdinalUtilization = float64(stats.LiveRecordCount) / float64(no)
+			}
+		}
 	}
 
 	return stats

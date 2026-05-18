@@ -83,6 +83,7 @@ type Collection interface {
 	Delete(ctx context.Context, id string) error
 	Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error
 	Count(ctx context.Context) (int, error)
+	NextOrdinal(ctx context.Context) (uint32, error)
 	Close() error
 }
 

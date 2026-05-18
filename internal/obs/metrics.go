@@ -11,6 +11,7 @@ import (
 type Metrics struct {
 	VectorInserts   prometheus.Counter
 	VectorUpdates   prometheus.Counter
+	VectorUpserts   prometheus.Counter
 	VectorDeletes   prometheus.Counter
 	TxBegins        prometheus.Counter
 	TxCommits       prometheus.Counter
@@ -47,6 +48,10 @@ func NewMetrics() *Metrics {
 			VectorUpdates: factory.NewCounter(prometheus.CounterOpts{
 				Name: "libravdb_vector_updates_total",
 				Help: "Total vector updates",
+			}),
+			VectorUpserts: factory.NewCounter(prometheus.CounterOpts{
+				Name: "libravdb_vector_upserts_total",
+				Help: "Total vector upserts",
 			}),
 			VectorDeletes: factory.NewCounter(prometheus.CounterOpts{
 				Name: "libravdb_vector_deletes_total",

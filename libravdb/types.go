@@ -63,6 +63,11 @@ type CollectionStats struct {
 	// Optimization information
 	OptimizationStatus *OptimizationStatus `json:"optimization_status,omitempty"`
 
+	// Ordinal statistics
+	LiveRecordCount    int     `json:"live_record_count"`
+	NextOrdinal        uint32  `json:"next_ordinal"`
+	OrdinalUtilization float64 `json:"ordinal_utilization"`
+
 	// Configuration information
 	HasQuantization      bool `json:"has_quantization"`
 	HasMemoryLimit       bool `json:"has_memory_limit"`

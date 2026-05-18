@@ -991,7 +991,7 @@ func (b *BatchUpdate) processUpdateWithRetries(ctx context.Context, update *Vect
 		// Perform the update/upsert
 		var err error
 		if update.Upsert && update.Vector != nil {
-			err = b.collection.Insert(ctx, update.ID, update.Vector, update.Metadata)
+			err = b.collection.Upsert(ctx, update.ID, update.Vector, update.Metadata)
 		} else {
 			// Use the new Update method
 			err = b.collection.Update(ctx, update.ID, update.Vector, update.Metadata)

@@ -16,6 +16,16 @@ type writeController struct {
 	waiting int
 }
 
+// The default maxConcurrent of 2 is safe for all index types because each
+// index Insert method acquires its own internal mutex:
+//
+//	Flat.BatchInsert    — idx.mu.Lock()
+//	HNSW.BatchInsert    — h.mu.Lock()
+//	IVFPQ.Insert        — per-cluster cluster.mutex.Lock()
+//
+// IVFPQ is the least parallel: it locks individual clusters but is not batch-atomic.
+// Even so, concurrent inserts into different clusters proceed without conflict.
+// The write semaphore therefore bounds memory pressure, not correctness.
 func newWriteController(maxConcurrent, maxQueueDepth int) *writeController {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1

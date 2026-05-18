@@ -55,6 +55,7 @@ type Tx interface {
 	// UpdateOwned is like Update but takes ownership of vector and metadata slices/maps.
 	// The caller must not read or write them after the call returns.
 	UpdateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
+	Upsert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
 }
@@ -65,6 +66,7 @@ const (
 	txMutationInsert txMutationKind = iota
 	txMutationUpdate
 	txMutationDelete
+	txMutationUpsert
 )
 
 type txMutation struct {
@@ -153,6 +155,19 @@ func (tx *transaction) Update(ctx context.Context, collection, id string, vector
 
 func (tx *transaction) UpdateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
 	return tx.updateOwned(ctx, collection, id, vector, metadata, 0, false)
+}
+
+func (tx *transaction) Upsert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	if err := tx.validateStage(ctx, collection, id, vector, true); err != nil {
+		return err
+	}
+	return tx.append(txMutation{
+		kind:       txMutationUpsert,
+		collection: collection,
+		id:         id,
+		vector:     cloneVector(vector),
+		metadata:   cloneMetadata(metadata),
+	})
 }
 
 func (tx *transaction) UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
@@ -474,7 +489,7 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 	state.applyPreparedOrdinals(preparedOps)
 
-	newIndexes, err := state.buildIndexes(ctx, names)
+	newIndexes, err := state.buildIndexes(ctx, names, db.logger)
 	if err != nil {
 		closeIndexes(newIndexes)
 		return err
@@ -608,6 +623,17 @@ func (s *txCommitState) apply(ops []txMutation) error {
 				replacement.Ordinal = current.Ordinal
 			}
 			state.working[op.id] = replacement
+		case txMutationUpsert:
+			current := state.working[op.id]
+			replacement := &index.VectorEntry{
+				ID:       op.id,
+				Vector:   op.vector,
+				Metadata: op.metadata,
+			}
+			if current != nil {
+				replacement.Ordinal = current.Ordinal
+			}
+			state.working[op.id] = replacement
 		case txMutationUpdate:
 			current := state.working[op.id]
 			if current == nil {
@@ -729,9 +755,12 @@ func (s *txCommitState) applyPreparedOrdinals(ops []storage.TxOperation) {
 	}
 }
 
-func (s *txCommitState) buildIndexes(ctx context.Context, names []string) (map[string]index.Index, error) {
+func (s *txCommitState) buildIndexes(ctx context.Context, names []string, logger Logger) (map[string]index.Index, error) {
+	start := time.Now()
 	indexes := make(map[string]index.Index, len(names))
+	totalRecords := 0
 	for _, name := range names {
+		colStart := time.Now()
 		state := s.collections[name]
 		entries := make([]*index.VectorEntry, 0, len(state.working))
 		for _, entry := range state.working {
@@ -750,6 +779,13 @@ func (s *txCommitState) buildIndexes(ctx context.Context, names []string) (map[s
 			return nil, err
 		}
 		indexes[name] = idx
+		totalRecords += len(entries)
+		if logger != nil {
+			logger.Printf("libravdb: tx buildIndex collection=%s records=%d elapsed=%s", name, len(entries), time.Since(colStart).Round(time.Microsecond))
+		}
+	}
+	if logger != nil {
+		logger.Printf("libravdb: tx buildIndex summary collections=%d total_records=%d total_elapsed=%s", len(names), totalRecords, time.Since(start).Round(time.Microsecond))
 	}
 	return indexes, nil
 }

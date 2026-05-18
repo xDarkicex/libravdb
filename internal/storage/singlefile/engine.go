@@ -1902,6 +1902,16 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	return int(persisted.LiveCount), nil
 }
 
+// NextOrdinal returns the next ordinal that would be assigned to a new record.
+func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
+	_ = ctx
+	persisted, err := c.persisted()
+	if err != nil {
+		return 0, err
+	}
+	return persisted.NextOrdinal, nil
+}
+
 // Close releases the collection handle.
 func (c *Collection) Close() error {
 	c.closed = true
