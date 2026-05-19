@@ -105,7 +105,12 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Run Gosec Security Scanner
-        uses: securecodewarrior/github-action-gosec@master
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          args: "./..."
+          go-version: 1.25.x
+
+      - name: Run Gosec Security Scanner
+        run: |
+          go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+          gosec ./...
