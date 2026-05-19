@@ -286,6 +286,12 @@ func (tx *transaction) ListByMetadata(ctx context.Context, collection, field str
 				Vector:   op.vector,
 				Metadata: op.metadata,
 			}
+		case txMutationUpsert:
+			working[op.id] = &index.VectorEntry{
+				ID:       op.id,
+				Vector:   op.vector,
+				Metadata: op.metadata,
+			}
 		case txMutationUpdate:
 			current := working[op.id]
 			if current == nil {

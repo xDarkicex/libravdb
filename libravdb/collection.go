@@ -2412,6 +2412,7 @@ func recordFromIndexEntry(entry *index.VectorEntry) Record {
 
 	return Record{
 		ID:       entry.ID,
+		Ordinal:  entry.Ordinal,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
 		Version:  entry.Version,

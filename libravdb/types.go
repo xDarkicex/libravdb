@@ -15,6 +15,7 @@ type VectorEntry struct {
 // Record represents a persisted vector record returned by iteration/list APIs.
 type Record struct {
 	ID       string                 `json:"id"`
+	Ordinal  uint32                 `json:"ordinal"`
 	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 	Version  uint64                 `json:"version"`

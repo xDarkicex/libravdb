@@ -279,3 +279,148 @@ func TestBatchUpsertTrueOnExistingRecord(t *testing.T) {
 		t.Fatalf("expected new='replaced', got %v", record.Metadata["new"])
 	}
 }
+
+func TestTransactionUpsertVisibleInListByMetadata(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, fmt.Sprintf("tx_upsert_list_%d", time.Now().UnixNano()), WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+
+	vec := []float32{1, 2, 3}
+	meta := map[string]interface{}{"source": "test"}
+	if err := tx.Upsert(ctx, collection.name, "id-001", vec, meta); err != nil {
+		t.Fatalf("stage upsert in tx: %v", err)
+	}
+
+	records, err := tx.ListByMetadata(ctx, collection.name, "source", "test")
+	if err != nil {
+		t.Fatalf("ListByMetadata before commit: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record in working view, got %d", len(records))
+	}
+	if records[0].ID != "id-001" {
+		t.Fatalf("expected id-001, got %s", records[0].ID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	record, err := collection.Get(ctx, "id-001")
+	if err != nil {
+		t.Fatalf("Get after commit: %v", err)
+	}
+	if record.Metadata["source"] != "test" {
+		t.Fatalf("expected source='test', got %v", record.Metadata["source"])
+	}
+}
+
+func TestTransactionUpsertReplaceVisibleInListByMetadata(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, fmt.Sprintf("tx_upsert_replace_%d", time.Now().UnixNano()), WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	if err := collection.Insert(ctx, "r1", []float32{0, 0, 0}, map[string]interface{}{"source": "old"}); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+
+	if err := tx.Upsert(ctx, collection.name, "r1", []float32{1, 1, 1}, map[string]interface{}{"source": "new"}); err != nil {
+		t.Fatalf("stage upsert in tx: %v", err)
+	}
+
+	// New metadata must be visible
+	newRecords, err := tx.ListByMetadata(ctx, collection.name, "source", "new")
+	if err != nil {
+		t.Fatalf("ListByMetadata new before commit: %v", err)
+	}
+	if len(newRecords) != 1 {
+		t.Fatalf("expected 1 record with new metadata, got %d", len(newRecords))
+	}
+	if newRecords[0].ID != "r1" {
+		t.Fatalf("expected r1, got %s", newRecords[0].ID)
+	}
+
+	// Old metadata must not be visible in working view
+	oldRecords, err := tx.ListByMetadata(ctx, collection.name, "source", "old")
+	if err != nil {
+		t.Fatalf("ListByMetadata old before commit: %v", err)
+	}
+	if len(oldRecords) != 0 {
+		t.Fatalf("expected 0 records with old metadata, got %d", len(oldRecords))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	record, err := collection.Get(ctx, "r1")
+	if err != nil {
+		t.Fatalf("Get after commit: %v", err)
+	}
+	if record.Metadata["source"] != "new" {
+		t.Fatalf("expected source='new', got %v", record.Metadata["source"])
+	}
+}
+
+func TestUpsertOrdinalPreservedOnReplace(t *testing.T) {
+	ctx := context.Background()
+	db, err := New(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("new database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(ctx, fmt.Sprintf("upsert_ordinal_%d", time.Now().UnixNano()), WithDimension(3))
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	if err := collection.Insert(ctx, "id-001", []float32{1, 0, 0}, map[string]interface{}{"tag": "original"}); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	first, err := collection.Get(ctx, "id-001")
+	if err != nil {
+		t.Fatalf("Get after insert: %v", err)
+	}
+	originalOrdinal := first.Ordinal
+
+	err = collection.Upsert(ctx, "id-001", []float32{4, 5, 6}, map[string]interface{}{"k": "v"})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	second, err := collection.Get(ctx, "id-001")
+	if err != nil {
+		t.Fatalf("Get after upsert: %v", err)
+	}
+	if second.Ordinal != originalOrdinal {
+		t.Fatalf("expected ordinal %d to be preserved, got %d", originalOrdinal, second.Ordinal)
+	}
+}
