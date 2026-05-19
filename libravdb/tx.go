@@ -466,7 +466,6 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 		collection.mu.Lock()
 		if collection.closed {
 			collection.mu.Unlock()
-			locked = locked[:len(locked)]
 			return ErrCollectionClosed
 		}
 		locked = append(locked, collection)
@@ -663,9 +662,6 @@ func (s *txCommitState) apply(ops []txMutation) error {
 			if _, exists := state.working[op.id]; !exists {
 				if op.hasExpectedVersion {
 					return fmt.Errorf("%w: %s", ErrRecordNotFound, op.id)
-				}
-				if _, existed := state.base[op.id]; existed {
-					continue
 				}
 				continue
 			}

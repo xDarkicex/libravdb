@@ -5,7 +5,6 @@ import (
 	"math"
 	"math/rand"
 	"testing"
-	"time"
 )
 
 func TestProductQuantizer_Configure(t *testing.T) {
@@ -597,7 +596,6 @@ func setupTrainedQuantizerWithParams(t *testing.T, dimension, codebooks, bits in
 }
 
 func generateRandomVectors(count, dimension int) [][]float32 {
-	rand.Seed(time.Now().UnixNano())
 	vectors := make([][]float32, count)
 
 	for i := 0; i < count; i++ {

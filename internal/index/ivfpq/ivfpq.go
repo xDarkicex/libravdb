@@ -907,7 +907,13 @@ func (idx *Index) DisableAdaptiveSearch() {
 func (idx *Index) GetSearchStats() SearchStats {
 	idx.searchStats.mutex.RLock()
 	defer idx.searchStats.mutex.RUnlock()
-	return *idx.searchStats
+	return SearchStats{
+		totalSearches:  idx.searchStats.totalSearches,
+		totalLatencyMs: idx.searchStats.totalLatencyMs,
+		accuracySum:    idx.searchStats.accuracySum,
+		currentProbes:  idx.searchStats.currentProbes,
+		lastAdjustment: idx.searchStats.lastAdjustment,
+	}
 }
 
 // adjustProbeCount adaptively adjusts the number of probes based on search performance

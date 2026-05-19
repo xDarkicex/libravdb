@@ -35,9 +35,6 @@ jobs:
       - name: Run tests
         run: go test -v ./...
 
-      - name: Run benchmarks
-        run: go test -bench=. -benchmem ./benchmark/ > benchmark_results.txt
-
       - name: Build examples
         run: |
           mkdir -p dist
@@ -50,11 +47,6 @@ jobs:
         run: |
           echo "## What's Changed" > CHANGELOG.md
           git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo "## Performance Metrics" >> CHANGELOG.md
-          echo '```' >> CHANGELOG.md
-          cat benchmark_results.txt >> CHANGELOG.md
-          echo '```' >> CHANGELOG.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -62,7 +54,6 @@ jobs:
           body_path: CHANGELOG.md
           files: |
             dist/*
-            benchmark_results.txt
           draft: false
           prerelease: false
         env:

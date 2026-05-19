@@ -186,9 +186,6 @@ func TestForceGC(t *testing.T) {
 		data[i] = make([]byte, 1024)
 	}
 
-	// Clear references
-	data = nil
-
 	freed := ForceGC()
 
 	// We can't guarantee memory will be freed, but the function should not panic

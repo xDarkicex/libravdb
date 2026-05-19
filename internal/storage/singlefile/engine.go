@@ -1033,15 +1033,15 @@ func (e *Engine) batchFlusher() {
 	for {
 		select {
 		case <-ticker.C:
-			e.flushBatch()
+			_ = e.flushBatch()
 		case <-e.batchBuffer.flusher:
 			delay := adaptiveGroupCommitWindow(atomic.LoadInt32(&e.batchBuffer.pendingWaiters))
 			if delay > 0 {
 				time.Sleep(delay)
 			}
-			e.flushBatch()
+			_ = e.flushBatch()
 		case <-timer.C:
-			e.flushBatch()
+			_ = e.flushBatch()
 		}
 		// Reset timer for next iteration
 		if !timer.Stop() {
@@ -1599,7 +1599,7 @@ func (e *Engine) Close() error {
 	}
 
 	// Flush any remaining buffered entries before close.
-	e.flushBatch()
+	_ = e.flushBatch()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()

@@ -156,7 +156,7 @@ func (qrm *QuantizationRecoveryManager) recoverFromInsufficientData(
 
 			// Restore original ratio
 			config.TrainRatio = originalRatio
-			quantizer.Configure(config)
+			_ = quantizer.Configure(config)
 		}
 	}
 
@@ -191,7 +191,7 @@ func (qrm *QuantizationRecoveryManager) recoverFromConvergenceFailure(
 
 		// Restore original configuration
 		config.Codebooks = originalCodebooks
-		quantizer.Configure(config)
+		_ = quantizer.Configure(config)
 	}
 
 	// Strategy 2: Reduce bit precision
@@ -209,7 +209,7 @@ func (qrm *QuantizationRecoveryManager) recoverFromConvergenceFailure(
 
 		// Restore original configuration
 		config.Bits = originalBits
-		quantizer.Configure(config)
+		_ = quantizer.Configure(config)
 	}
 
 	return fmt.Errorf("convergence recovery failed")
@@ -242,7 +242,7 @@ func (qrm *QuantizationRecoveryManager) recoverFromMemoryExhaustion(
 
 		// Restore original configuration
 		config.TrainRatio = originalRatio
-		quantizer.Configure(config)
+		_ = quantizer.Configure(config)
 	}
 
 	// Strategy 2: Reduce cache size
@@ -260,7 +260,7 @@ func (qrm *QuantizationRecoveryManager) recoverFromMemoryExhaustion(
 
 		// Restore original configuration
 		config.CacheSize = originalCacheSize
-		quantizer.Configure(config)
+		_ = quantizer.Configure(config)
 	}
 
 	return fmt.Errorf("memory exhaustion recovery failed")

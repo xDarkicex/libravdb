@@ -149,7 +149,7 @@ func TestCompleteErrorRecoveryWorkflow(t *testing.T) {
 		healthMonitor := NewSystemHealthMonitor(100 * time.Millisecond)
 
 		// Register memory health check
-		healthMonitor.RegisterHealthCheck("memory", func(ctx context.Context) (HealthLevel, error) {
+		_ = healthMonitor.RegisterHealthCheck("memory", func(ctx context.Context) (HealthLevel, error) {
 			usage := memMgr.GetUsage()
 			if usage.Limit > 0 {
 				usageRatio := float64(usage.Total) / float64(usage.Limit)
@@ -689,8 +689,6 @@ func TestErrorHandlingEdgeCases(t *testing.T) {
 
 		// Health check should have timed out, but system should still function
 		status := monitor.GetHealthStatus()
-		if status.Overall == HealthUnknown {
-			// This is acceptable - the timeout was handled gracefully
-		}
+		_ = status
 	})
 }

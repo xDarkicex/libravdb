@@ -220,7 +220,7 @@ func TestLRUCacheEvictMethod(t *testing.T) {
 	}
 
 	// Evict more than available
-	freed = cache.Evict(10000)
+	_ = cache.Evict(10000)
 	if cache.Size() != 0 {
 		t.Errorf("Expected cache to be empty after large eviction, size is %d", cache.Size())
 	}

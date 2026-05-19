@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"sync"
-	"time"
 )
 
 // ProductQuantizer implements Product Quantization (PQ) algorithm
@@ -151,7 +150,6 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 
 	// Initialize centroids randomly
 	centroids := make([][]float32, k)
-	rand.Seed(time.Now().UnixNano())
 
 	for i := 0; i < k; i++ {
 		centroids[i] = make([]float32, dim)
@@ -434,7 +432,6 @@ func (pq *ProductQuantizer) sampleVectors(vectors [][]float32, n int) [][]float3
 		return vectors
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	indices := rand.Perm(len(vectors))[:n]
 
 	sampled := make([][]float32, n)

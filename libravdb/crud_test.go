@@ -101,7 +101,7 @@ func TestCollectionCRUDOperations(t *testing.T) {
 	}
 
 	// Test Delete - non-existent vector (may error, which is acceptable)
-	err = collection.Delete(ctx, "nonexistent")
+	_ = collection.Delete(ctx, "nonexistent")
 	// It's acceptable for delete to error on non-existent vectors or empty index
 	// The important thing is that it doesn't crash
 }

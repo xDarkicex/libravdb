@@ -1262,13 +1262,7 @@ func (b *BatchDelete) processDeleteChunk(ctx context.Context, chunk []string, st
 			if b.options.ErrorCallback != nil {
 				b.options.ErrorCallback(itemResult, err)
 			}
-		} else {
-			// Track successful delete for rollback (store the deleted entry)
-			// TODO: Retrieve the entry before deletion for rollback
-			b.rollbackMutex.Lock()
-			// This would store the actual entry: b.deletedEntries = append(b.deletedEntries, entry)
-			b.rollbackMutex.Unlock()
-		}
+			}
 
 		result.items = append(result.items, itemResult)
 

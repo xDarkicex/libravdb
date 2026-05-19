@@ -1313,17 +1313,36 @@ func (s *StreamingBatchUpdate) Stats() *StreamingStats {
 	defer s.stats.mutex.RUnlock()
 
 	// Create a copy to avoid race conditions
-	statsCopy := *s.stats
-	statsCopy.ErrorsByType = make(map[string]int64)
-	for k, v := range s.stats.ErrorsByType {
-		statsCopy.ErrorsByType[k] = v
-	}
-
 	recentErrors := make([]error, len(s.stats.RecentErrors))
 	copy(recentErrors, s.stats.RecentErrors)
-	statsCopy.RecentErrors = recentErrors
+	errorsByType := make(map[string]int64)
+	for k, v := range s.stats.ErrorsByType {
+		errorsByType[k] = v
+	}
+	statsCopy := &StreamingStats{
+		TotalReceived:      s.stats.TotalReceived,
+		TotalProcessed:     s.stats.TotalProcessed,
+		TotalSuccessful:    s.stats.TotalSuccessful,
+		TotalFailed:        s.stats.TotalFailed,
+		ItemsPerSecond:     s.stats.ItemsPerSecond,
+		SuccessRate:        s.stats.SuccessRate,
+		ErrorRate:          s.stats.ErrorRate,
+		CurrentMemoryUsage: s.stats.CurrentMemoryUsage,
+		BufferUtilization:  s.stats.BufferUtilization,
+		BackpressureActive: s.stats.BackpressureActive,
+		StartTime:          s.stats.StartTime,
+		LastUpdate:         s.stats.LastUpdate,
+		ElapsedTime:        s.stats.ElapsedTime,
+		EstimatedETA:       s.stats.EstimatedETA,
+		ActiveWorkers:      s.stats.ActiveWorkers,
+		QueuedItems:        s.stats.QueuedItems,
+		Status:             s.stats.Status,
+		LastError:          s.stats.LastError,
+		ErrorsByType:       errorsByType,
+		RecentErrors:       recentErrors,
+	}
 
-	return &statsCopy
+	return statsCopy
 }
 
 // Results returns the result channel for streaming deletes
@@ -1342,17 +1361,36 @@ func (s *StreamingBatchDelete) Stats() *StreamingStats {
 	defer s.stats.mutex.RUnlock()
 
 	// Create a copy to avoid race conditions
-	statsCopy := *s.stats
-	statsCopy.ErrorsByType = make(map[string]int64)
-	for k, v := range s.stats.ErrorsByType {
-		statsCopy.ErrorsByType[k] = v
-	}
-
 	recentErrors := make([]error, len(s.stats.RecentErrors))
 	copy(recentErrors, s.stats.RecentErrors)
-	statsCopy.RecentErrors = recentErrors
+	errorsByType := make(map[string]int64)
+	for k, v := range s.stats.ErrorsByType {
+		errorsByType[k] = v
+	}
+	statsCopy := &StreamingStats{
+		TotalReceived:      s.stats.TotalReceived,
+		TotalProcessed:     s.stats.TotalProcessed,
+		TotalSuccessful:    s.stats.TotalSuccessful,
+		TotalFailed:        s.stats.TotalFailed,
+		ItemsPerSecond:     s.stats.ItemsPerSecond,
+		SuccessRate:        s.stats.SuccessRate,
+		ErrorRate:          s.stats.ErrorRate,
+		CurrentMemoryUsage: s.stats.CurrentMemoryUsage,
+		BufferUtilization:  s.stats.BufferUtilization,
+		BackpressureActive: s.stats.BackpressureActive,
+		StartTime:          s.stats.StartTime,
+		LastUpdate:         s.stats.LastUpdate,
+		ElapsedTime:        s.stats.ElapsedTime,
+		EstimatedETA:       s.stats.EstimatedETA,
+		ActiveWorkers:      s.stats.ActiveWorkers,
+		QueuedItems:        s.stats.QueuedItems,
+		Status:             s.stats.Status,
+		LastError:          s.stats.LastError,
+		ErrorsByType:       errorsByType,
+		RecentErrors:       recentErrors,
+	}
 
-	return &statsCopy
+	return statsCopy
 }
 
 // Close gracefully shuts down the streaming update operation

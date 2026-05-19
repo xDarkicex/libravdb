@@ -315,10 +315,10 @@ func (h *Index) calculateCRC32() uint32 {
 	crc := crc32.NewIEEE()
 
 	// Include key parameters in CRC
-	binary.Write(crc, binary.LittleEndian, uint32(h.config.M))
-	binary.Write(crc, binary.LittleEndian, uint32(h.config.EfConstruction))
-	binary.Write(crc, binary.LittleEndian, uint32(h.config.Dimension))
-	binary.Write(crc, binary.LittleEndian, uint32(len(h.nodes)))
+	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.M))
+	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.EfConstruction))
+	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.Dimension))
+	_ = binary.Write(crc, binary.LittleEndian, uint32(len(h.nodes)))
 
 	return crc.Sum32()
 }

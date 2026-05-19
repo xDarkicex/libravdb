@@ -180,7 +180,7 @@ func TestBatchDeleteRollback(t *testing.T) {
 	options.FailFast = true
 
 	batchDelete := collection.NewBatchDelete(idsToDelete, options)
-	result, err := batchDelete.Execute(ctx)
+	result, _ := batchDelete.Execute(ctx)
 
 	// Note: Delete operations might not fail on non-existent IDs depending on implementation
 	// This test verifies that if rollback is triggered, it works correctly
@@ -240,7 +240,7 @@ func TestBatchOperationsWithoutRollback(t *testing.T) {
 	options.FailFast = false
 
 	batchInsert := collection.NewBatchInsert(vectors, options)
-	result, err := batchInsert.Execute(ctx)
+	result, _ := batchInsert.Execute(ctx)
 
 	// Should complete with some successes and some failures
 	if result.Successful == 0 {

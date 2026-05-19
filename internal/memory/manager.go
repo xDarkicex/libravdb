@@ -358,7 +358,7 @@ func (m *manager) checkMemoryUsage() {
 	// Trigger automatic GC if enabled and threshold exceeded
 	if config.EnableGC && usageRatio >= config.GCThreshold {
 		beforeGC := usage.Total
-		m.TriggerGC()
+		_ = m.TriggerGC()
 
 		// Measure freed memory
 		afterUsage := m.GetUsage()
@@ -597,7 +597,7 @@ func (m *manager) HandleMemoryLimitExceeded() error {
 
 	// Step 1: Force garbage collection
 	beforeGC := usage.Total
-	m.TriggerGC()
+	_ = m.TriggerGC()
 	afterGC := m.GetUsage().Total
 	gcFreed := beforeGC - afterGC
 	totalFreed += gcFreed
