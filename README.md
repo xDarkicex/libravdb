@@ -35,6 +35,7 @@
 - [Installation](#-installation)
 - [Configuration](#-configuration)
 - [Advanced Features](#-advanced-features)
+- [Roadmap](#-roadmap)
 - [Use Cases](#-use-cases)
 - [Development](#-development)
 - [Testing](#-testing)
@@ -626,6 +627,36 @@ if stats.OptimizationStatus.CanOptimize {
     fmt.Println("Collection can be optimized")
 }
 ```
+
+## 🗺️ Roadmap
+
+### Configurable Local Sharding
+
+Collections already support internal write-lane sharding via `WithSharding(true)`, which splits a collection into parallel shards with independent storage and indexes. The next step is making this user-configurable:
+
+- `WithShardCount(n)` — user-controlled shard count instead of the current hardcoded constant
+- `ShardStats` — per-shard observability (vector count, memory usage, disk size) so consumers can detect hot shards
+- Expose shard-level index rebuilds for targeted maintenance
+
+### Dynamic Resharding
+
+Adding or removing shards without dropping and recreating the collection:
+
+- **Split**: grow from N → 2N shards, redistributing vectors by a consistent hash ring
+- **Merge**: shrink back from 2N → N shards, combining adjacent shard pairs
+- Hash-ring-based routing so the owning shard is deterministic and stable across resizes
+
+### Consumer-Side Distributed Sharding
+
+The library stays an embedded single-file engine. Distributed sharding is implemented at the consumer/daemon layer:
+
+- Each `.libravdb` file is a shard — the library needs no network awareness
+- The consumer owns hash-based write routing, scatter/gather search with oversampling, and ranked result merging
+- Shard sync (WAL shipping, snapshot transfer) lives in the daemon, not the library
+
+This is the "wrap it, don't rewrite it" model — SQLite didn't grow a network stack, people built rqlite around it.
+
+---
 
 ## 🎯 Use Cases
 
