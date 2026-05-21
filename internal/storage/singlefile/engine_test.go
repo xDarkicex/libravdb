@@ -932,3 +932,344 @@ func TestFlushErrorReQueuesRemainingBatches(t *testing.T) {
 		t.Errorf("expected error on stale collection insert, got nil")
 	}
 }
+
+func TestCompactEmptyEngine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compact-empty.libravdb")
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	if err := engine.Compact(); err != nil {
+		t.Fatalf("Compact() on empty engine should succeed: %v", err)
+	}
+	if engine.CompactionErrors() != 0 {
+		t.Errorf("expected 0 compaction errors on empty engine, got %d", engine.CompactionErrors())
+	}
+}
+
+func TestCompactPreservesDataAndReducesFileSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compact-data.libravdb")
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	col := engine.collections["test"]
+
+	for i := 0; i < 50; i++ {
+		if err := col.Insert(context.Background(), &index.VectorEntry{
+			ID:     fmt.Sprintf("r%d", i),
+			Vector: []float32{float32(i), 0, 0},
+		}); err != nil {
+			t.Fatalf("insert record %d: %v", i, err)
+		}
+	}
+
+	preCompact, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat pre-compact: %v", err)
+	}
+	preSize := preCompact.Size()
+
+	if err := engine.Compact(); err != nil {
+		t.Fatalf("Compact() failed: %v", err)
+	}
+
+	postCompact, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat post-compact: %v", err)
+	}
+	postSize := postCompact.Size()
+
+	for i := 50; i < 100; i++ {
+		if err := col.Insert(context.Background(), &index.VectorEntry{
+			ID:     fmt.Sprintf("r%d", i),
+			Vector: []float32{float32(i), 0, 0},
+		}); err != nil {
+			t.Fatalf("insert record %d: %v", i, err)
+		}
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	engineIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	engine2 := engineIface2.(*Engine)
+	defer engine2.Close()
+
+	col2, err := engine2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		entry, err := col2.Get(context.Background(), fmt.Sprintf("r%d", i))
+		if err != nil {
+			t.Fatalf("get record r%d: %v", i, err)
+		}
+		if entry == nil {
+			t.Fatalf("record r%d not found after reopen", i)
+		}
+	}
+
+	if postSize >= preSize {
+		t.Errorf("expected Compact() to reduce file size: pre=%d post=%d", preSize, postSize)
+	}
+}
+
+func TestOpenExistingIgnoresOrphanCompactSidecar(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "orphan-compact.libravdb")
+	sidecarPath := path + ".compact"
+
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	col := engine.collections["test"]
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID: "survivor", Vector: []float32{1, 2, 3},
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if err := os.WriteFile(sidecarPath, original, 0644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	engineIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("open with orphan sidecar should succeed: %v", err)
+	}
+	engine2 := engineIface2.(*Engine)
+	defer engine2.Close()
+
+	col2, err := engine2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	entry, err := col2.Get(context.Background(), "survivor")
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("survivor record not found after recovery with orphan sidecar")
+	}
+}
+
+func TestCompactPreventsUnboundedFileGrowth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compact-growth.libravdb")
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	col := engine.collections["test"]
+
+	var sizes []int64
+
+	for cycle := 0; cycle < 5; cycle++ {
+		for i := 0; i < 20; i++ {
+			id := fmt.Sprintf("c%d_r%d", cycle, i)
+			if err := col.Insert(context.Background(), &index.VectorEntry{
+				ID: id, Vector: []float32{float32(cycle), float32(i), 0},
+			}); err != nil {
+				t.Fatalf("insert %s: %v", id, err)
+			}
+		}
+
+		if err := engine.Compact(); err != nil {
+			t.Fatalf("Compact() cycle %d: %v", cycle, err)
+		}
+
+		stat, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat cycle %d: %v", cycle, err)
+		}
+		sizes = append(sizes, stat.Size())
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	first := sizes[0]
+	last := sizes[len(sizes)-1]
+	if last > first*5 {
+		t.Errorf("file size grew unboundedly across cycles: first=%d last=%d sizes=%v",
+			first, last, sizes)
+	}
+
+	engineIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	engine2 := engineIface2.(*Engine)
+	defer engine2.Close()
+
+	col2, err := engine2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	for cycle := 0; cycle < 5; cycle++ {
+		for i := 0; i < 20; i++ {
+			id := fmt.Sprintf("c%d_r%d", cycle, i)
+			entry, err := col2.Get(context.Background(), id)
+			if err != nil {
+				t.Fatalf("get %s: %v", id, err)
+			}
+			if entry == nil {
+				t.Fatalf("record %s not found after cycles", id)
+			}
+		}
+	}
+}
+
+func TestDeleteReleasesOrdinalSlot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "delete-ordinal.libravdb")
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	col := engine.collections["test"]
+
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID: "doomed", Vector: []float32{1, 2, 3},
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Capture the assigned ordinal.
+	ordinal, err := col.GetIDByOrdinal(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("GetIDByOrdinal(0): %v", err)
+	}
+	if ordinal != "doomed" {
+		t.Fatalf("expected ordinal 0 -> doomed, got %q", ordinal)
+	}
+
+	// Delete the record.
+	if err := col.Delete(context.Background(), "doomed"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Immediately after delete, GetByOrdinal must return not-found.
+	_, err = col.GetByOrdinal(0)
+	if err == nil {
+		t.Fatal("expected GetByOrdinal(0) to fail after delete")
+	}
+
+	// GetIDByOrdinal must also return not-found.
+	_, err = col.GetIDByOrdinal(context.Background(), 0)
+	if err == nil {
+		t.Fatal("expected GetIDByOrdinal(0) to fail after delete")
+	}
+
+	// Close and reopen — ordinalToID is reconstructed from Records.
+	// Deleted records must not re-populate the ordinal slot.
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	engineIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	engine2 := engineIface2.(*Engine)
+	defer engine2.Close()
+
+	// Populate the handle cache so we can access the concrete *Collection.
+	if _, err := engine2.GetCollection("test"); err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	col2 := engine2.collections["test"]
+
+	_, err = col2.GetByOrdinal(0)
+	if err == nil {
+		t.Fatal("expected GetByOrdinal(0) to fail after reopen")
+	}
+
+	_, err = col2.GetIDByOrdinal(context.Background(), 0)
+	if err == nil {
+		t.Fatal("expected GetIDByOrdinal(0) to fail after reopen")
+	}
+}

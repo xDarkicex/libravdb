@@ -831,9 +831,11 @@ func (dec *binaryDecoder) readCollection() (*persistedCollection, error) {
 		NextOrdinal: nextOrdinal,
 		Records:     records,
 	}
-	for recordID, record := range records {
-		ensureOrdinalSlot(collection, record.Ordinal, recordID)
-	}
+		for recordID, record := range records {
+			if !record.Deleted {
+				ensureOrdinalSlot(collection, record.Ordinal, recordID)
+			}
+		}
 	return collection, nil
 }
 

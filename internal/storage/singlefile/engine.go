@@ -196,10 +196,11 @@ type Engine struct {
 	walBytes        uint64
 	batchFlushes    uint64
 	batchedEntries  uint64
-	checkpoints     uint64
-	replayedTxs     uint64
-	discardedTxs    uint64
-	closed          bool
+	checkpoints      uint64
+	replayedTxs      uint64
+	discardedTxs     uint64
+	compactionErrors uint64
+	closed           bool
 
 	// WAL batch buffer: accumulates entries across multiple putRecords calls
 	// and flushes them together to reduce fsync overhead.
@@ -804,6 +805,9 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	if collection.LiveCount > 0 {
 		collection.LiveCount--
 	}
+	if int(current.Ordinal) < len(collection.ordinalToID) {
+		collection.ordinalToID[current.Ordinal] = ""
+	}
 	collection.UpdatedLSN = lsn
 }
 
@@ -865,7 +869,168 @@ func (e *Engine) checkpointLocked() error {
 	e.dirtyBytes = 0
 	e.dirtyOps = 0
 	e.checkpoints++
-	return e.file.Sync()
+
+	if err := e.file.Sync(); err != nil {
+		return err
+	}
+	// Auto-compact when WAL bloat exceeds 2× the minimum (snapshot-only) file size.
+	// snapshot and stat are already in scope from lines 814 and 831.
+	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot))
+	if stat.Size() > compactSize*2 {
+		_ = e.compactFile() // non-fatal; next checkpoint will retry if this fails
+	}
+	return nil
+}
+
+// compactFile rewrites the database into a fresh temp file containing only the
+// current snapshot, then atomically renames it over the original. Caller must
+// hold e.mu. The checkpoint that precedes this call must already be fsynced.
+func (e *Engine) compactFile() error {
+	err := e.compactFileLocked()
+	if err != nil {
+		e.compactionErrors++
+	}
+	return err
+}
+
+// compactFileLocked implements the actual compaction logic. The caller
+// (compactFile) wraps it to increment compactionErrors on failure.
+func (e *Engine) compactFileLocked() error {
+	snapshot, err := encodeStateBinary(e.state)
+	if err != nil {
+		return fmt.Errorf("compact: encode state: %w", err)
+	}
+
+	// Preserve FileID and CreatedUnixNano from the live header.
+	origHeader, err := e.readHeader()
+	if err != nil {
+		return fmt.Errorf("compact: read header: %w", err)
+	}
+
+	tmpPath := e.path + ".compact"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("compact: create temp file: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// ── Page 0: file header ────────────────────────────────────────────────
+	const snapshotOffset = uint64(3 * pageSize) // 12288
+	snapshotTotal := int64(snapshotOffset) + 16 + int64(len(snapshot))
+	pageCount := uint64((snapshotTotal + pageSize - 1) / pageSize)
+
+	fh := &fileHeader{
+		FormatVersion:     origHeader.FormatVersion,
+		PageSize:          origHeader.PageSize,
+		FeatureFlags:      origHeader.FeatureFlags,
+		FileID:            origHeader.FileID,
+		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		LastCheckpointLSN: e.lastLSN,
+		ActiveMetaPage:    1,
+		WALStartPage:      pageCount, // no WAL in compacted file
+		WALHeadPage:       pageCount,
+		WALTailPage:       pageCount,
+	}
+	copy(fh.Magic[:], origHeader.Magic[:])
+	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh)); err != nil {
+		return fmt.Errorf("compact: write header: %w", err)
+	}
+
+	// ── Pages 1 & 2: dual metapages ───────────────────────────────────────
+	meta := &metaPage{
+		Magic:           metaMagic,
+		MetaEpoch:       1,
+		RootCatalog:     3,
+		RootFreelist:    0, // meta A marker
+		LastAppliedLSN:  e.lastLSN,
+		PageCount:       pageCount,
+		CollectionCount: uint64(e.visibleCollectionCountLocked()),
+		SnapshotOffset:  snapshotOffset,
+		SnapshotLength:  uint64(len(snapshot)),
+	}
+	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta)); err != nil {
+		return fmt.Errorf("compact: write meta A: %w", err)
+	}
+	meta.RootFreelist = math.MaxUint64 // meta B marker
+	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta)); err != nil {
+		return fmt.Errorf("compact: write meta B: %w", err)
+	}
+
+	// ── Page 3 (offset 12288): snapshot chunk ─────────────────────────────
+	checksum := crc32.Checksum(snapshot, castagnoli)
+	var chunkHdr [16]byte
+	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
+	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
+	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
+	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshot)))
+	binary.LittleEndian.PutUint32(chunkHdr[12:16], checksum)
+	if _, err := tmpFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+		return fmt.Errorf("compact: write chunk header: %w", err)
+	}
+	if _, err := tmpFile.WriteAt(snapshot, int64(snapshotOffset)+16); err != nil {
+		return fmt.Errorf("compact: write snapshot payload: %w", err)
+	}
+
+	// ── Fsync before rename ───────────────────────────────────────────────
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("compact: sync: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("compact: close temp: %w", err)
+	}
+
+	// ── Atomic rename ─────────────────────────────────────────────────────
+	// Close original before rename; if anything fails, reopen original.
+	if err := e.file.Close(); err != nil {
+		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		return fmt.Errorf("compact: close original: %w", err)
+	}
+	e.file = nil
+
+	if err := os.Rename(tmpPath, e.path); err != nil {
+		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		return fmt.Errorf("compact: rename: %w", err)
+	}
+
+	newFile, err := os.OpenFile(e.path, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("compact: reopen: %w", err)
+	}
+	e.file = newFile
+
+	// ── Reset bookkeeping to match the compacted file ─────────────────────
+	e.activeMetaPage = 1
+	e.metaEpoch = 1
+	e.dirty = false
+	e.dirtyBytes = 0
+	e.dirtyOps = 0
+	e.checkpoints++
+
+	ok = true
+	return nil
+}
+
+// Compact explicitly rewrites the database file, discarding all WAL history
+// subsumed by the current snapshot. Blocks until complete. Safe to call at any
+// time; the caller does not need to hold any lock.
+func (e *Engine) Compact() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return fmt.Errorf("compact: database is closed")
+	}
+	return e.compactFile()
+}
+
+// CompactionErrors returns the count of compaction errors since engine startup.
+func (e *Engine) CompactionErrors() uint64 {
+	return e.compactionErrors
 }
 
 func (e *Engine) appendChunkLocked(kind uint16, payload []byte) (uint64, error) {
