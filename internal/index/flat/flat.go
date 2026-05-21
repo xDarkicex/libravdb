@@ -7,6 +7,9 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unsafe"
+
+	"github.com/xDarkicex/memory"
 
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -156,7 +159,120 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	return nil
 }
 
-// Search performs brute-force search across all vectors
+// heapElement is a max-heap node storing a vector index and its distance.
+// Sized at 16 bytes (int=8 + float32=4 + padding) — fits two per cache line.
+type heapElement struct {
+	vecIdx int
+	score  float32
+}
+
+// upHeap bubbles the element at i up to restore max-heap property.
+func upHeap(h []heapElement, i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if h[parent].score >= h[i].score {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+// downHeap sifts the element at i down to restore max-heap property.
+func downHeap(h []heapElement, i, n int) {
+	for {
+		largest := i
+		left := 2*i + 1
+		right := 2*i + 2
+		if left < n && h[left].score > h[largest].score {
+			largest = left
+		}
+		if right < n && h[right].score > h[largest].score {
+			largest = right
+		}
+		if largest == i {
+			break
+		}
+		h[i], h[largest] = h[largest], h[i]
+		i = largest
+	}
+}
+
+// userDataOffset is the byte offset within a ShardedFreeList slot where user
+// data begins. The first 64 bytes are reserved for FreeList/ShardedFreeList
+// metadata (next ptr at 0, structIdx at 24, homeShard at 40, Hyaline chain).
+const userDataOffset = 64
+
+// heapSlot binds an off-heap slot to its originating pool so that free()
+// routes to the correct tier by construction — no runtime lookup, no ignored
+// error from a mismatched Deallocate.
+type heapSlot struct {
+	slot []byte
+	pool *memory.ShardedFreeList
+}
+
+func (hs *heapSlot) free() { hs.pool.Deallocate(hs.slot) }
+
+// Power-of-2 tier table. Each tier's slot is sized for its maxK, bounding
+// waste to <8× in the worst case (k=17 uses a k=128 slot).
+//
+//	 k=1–16    → 320 bytes
+//	 k=17–128  → 2,112 bytes
+//	 k=129–1024 → 16,448 bytes
+//	 k=1025–4096 → 65,600 bytes
+//
+// k > 4096 falls back to Go heap.
+type poolTier struct {
+	maxK int
+	pool *memory.ShardedFreeList
+	once sync.Once
+}
+
+var queryTiers = [...]poolTier{
+	{maxK: 16},
+	{maxK: 128},
+	{maxK: 1024},
+	{maxK: 4096},
+}
+
+// acquireHeapSlot returns a heapSlot paired with a []heapElement buffer backed
+// by the appropriate off-heap tier. The buffer has len=k and cap=tierMaxK.
+// Returns nil, nil if k exceeds the largest tier — caller must fall back to
+// Go heap allocation.
+func acquireHeapSlot(k int) (*heapSlot, []heapElement) {
+	for i := range queryTiers {
+		if k > queryTiers[i].maxK {
+			continue
+		}
+		tier := &queryTiers[i]
+		tier.once.Do(func() {
+			slotSize := uint64(userDataOffset + tier.maxK*16)
+			pool, err := memory.NewShardedFreeList(memory.FreeListConfig{
+				PoolSize:  16 * 1024 * 1024,
+				SlotSize:  slotSize,
+				SlabSize:  1 * 1024 * 1024,
+				SlabCount: 16,
+				Prealloc:  true,
+			}, 64)
+			if err != nil {
+				panic("flat: failed to create query pool tier: " + err.Error())
+			}
+			tier.pool = pool
+		})
+		slot, err := tier.pool.Allocate()
+		if err != nil {
+			return nil, nil
+		}
+		ptr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(slot)), userDataOffset)
+		// Create the buffer with the tier's full capacity, then re-slice to k
+		// so len(heapBuf) is the authority for heap bounds.
+		heapBuf := unsafe.Slice((*heapElement)(ptr), tier.maxK)[:k]
+		return &heapSlot{slot: slot, pool: tier.pool}, heapBuf
+	}
+	return nil, nil
+}
+
+// Search performs brute-force search across all vectors using a max-heap for top-k.
 func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
 	if len(query) != idx.config.Dimension {
 		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d",
@@ -166,6 +282,9 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	if k <= 0 {
 		return []*SearchResult{}, nil
 	}
+	if k > 4096 {
+		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
+	}
 
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -174,10 +293,26 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		return []*SearchResult{}, nil
 	}
 
-	// Compute distance to all vectors and collect results
-	allResults := make([]*SearchResult, 0, len(idx.vectors))
+	if k > len(idx.vectors) {
+		k = len(idx.vectors)
+	}
 
-	for _, entry := range idx.vectors {
+	limit := k
+
+	// Acquire off-heap buffer for the heap. Gracefully degrades to Go heap
+	// if k exceeds the largest tier or the pool is exhausted.
+	var heapBuf []heapElement
+	hs, buf := acquireHeapSlot(k)
+	if hs != nil {
+		defer hs.free()
+		heapBuf = buf
+	} else {
+		heapBuf = make([]heapElement, k)
+	}
+
+	count := 0
+
+	for vecIdx, entry := range idx.vectors {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -189,34 +324,29 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 			return nil, fmt.Errorf("failed to compute distance: %w", err)
 		}
 
-		result := &SearchResult{
-			ID:    entry.ID,
-			Score: distance,
-		}
-
-		allResults = append(allResults, result)
-	}
-
-	// Sort results by distance (ascending for similarity search)
-	for i := 0; i < len(allResults)-1; i++ {
-		for j := i + 1; j < len(allResults); j++ {
-			if allResults[i].Score > allResults[j].Score {
-				allResults[i], allResults[j] = allResults[j], allResults[i]
-			}
+		if count < limit {
+			heapBuf[count] = heapElement{vecIdx: vecIdx, score: distance}
+			upHeap(heapBuf, count)
+			count++
+		} else if distance < heapBuf[0].score {
+			heapBuf[0] = heapElement{vecIdx: vecIdx, score: distance}
+			downHeap(heapBuf, 0, count)
 		}
 	}
 
-	// Return top-k results
-	if k > len(allResults) {
-		k = len(allResults)
-	}
-	results := make([]*SearchResult, k)
-	for i := range k {
-		r := allResults[i]
-		entry := idx.vectors[idx.idToIndex[r.ID]]
+	// Extract results in ascending distance order (smallest first).
+	results := make([]*SearchResult, count)
+	for i := count - 1; i >= 0; i-- {
+		// Pop root (largest distance)
+		elem := heapBuf[0]
+		count--
+		heapBuf[0] = heapBuf[count]
+		downHeap(heapBuf, 0, count)
+
+		entry := idx.vectors[elem.vecIdx]
 		results[i] = &SearchResult{
-			ID:       r.ID,
-			Score:    r.Score,
+			ID:       entry.ID,
+			Score:    elem.score,
 			Vector:   cloneFloat32(entry.Vector),
 			Metadata: cloneMetadata(entry.Metadata),
 			Version:  entry.Version,

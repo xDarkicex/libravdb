@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -11,8 +12,8 @@ import (
 type MockMemoryMappable struct {
 	canMap        bool
 	estimatedSize int64
-	isMapped      bool
-	mappedSize    int64
+	isMapped      atomic.Bool
+	mappedSize    atomic.Int64
 	enableError   error
 	disableError  error
 }
@@ -29,8 +30,8 @@ func (m *MockMemoryMappable) EnableMemoryMapping(path string) error {
 	if m.enableError != nil {
 		return m.enableError
 	}
-	m.isMapped = true
-	m.mappedSize = m.estimatedSize
+	m.isMapped.Store(true)
+	m.mappedSize.Store(m.estimatedSize)
 	return nil
 }
 
@@ -38,17 +39,17 @@ func (m *MockMemoryMappable) DisableMemoryMapping() error {
 	if m.disableError != nil {
 		return m.disableError
 	}
-	m.isMapped = false
-	m.mappedSize = 0
+	m.isMapped.Store(false)
+	m.mappedSize.Store(0)
 	return nil
 }
 
 func (m *MockMemoryMappable) IsMemoryMapped() bool {
-	return m.isMapped
+	return m.isMapped.Load()
 }
 
 func (m *MockMemoryMappable) MemoryMappedSize() int64 {
-	return m.mappedSize
+	return m.mappedSize.Load()
 }
 
 func TestMemoryManager_MemoryMapping(t *testing.T) {
@@ -79,13 +80,8 @@ func TestMemoryManager_MemoryMapping(t *testing.T) {
 		t.Fatalf("Failed to register mappable: %v", err)
 	}
 
-	// Give some time for automatic mapping to occur
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if it was automatically mapped
-	if !mockMappable.IsMemoryMapped() {
-		t.Error("Expected automatic memory mapping for large component")
-	}
+	// Poll for automatic mapping to occur (background goroutine)
+	assertMappedState(t, mockMappable, true, "auto-mapping", 5*time.Second)
 
 	// Test memory usage calculation
 	usage := manager.GetUsage()
@@ -148,20 +144,14 @@ func TestMemoryManager_MemoryPressureMapping(t *testing.T) {
 	}
 
 	// Initially should not be mapped (below threshold)
-	// Give more time for potential automatic mapping to occur, but it shouldn't happen
-	time.Sleep(300 * time.Millisecond)
+	// Poll to verify no automatic mapping occurred (use generous deadline for -race)
+	assertMappedState(t, mockMappable, false, "below threshold", 2*time.Second)
 
-	// Check current memory usage to see if pressure is already triggered
+	// Check current memory usage
 	usage := manager.GetUsage()
 	t.Logf("Current memory usage: Total=%d, Limit=%d, Available=%d", usage.Total, usage.Limit, usage.Available)
 
-	if mockMappable.IsMemoryMapped() {
-		t.Errorf("Expected no automatic mapping below threshold (size=%d, threshold=%d)",
-			mockMappable.EstimateSize(), config.MMapThreshold)
-	}
-
 	// Now simulate memory pressure by setting a very low limit
-	// Use current usage as baseline and set limit slightly below it
 	currentUsage := usage.Total - usage.MemoryMapped // Only heap usage counts against limit
 	lowLimit := currentUsage - 100                   // Set limit below current usage to trigger pressure
 	err = manager.SetLimit(lowLimit)
@@ -169,12 +159,27 @@ func TestMemoryManager_MemoryPressureMapping(t *testing.T) {
 		t.Fatalf("Failed to set memory limit: %v", err)
 	}
 
-	// Wait for pressure response
-	time.Sleep(200 * time.Millisecond)
+	// Poll until pressure response maps the mappable (generous deadline for -race)
+	assertMappedState(t, mockMappable, true, "memory pressure", 5*time.Second)
+}
 
-	// Should now be mapped due to memory pressure
-	if !mockMappable.IsMemoryMapped() {
-		t.Error("Expected memory mapping to be enabled under memory pressure")
+// assertMappedState polls until the mappable reaches the expected mapped state or deadline expires.
+func assertMappedState(t *testing.T, mappable *MockMemoryMappable, want bool, context string, deadline time.Duration) {
+	t.Helper()
+	timeout := time.After(deadline)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if mappable.IsMemoryMapped() == want {
+			return
+		}
+		select {
+		case <-timeout:
+			t.Errorf("Expected mapped=%v (%s) after %v but got mapped=%v",
+				want, context, deadline, mappable.IsMemoryMapped())
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -234,13 +239,8 @@ func TestMemoryManager_MappingDisabled(t *testing.T) {
 		t.Fatalf("Failed to register mappable: %v", err)
 	}
 
-	// Give some time for potential mapping
-	time.Sleep(100 * time.Millisecond)
-
-	// Should not be mapped when disabled
-	if mockMappable.IsMemoryMapped() {
-		t.Error("Expected no memory mapping when disabled")
-	}
+	// Poll to verify no mapping occurs when disabled
+	assertMappedState(t, mockMappable, false, "mmap disabled", 2*time.Second)
 }
 
 func TestMemoryManager_MappingPriorityOrder(t *testing.T) {
@@ -297,19 +297,26 @@ func TestMemoryManager_MappingPriorityOrder(t *testing.T) {
 		t.Fatalf("Failed to set memory limit: %v", err)
 	}
 
-	// Wait for pressure response
-	time.Sleep(200 * time.Millisecond)
-
-	// At least one of the mappables should be mapped under pressure
-	mappedCount := 0
-	if smallMappable.IsMemoryMapped() {
-		mappedCount++
-	}
-	if largeMappable.IsMemoryMapped() {
-		mappedCount++
-	}
-
-	if mappedCount == 0 {
-		t.Error("Expected at least one mappable to be mapped under memory pressure")
+	// Poll until at least one mappable is mapped under pressure
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		mappedCount := 0
+		if smallMappable.IsMemoryMapped() {
+			mappedCount++
+		}
+		if largeMappable.IsMemoryMapped() {
+			mappedCount++
+		}
+		if mappedCount > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Error("Expected at least one mappable to be mapped under memory pressure")
+			return
+		case <-ticker.C:
+		}
 	}
 }

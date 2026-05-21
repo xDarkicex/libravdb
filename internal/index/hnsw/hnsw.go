@@ -349,6 +349,13 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
+	if k <= 0 {
+		return nil, fmt.Errorf("k must be positive, got %d", k)
+	}
+	if k > 4096 {
+		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
+	}
+
 	if h.size == 0 {
 		return nil, fmt.Errorf("index is empty")
 	}

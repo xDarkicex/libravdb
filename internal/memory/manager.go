@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,7 +18,6 @@ type manager struct {
 	limit     int64
 	caches    map[string]Cache
 	mappables map[string]MemoryMappable
-	lastUsage MemoryUsage
 
 	// Memory mapping
 	mmapManager *MemoryMapManager
@@ -32,7 +32,7 @@ type manager struct {
 	done   chan struct{}
 
 	// Pressure tracking
-	lastPressureLevel MemoryPressureLevel
+	lastPressureLevel atomic.Int32
 }
 
 // NewManager creates a new memory manager with the given configuration
@@ -64,8 +64,7 @@ func NewManager(config MemoryConfig) MemoryManager {
 		mmapManager:       mmapManager,
 		pressureCallbacks: make([]func(usage MemoryUsage), 0),
 		releaseCallbacks:  make([]func(freed int64), 0),
-		done:              make(chan struct{}),
-		lastPressureLevel: NoPressure,
+		done: make(chan struct{}),
 	}
 }
 
@@ -144,7 +143,6 @@ func (m *manager) getCurrentUsage() MemoryUsage {
 		usage.Available = -1 // Unlimited
 	}
 
-	m.lastUsage = usage
 	return usage
 }
 
@@ -350,9 +348,10 @@ func (m *manager) checkMemoryUsage() {
 	pressureLevel := m.calculatePressureLevel(usageRatio)
 
 	// Trigger pressure callbacks if level changed
-	if pressureLevel != m.lastPressureLevel && pressureLevel != NoPressure {
+	prev := MemoryPressureLevel(m.lastPressureLevel.Load())
+	if pressureLevel != prev && pressureLevel != NoPressure {
 		m.handleMemoryPressure(usage)
-		m.lastPressureLevel = pressureLevel
+		m.lastPressureLevel.Store(int32(pressureLevel))
 	}
 
 	// Trigger automatic GC if enabled and threshold exceeded

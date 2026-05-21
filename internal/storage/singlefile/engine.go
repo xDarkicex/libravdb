@@ -57,9 +57,22 @@ const (
 
 // groupCommitWindow is the short delay used to coalesce flushNow requests
 // into a single durable WAL commit. Tests may temporarily override this.
-var groupCommitWindow = 1 * time.Millisecond
-var groupCommitMaxWindow = 5 * time.Millisecond
-var groupCommitStepWindow = 500 * time.Microsecond
+// Each atomic is padded to 64 bytes to prevent false sharing between the
+// ingestion threads (Store/Add) and the flusher loop (Load) on the same
+// cache line.
+var (
+	groupCommitWindow     atomic.Int64
+	_                     [7]uint64 // pad to 64-byte cache line boundary
+	groupCommitMaxWindow  atomic.Int64
+	_                     [7]uint64
+	groupCommitStepWindow atomic.Int64
+)
+
+func init() {
+	groupCommitWindow.Store(int64(1 * time.Millisecond))
+	groupCommitMaxWindow.Store(int64(5 * time.Millisecond))
+	groupCommitStepWindow.Store(int64(500 * time.Microsecond))
+}
 
 type fileHeader struct {
 	Magic             [8]byte
@@ -223,7 +236,7 @@ type RecoveryStats struct {
 type Collection struct {
 	engine *Engine
 	name   string
-	closed bool
+	closed atomic.Bool
 }
 
 // New opens or creates a single-file database.
@@ -911,31 +924,35 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	buf := make([]byte, 0, totalSize)
 	var written uint64
 	for _, record := range records {
-		var frameHeader [40]byte
-		binary.LittleEndian.PutUint32(frameHeader[0:4], record.Header.Magic)
-		binary.LittleEndian.PutUint16(frameHeader[4:6], record.Header.Version)
-		binary.LittleEndian.PutUint16(frameHeader[6:8], record.Header.RecordType)
-		binary.LittleEndian.PutUint64(frameHeader[8:16], record.Header.LSN)
-		binary.LittleEndian.PutUint64(frameHeader[16:24], record.Header.TxID)
-		binary.LittleEndian.PutUint64(frameHeader[24:32], record.Header.PrevLSN)
-		binary.LittleEndian.PutUint32(frameHeader[32:36], record.Header.PayloadLen)
-		binary.LittleEndian.PutUint32(frameHeader[36:40], record.Header.Checksum)
+		// Reserve space in buf for chunk header + frame header.
+		start := len(buf)
+		buf = buf[:start+16+40]
 
-		payloadLen := uint32(len(frameHeader) + len(record.Payload))
-		checksum := crc32.Update(0, castagnoli, frameHeader[:])
+		// Write frame header directly into buf — no stack array escape.
+		fh := buf[start+16 : start+16+40]
+		binary.LittleEndian.PutUint32(fh[0:4], record.Header.Magic)
+		binary.LittleEndian.PutUint16(fh[4:6], record.Header.Version)
+		binary.LittleEndian.PutUint16(fh[6:8], record.Header.RecordType)
+		binary.LittleEndian.PutUint64(fh[8:16], record.Header.LSN)
+		binary.LittleEndian.PutUint64(fh[16:24], record.Header.TxID)
+		binary.LittleEndian.PutUint64(fh[24:32], record.Header.PrevLSN)
+		binary.LittleEndian.PutUint32(fh[32:36], record.Header.PayloadLen)
+		binary.LittleEndian.PutUint32(fh[36:40], record.Header.Checksum)
+
+		payloadLen := uint32(40 + len(record.Payload))
+		checksum := crc32.Update(0, castagnoli, fh)
 		checksum = crc32.Update(checksum, castagnoli, record.Payload)
 
-		var chunkHeader [16]byte
-		binary.LittleEndian.PutUint32(chunkHeader[0:4], chunkMagic)
-		binary.LittleEndian.PutUint16(chunkHeader[4:6], chunkTypeWAL)
-		binary.LittleEndian.PutUint16(chunkHeader[6:8], formatVersion)
-		binary.LittleEndian.PutUint32(chunkHeader[8:12], payloadLen)
-		binary.LittleEndian.PutUint32(chunkHeader[12:16], checksum)
+		// Write chunk header directly into buf.
+		ch := buf[start : start+16]
+		binary.LittleEndian.PutUint32(ch[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(ch[4:6], chunkTypeWAL)
+		binary.LittleEndian.PutUint16(ch[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(ch[8:12], payloadLen)
+		binary.LittleEndian.PutUint32(ch[12:16], checksum)
 
-		buf = append(buf, chunkHeader[:]...)
-		buf = append(buf, frameHeader[:]...)
 		buf = append(buf, record.Payload...)
-		written += uint64(16 + len(frameHeader) + len(record.Payload))
+		written += uint64(16 + 40 + len(record.Payload))
 	}
 
 	if _, err := e.file.Write(buf); err != nil {
@@ -1063,15 +1080,18 @@ func (e *Engine) batchFlusher() {
 }
 
 func adaptiveGroupCommitWindow(waiters int32) time.Duration {
-	if groupCommitWindow <= 0 {
+	window := time.Duration(groupCommitWindow.Load())
+	if window <= 0 {
 		return 0
 	}
 	if waiters <= 1 {
-		return groupCommitWindow
+		return window
 	}
-	delay := groupCommitWindow + time.Duration(waiters-1)*groupCommitStepWindow
-	if delay > groupCommitMaxWindow {
-		return groupCommitMaxWindow
+	step := time.Duration(groupCommitStepWindow.Load())
+	maxWindow := time.Duration(groupCommitMaxWindow.Load())
+	delay := window + time.Duration(waiters-1)*step
+	if delay > maxWindow {
+		return maxWindow
 	}
 	return delay
 }
@@ -1504,7 +1524,7 @@ func (e *Engine) GetCollection(name string) (storage.Collection, error) {
 	if persisted == nil || persisted.Deleted {
 		return nil, fmt.Errorf("collection %s not found", name)
 	}
-	if collection, ok := e.collections[name]; ok && !collection.closed {
+	if collection, ok := e.collections[name]; ok && !collection.closed.Load() {
 		return collection, nil
 	}
 	collection := &Collection{engine: e, name: name}
@@ -1576,7 +1596,7 @@ func (e *Engine) DeleteCollection(name string) error {
 	}
 	e.applyDeleteCollection(name, opLSN)
 	if collectionObj := e.collections[name]; collectionObj != nil {
-		collectionObj.closed = true
+		collectionObj.closed.Store(true)
 		delete(e.collections, name)
 	}
 	e.markDirtyLocked(written, 1)
@@ -1685,7 +1705,7 @@ func cloneEntry(record *recordValue) *index.VectorEntry {
 func (c *Collection) persisted() (*persistedCollection, error) {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed || c.engine.closed {
+	if c.closed.Load() || c.engine.closed {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -1699,7 +1719,7 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 	_ = ctx
 	c.engine.mu.Lock()
 	defer c.engine.mu.Unlock()
-	if c.closed || c.engine.closed {
+	if c.closed.Load() || c.engine.closed {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -1758,9 +1778,14 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 // Get returns a persisted entry by ID.
 func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return nil, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return nil, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return nil, fmt.Errorf("collection %s not found", c.name)
 	}
 	record := persisted.Records[id]
 	if record == nil || record.Deleted {
@@ -1773,18 +1798,28 @@ func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, er
 
 func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return false, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return false, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return false, fmt.Errorf("collection %s not found", c.name)
 	}
 	record := persisted.Records[id]
 	return record != nil && !record.Deleted, nil
 }
 
 func (c *Collection) GetByOrdinal(ordinal uint32) ([]float32, error) {
-	persisted, err := c.persisted()
-	if err != nil {
-		return nil, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return nil, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return nil, fmt.Errorf("collection %s not found", c.name)
 	}
 	if int(ordinal) >= len(persisted.ordinalToID) {
 		return nil, fmt.Errorf("ordinal %d not found", ordinal)
@@ -1818,9 +1853,14 @@ func (c *Collection) Distance(query []float32, ordinal uint32) (float32, error) 
 
 func (c *Collection) GetIDByOrdinal(ctx context.Context, ordinal uint32) (string, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return "", err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return "", fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return "", fmt.Errorf("collection %s not found", c.name)
 	}
 	if int(ordinal) >= len(persisted.ordinalToID) {
 		return "", fmt.Errorf("ordinal %d not found", ordinal)
@@ -1838,9 +1878,14 @@ func (c *Collection) GetIDByOrdinal(ctx context.Context, ordinal uint32) (string
 
 func (c *Collection) MemoryUsage(ctx context.Context) (int64, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return 0, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return 0, fmt.Errorf("collection %s not found", c.name)
 	}
 	var usage int64
 	for id, record := range persisted.Records {
@@ -1865,28 +1910,60 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 // Iterate walks all live records.
 func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error {
-	persisted, err := c.persisted()
-	if err != nil {
-		return err
+	c.engine.mu.RLock()
+	if c.closed.Load() || c.engine.closed {
+		c.engine.mu.RUnlock()
+		return fmt.Errorf("collection %s is closed", c.name)
 	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		c.engine.mu.RUnlock()
+		return fmt.Errorf("collection %s not found", c.name)
+	}
+
+	// Collect live IDs under lock (fast — map key iteration only, no cloning).
+	// We release the lock before sorting/cloning so flushBatch is never starved
+	// by a multi-million-record Iterate.
 	ids := make([]string, 0, len(persisted.Records))
 	for id, record := range persisted.Records {
 		if record != nil && !record.Deleted {
 			ids = append(ids, id)
 		}
 	}
+	c.engine.mu.RUnlock()
+
 	sort.Strings(ids)
-	for _, id := range ids {
+
+	// Process in chunks of 10K. Each chunk re-acquires RLock briefly to clone
+	// entries, then calls the user callback outside the lock. This bounds the
+	// worst-case lock hold to O(chunkSize) regardless of collection cardinality.
+	const chunkSize = 10000
+	for start := 0; start < len(ids); start += chunkSize {
+		end := min(start+chunkSize, len(ids))
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		record := persisted.Records[id]
-		entry := cloneEntry(record)
-		entry.ID = id
-		if err := fn(entry); err != nil {
-			return err
+
+		chunk := make([]*index.VectorEntry, 0, end-start)
+		c.engine.mu.RLock()
+		for _, id := range ids[start:end] {
+			record := persisted.Records[id]
+			if record == nil || record.Deleted {
+				continue
+			}
+			entry := cloneEntry(record)
+			entry.ID = id
+			chunk = append(chunk, entry)
+		}
+		c.engine.mu.RUnlock()
+
+		for _, entry := range chunk {
+			if err := fn(entry); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1895,9 +1972,14 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 // Count returns the exact number of live records.
 func (c *Collection) Count(ctx context.Context) (int, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return 0, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return 0, fmt.Errorf("collection %s not found", c.name)
 	}
 	return int(persisted.LiveCount), nil
 }
@@ -1905,23 +1987,28 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 // NextOrdinal returns the next ordinal that would be assigned to a new record.
 func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
 	_ = ctx
-	persisted, err := c.persisted()
-	if err != nil {
-		return 0, err
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return 0, fmt.Errorf("collection %s not found", c.name)
 	}
 	return persisted.NextOrdinal, nil
 }
 
 // Close releases the collection handle.
 func (c *Collection) Close() error {
-	c.closed = true
+	c.closed.Store(true)
 	return nil
 }
 
 func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 	c.engine.mu.Lock()
 	defer c.engine.mu.Unlock()
-	if c.closed || c.engine.closed {
+	if c.closed.Load() || c.engine.closed {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]

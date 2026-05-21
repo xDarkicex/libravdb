@@ -1507,6 +1507,13 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		c.mu.RUnlock()
 		return nil, ErrCollectionClosed
 	}
+	// Snapshot the index and shard indexes under lock so concurrent tx commits
+	// that swap indexes don't race with Search reading them.
+	idx := c.index
+	shardIndexes := make([]index.Index, len(c.shards))
+	for i := range c.shards {
+		shardIndexes[i] = c.shards[i].index
+	}
 	c.mu.RUnlock()
 
 	// Validate input
@@ -1540,7 +1547,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				defer wg.Done()
 				// Each shard only needs its local top-k; the parent merges all shard results.
 				shardK := k
-				results, err := c.shards[shardIdx].index.Search(ctx, vector, shardK)
+				results, err := shardIndexes[shardIdx].Search(ctx, vector, shardK)
 				resultsCh <- shardResult{results: results, err: err}
 			}(i)
 		}
@@ -1550,7 +1557,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results, err := c.index.Search(ctx, vector, k)
+			results, err := idx.Search(ctx, vector, k)
 			resultsCh <- shardResult{results: results, err: err}
 		}()
 	}
@@ -1587,10 +1594,10 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 			Version: r.Version,
 		}
 		if len(r.Vector) > 0 {
-			result.Vector = cloneVector(r.Vector)
+			result.Vector = r.Vector // index already cloned; we take ownership
 		}
 		if r.Metadata != nil {
-			result.Metadata = cloneMetadata(r.Metadata)
+			result.Metadata = r.Metadata // index already cloned; we take ownership
 		}
 
 		// Get full record from storage if needed.
@@ -1607,10 +1614,10 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				result.ID = entry.ID
 				result.Version = entry.Version
 				if result.Vector == nil {
-					result.Vector = cloneVector(entry.Vector)
+					result.Vector = entry.Vector // cloneEntry already cloned
 				}
 				if result.Metadata == nil {
-					result.Metadata = cloneMetadata(entry.Metadata)
+					result.Metadata = entry.Metadata // cloneEntry already cloned
 				}
 			} else if result.Metadata == nil {
 				result.Metadata = map[string]interface{}{}

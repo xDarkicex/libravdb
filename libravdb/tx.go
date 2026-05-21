@@ -330,8 +330,8 @@ func (tx *transaction) ListByMetadata(ctx context.Context, collection, field str
 		entry := working[id]
 		records = append(records, Record{
 			ID:       entry.ID,
-			Vector:   cloneVector(entry.Vector),
-			Metadata: cloneMetadata(entry.Metadata),
+			Vector:   entry.Vector,   // Iterate/cloneEntry already cloned
+			Metadata: entry.Metadata, // Iterate/cloneEntry already cloned
 			Version:  entry.Version,
 		})
 	}

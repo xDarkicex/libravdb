@@ -351,9 +351,9 @@ func TestConcurrentSingleInsertsCoalesceIntoFewerTransactions(t *testing.T) {
 		t.Fatalf("create collection: %v", err)
 	}
 
-	origWindow := groupCommitWindow
-	groupCommitWindow = 20 * time.Millisecond
-	defer func() { groupCommitWindow = origWindow }()
+	origWindow := groupCommitWindow.Load()
+	groupCommitWindow.Store(int64(20 * time.Millisecond))
+	defer func() { groupCommitWindow.Store(origWindow) }()
 
 	before := engine.WriteStats()
 
@@ -441,9 +441,9 @@ func TestConcurrentSingleInsertsGroupCommitWindowSweep(t *testing.T) {
 				t.Fatalf("create collection: %v", err)
 			}
 
-			origWindow := groupCommitWindow
-			groupCommitWindow = tc.window
-			defer func() { groupCommitWindow = origWindow }()
+			origWindow := groupCommitWindow.Load()
+			groupCommitWindow.Store(int64(tc.window))
+			defer func() { groupCommitWindow.Store(origWindow) }()
 
 			before := engine.WriteStats()
 

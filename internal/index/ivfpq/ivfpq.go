@@ -9,6 +9,9 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
+
+	"github.com/xDarkicex/memory"
 
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -178,6 +181,106 @@ type candidate struct {
 	entry       *VectorEntry
 	distance    float32
 	clusterDist float32
+}
+
+// ivfHeapElement is a max-heap node storing a candidate entry and its distance.
+// Sized at 16 bytes (pointer=8 + float32=4 + padding=4) — fits two per cache line.
+type ivfHeapElement struct {
+	entry    *VectorEntry
+	distance float32
+}
+
+// ivfUpHeap bubbles the element at i up to restore max-heap property.
+func ivfUpHeap(h []ivfHeapElement, i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if h[parent].distance >= h[i].distance {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+// ivfDownHeap sifts the element at i down to restore max-heap property.
+func ivfDownHeap(h []ivfHeapElement, i, n int) {
+	for {
+		largest := i
+		left := 2*i + 1
+		right := 2*i + 2
+		if left < n && h[left].distance > h[largest].distance {
+			largest = left
+		}
+		if right < n && h[right].distance > h[largest].distance {
+			largest = right
+		}
+		if largest == i {
+			break
+		}
+		h[i], h[largest] = h[largest], h[i]
+		i = largest
+	}
+}
+
+// ivfUserDataOffset is the byte offset within a ShardedFreeList slot where user
+// data begins. The first 64 bytes are reserved for FreeList/ShardedFreeList metadata.
+const ivfUserDataOffset = 64
+
+// ivfHeapSlot binds an off-heap slot to its originating pool so that free()
+// routes to the correct tier by construction.
+type ivfHeapSlot struct {
+	slot []byte
+	pool *memory.ShardedFreeList
+}
+
+func (hs *ivfHeapSlot) free() { hs.pool.Deallocate(hs.slot) }
+
+// Power-of-2 tier table. Each tier's slot is sized for its maxK.
+type ivfPoolTier struct {
+	maxK int
+	pool *memory.ShardedFreeList
+	once sync.Once
+}
+
+var ivfQueryTiers = [...]ivfPoolTier{
+	{maxK: 16},
+	{maxK: 128},
+	{maxK: 1024},
+	{maxK: 4096},
+}
+
+// acquireHeapSlot returns an ivfHeapSlot paired with a []ivfHeapElement buffer
+// backed by the appropriate off-heap tier. Returns nil, nil if k exceeds the
+// largest tier — caller must fall back to Go heap allocation.
+func acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
+	for i := range ivfQueryTiers {
+		if k > ivfQueryTiers[i].maxK {
+			continue
+		}
+		tier := &ivfQueryTiers[i]
+		tier.once.Do(func() {
+			slotSize := uint64(ivfUserDataOffset + tier.maxK*16)
+			pool, err := memory.NewShardedFreeList(memory.FreeListConfig{
+				PoolSize:  16 * 1024 * 1024,
+				SlotSize:  slotSize,
+				SlabSize:  1 * 1024 * 1024,
+				SlabCount: 16,
+				Prealloc:  true,
+			}, 64)
+			if err != nil {
+				panic("ivfpq: failed to create query pool tier: " + err.Error())
+			}
+			tier.pool = pool
+		})
+		slot, err := tier.pool.Allocate()
+		if err != nil {
+			return nil, nil
+		}
+		ptr := unsafe.Add(unsafe.Pointer(unsafe.SliceData(slot)), ivfUserDataOffset)
+		heapBuf := unsafe.Slice((*ivfHeapElement)(ptr), tier.maxK)[:k]
+		return &ivfHeapSlot{slot: slot, pool: tier.pool}, heapBuf
+	}
+	return nil, nil
 }
 
 // NewIVFPQ creates a new IVF-PQ index
@@ -648,6 +751,9 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	if k <= 0 {
 		return nil, fmt.Errorf("k must be positive, got %d", k)
 	}
+	if k > 4096 {
+		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
+	}
 
 	if !idx.trained {
 		return nil, fmt.Errorf("index must be trained before search")
@@ -662,26 +768,20 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
 	}
 
-	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances)
+	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k)
 	if err != nil {
 		return nil, err
 	}
 
-	// Sort all candidates by distance
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].distance < candidates[j].distance
-	})
+	// Candidates are already top-k in ascending distance order from the heap.
+	results := make([]*SearchResult, len(candidates))
 
-	// Convert to search results
-	resultCount := min(k, len(candidates))
-	results := make([]*SearchResult, resultCount)
-
-	for i := 0; i < resultCount; i++ {
+	for i, cand := range candidates {
 		results[i] = &SearchResult{
-			ID:       candidates[i].entry.ID,
-			Score:    candidates[i].distance,
-			Vector:   candidates[i].entry.Vector,
-			Metadata: candidates[i].entry.Metadata,
+			ID:       cand.entry.ID,
+			Score:    cand.distance,
+			Vector:   cand.entry.Vector,
+			Metadata: cand.entry.Metadata,
 		}
 	}
 
@@ -701,10 +801,10 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32) ([]candidate, error) {
+func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
 	workers := parallelismFor(len(probeClusters))
 	if workers == 1 {
-		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances)
+		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k)
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
@@ -723,7 +823,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		go func(worker, start, end int) {
 			defer wg.Done()
 
-			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end])
+			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k)
 			if err != nil {
 				errCh <- err
 				return
@@ -741,20 +841,116 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		}
 	}
 
-	total := 0
-	for _, batch := range results {
-		total += len(batch)
-	}
-
-	candidates := make([]candidate, 0, total)
-	for _, batch := range results {
-		candidates = append(candidates, batch...)
-	}
+	// Merge: k-way merge over W pre-sorted worker arrays.
+	// Each worker already produced ascending-distance output. Instead of
+	// re-heaping element-by-element (O(W·k log k)), a min-heap of size W
+	// performs a linear merge in O(W·k log W).
+	candidates := mergeSortedWorkerResults(results, k)
 	return candidates, nil
 }
 
-func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32) ([]candidate, error) {
-	candidates := make([]candidate, 0)
+// mergeElem is a k-way merge heap node: (distance, source worker, position within worker).
+type mergeElem struct {
+	distance float32
+	worker   int
+	pos      int
+}
+
+func mergeDownHeap(h []mergeElem, i, n int) {
+	for {
+		smallest := i
+		left := 2*i + 1
+		right := 2*i + 2
+		if left < n && h[left].distance < h[smallest].distance {
+			smallest = left
+		}
+		if right < n && h[right].distance < h[smallest].distance {
+			smallest = right
+		}
+		if smallest == i {
+			break
+		}
+		h[i], h[smallest] = h[smallest], h[i]
+		i = smallest
+	}
+}
+
+// mergeSortedWorkerResults merges W pre-sorted (ascending distance) candidate
+// arrays into a single top-k candidate slice via k-way merge.
+// Complexity: O(W·k log W) instead of the previous O(W·k log k) re-heaping.
+func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
+	// Count non-empty workers and compute total available results.
+	active := 0
+	total := 0
+	for _, batch := range results {
+		if len(batch) > 0 {
+			active++
+			total += len(batch)
+		}
+	}
+	if active == 0 {
+		return nil
+	}
+	if k > total {
+		k = total
+	}
+
+	// Allocate a small merge heap on the Go heap — size is bounded by W (workers),
+	// typically ≤ GOMAXPROCS, not by k. This is a trivial allocation.
+	mergeHeap := make([]mergeElem, 0, active)
+	pos := make([]int, len(results))
+
+	for w, batch := range results {
+		if len(batch) == 0 {
+			continue
+		}
+		mergeHeap = append(mergeHeap, mergeElem{
+			distance: batch[0].distance,
+			worker:   w,
+			pos:      0,
+		})
+	}
+	// Heapify: build min-heap in O(W).
+	for i := len(mergeHeap)/2 - 1; i >= 0; i-- {
+		mergeDownHeap(mergeHeap, i, len(mergeHeap))
+	}
+
+	candidates := make([]candidate, 0, k)
+	for len(candidates) < k && len(mergeHeap) > 0 {
+		root := mergeHeap[0]
+		w := root.worker
+		p := root.pos
+
+		candidates = append(candidates, results[w][p])
+
+		// Advance this worker's cursor; if more elements remain, replace root.
+		pos[w] = p + 1
+		if pos[w] < len(results[w]) {
+			mergeHeap[0] = mergeElem{
+				distance: results[w][pos[w]].distance,
+				worker:   w,
+				pos:      pos[w],
+			}
+		} else {
+			// Worker exhausted — swap with last and shrink.
+			mergeHeap[0] = mergeHeap[len(mergeHeap)-1]
+			mergeHeap = mergeHeap[:len(mergeHeap)-1]
+		}
+		mergeDownHeap(mergeHeap, 0, len(mergeHeap))
+	}
+	return candidates
+}
+
+func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
+	hs, heapBuf := acquireIVFHeapSlot(k)
+	if hs != nil {
+		defer hs.free()
+	} else {
+		heapBuf = make([]ivfHeapElement, k)
+	}
+
+	count := 0
+
 	for i, clusterID := range probeClusters {
 		select {
 		case <-ctx.Done():
@@ -772,15 +968,34 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 				cluster.mutex.RUnlock()
 				return nil, err
 			}
+			_ = clusterDist
 
-			candidates = append(candidates, candidate{
-				entry:       entry,
-				distance:    distance,
-				clusterDist: clusterDist,
-			})
+			if count < k {
+				heapBuf[count] = ivfHeapElement{entry: entry, distance: distance}
+				ivfUpHeap(heapBuf, count)
+				count++
+			} else if distance < heapBuf[0].distance {
+				heapBuf[0] = ivfHeapElement{entry: entry, distance: distance}
+				ivfDownHeap(heapBuf, 0, count)
+			}
 		}
 
 		cluster.mutex.RUnlock()
+	}
+
+	// Extract results in ascending distance order (smallest first).
+	candidates := make([]candidate, count)
+	for i := count - 1; i >= 0; i-- {
+		elem := heapBuf[0]
+		count--
+		heapBuf[0] = heapBuf[count]
+		ivfDownHeap(heapBuf, 0, count)
+
+		candidates[i] = candidate{
+			entry:       elem.entry,
+			distance:    elem.distance,
+			clusterDist: 0,
+		}
 	}
 
 	return candidates, nil
