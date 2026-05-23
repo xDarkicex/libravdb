@@ -1,6 +1,8 @@
 package hnsw
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -109,19 +111,17 @@ func NewHNSW(config *Config) (*Index, error) {
 	index.searchScratchPool.New = func() interface{} {
 		return &searchScratch{}
 	}
-	if config.Provider == nil {
-		switch config.RawVectorStore {
-		case "", RawVectorStoreMemory:
-			index.rawVectorStore = NewInMemoryRawVectorStore(config.Dimension)
-		case RawVectorStoreSlabby:
-			store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create slabby raw vector store: %w", err)
-			}
-			index.rawVectorStore = store
-		default:
-			return nil, fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
+	switch config.RawVectorStore {
+	case "", RawVectorStoreMemory:
+		index.rawVectorStore = NewInMemoryRawVectorStore(config.Dimension)
+	case RawVectorStoreSlabby:
+		store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create slabby raw vector store: %w", err)
 		}
+		index.rawVectorStore = store
+	default:
+		return nil, fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
 	}
 
 	// Initialize quantizer if quantization is configured
@@ -189,7 +189,7 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 			return fmt.Errorf("failed to compress vector: %w", err)
 		}
 		node.CompressedVector = compressed
-	} else if h.provider == nil {
+	} else if h.rawVectorStore != nil {
 		_, err := h.rawVectorStore.Put(entry.Vector)
 		if err != nil {
 			return fmt.Errorf("failed to store raw vector: %w", err)
@@ -675,6 +675,77 @@ func (h *Index) getNodeVector(node *Node) ([]float32, error) {
 	return nil, fmt.Errorf("vector unavailable for ordinal %d", node.Ordinal)
 }
 
+// getNodeVectorLocal retrieves a node's vector from local storage only.
+// It deliberately skips h.provider to avoid re-entrant lock acquisition
+// during serialization (engine holds e.mu.Lock; provider.GetByOrdinal
+// would try e.mu.RLock → deadlock).
+func (h *Index) getNodeVectorLocal(node *Node) ([]float32, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
+	if node.CompressedVector != nil && h.quantizer != nil {
+		return h.quantizer.Decompress(node.CompressedVector)
+	}
+	if h.rawVectorStore != nil {
+		ref := VectorRef{
+			Kind:  VectorEncodingRaw,
+			Slot:  node.Ordinal,
+			Bytes: uint32(h.config.Dimension * 4),
+			Valid: true,
+		}
+		vec, err := h.rawVectorStore.Get(ref)
+		if err == nil && vec != nil {
+			return vec, nil
+		}
+	}
+	return nil, fmt.Errorf("vector for ordinal %d not in local storage", node.Ordinal)
+}
+
+// SnapshotVectorsFromProvider copies all node vectors from the provider into
+// rawVectorStore so that subsequent serialization can proceed without calling
+// back into the provider. Must be called before SerializeToBytes when a
+// provider is set and the caller cannot re-enter the provider.
+func (h *Index) SnapshotVectorsFromProvider(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.provider == nil {
+		return nil
+	}
+	if h.rawVectorStore == nil {
+		h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+	}
+
+	for _, node := range h.nodes {
+		if node == nil || node.CompressedVector != nil {
+			continue
+		}
+		// Check if already present in rawVectorStore.
+		ref := VectorRef{
+			Kind:  VectorEncodingRaw,
+			Slot:  node.Ordinal,
+			Bytes: uint32(h.config.Dimension * 4),
+			Valid: true,
+		}
+		if vec, err := h.rawVectorStore.Get(ref); err == nil && vec != nil {
+			continue
+		}
+		vec, err := h.provider.GetByOrdinal(node.Ordinal)
+		if err != nil || vec == nil {
+			return fmt.Errorf("snapshot vector ordinal %d: %w", node.Ordinal, err)
+		}
+		if _, err := h.rawVectorStore.Put(vec); err != nil {
+			return fmt.Errorf("snapshot store ordinal %d: %w", node.Ordinal, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	return nil
+}
+
 // computeDistance computes distance between vectors, handling quantization
 func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float32, error) {
 	// If both nodes are quantized, use quantized distance computation
@@ -839,6 +910,76 @@ func (h *Index) SaveToDisk(ctx context.Context, path string) error {
 // LoadFromDisk rebuilds HNSW index from disk
 func (h *Index) LoadFromDisk(ctx context.Context, path string) error {
 	return h.loadFromDiskImpl(ctx, path)
+}
+
+// SerializeToBytes serializes the index to an in-memory byte slice using the
+// same binary format as SaveToDisk.
+func (h *Index) SerializeToBytes() ([]byte, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+
+	if err := h.writeHeader(writer); err != nil {
+		return nil, fmt.Errorf("failed to write header: %w", err)
+	}
+	if err := h.writeConfig(writer); err != nil {
+		return nil, fmt.Errorf("failed to write config: %w", err)
+	}
+	if err := h.writeNodes(writer); err != nil {
+		return nil, fmt.Errorf("failed to write nodes: %w", err)
+	}
+	if err := h.writeLinks(writer); err != nil {
+		return nil, fmt.Errorf("failed to write links: %w", err)
+	}
+	if err := h.writeMetadata(writer); err != nil {
+		return nil, fmt.Errorf("failed to write metadata: %w", err)
+	}
+
+	writer.Flush()
+	return buf.Bytes(), nil
+}
+
+// DeserializeFromBytes restores the index from an in-memory byte slice.
+func (h *Index) DeserializeFromBytes(data []byte) error {
+	reader := bufio.NewReader(bytes.NewReader(data))
+
+	if err := h.readHeader(reader); err != nil {
+		return fmt.Errorf("failed to read header: %w", err)
+	}
+	if err := h.readConfig(reader); err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	// Always restore a local raw vector store during deserialization so the
+	// index can answer searches even before external storage is populated.
+	if h.rawVectorStore == nil {
+		switch h.config.RawVectorStore {
+		case "", RawVectorStoreMemory:
+			h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+		case RawVectorStoreSlabby:
+			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
+			if err != nil {
+				return fmt.Errorf("failed to create slabby raw vector store: %w", err)
+			}
+			h.rawVectorStore = store
+		default:
+			return fmt.Errorf("unsupported raw vector store backend: %s", h.config.RawVectorStore)
+		}
+	}
+
+	if err := h.readNodes(reader); err != nil {
+		return fmt.Errorf("failed to read nodes: %w", err)
+	}
+	if err := h.readLinks(reader); err != nil {
+		return fmt.Errorf("failed to read links: %w", err)
+	}
+	if err := h.readMetadata(reader); err != nil {
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	return h.rebuildIndexState()
 }
 
 // GetPersistenceMetadata returns metadata about the current index state

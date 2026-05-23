@@ -448,7 +448,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 }
 
 // newCollectionFromStorage creates a collection instance from existing storage
-func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController) (*Collection, error) {
+func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index) (*Collection, error) {
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
 		Dimension:      engineConfig.Dimension,
@@ -471,14 +471,21 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		config.NProbes = min(config.NClusters, 10)
 	}
 
-	// Create index with stored config.
-	provider, _ := storageCollection.(interface {
-		GetByOrdinal(uint32) ([]float32, error)
-		Distance([]float32, uint32) (float32, error)
-	})
-	idx, err := createIndexForCollection(config, provider)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create index: %w", err)
+	// Use cached index if available (deserialized or rebuilt during recovery),
+	// otherwise create a new one and rebuild from storage records.
+	var idx index.Index
+	if cachedIndex != nil {
+		idx = cachedIndex
+	} else {
+		provider, _ := storageCollection.(interface {
+			GetByOrdinal(uint32) ([]float32, error)
+			Distance([]float32, uint32) (float32, error)
+		})
+		var err error
+		idx, err = createIndexForCollection(config, provider)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create index: %w", err)
+		}
 	}
 
 	// Initialize memory manager if memory management is configured
@@ -518,12 +525,43 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		memoryManager: memManager,
 	}
 
-	// Rebuild index from storage data
-	if err := collection.rebuildIndex(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to rebuild index: %w", err)
+	// Rebuild index from storage data (skipped if cached index was used).
+	if cachedIndex == nil {
+		if err := collection.rebuildIndex(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to rebuild index: %w", err)
+		}
+	} else if hasMeta, ok := idx.(interface{ HasDeserializedMeta() bool }); ok && hasMeta.HasDeserializedMeta() {
+		// IVF-PQ two-phase deserialization: centroids and codebooks were
+		// restored by DeserializeFromBytes, but cluster entries must be
+		// populated from live storage records. Only entered when the
+		// index has pending deserialized metadata (never for HNSW, Flat,
+		// or rebuilt IVF-PQ where the bridge already fully populated).
+		if populator, ok := idx.(interface {
+			PopulateEntriesFromStorage(interface {
+				IterateEntries(fn func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error) error
+			}) error
+		}); ok {
+			provider := storageEntryProvider{col: storageCollection}
+			if err := populator.PopulateEntriesFromStorage(provider); err != nil {
+				return nil, fmt.Errorf("failed to populate IVF-PQ entries from storage: %w", err)
+			}
+		}
 	}
+	// All other cached-index cases (HNSW, Flat, rebuilt IVF-PQ):
+	// the bridge already fully populated the index during recovery.
 
 	return collection, nil
+}
+
+// storageEntryProvider adapts a storage.Collection to ivfpq.EntryProvider.
+type storageEntryProvider struct {
+	col storage.Collection
+}
+
+func (p storageEntryProvider) IterateEntries(fn func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error) error {
+	return p.col.Iterate(context.Background(), func(entry *index.VectorEntry) error {
+		return fn(entry.ID, entry.Ordinal, entry.Vector, entry.Metadata)
+	})
 }
 
 // newShardedCollectionFromStorage creates a sharded collection from existing shard storages
@@ -1502,6 +1540,7 @@ func (c *Collection) effectiveWriteConcurrency(requested int) int {
 
 // Search performs a vector similarity search
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
+
 	c.mu.RLock()
 	if c.closed {
 		c.mu.RUnlock()

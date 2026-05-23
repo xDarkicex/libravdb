@@ -26,10 +26,12 @@ const (
 	fileMagic            = "LIBRAVDB"
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
+	metaMagicV2   uint32 = 0x4C56444E // V2 metapage includes index persistence fields
 	chunkMagic    uint32 = 0x4C564443
 
 	chunkTypeSnapshot = uint16(1)
 	chunkTypeWAL      = uint16(2)
+	chunkTypeIndex    = uint16(3)
 
 	recordTypeTxBegin          = uint16(1)
 	recordTypeTxCommit         = uint16(2)
@@ -100,6 +102,9 @@ type metaPage struct {
 	CollectionCount uint64
 	SnapshotOffset  uint64
 	SnapshotLength  uint64
+	IndexOffset     uint64 // byte offset of index chunk (0 = no index persisted)
+	IndexLength     uint64 // payload length of index chunk
+	IndexChecksum   uint32 // CRC32 of entire indexBlock payload
 	Checksum        uint32
 }
 
@@ -177,6 +182,41 @@ type recordDeletePayload struct {
 	ID         string `json:"id"`
 }
 
+// IndexSnapshotProvider is implemented by the layer above the engine to
+// provide index serialization during checkpoint and deserialization during
+// recovery. The engine itself has no knowledge of index internals.
+type IndexSnapshotProvider interface {
+	// SerializeIndex returns serialized bytes for a collection's index, or
+	// (nil, nil) if the collection has no index yet (e.g. empty collection).
+	SerializeIndex(collectionName string) ([]byte, error)
+	// DeserializeIndex restores a collection's index from serialized bytes.
+	// Config provides the collection's dimension, index type, and other
+	// parameters needed to reconstruct the index.
+	DeserializeIndex(collectionName string, indexBytes []byte, config *storage.CollectionConfig) error
+	// RebuildIndex rebuilds a collection's index from scratch using the
+	// engine's current Records. Called when no valid index checkpoint exists
+	// or when the checkpoint is corrupt. Config provides the collection's
+	// dimension, index type, and other parameters needed to create the index.
+	RebuildIndex(collectionName string, config *storage.CollectionConfig) error
+	// IndexTypeVersion returns the index type code (0=flat,1=hnsw,2=ivfpq)
+	// and format version for verification on load.
+	IndexTypeVersion(collectionName string) (indexType uint8, indexVersion uint16)
+	// SnapshotVectors copies node vectors from provider-backed collections
+	// into local storage so that SerializeIndex can proceed without calling
+	// back into the provider (which would deadlock if the engine lock is held).
+	// Called before e.mu.Lock in Compact and checkpoint paths.
+	SnapshotVectors(ctx context.Context) error
+}
+
+// indexBlockEntry is a single collection's serialized index within the index chunk.
+type indexBlockEntry struct {
+	name           string
+	indexType      uint8
+	indexVersion   uint16
+	payload        []byte
+	payloadChecksum uint32
+}
+
 // Engine is the single-file storage engine.
 type Engine struct {
 	mu              sync.RWMutex
@@ -201,6 +241,9 @@ type Engine struct {
 	discardedTxs     uint64
 	compactionErrors uint64
 	closed           bool
+	status           atomic.Int32 // EngineStatus: Starting → Recovering* → Ready | Failed
+	recoveryErr      atomic.Value // error, set when status transitions to Failed
+	indexProvider    IndexSnapshotProvider
 
 	// WAL batch buffer: accumulates entries across multiple putRecords calls
 	// and flushes them together to reduce fsync overhead.
@@ -240,8 +283,23 @@ type Collection struct {
 	closed atomic.Bool
 }
 
+// Option is a functional option for New.
+type Option func(*Engine) error
+
+// WithIndexSnapshotProvider wires the index persistence bridge before recovery
+// so persisted indexes can be deserialized during openExisting/loadIndexes.
+func WithIndexSnapshotProvider(provider IndexSnapshotProvider) Option {
+	return func(e *Engine) error {
+		e.indexProvider = provider
+		if es, ok := provider.(interface{ SetEngine(storage.Engine) }); ok {
+			es.SetEngine(e)
+		}
+		return nil
+	}
+}
+
 // New opens or creates a single-file database.
-func New(path string) (storage.Engine, error) {
+func New(path string, opts ...Option) (storage.Engine, error) {
 	resolved, err := resolveDatabasePath(path)
 	if err != nil {
 		return nil, err
@@ -257,6 +315,14 @@ func New(path string) (storage.Engine, error) {
 		file:        file,
 		state:       &persistedState{NextCollectionID: 1, Collections: make(map[string]*persistedCollection)},
 		collections: make(map[string]*Collection),
+	}
+
+	// Apply options before recovery so provider is available to loadIndexes.
+	for _, opt := range opts {
+		if err := opt(engine); err != nil {
+			file.Close()
+			return nil, err
+		}
 	}
 
 	// Initialize WAL batch buffer channels (flusher goroutine started after init succeeds)
@@ -276,6 +342,7 @@ func New(path string) (storage.Engine, error) {
 		}
 		// Start background flusher only after successful initialization
 		startBatchFlusher(engine)
+		engine.status.Store(int32(storage.StatusReady))
 		return engine, nil
 	}
 
@@ -335,8 +402,11 @@ func (e *Engine) initializeEmpty() error {
 }
 
 func (e *Engine) openExisting() error {
+	e.status.Store(int32(storage.StatusStarting))
+
 	header, err := e.readHeader()
 	if err != nil {
+		e.fail(fmt.Errorf("read header: %w", err))
 		return err
 	}
 	e.fileID = header.FileID
@@ -344,6 +414,7 @@ func (e *Engine) openExisting() error {
 	meta1, err1 := e.readMetaPage(1)
 	meta2, err2 := e.readMetaPage(2)
 	if err1 != nil && err2 != nil {
+		e.fail(fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2))
 		return fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2)
 	}
 
@@ -352,17 +423,136 @@ func (e *Engine) openExisting() error {
 	e.activeMetaPage = metaPageNumber(chosen)
 	e.lastLSN = chosen.LastAppliedLSN
 
+	// Phase 1: load snapshot
+	e.status.Store(int32(storage.StatusRecoveringSnapshot))
 	if chosen.SnapshotLength > 0 {
 		if err := e.loadSnapshot(chosen.SnapshotOffset, chosen.SnapshotLength); err != nil {
+			e.fail(fmt.Errorf("load snapshot: %w", err))
 			return err
 		}
 	}
 
-	if err := e.replayWAL(chosen.LastAppliedLSN); err != nil {
+	// Phase 2: load or rebuild indexes
+	e.status.Store(int32(storage.StatusRecoveringIndexes))
+	if err := e.loadIndexes(chosen); err != nil {
+		e.fail(fmt.Errorf("load indexes: %w", err))
 		return err
 	}
 
+	// Phase 3: replay WAL
+	e.status.Store(int32(storage.StatusReplayingWAL))
+	if err := e.replayWAL(chosen.LastAppliedLSN); err != nil {
+		e.fail(fmt.Errorf("replay WAL: %w", err))
+		return err
+	}
+
+	e.status.Store(int32(storage.StatusReady))
 	return nil
+}
+
+// loadIndexes loads serialized indexes from the index chunk, or rebuilds
+// them from Records if no valid index chunk exists.
+func (e *Engine) loadIndexes(chosen *metaPage) error {
+	if e.indexProvider == nil {
+		return nil // no provider registered, indexes will be built by collection layer
+	}
+
+	// No index persisted — rebuild all from Records.
+	if chosen.IndexOffset == 0 || chosen.IndexLength == 0 {
+		return e.rebuildIndexesFromRecords()
+	}
+
+	// Read and validate the index chunk.
+	indexBlock, err := e.readChunkAt(chosen.IndexOffset)
+	if err != nil {
+		// Index chunk unreadable — rebuild all.
+		return e.rebuildIndexesFromRecords()
+	}
+	if uint64(len(indexBlock)) != chosen.IndexLength {
+		return e.rebuildIndexesFromRecords()
+	}
+	if crc32.Checksum(indexBlock, castagnoli) != chosen.IndexChecksum {
+		// Block-level checksum mismatch — rebuild all.
+		return e.rebuildIndexesFromRecords()
+	}
+
+	entries, err := decodeIndexBlock(indexBlock)
+	if err != nil {
+		return e.rebuildIndexesFromRecords()
+	}
+
+	// Per-collection validation and deserialization.
+	for _, entry := range entries {
+		collection := e.state.Collections[entry.name]
+		if collection == nil {
+			continue // stale collection, skip
+		}
+		if crc32.Checksum(entry.payload, castagnoli) != entry.payloadChecksum {
+			// Per-collection checksum fail — rebuild this collection only.
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Validate index type matches current collection config.
+		if entry.indexType != uint8(collection.Config.IndexType) {
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Validate index format version is supported.
+		if entry.indexVersion != formatVersion {
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := e.indexProvider.DeserializeIndex(entry.name, entry.payload, &collection.Config); err != nil {
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			continue
+		}
+	}
+
+	return nil
+}
+
+// rebuildIndexesFromRecords rebuilds every collection's index from its Records map.
+func (e *Engine) rebuildIndexesFromRecords() error {
+	if e.indexProvider == nil {
+		return nil
+	}
+	for name, collection := range e.state.Collections {
+		if collection.Deleted {
+			continue
+		}
+		if err := e.rebuildCollectionIndexFromRecords(name, collection); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rebuildCollectionIndexFromRecords rebuilds a single collection's index from
+// its Records map via the registered provider. This is faster than WAL replay
+// because it iterates Records directly without JSON decoding or transaction
+// bookkeeping overhead.
+func (e *Engine) rebuildCollectionIndexFromRecords(name string, collection *persistedCollection) error {
+	if e.indexProvider == nil {
+		return nil
+	}
+	return e.indexProvider.RebuildIndex(name, &collection.Config)
+}
+
+// fail transitions the engine to storage.StatusFailed and stores the error.
+func (e *Engine) fail(err error) {
+	e.recoveryErr.Store(err)
+	e.status.Store(int32(storage.StatusFailed))
 }
 
 func chooseMeta(meta1 *metaPage, err1 error, meta2 *metaPage, err2 error) *metaPage {
@@ -437,7 +627,7 @@ func encodeHeader(header *fileHeader) []byte {
 
 func encodeMeta(meta *metaPage) []byte {
 	buf := make([]byte, pageSize)
-	binary.LittleEndian.PutUint32(buf[0:4], meta.Magic)
+	binary.LittleEndian.PutUint32(buf[0:4], metaMagicV2)
 	binary.LittleEndian.PutUint64(buf[4:12], meta.MetaEpoch)
 	binary.LittleEndian.PutUint64(buf[12:20], meta.RootCatalog)
 	binary.LittleEndian.PutUint64(buf[20:28], meta.RootFreelist)
@@ -446,8 +636,11 @@ func encodeMeta(meta *metaPage) []byte {
 	binary.LittleEndian.PutUint64(buf[44:52], meta.CollectionCount)
 	binary.LittleEndian.PutUint64(buf[52:60], meta.SnapshotOffset)
 	binary.LittleEndian.PutUint64(buf[60:68], meta.SnapshotLength)
-	checksum := crc32.Checksum(buf[:68], castagnoli)
-	binary.LittleEndian.PutUint32(buf[68:72], checksum)
+	binary.LittleEndian.PutUint64(buf[68:76], meta.IndexOffset)
+	binary.LittleEndian.PutUint64(buf[76:84], meta.IndexLength)
+	binary.LittleEndian.PutUint32(buf[84:88], meta.IndexChecksum)
+	checksum := crc32.Checksum(buf[:88], castagnoli)
+	binary.LittleEndian.PutUint32(buf[88:92], checksum)
 	return buf
 }
 
@@ -484,26 +677,37 @@ func (e *Engine) readMetaPage(page uint64) (*metaPage, error) {
 	if _, err := e.file.ReadAt(buf, int64(page)*pageSize); err != nil {
 		return nil, err
 	}
-	expected := crc32.Checksum(buf[:68], castagnoli)
-	got := binary.LittleEndian.Uint32(buf[68:72])
-	if got != expected {
-		return nil, fmt.Errorf("invalid metapage checksum")
-	}
-	meta := &metaPage{
-		PageNumber:      page,
-		Magic:           binary.LittleEndian.Uint32(buf[0:4]),
-		MetaEpoch:       binary.LittleEndian.Uint64(buf[4:12]),
-		RootCatalog:     binary.LittleEndian.Uint64(buf[12:20]),
-		RootFreelist:    binary.LittleEndian.Uint64(buf[20:28]),
-		LastAppliedLSN:  binary.LittleEndian.Uint64(buf[28:36]),
-		PageCount:       binary.LittleEndian.Uint64(buf[36:44]),
-		CollectionCount: binary.LittleEndian.Uint64(buf[44:52]),
-		SnapshotOffset:  binary.LittleEndian.Uint64(buf[52:60]),
-		SnapshotLength:  binary.LittleEndian.Uint64(buf[60:68]),
-		Checksum:        got,
-	}
-	if meta.Magic != metaMagic {
-		return nil, fmt.Errorf("invalid metapage magic")
+	magic := binary.LittleEndian.Uint32(buf[0:4])
+
+	meta := &metaPage{PageNumber: page, Magic: magic}
+	meta.MetaEpoch = binary.LittleEndian.Uint64(buf[4:12])
+	meta.RootCatalog = binary.LittleEndian.Uint64(buf[12:20])
+	meta.RootFreelist = binary.LittleEndian.Uint64(buf[20:28])
+	meta.LastAppliedLSN = binary.LittleEndian.Uint64(buf[28:36])
+	meta.PageCount = binary.LittleEndian.Uint64(buf[36:44])
+	meta.CollectionCount = binary.LittleEndian.Uint64(buf[44:52])
+	meta.SnapshotOffset = binary.LittleEndian.Uint64(buf[52:60])
+	meta.SnapshotLength = binary.LittleEndian.Uint64(buf[60:68])
+
+	switch magic {
+	case metaMagicV2:
+		meta.IndexOffset = binary.LittleEndian.Uint64(buf[68:76])
+		meta.IndexLength = binary.LittleEndian.Uint64(buf[76:84])
+		meta.IndexChecksum = binary.LittleEndian.Uint32(buf[84:88])
+		meta.Checksum = binary.LittleEndian.Uint32(buf[88:92])
+		expected := crc32.Checksum(buf[:88], castagnoli)
+		if meta.Checksum != expected {
+			return nil, fmt.Errorf("invalid V2 metapage checksum")
+		}
+	case metaMagic:
+		meta.Checksum = binary.LittleEndian.Uint32(buf[68:72])
+		expected := crc32.Checksum(buf[:68], castagnoli)
+		if meta.Checksum != expected {
+			return nil, fmt.Errorf("invalid metapage checksum")
+		}
+		// IndexOffset==0 means "no index persisted" — correct for V1 files.
+	default:
+		return nil, fmt.Errorf("invalid metapage magic: 0x%X", magic)
 	}
 	return meta, nil
 }
@@ -573,6 +777,16 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		if chunk.Magic != chunkMagic {
 			break
 		}
+
+		// Skip non-WAL chunks. Snapshot and index chunks are validated
+		// by recoverSnapshot / loadIndexes before replayWAL runs;
+		// re-validating them here is redundant and fatal on legitimate
+		// corruption that those paths already handle gracefully.
+		if chunk.Kind != chunkTypeWAL {
+			offset += int64(16 + chunk.PayloadLen)
+			continue
+		}
+
 		payload := make([]byte, chunk.PayloadLen)
 		if _, err := e.file.ReadAt(payload, offset+16); err != nil {
 			return err
@@ -580,37 +794,36 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		if crc32.Checksum(payload, castagnoli) != chunk.Checksum {
 			return fmt.Errorf("invalid chunk checksum during replay")
 		}
-		if chunk.Kind == chunkTypeWAL {
-			record, err := decodeWALRecord(payload)
-			if err != nil {
+
+		record, err := decodeWALRecord(payload)
+		if err != nil {
+			return err
+		}
+		if record.Header.LSN <= lastApplied {
+			offset += int64(16 + chunk.PayloadLen)
+			continue
+		}
+		switch record.Header.RecordType {
+		case recordTypeTxBegin:
+			pending[record.Header.TxID] = []walRecord{record}
+		case recordTypeTxCommit:
+			frames := append(pending[record.Header.TxID], record)
+			if err := e.applyCommittedFrames(frames); err != nil {
 				return err
 			}
-			if record.Header.LSN <= lastApplied {
-				offset += int64(16 + chunk.PayloadLen)
-				continue
-			}
-			switch record.Header.RecordType {
-			case recordTypeTxBegin:
-				pending[record.Header.TxID] = []walRecord{record}
-			case recordTypeTxCommit:
-				frames := append(pending[record.Header.TxID], record)
-				if err := e.applyCommittedFrames(frames); err != nil {
-					return err
-				}
-				e.replayedTxs++
-				delete(pending, record.Header.TxID)
-			case recordTypeTxAbort:
-				e.discardedTxs++
-				delete(pending, record.Header.TxID)
-			default:
-				pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
-			}
-			if record.Header.LSN > e.lastLSN {
-				e.lastLSN = record.Header.LSN
-			}
-			if record.Header.TxID > e.lastTxID {
-				e.lastTxID = record.Header.TxID
-			}
+			e.replayedTxs++
+			delete(pending, record.Header.TxID)
+		case recordTypeTxAbort:
+			e.discardedTxs++
+			delete(pending, record.Header.TxID)
+		default:
+			pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
+		}
+		if record.Header.LSN > e.lastLSN {
+			e.lastLSN = record.Header.LSN
+		}
+		if record.Header.TxID > e.lastTxID {
+			e.lastTxID = record.Header.TxID
 		}
 		offset += int64(16 + chunk.PayloadLen)
 	}
@@ -811,19 +1024,132 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	collection.UpdatedLSN = lsn
 }
 
+// encodeIndexBlock serializes all collection indexes into a single binary blob.
+// Format: collectionCount | repeated { nameLen, name, indexType, indexVersion, payloadLen, payload, payloadChecksum }
+func encodeIndexBlock(entries []indexBlockEntry) []byte {
+	size := 4 // collectionCount uint32
+	for _, e := range entries {
+		size += 2 + len(e.name) // nameLen uint16 + name bytes
+		size += 1 + 2            // indexType uint8 + indexVersion uint16
+		size += 4 + len(e.payload) + 4 // payloadLen uint32 + payload bytes + payloadChecksum uint32
+	}
+	buf := make([]byte, 0, size)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
+	for _, e := range entries {
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.name)))
+		buf = append(buf, []byte(e.name)...)
+		buf = append(buf, e.indexType)
+		buf = binary.LittleEndian.AppendUint16(buf, e.indexVersion)
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.payload)))
+		buf = append(buf, e.payload...)
+		buf = binary.LittleEndian.AppendUint32(buf, e.payloadChecksum)
+	}
+	return buf
+}
+
+// decodeIndexBlock deserializes the index block. Returns entries for valid
+// collections; entries with mismatched checksums are skipped (caller rebuilds).
+func decodeIndexBlock(data []byte) ([]indexBlockEntry, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("index block too small")
+	}
+	count := binary.LittleEndian.Uint32(data)
+	pos := 4
+	entries := make([]indexBlockEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if pos+2 > len(data) {
+			break
+		}
+		nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		if pos+nameLen > len(data) {
+			break
+		}
+		name := string(data[pos : pos+nameLen])
+		pos += nameLen
+		if pos+7 > len(data) {
+			break
+		}
+		indexType := data[pos]
+		indexVersion := binary.LittleEndian.Uint16(data[pos+1:])
+		payloadLen := int(binary.LittleEndian.Uint32(data[pos+3:]))
+		pos += 7
+		if pos+payloadLen+4 > len(data) {
+			break
+		}
+		payload := make([]byte, payloadLen)
+		copy(payload, data[pos:pos+payloadLen])
+		pos += payloadLen
+		payloadChecksum := binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
+		entries = append(entries, indexBlockEntry{
+			name:            name,
+			indexType:       indexType,
+			indexVersion:    indexVersion,
+			payload:         payload,
+			payloadChecksum: payloadChecksum,
+		})
+	}
+	return entries, nil
+}
+
 func (e *Engine) checkpointLocked() error {
 	if !e.dirty {
 		return nil
 	}
+	// STEP 1: write snapshot chunk
 	snapshot, err := encodeStateBinary(e.state)
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
-	offset, err := e.appendChunkLocked(chunkTypeSnapshot, snapshot)
+	snapshotOffset, err := e.appendChunkLocked(chunkTypeSnapshot, snapshot)
 	if err != nil {
 		return err
 	}
 
+	// STEP 2: serialize and write index chunk (after snapshot, before metapage)
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(e.state.Collections))
+		for name := range e.state.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("serialize index for %s: %w", name, err)
+			}
+			if indexBytes == nil {
+				continue // empty collection (no index to persist); rebuilt from Records on recovery
+			}
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+	var indexOffset uint64
+	var indexLength uint64
+	if len(indexBlock) > 0 {
+		indexOffset, err = e.appendChunkLocked(chunkTypeIndex, indexBlock)
+		if err != nil {
+			return err
+		}
+		indexLength = uint64(len(indexBlock))
+	}
+
+	// STEP 3: write metapage (now authoritative: snapshot + index)
 	e.metaEpoch++
 	nextMetaPage := uint64(1)
 	rootFreelist := uint64(0)
@@ -839,20 +1165,28 @@ func (e *Engine) checkpointLocked() error {
 	pageCount := uint64((stat.Size() + pageSize - 1) / pageSize)
 
 	meta := &metaPage{
-		Magic:           metaMagic,
+		Magic:           metaMagicV2,
 		MetaEpoch:       e.metaEpoch,
 		RootCatalog:     3,
 		RootFreelist:    rootFreelist,
 		LastAppliedLSN:  e.lastLSN,
 		PageCount:       pageCount,
 		CollectionCount: uint64(e.visibleCollectionCountLocked()),
-		SnapshotOffset:  offset,
+		SnapshotOffset:  snapshotOffset,
 		SnapshotLength:  uint64(len(snapshot)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
 	}
+	// STEP 4: fsync (durable: snapshot + index + metapage)
 	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta)); err != nil {
 		return err
 	}
+	if err := e.file.Sync(); err != nil {
+		return err
+	}
 
+	// STEP 5: write header (publishes the new metapage as authoritative)
 	header, err := e.readHeader()
 	if err != nil {
 		return err
@@ -863,6 +1197,9 @@ func (e *Engine) checkpointLocked() error {
 	if err := writeFixedPage(e.file, 0, encodeHeader(header)); err != nil {
 		return err
 	}
+	if err := e.file.Sync(); err != nil {
+		return err
+	}
 
 	e.activeMetaPage = nextMetaPage
 	e.dirty = false
@@ -870,14 +1207,10 @@ func (e *Engine) checkpointLocked() error {
 	e.dirtyOps = 0
 	e.checkpoints++
 
-	if err := e.file.Sync(); err != nil {
-		return err
-	}
-	// Auto-compact when WAL bloat exceeds 2× the minimum (snapshot-only) file size.
-	// snapshot and stat are already in scope from lines 814 and 831.
-	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot))
+	// Auto-compact when WAL bloat exceeds 2× the minimum file size.
+	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot)) + 16 + int64(len(indexBlock))
 	if stat.Size() > compactSize*2 {
-		_ = e.compactFile() // non-fatal; next checkpoint will retry if this fails
+		_ = e.compactFile()
 	}
 	return nil
 }
@@ -907,6 +1240,39 @@ func (e *Engine) compactFileLocked() error {
 		return fmt.Errorf("compact: read header: %w", err)
 	}
 
+	// Build index block (same as checkpointLocked).
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(e.state.Collections))
+		for name := range e.state.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("compact: serialize index for %s: %w", name, err)
+			}
+			if indexBytes == nil {
+				continue
+			}
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+
 	tmpPath := e.path + ".compact"
 	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -920,11 +1286,17 @@ func (e *Engine) compactFileLocked() error {
 		}
 	}()
 
-	// ── Page 0: file header ────────────────────────────────────────────────
+	// ── Calculate layout ───────────────────────────────────────────────────
 	const snapshotOffset = uint64(3 * pageSize) // 12288
-	snapshotTotal := int64(snapshotOffset) + 16 + int64(len(snapshot))
-	pageCount := uint64((snapshotTotal + pageSize - 1) / pageSize)
+	indexOffset := snapshotOffset + 16 + uint64(len(snapshot))
+	indexLength := uint64(len(indexBlock))
+	totalSize := int64(indexOffset)
+	if len(indexBlock) > 0 {
+		totalSize += 16 + int64(indexLength)
+	}
+	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
 
+	// ── Page 0: file header ────────────────────────────────────────────────
 	fh := &fileHeader{
 		FormatVersion:     origHeader.FormatVersion,
 		PageSize:          origHeader.PageSize,
@@ -942,9 +1314,9 @@ func (e *Engine) compactFileLocked() error {
 		return fmt.Errorf("compact: write header: %w", err)
 	}
 
-	// ── Pages 1 & 2: dual metapages ───────────────────────────────────────
+	// ── Pages 1 & 2: dual metapages (V2 with index fields) ────────────────
 	meta := &metaPage{
-		Magic:           metaMagic,
+		Magic:           metaMagicV2,
 		MetaEpoch:       1,
 		RootCatalog:     3,
 		RootFreelist:    0, // meta A marker
@@ -953,6 +1325,9 @@ func (e *Engine) compactFileLocked() error {
 		CollectionCount: uint64(e.visibleCollectionCountLocked()),
 		SnapshotOffset:  snapshotOffset,
 		SnapshotLength:  uint64(len(snapshot)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
 	}
 	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta)); err != nil {
 		return fmt.Errorf("compact: write meta A: %w", err)
@@ -975,6 +1350,22 @@ func (e *Engine) compactFileLocked() error {
 	}
 	if _, err := tmpFile.WriteAt(snapshot, int64(snapshotOffset)+16); err != nil {
 		return fmt.Errorf("compact: write snapshot payload: %w", err)
+	}
+
+	// ── Index chunk (if present) ──────────────────────────────────────────
+	if len(indexBlock) > 0 {
+		var idxHdr [16]byte
+		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
+		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
+		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
+		if _, err := tmpFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+			return fmt.Errorf("compact: write index chunk header: %w", err)
+		}
+		if _, err := tmpFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+			return fmt.Errorf("compact: write index block payload: %w", err)
+		}
 	}
 
 	// ── Fsync before rename ───────────────────────────────────────────────
@@ -1020,6 +1411,15 @@ func (e *Engine) compactFileLocked() error {
 // subsumed by the current snapshot. Blocks until complete. Safe to call at any
 // time; the caller does not need to hold any lock.
 func (e *Engine) Compact() error {
+	// Snapshot vectors from provider-backed indexes into local storage
+	// before acquiring e.mu.Lock. Once the lock is held, provider calls
+	// would deadlock (e.mu.Lock held; provider.GetByOrdinal needs e.mu.RLock).
+	if e.indexProvider != nil {
+		if err := e.indexProvider.SnapshotVectors(context.Background()); err != nil {
+			return fmt.Errorf("compact: snapshot vectors: %w", err)
+		}
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {

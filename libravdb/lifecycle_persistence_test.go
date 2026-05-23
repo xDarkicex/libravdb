@@ -806,3 +806,113 @@ func TestShardedCollectionCloseCleansUpResources(t *testing.T) {
 		t.Fatal("expected error getting deleted collection after reopen")
 	}
 }
+
+// TestIVFPQCompactReopenRoundTrip verifies that an IVF-PQ index survives
+// compact+reopen without retraining and returns correct search results.
+func TestIVFPQCompactReopenRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dbPath := testDBPath(t)
+
+	db, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+
+	collection, err := db.CreateCollection(ctx, "ivfpq_compact",
+		WithDimension(3),
+		WithMetric(CosineDistance),
+		WithIVFPQ(4, 4),
+	)
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	// Enough vectors for k-means clustering to produce meaningful centroids.
+	entries := []VectorEntry{
+		{ID: "exact", Vector: []float32{1, 0, 0}},
+		{ID: "close", Vector: []float32{0.8, 0.6, 0}},
+		{ID: "orthogonal", Vector: []float32{0, 1, 0}},
+		{ID: "opposite", Vector: []float32{-1, 0, 0}},
+		{ID: "a", Vector: []float32{0.5, 0.5, 0}},
+		{ID: "b", Vector: []float32{0, 0, 1}},
+		{ID: "c", Vector: []float32{0.3, 0.7, 0.1}},
+		{ID: "d", Vector: []float32{-0.5, 0.5, 0}},
+	}
+	if err := collection.InsertBatch(ctx, entries); err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+
+	// Pre-compact search baseline.
+	preResults, err := collection.Search(ctx, []float32{1, 0, 0}, 4)
+	if err != nil {
+		t.Fatalf("pre-compact search: %v", err)
+	}
+	if len(preResults.Results) < 4 {
+		t.Fatalf("pre-compact: expected at least 4 results, got %d", len(preResults.Results))
+	}
+	t.Logf("pre-compact top result: %s (score=%.4f)", preResults.Results[0].ID, preResults.Results[0].Score)
+
+	// Compact serializes the IVF-PQ index to disk.
+	compactor, ok := db.storage.(interface{ Compact() error })
+	if !ok {
+		t.Fatal("storage engine does not support Compact()")
+	}
+	if err := compactor.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+
+	// Reopen — exercises DeserializeFromBytes + PopulateEntriesFromStorage.
+	reopened, err := New(WithStoragePath(dbPath))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer reopened.Close()
+
+	reloaded, err := reopened.GetCollection("ivfpq_compact")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+
+	// Verify count survived compact+reopen.
+	count, err := reloaded.Count(ctx)
+	if err != nil {
+		t.Fatalf("count after reopen: %v", err)
+	}
+	if count != len(entries) {
+		t.Fatalf("expected count %d, got %d", len(entries), count)
+	}
+
+	// Verify search produces the same top result ordering.
+	postResults, err := reloaded.Search(ctx, []float32{1, 0, 0}, 4)
+	if err != nil {
+		t.Fatalf("post-reopen search: %v", err)
+	}
+	if len(postResults.Results) < 4 {
+		t.Fatalf("post-reopen: expected at least 4 results, got %d", len(postResults.Results))
+	}
+	t.Logf("post-reopen top result: %s (score=%.4f)", postResults.Results[0].ID, postResults.Results[0].Score)
+
+	// Top result must still be "exact" (cosine similarity 1.0).
+	if postResults.Results[0].ID != "exact" {
+		t.Fatalf("expected top result 'exact', got '%s'", postResults.Results[0].ID)
+	}
+	assertApproxScore(t, postResults.Results[0].Score, 1.0, 1e-4)
+
+	// Verify the index was deserialized (trained) rather than rebuilt.
+	reloaded.mu.RLock()
+	idx := reloaded.index
+	reloaded.mu.RUnlock()
+	if idx == nil {
+		t.Fatal("index is nil after reopen")
+	}
+	if trained, ok := idx.(interface{ IsTrained() bool }); ok {
+		if !trained.IsTrained() {
+			t.Fatal("IVF-PQ index is not trained after reopen — was it rebuilt instead of deserialized?")
+		}
+		t.Log("IVF-PQ index confirmed trained after compact+reopen")
+	}
+}

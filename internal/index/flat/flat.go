@@ -540,6 +540,62 @@ func (idx *Index) GetPersistenceMetadata() *PersistenceMetadata {
 	}
 }
 
+// SerializeToBytes serializes the index to an in-memory byte slice (JSON).
+func (idx *Index) SerializeToBytes() ([]byte, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	data := struct {
+		Config   *Config              `json:"config"`
+		Vectors  []*VectorEntry       `json:"vectors"`
+		Metadata *PersistenceMetadata `json:"metadata"`
+	}{
+		Config:  idx.config,
+		Vectors: idx.vectors,
+		Metadata: &PersistenceMetadata{
+			Version:   1,
+			NodeCount: len(idx.vectors),
+			Dimension: idx.config.Dimension,
+			MaxLevel:  0,
+			IndexType: "Flat",
+			CreatedAt: time.Now(),
+		},
+	}
+	return json.Marshal(data)
+}
+
+// DeserializeFromBytes restores the index from an in-memory byte slice.
+func (idx *Index) DeserializeFromBytes(data []byte) error {
+	var loaded struct {
+		Config   *Config              `json:"config"`
+		Vectors  []*VectorEntry       `json:"vectors"`
+		Metadata *PersistenceMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return fmt.Errorf("failed to decode index data: %w", err)
+	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.config = loaded.Config
+	idx.vectors = loaded.Vectors
+	idx.idToIndex = make(map[string]int, len(loaded.Vectors))
+	for i, entry := range loaded.Vectors {
+		idx.idToIndex[entry.ID] = i
+	}
+
+	if idx.config.Quantization != nil {
+		var err error
+		idx.quantizer, err = quant.Create(idx.config.Quantization)
+		if err != nil {
+			return fmt.Errorf("failed to recreate quantizer: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // GetConfig returns the index configuration
 func (idx *Index) GetConfig() *Config {
 	return idx.config

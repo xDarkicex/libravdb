@@ -40,6 +40,18 @@ type WriteStats struct {
 	Checkpoints           uint64
 }
 
+// EngineStatus represents the engine's recovery and operational lifecycle.
+type EngineStatus int32
+
+const (
+	StatusStarting          EngineStatus = iota // New() called, not yet opened
+	StatusRecoveringSnapshot                    // loading snapshot from disk
+	StatusRecoveringIndexes                     // loading or rebuilding indexes
+	StatusReplayingWAL                          // replaying WAL from last checkpoint LSN
+	StatusReady                                 // fully operational, queries accepted
+	StatusFailed                                // fatal recovery error, engine unusable
+)
+
 // WriteStatsProvider is an optional interface for engines that expose write-path counters.
 type WriteStatsProvider interface {
 	WriteStats() WriteStats

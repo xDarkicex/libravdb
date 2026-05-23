@@ -561,3 +561,33 @@ func (f *ProductQuantizerFactory) Supports(qType QuantizationType) bool {
 func (f *ProductQuantizerFactory) Name() string {
 	return "ProductQuantizer"
 }
+
+// GetCodebooks returns the trained PQ codebooks for persistence.
+// Returns nil if the quantizer is not trained.
+func (pq *ProductQuantizer) GetCodebooks() [][][]float32 {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	if !pq.trained {
+		return nil
+	}
+	return pq.centroids
+}
+
+// SetCodebooks restores trained PQ codebooks from persistence.
+func (pq *ProductQuantizer) SetCodebooks(codebooks [][][]float32, dimension, subspaces, subDim int) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	pq.dimension = dimension
+	pq.subspaces = subspaces
+	pq.subDim = subDim
+	pq.centroids = codebooks
+
+	// Rebuild distance tables.
+	numCentroids := len(codebooks[0])
+	pq.distanceTables = make([][]float32, subspaces)
+	for s := 0; s < subspaces; s++ {
+		pq.distanceTables[s] = make([]float32, numCentroids)
+	}
+	pq.trained = true
+	pq.updateMemoryUsage()
+}

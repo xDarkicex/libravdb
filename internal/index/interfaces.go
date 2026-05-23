@@ -24,6 +24,8 @@ type Index interface {
 	// NEW: Index Persistence Methods
 	SaveToDisk(ctx context.Context, path string) error
 	LoadFromDisk(ctx context.Context, path string) error
+	SerializeToBytes() ([]byte, error)
+	DeserializeFromBytes(data []byte) error
 	GetPersistenceMetadata() *PersistenceMetadata
 }
 
@@ -202,6 +204,16 @@ func (w *hnswWrapper) LoadFromDisk(ctx context.Context, path string) error {
 	return w.index.LoadFromDisk(ctx, path)
 }
 
+// SerializeToBytes delegates to the wrapped HNSW index
+func (w *hnswWrapper) SerializeToBytes() ([]byte, error) {
+	return w.index.SerializeToBytes()
+}
+
+// DeserializeFromBytes delegates to the wrapped HNSW index
+func (w *hnswWrapper) DeserializeFromBytes(data []byte) error {
+	return w.index.DeserializeFromBytes(data)
+}
+
 // NEW: GetPersistenceMetadata delegates to the wrapped index
 func (w *hnswWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 	hnswMeta := w.index.GetPersistenceMetadata()
@@ -260,10 +272,27 @@ func (w *ivfpqWrapper) IsTrained() bool {
 	return w.index.IsTrained()
 }
 
+// HasDeserializedMeta reports whether deserialized entry metadata is pending
+// population. Used by the collection layer to decide between two-phase
+// deserialization (PopulateEntriesFromStorage) and a fully-populated index.
+func (w *ivfpqWrapper) HasDeserializedMeta() bool {
+	return w.index.HasDeserializedMeta()
+}
+
+// PopulateEntriesFromStorage delegates to the wrapped IVFPQ index so the
+// collection layer can wire deserialized centroids/codebooks to storage entries.
+// Uses anonymous interface to match the type assertion in the collection layer.
+func (w *ivfpqWrapper) PopulateEntriesFromStorage(provider interface {
+	IterateEntries(fn func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error) error
+}) error {
+	return w.index.PopulateEntriesFromStorage(provider)
+}
+
 // Insert adapts the interface VectorEntry to IVF-PQ VectorEntry
 func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 	ivfpqEntry := &ivfpq.VectorEntry{
 		ID:       entry.ID,
+		Ordinal:  entry.Ordinal,
 		Vector:   entry.Vector,
 		Metadata: entry.Metadata,
 		Version:  entry.Version,
@@ -329,6 +358,16 @@ func (w *ivfpqWrapper) SaveToDisk(ctx context.Context, path string) error {
 // LoadFromDisk delegates loading to the wrapped index
 func (w *ivfpqWrapper) LoadFromDisk(ctx context.Context, path string) error {
 	return w.index.LoadFromDisk(ctx, path)
+}
+
+// SerializeToBytes delegates to the wrapped IVFPQ index
+func (w *ivfpqWrapper) SerializeToBytes() ([]byte, error) {
+	return w.index.SerializeToBytes()
+}
+
+// DeserializeFromBytes delegates to the wrapped IVFPQ index
+func (w *ivfpqWrapper) DeserializeFromBytes(data []byte) error {
+	return w.index.DeserializeFromBytes(data)
 }
 
 // GetPersistenceMetadata delegates to the wrapped index
@@ -452,6 +491,16 @@ func (w *flatWrapper) SaveToDisk(ctx context.Context, path string) error {
 // LoadFromDisk delegates loading to the wrapped index
 func (w *flatWrapper) LoadFromDisk(ctx context.Context, path string) error {
 	return w.index.LoadFromDisk(ctx, path)
+}
+
+// SerializeToBytes delegates to the wrapped Flat index
+func (w *flatWrapper) SerializeToBytes() ([]byte, error) {
+	return w.index.SerializeToBytes()
+}
+
+// DeserializeFromBytes delegates to the wrapped Flat index
+func (w *flatWrapper) DeserializeFromBytes(data []byte) error {
+	return w.index.DeserializeFromBytes(data)
 }
 
 // GetPersistenceMetadata delegates to the wrapped index

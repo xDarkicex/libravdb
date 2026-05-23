@@ -217,7 +217,7 @@ func (h *Index) writeNodes(writer io.Writer) error {
 				return err
 			}
 
-			vector, err := h.getNodeVector(node)
+			vector, err := h.getNodeVectorLocal(node)
 			if err != nil {
 				return fmt.Errorf("failed to get node vector for persistence: %w", err)
 			}

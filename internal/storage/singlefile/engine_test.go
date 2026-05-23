@@ -1273,3 +1273,103 @@ func TestDeleteReleasesOrdinalSlot(t *testing.T) {
 		t.Fatal("expected GetIDByOrdinal(0) to fail after reopen")
 	}
 }
+
+// TestReplayWALSkipsCorruptNonWALHeader verifies that replayWAL skips
+// non-WAL chunks before reading their payload. Corrupting the PayloadLen
+// in an index chunk header should not cause a hard failure — replayWAL
+// skips it (kind != chunkTypeWAL), then the next iteration's chunkMagic
+// check fails and breaks the loop cleanly.
+func TestReplayWALSkipsCorruptNonWALHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replay-corrupt-header.libravdb")
+
+	// Create and populate an engine with a compacted index chunk.
+	eng, err := New(path)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	engine := eng.(*Engine)
+	_, err = engine.CreateCollection("test", &storage.CollectionConfig{
+		Dimension:      3,
+		Metric:         2,
+		IndexType:      0, // Flat
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Version:        1,
+		RawVectorStore: "memory",
+		RawStoreCap:    1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	col := engine.collections["test"]
+	if err := col.Insert(context.Background(), &index.VectorEntry{
+		ID: "a", Vector: []float32{1, 2, 3},
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := engine.Compact(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	engine.Close()
+
+	// Corrupt the PayloadLen field in the index chunk header.
+	// Chunk header layout: Magic(4) + Kind(2) + Version(2) + PayloadLen(4) + Checksum(4) = 16 bytes
+	// PayloadLen is at offset 8 in the header.
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	// Read header to find active metapage.
+	headerBuf := make([]byte, pageSize)
+	if _, err := f.ReadAt(headerBuf, 0); err != nil {
+		f.Close()
+		t.Fatalf("read header: %v", err)
+	}
+	activeMeta := binary.LittleEndian.Uint64(headerBuf[40:48])
+
+	// Read active metapage to find IndexOffset.
+	metaBuf := make([]byte, pageSize)
+	if _, err := f.ReadAt(metaBuf, int64(activeMeta)*pageSize); err != nil {
+		f.Close()
+		t.Fatalf("read metapage: %v", err)
+	}
+	indexOffset := int64(binary.LittleEndian.Uint64(metaBuf[68:76]))
+	if indexOffset == 0 {
+		f.Close()
+		t.Fatal("no index chunk to corrupt")
+	}
+
+	// Corrupt PayloadLen (offset 8 in chunk header) to a wildly wrong value.
+	corruptBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(corruptBytes, 0xFFFFFFFF)
+	if _, err := f.WriteAt(corruptBytes, indexOffset+8); err != nil {
+		f.Close()
+		t.Fatalf("corrupt PayloadLen: %v", err)
+	}
+	f.Close()
+
+	// Reopen should succeed — replayWAL skips the non-WAL chunk before
+	// reading its (now-corrupt) payload, then the next iteration fails
+	// chunkMagic check and breaks cleanly.
+	eng2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen after header corruption: %v", err)
+	}
+	defer eng2.Close()
+
+	// Verify the collection exists and data was rebuilt from records.
+	colIface, err := eng2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("GetCollection: %v", err)
+	}
+	col2 := colIface.(*Collection)
+	vec, err := col2.GetByOrdinal(0)
+	if err != nil {
+		t.Fatalf("GetByOrdinal(0): %v", err)
+	}
+	if len(vec) != 3 || vec[0] != 1 || vec[1] != 2 || vec[2] != 3 {
+		t.Fatalf("unexpected vector: %v", vec)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
@@ -27,6 +28,7 @@ type Database struct {
 	mu          sync.RWMutex
 	collections map[string]*Collection
 	storage     storage.Engine
+	bridge      *indexPersistenceBridge // cached indexes from recovery, used for lazy-loading
 	metrics     *obs.Metrics
 	health      *obs.HealthChecker
 	config      *Config
@@ -63,7 +65,12 @@ func New(opts ...Option) (*Database, error) {
 		}
 	}
 
-	storageEngine, err := singlefile.New(config.StoragePath)
+	// Create the index persistence bridge so persisted indexes can be
+	// deserialized during recovery (avoiding full rebuild from records).
+	bridge := &indexPersistenceBridge{cache: make(map[string]index.Index)}
+	storageEngine, err := singlefile.New(config.StoragePath,
+		singlefile.WithIndexSnapshotProvider(bridge),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
@@ -77,16 +84,24 @@ func New(opts ...Option) (*Database, error) {
 	db := &Database{
 		collections: make(map[string]*Collection),
 		storage:     storageEngine,
+		bridge:      bridge,
 		metrics:     metrics,
 		config:      config,
 		logger:      config.Logger,
 	}
 
+	// Wire the bridge back to the database so SerializeIndex can access
+	// collection indexes during checkpoint.
+	bridge.mu.Lock()
+	bridge.db = db
+	bridge.mu.Unlock()
+
 	// Initialize health checker
 	db.health = obs.NewHealthChecker(db)
 
-	// Load existing collections from storage
-	if err := db.loadExistingCollections(context.Background()); err != nil {
+	// Load existing collections from storage, preferring cached indexes
+	// that were deserialized or rebuilt during recovery.
+	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 
@@ -236,7 +251,7 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 	}); ok {
 		var err error
-		collection, err = db.loadCollectionFromStorage(name, fileEngine)
+		collection, err = db.loadCollectionFromStorage(name, fileEngine, db.bridge)
 		if err != nil {
 			return nil, err
 		}
@@ -504,7 +519,7 @@ func (db *Database) TriggerGlobalGC() error {
 }
 
 // loadExistingCollections discovers and loads existing collections from storage
-func (db *Database) loadExistingCollections(ctx context.Context) error {
+func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPersistenceBridge) error {
 	fileEngine, ok := db.storage.(interface {
 		ListCollections() ([]string, error)
 		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
@@ -533,7 +548,7 @@ func (db *Database) loadExistingCollections(ctx context.Context) error {
 			continue
 		}
 
-		collection, err := db.loadCollectionFromStorage(name, fileEngine)
+		collection, err := db.loadCollectionFromStorage(name, fileEngine, bridge)
 		if err != nil {
 			return err
 		}
@@ -554,7 +569,7 @@ func (db *Database) loadExistingCollections(ctx context.Context) error {
 
 func (db *Database) loadCollectionFromStorage(name string, engine interface {
 	GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
-}) (*Collection, error) {
+}, bridge *indexPersistenceBridge) (*Collection, error) {
 	// Check if this is a shard collection name - if so, skip it
 	if _, _, ok := parseShardName(name); ok {
 		return nil, fmt.Errorf("cannot load shard collection %s directly, load parent collection instead", name)
@@ -590,7 +605,14 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 		return nil, fmt.Errorf("collection %s not found", name)
 	}
 
-	collection, err := newCollectionFromStorage(name, storageCollection, db.metrics, config, db.newWriteController())
+	// Prefer a cached index that was deserialized or rebuilt during recovery,
+	// avoiding an expensive full rebuild from storage records.
+	var cachedIndex index.Index
+	if bridge != nil {
+		cachedIndex = bridge.takeCachedIndex(name)
+	}
+
+	collection, err := newCollectionFromStorage(name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}

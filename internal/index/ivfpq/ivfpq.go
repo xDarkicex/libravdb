@@ -32,6 +32,7 @@ type Config struct {
 // VectorEntry represents a vector entry
 type VectorEntry struct {
 	ID       string
+	Ordinal  uint32
 	Vector   []float32
 	Metadata map[string]interface{}
 	Version  uint64
@@ -165,6 +166,14 @@ type Index struct {
 	// Adaptive search parameters
 	searchStats  *SearchStats
 	adaptiveMode bool
+
+	// deserMeta holds deserialized entry metadata pending population.
+	// Set by DeserializeFromBytes, consumed by PopulateEntriesFromStorage.
+	deserMeta *deserializedMeta
+
+	// populatedFromStorage tracks whether PopulateEntriesFromStorage has been
+	// called. Used to avoid double-population on subsequent reopen attempts.
+	populatedFromStorage bool
 }
 
 // SearchStats tracks search performance for adaptive optimization
@@ -1291,29 +1300,40 @@ func (idx *Index) Close() error {
 	idx.quantizer = nil
 	idx.trained = false
 	idx.size = 0
+	idx.deserMeta = nil
 
 	return nil
 }
 
-// SaveToDisk saves the index to disk (placeholder implementation)
-func (idx *Index) SaveToDisk(ctx context.Context, path string) error {
-	// TODO: Implement persistence for IVF-PQ index
-	return fmt.Errorf("persistence not yet implemented for IVF-PQ index")
-}
-
-// LoadFromDisk loads the index from disk (placeholder implementation)
-func (idx *Index) LoadFromDisk(ctx context.Context, path string) error {
-	// TODO: Implement persistence for IVF-PQ index
-	return fmt.Errorf("persistence not yet implemented for IVF-PQ index")
-}
-
-// PersistenceMetadata holds metadata about persisted index (placeholder)
+// PersistenceMetadata holds metadata about a persisted IVF-PQ index.
 type PersistenceMetadata struct {
-	// TODO: Define persistence metadata structure
+	NumClusters    int
+	NumSubspaces   int
+	NumCentroids   int
+	CompressedSize int64
 }
 
-// GetPersistenceMetadata returns persistence metadata (placeholder implementation)
+// GetPersistenceMetadata returns metadata about the persisted index state,
+// or nil if the index is not trained.
 func (idx *Index) GetPersistenceMetadata() *PersistenceMetadata {
-	// TODO: Implement persistence metadata for IVF-PQ index
-	return nil
+	idx.mutex.RLock()
+	defer idx.mutex.RUnlock()
+	if !idx.trained {
+		return nil
+	}
+	meta := &PersistenceMetadata{
+		NumClusters: len(idx.clusters),
+	}
+	if idx.config.Quantization != nil && idx.quantizer != nil {
+		meta.NumSubspaces = idx.config.Quantization.Codebooks
+		meta.NumCentroids = 1 << idx.config.Quantization.Bits
+	}
+	for _, cluster := range idx.clusters {
+		cluster.mutex.RLock()
+		for _, compressed := range cluster.CompressedVectors {
+			meta.CompressedSize += int64(len(compressed))
+		}
+		cluster.mutex.RUnlock()
+	}
+	return meta
 }
