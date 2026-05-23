@@ -330,8 +330,18 @@ func (idx *Index) PopulateEntriesFromStorage(provider EntryProvider) error {
 		return nil
 	}
 
+	// Compute total entry count from persisted metadata for pre-sizing.
+	totalEntries := 0
+	for cid := range idx.deserMeta.clusters {
+		if cid >= len(idx.clusters) {
+			break
+		}
+		totalEntries += len(idx.deserMeta.clusters[cid].entries)
+	}
+
 	// Build ordinal → entry map from storage in a single pass.
-	ordinalToEntry := make(map[uint32]*VectorEntry)
+	// Map is pre-sized to avoid rehash cascades during insertion.
+	ordinalToEntry := make(map[uint32]*VectorEntry, totalEntries)
 	err := provider.IterateEntries(func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error {
 		ordinalToEntry[ordinal] = &VectorEntry{
 			ID:       id,
@@ -346,19 +356,27 @@ func (idx *Index) PopulateEntriesFromStorage(provider EntryProvider) error {
 	}
 
 	// Place entries directly by ordinal using stored cluster membership.
-	// Compressed vectors are wired at the same time — both came from the
-	// same serialized inverted list section.
+	// Slices and maps are pre-sized to avoid incremental growth allocations.
 	for cid := range idx.deserMeta.clusters {
 		if cid >= len(idx.clusters) {
 			break
 		}
 		cluster := idx.clusters[cid]
 		clusterMeta := idx.deserMeta.clusters[cid]
+		n := len(clusterMeta.entries)
+		if n == 0 {
+			continue
+		}
 		cluster.mutex.Lock()
+		if cap(cluster.Entries) < n {
+			cluster.Entries = make([]*VectorEntry, 0, n)
+		}
+		if cluster.CompressedVectors == nil {
+			cluster.CompressedVectors = make(map[string][]byte, n)
+		}
 		for _, em := range clusterMeta.entries {
 			entry, ok := ordinalToEntry[em.ordinal]
 			if !ok {
-				// Entry may have been deleted since serialization.
 				continue
 			}
 			cluster.Entries = append(cluster.Entries, entry)

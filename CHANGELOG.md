@@ -25,11 +25,13 @@
 
 ### Changed
 - **`hnsw-performance-optimizations.md`**: rewritten to reflect actual tiered off-heap architecture, verified benchmarks, concurrency hardening, k-way merge, and k-cap protection.
+- **IVF-PQ `PopulateEntriesFromStorage` allocation pre-sizing**: `ordinalToEntry` map, per-cluster `Entries` slices, and per-cluster `CompressedVectors` maps are now pre-sized using entry counts from the deserialized inverted lists, eliminating incremental rehash and slice-growth allocations during persisted reopen. Empty clusters are skipped. Net savings: ~1.7% B/op and ~0.2% allocs/op at 50K; dominant allocations (>90%) are structural (vector data clones and entry struct wrapping), inherent to the two-layer architecture and not reducible without refactoring storage→index data ownership.
 
 ### Benchmark Results (Apple M2)
 - **IVF-PQ persisted reopen** (no retraining, direct cluster placement by ordinal):
-  - 1K vectors (16 clusters, PQ 16×8): 1.91ms, 2.80MB, 12,541 allocs — **23.8x faster** than rebuild (45.5ms)
-  - 10K vectors (64 clusters, PQ 16×8): 16.3ms, 22.8MB, 85,429 allocs — **289x faster** than rebuild (4.70s)
-  - 50K vectors (128 clusters, PQ 16×8): 91.0ms, 112.3MB, 406,874 allocs — **962x faster** than rebuild (87.55s)
+  - 1K vectors (16 clusters, PQ 16×8): 1.81ms, 2.75MB, 12,442 allocs — **24.6x faster** than rebuild (44.5ms)
+  - 10K vectors (64 clusters, PQ 16×8): 16.5ms, 22.6MB, 85,101 allocs — **278x faster** than rebuild (4.58s)
+  - 50K vectors (128 clusters, PQ 16×8): 97.4ms, 110.4MB, 406,214 allocs — **893x faster** than rebuild (86.94s)
+- IVF-PQ persisted reopen allocation profile (50K): dominant sources are vector data clones (~25.6MB) and entry struct wrapping (~4MB) — both structural. Remaining transient allocations: deserMeta entry structs (~2.4MB) and map bucket overhead (~2MB), freed at end of population.
 - Flat search (1M entries, k=10): 192 µs/op, 6352 B/op, 32 allocs/op — allocations are from result extraction only, inner scan loop is zero-alloc.
 - HNSW search (25K vectors, 32-dim): 25 ms/op, 3,866 qps.
