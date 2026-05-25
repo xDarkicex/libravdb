@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
@@ -440,6 +441,9 @@ func (enc *binaryEncoder) writeValue(value interface{}) error {
 	case int32:
 		enc.writeByte(valueTypeInt64)
 		enc.writeUint64(uint64(int64(typed)))
+	case time.Time:
+		enc.writeByte(valueTypeString)
+		enc.writeString(typed.Format(time.RFC3339Nano))
 	case int64:
 		enc.writeByte(valueTypeInt64)
 		enc.writeUint64(uint64(typed))
@@ -544,6 +548,8 @@ func estimateValueSize(value interface{}) int {
 		return 2
 	case string:
 		return 1 + 4 + len(typed)
+	case time.Time:
+		return 1 + 4 + len(typed.Format(time.RFC3339Nano))
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return 1 + 8
 	case float32:
