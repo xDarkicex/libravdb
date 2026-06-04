@@ -1373,3 +1373,227 @@ func TestReplayWALSkipsCorruptNonWALHeader(t *testing.T) {
 		t.Fatalf("unexpected vector: %v", vec)
 	}
 }
+
+// TestOrdinalPreReservation_CrashRecovery verifies that ordinals reserved via the
+// atomic counter but never committed do not leak into NextOrdinal after restart.
+func TestOrdinalPreReservation_CrashRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordinal_crash.libravdb")
+
+	engIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	eng := engIface.(*Engine)
+	defer eng.Close()
+
+	_, err = eng.CreateCollection("test", &storage.CollectionConfig{
+		Dimension: 3, Metric: 2, IndexType: 0, M: 16, EfConstruction: 100, EfSearch: 50,
+		ML: 1.0, Version: 1, RawVectorStore: "memory", RawStoreCap: 1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	colIface, err := eng.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	col := colIface.(*Collection)
+
+	// Assign ordinals via atomic counter but do NOT commit via putRecords/flushBatch.
+	// These reservations must be treated as ephemeral after restart.
+	uncommitted := []*index.VectorEntry{
+		{ID: "u1", Vector: []float32{1, 0, 0}},
+		{ID: "u2", Vector: []float32{0, 1, 0}},
+	}
+	if err := col.assignOrdinals(uncommitted); err != nil {
+		t.Fatalf("assign ordinals: %v", err)
+	}
+	t.Logf("uncommitted ordinals: u1=%d u2=%d", uncommitted[0].Ordinal, uncommitted[1].Ordinal)
+
+	eng.Close()
+
+	// Reopen: recovery must recompute NextOrdinal from committed state only.
+	engIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	eng2 := engIface2.(*Engine)
+	defer eng2.Close()
+
+	colIface2, err := eng2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+	col2 := colIface2.(*Collection)
+
+	next, err := col2.NextOrdinal(context.Background())
+	if err != nil {
+		t.Fatalf("NextOrdinal: %v", err)
+	}
+	if next != 0 {
+		t.Fatalf("expected NextOrdinal=0 (no committed entries), got %d", next)
+	}
+
+	reserved := eng2.state.Collections["test"].reservedNextOrdinal.Load()
+	if reserved != 0 {
+		t.Fatalf("expected reservedNextOrdinal=0 after recovery, got %d", reserved)
+	}
+}
+
+// TestOrdinalPreReservation_NextOrdinalAfterCommit verifies that NextOrdinal
+// and reservedNextOrdinal reflect committed state after writes and after restart.
+func TestOrdinalPreReservation_NextOrdinalAfterCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordinal_commit.libravdb")
+
+	engIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	eng := engIface.(*Engine)
+	defer eng.Close()
+
+	_, err = eng.CreateCollection("test", &storage.CollectionConfig{
+		Dimension: 3, Metric: 2, IndexType: 0, M: 16, EfConstruction: 100, EfSearch: 50,
+		ML: 1.0, Version: 1, RawVectorStore: "memory", RawStoreCap: 1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	colIface, err := eng.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	col := colIface.(*Collection)
+
+	for i := 0; i < 5; i++ {
+		entry := &index.VectorEntry{
+			ID: fmt.Sprintf("e%d", i), Vector: []float32{float32(i), 0, 0},
+		}
+		if err := col.Insert(context.Background(), entry); err != nil {
+			t.Fatalf("insert e%d: %v", i, err)
+		}
+	}
+
+	next, err := col.NextOrdinal(context.Background())
+	if err != nil {
+		t.Fatalf("NextOrdinal: %v", err)
+	}
+	if next != 5 {
+		t.Fatalf("expected NextOrdinal=5 after 5 inserts, got %d", next)
+	}
+
+	persisted := eng.state.Collections["test"]
+	reserved := persisted.reservedNextOrdinal.Load()
+	if reserved < 5 {
+		t.Fatalf("reservedNextOrdinal=%d < NextOrdinal=%d after commits", reserved, next)
+	}
+	t.Logf("NextOrdinal=%d reservedNextOrdinal=%d", next, reserved)
+
+	eng.Close()
+
+	engIface2, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	eng2 := engIface2.(*Engine)
+	defer eng2.Close()
+
+	colIface2, err := eng2.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection after reopen: %v", err)
+	}
+	col2 := colIface2.(*Collection)
+
+	next2, err := col2.NextOrdinal(context.Background())
+	if err != nil {
+		t.Fatalf("NextOrdinal after reopen: %v", err)
+	}
+	if next2 != 5 {
+		t.Fatalf("expected NextOrdinal=5 after reopen, got %d", next2)
+	}
+
+	reserved2 := eng2.state.Collections["test"].reservedNextOrdinal.Load()
+	if reserved2 != 5 {
+		t.Fatalf("expected reservedNextOrdinal=5 after reopen, got %d", reserved2)
+	}
+}
+
+// TestOrdinalPreReservation_ConcurrentAssignments verifies that concurrent
+// atomic ordinal assignments produce unique, contiguous ordinals.
+func TestOrdinalPreReservation_ConcurrentAssignments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordinal_concurrent.libravdb")
+
+	engIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	eng := engIface.(*Engine)
+	defer eng.Close()
+
+	_, err = eng.CreateCollection("test", &storage.CollectionConfig{
+		Dimension: 3, Metric: 2, IndexType: 0, M: 16, EfConstruction: 100, EfSearch: 50,
+		ML: 1.0, Version: 1, RawVectorStore: "memory", RawStoreCap: 1024,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	colIface, err := eng.GetCollection("test")
+	if err != nil {
+		t.Fatalf("get collection: %v", err)
+	}
+	col := colIface.(*Collection)
+
+	const numG = 8
+	const perG = 100
+	var wg sync.WaitGroup
+	ordinals := make([]uint32, numG*perG)
+	var ordMu sync.Mutex
+
+	for g := 0; g < numG; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				entry := &index.VectorEntry{
+					ID: fmt.Sprintf("g%d_i%d", gid, i), Vector: []float32{float32(gid), float32(i), 0},
+				}
+				if err := col.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
+					t.Errorf("assignOrdinals g=%d i=%d: %v", gid, i, err)
+					return
+				}
+				ordMu.Lock()
+				ordinals[gid*perG+i] = entry.Ordinal
+				ordMu.Unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	seen := make(map[uint32]bool, len(ordinals))
+	var minO, maxO uint32 = ^uint32(0), 0
+	for _, o := range ordinals {
+		if seen[o] {
+			t.Fatalf("duplicate ordinal %d", o)
+		}
+		seen[o] = true
+		if o < minO {
+			minO = o
+		}
+		if o > maxO {
+			maxO = o
+		}
+	}
+
+	expected := uint32(numG * perG)
+	if uint32(len(seen)) != expected {
+		t.Fatalf("expected %d unique ordinals, got %d", expected, len(seen))
+	}
+	if minO != 0 || maxO != expected-1 {
+		t.Fatalf("expected range [0,%d], got [%d,%d]", expected-1, minO, maxO)
+	}
+	t.Logf("concurrent: %d goroutines x %d = %d unique ordinals [%d,%d]",
+		numG, perG, expected, minO, maxO)
+}

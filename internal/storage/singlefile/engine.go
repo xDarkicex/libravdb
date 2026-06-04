@@ -148,6 +148,11 @@ type persistedCollection struct {
 	NextOrdinal uint32                   `json:"next_ordinal"`
 	Records     map[string]*recordValue  `json:"records"`
 	ordinalToID []string
+
+	// reservedNextOrdinal is an ephemeral pre-reservation counter for ordinal
+	// assignment. It is not persisted; after recovery it is re-initialised from
+	// NextOrdinal (which reflects committed state).
+	reservedNextOrdinal atomic.Uint32
 }
 
 type recordValue struct {
@@ -262,6 +267,10 @@ type Engine struct {
 type batchEntry struct {
 	collection string
 	entries    []*index.VectorEntry
+	// encoded holds pre-encoded recordPut payloads, 1:1 with entries.
+	// When set, flushBatch passes these to putRecordsInlocked to avoid
+	// re-encoding under e.mu.Lock().
+	encoded []encodedPayload
 }
 
 // startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
@@ -343,6 +352,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		// Start background flusher only after successful initialization
 		startBatchFlusher(engine)
 		engine.status.Store(int32(storage.StatusReady))
+		engine.initReservedOrdinals()
 		return engine, nil
 	}
 
@@ -353,6 +363,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 
 	// Start background flusher only after successful open
 	startBatchFlusher(engine)
+	engine.initReservedOrdinals()
 	return engine, nil
 }
 
@@ -1725,11 +1736,13 @@ func (e *Engine) flushBatch() error {
 	for _, batch := range entries {
 		if len(merged) > 0 && merged[len(merged)-1].collection == batch.collection {
 			merged[len(merged)-1].entries = append(merged[len(merged)-1].entries, batch.entries...)
+			merged[len(merged)-1].encoded = append(merged[len(merged)-1].encoded, batch.encoded...)
 			continue
 		}
 		merged = append(merged, batchEntry{
 			collection: batch.collection,
 			entries:    batch.entries,
+			encoded:    batch.encoded,
 		})
 	}
 
@@ -1738,9 +1751,9 @@ func (e *Engine) flushBatch() error {
 		batchedEntries += len(batch.entries)
 	}
 
-	// Write all entries to WAL - inline the put logic to avoid lock issues
+	// Write all entries to WAL - use pre-encoded payloads to minimise time under e.mu.
 	for i, batch := range merged {
-		if err := e.putRecordsInlocked(batch.collection, batch.entries); err != nil {
+		if err := e.putRecordsInlocked(batch.collection, batch.entries, batch.encoded); err != nil {
 			// On error, re-queue only the failed suffix (merged[i:] onwards).
 			// Do NOT re-queue merged[:i] because they were already committed.
 			failedSuffix := merged[i:]
@@ -1771,7 +1784,7 @@ func (e *Engine) flushBatch() error {
 
 // putRecordsInlocked writes records to WAL and applies them to memory.
 // Caller must hold e.mu. This is the internal batch-friendly variant.
-func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) error {
+func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, encoded []encodedPayload) error {
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
@@ -1805,19 +1818,36 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) e
 		copy(ownedVector, entry.Vector)
 		vectorOffset += vectorLen
 		ownedVectors[i] = ownedVector
-		payloadStruct := recordPutPayload{
-			Collection: name,
-			ID:         entry.ID,
-			Ordinal:    entry.Ordinal,
-			Vector:     ownedVector,
-			Metadata:   entry.Metadata,
-		}
-		payload, err := encodeRecordPutPayloadBinary(payloadStruct)
-		if err != nil {
-			return err
-		}
+
 		lsn := e.nextLSNLocked()
-		frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+		if i < len(encoded) && encoded[i].encoder != nil {
+			frames[i+1] = walRecord{
+				Header: walFrameHeader{
+					Magic:      chunkMagic,
+					Version:    formatVersion,
+					RecordType: recordTypeRecordPut,
+					LSN:        lsn,
+					TxID:       txID,
+					PrevLSN:    prevLSN,
+					PayloadLen: uint32(len(encoded[i].bytes)),
+					Checksum:   crc32.Checksum(encoded[i].bytes, castagnoli),
+				},
+				Payload:        encoded[i].bytes,
+				payloadEncoder: encoded[i].encoder,
+			}
+		} else {
+			payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+				Collection: name,
+				ID:         entry.ID,
+				Ordinal:    entry.Ordinal,
+				Vector:     ownedVector,
+				Metadata:   entry.Metadata,
+			})
+			if err != nil {
+				return err
+			}
+			frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+		}
 		prevLSN = lsn
 	}
 	commitLSN := e.nextLSNLocked()
@@ -1843,6 +1873,27 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 		return false, fmt.Errorf("database is closed")
 	}
 
+	// Pre-encode recordPut payloads before acquiring any locks. This hoists
+	// CPU-bound JSON metadata serialisation + binary framing out of the
+	// batchBuffer.mu and e.mu critical sections.
+	encoded := make([]encodedPayload, len(entries))
+	for i, entry := range entries {
+		payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+			Collection: name,
+			ID:         entry.ID,
+			Ordinal:    entry.Ordinal,
+			Vector:     entry.Vector,
+			Metadata:   entry.Metadata,
+		})
+		if err != nil {
+			for j := 0; j < i; j++ {
+				releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+			}
+			return false, err
+		}
+		encoded[i] = payload
+	}
+
 	// Add entries to batch buffer
 	e.batchBuffer.mu.Lock()
 	bufferedEntries := 0
@@ -1853,6 +1904,7 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
 		collection: name,
 		entries:    entries,
+		encoded:    encoded,
 	})
 	e.batchBuffer.mu.Unlock()
 
@@ -2549,6 +2601,17 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	return int(persisted.LiveCount), nil
 }
 
+// initReservedOrdinals seeds each collection's atomic ordinal pre-reservation
+// counter from the committed NextOrdinal. Called after recovery so the first
+// insert doesn't collide with ordinals already assigned to committed records.
+func (e *Engine) initReservedOrdinals() {
+	for _, coll := range e.state.Collections {
+		if coll != nil && !coll.Deleted {
+			coll.reservedNextOrdinal.Store(coll.NextOrdinal)
+		}
+	}
+}
+
 // NextOrdinal returns the next ordinal that would be assigned to a new record.
 func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
 	_ = ctx
@@ -2571,8 +2634,8 @@ func (c *Collection) Close() error {
 }
 
 func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
-	c.engine.mu.Lock()
-	defer c.engine.mu.Unlock()
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
 	if c.closed.Load() || c.engine.closed {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
@@ -2588,8 +2651,7 @@ func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 			entry.Ordinal = current.Ordinal
 			continue
 		}
-		entry.Ordinal = persisted.NextOrdinal
-		persisted.NextOrdinal++
+		entry.Ordinal = persisted.reservedNextOrdinal.Add(1) - 1
 	}
 	return nil
 }
