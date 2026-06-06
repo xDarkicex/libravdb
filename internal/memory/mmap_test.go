@@ -211,6 +211,70 @@ func TestMemoryMap_ErrorCases(t *testing.T) {
 	}
 }
 
+// TestMemoryMapManager_PathTraversal ensures CreateMapping rejects any name
+// that would resolve outside the manager's basePath. Sentinel file outside
+// basePath verifies no actual file is created or modified.
+func TestMemoryMapManager_PathTraversal(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mmap_traversal_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	manager := NewMemoryMapManager(tmpDir)
+	defer manager.Close()
+
+	// Sentinel file outside basePath that must remain untouched.
+	outsideDir, err := os.MkdirTemp("", "mmap_traversal_outside")
+	if err != nil {
+		t.Fatalf("Failed to create outside dir: %v", err)
+	}
+	defer os.RemoveAll(outsideDir)
+	sentinel := filepath.Join(outsideDir, "sentinel.txt")
+	if err := os.WriteFile(sentinel, []byte("must not be modified"), 0o644); err != nil {
+		t.Fatalf("Failed to write sentinel: %v", err)
+	}
+
+	attempts := []string{
+		"../sentinel",
+		"../../etc/passwd",
+		"foo/../sentinel",
+		"foo/bar",
+		`foo\bar`,
+		".",
+		"..",
+		"",
+		"~/.ssh/authorized_keys",
+		"foo/../../sentinel",
+	}
+
+	for _, name := range attempts {
+		t.Run(name, func(t *testing.T) {
+			_, err := manager.CreateMapping(name, 1024, false)
+			if err == nil {
+				t.Errorf("CreateMapping(%q) succeeded; want error for path traversal", name)
+			}
+		})
+	}
+
+	// Sentinel file must still exist with original contents.
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("Sentinel file missing or unreadable: %v", err)
+	}
+	if string(data) != "must not be modified" {
+		t.Errorf("Sentinel file contents changed: %q", data)
+	}
+
+	// Valid names still work.
+	if _, err := manager.CreateMapping("valid_name", 1024, false); err != nil {
+		t.Errorf("Valid name rejected: %v", err)
+	}
+	if _, err := manager.CreateMapping("valid-name.with.dots", 1024, false); err != nil {
+		t.Errorf("Valid name with dots rejected: %v", err)
+	}
+}
+
 func TestMemoryMap_CloseOperations(t *testing.T) {
 	// Create temporary directory
 	tmpDir, err := os.MkdirTemp("", "mmap_test")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -207,8 +208,31 @@ func NewMemoryMapManager(basePath string) *MemoryMapManager {
 	}
 }
 
+// validateMappingName rejects names that would escape basePath via path
+// traversal. Names must be non-empty, single path components, and free of
+// reserved names and ".." sequences.
+func validateMappingName(name string) error {
+	if name == "" {
+		return fmt.Errorf("mapping name must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("mapping name %q is reserved", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("mapping name %q must not contain path separators", name)
+	}
+	if filepath.Clean(name) != name {
+		return fmt.Errorf("mapping name %q must not contain traversal sequences", name)
+	}
+	return nil
+}
+
 // CreateMapping creates a new memory mapping
 func (m *MemoryMapManager) CreateMapping(name string, size int64, readOnly bool) (*MemoryMap, error) {
+	if err := validateMappingName(name); err != nil {
+		return nil, err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
