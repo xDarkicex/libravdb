@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -635,11 +636,11 @@ func categorizeStreamingError(err error) string {
 		return "cancelled"
 	case err == ErrBackpressureActive:
 		return "backpressure"
-	case contains(errStr, "dimension"):
+	case strings.Contains(errStr, "dimension"):
 		return "validation"
-	case contains(errStr, "memory"):
+	case strings.Contains(errStr, "memory"):
 		return "memory"
-	case contains(errStr, "duplicate"):
+	case strings.Contains(errStr, "duplicate"):
 		return "duplicate"
 	default:
 		return "internal"
@@ -1125,11 +1126,11 @@ func (s *StreamingBatchUpdate) handleUpdateError(err error, update *VectorUpdate
 	if err != nil {
 		errStr := err.Error()
 		switch {
-		case contains(errStr, "dimension"):
+		case strings.Contains(errStr, "dimension"):
 			errorType = "validation"
-		case contains(errStr, "not found"):
+		case strings.Contains(errStr, "not found"):
 			errorType = "not_found"
-		case contains(errStr, "timeout"):
+		case strings.Contains(errStr, "timeout"):
 			errorType = "timeout"
 		default:
 			errorType = "internal"
@@ -1174,9 +1175,9 @@ func (s *StreamingBatchDelete) handleDeleteError(err error, id string) {
 	if err != nil {
 		errStr := err.Error()
 		switch {
-		case contains(errStr, "not found"):
+		case strings.Contains(errStr, "not found"):
 			errorType = "not_found"
-		case contains(errStr, "timeout"):
+		case strings.Contains(errStr, "timeout"):
 			errorType = "timeout"
 		default:
 			errorType = "internal"

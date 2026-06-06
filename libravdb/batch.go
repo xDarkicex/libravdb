@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -719,13 +720,13 @@ func (b *BatchInsert) categorizeError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "dimension"):
+	case strings.Contains(errStr, "dimension"):
 		return BatchErrorValidation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "duplicate"):
+	case strings.Contains(errStr, "duplicate"):
 		return BatchErrorDuplicate
-	case contains(errStr, "memory"):
+	case strings.Contains(errStr, "memory"):
 		return BatchErrorMemory
 	default:
 		return BatchErrorInternal
@@ -739,9 +740,9 @@ func (b *BatchInsert) isNonRetryableError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "dimension") ||
-		contains(errStr, "empty") ||
-		contains(errStr, "duplicate")
+	return strings.Contains(errStr, "dimension") ||
+		strings.Contains(errStr, "empty") ||
+		strings.Contains(errStr, "duplicate")
 }
 
 // validateEntry validates a vector entry before insertion
@@ -760,22 +761,6 @@ func (b *BatchInsert) validateEntry(entry *VectorEntry) error {
 	}
 
 	return nil
-}
-
-// contains is a simple string contains helper
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || (len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			findSubstring(s, substr))))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // Size returns the number of items in the batch update
@@ -1083,11 +1068,11 @@ func (b *BatchUpdate) categorizeUpdateError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "dimension"):
+	case strings.Contains(errStr, "dimension"):
 		return BatchErrorValidation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "not found"):
+	case strings.Contains(errStr, "not found"):
 		return BatchErrorNotFound
 	default:
 		return BatchErrorInternal
@@ -1101,8 +1086,8 @@ func (b *BatchUpdate) isNonRetryableUpdateError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "dimension") ||
-		contains(errStr, "empty")
+	return strings.Contains(errStr, "dimension") ||
+		strings.Contains(errStr, "empty")
 }
 
 // validateUpdate validates an update operation
@@ -1262,7 +1247,7 @@ func (b *BatchDelete) processDeleteChunk(ctx context.Context, chunk []string, st
 			if b.options.ErrorCallback != nil {
 				b.options.ErrorCallback(itemResult, err)
 			}
-			}
+		}
 
 		result.items = append(result.items, itemResult)
 
@@ -1398,11 +1383,11 @@ func (b *BatchDelete) categorizeDeleteError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "not found"):
+	case strings.Contains(errStr, "not found"):
 		return BatchErrorNotFound
-	case contains(errStr, "not yet implemented"):
+	case strings.Contains(errStr, "not yet implemented"):
 		return BatchErrorInternal
 	default:
 		return BatchErrorInternal
@@ -1416,6 +1401,6 @@ func (b *BatchDelete) isNonRetryableDeleteError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "empty") ||
-		contains(errStr, "not yet implemented")
+	return strings.Contains(errStr, "empty") ||
+		strings.Contains(errStr, "not yet implemented")
 }
