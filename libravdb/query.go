@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/filter"
@@ -413,15 +414,12 @@ func (qb *QueryBuilder) optimizeFilters() []filter.Filter {
 	optimized := make([]filter.Filter, len(qb.filters))
 	copy(optimized, qb.filters)
 
-	// Sort filters by selectivity (most selective first)
-	// This is a simple optimization - more sophisticated cost-based optimization could be added
-	for i := 0; i < len(optimized)-1; i++ {
-		for j := i + 1; j < len(optimized); j++ {
-			if optimized[i].EstimateSelectivity() > optimized[j].EstimateSelectivity() {
-				optimized[i], optimized[j] = optimized[j], optimized[i]
-			}
-		}
-	}
+	// Sort filters by selectivity (most selective first) so cheaper/more
+	// selective predicates run before broader ones. O(n log n) instead of
+	// the O(n²) bubble sort that previously lived here.
+	sort.Slice(optimized, func(i, j int) bool {
+		return optimized[i].EstimateSelectivity() < optimized[j].EstimateSelectivity()
+	})
 
 	return optimized
 }
