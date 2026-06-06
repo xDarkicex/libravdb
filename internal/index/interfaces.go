@@ -377,8 +377,12 @@ func (w *ivfpqWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 		return nil
 	}
 
-	// For now, return a basic metadata structure
-	// TODO: Implement proper persistence metadata for IVF-PQ
+	// FileSize is the total bytes of compressed vectors (the on-disk payload
+	// for an IVF-PQ index). ChecksumCRC32 stays 0 here because the in-memory
+	// representation has no canonical serialized form without calling
+	// SerializeToBytes (which would allocate the full buffer). Callers that
+	// need a real CRC should persist via SaveToDisk and read the on-disk
+	// header instead.
 	return &PersistenceMetadata{
 		Version:       1,
 		NodeCount:     w.index.Size(),
@@ -386,8 +390,8 @@ func (w *ivfpqWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 		MaxLevel:      0, // Not applicable for IVF-PQ
 		IndexType:     "IVF-PQ",
 		CreatedAt:     time.Now(),
-		ChecksumCRC32: 0, // TODO: Implement checksum
-		FileSize:      0, // TODO: Implement file size calculation
+		ChecksumCRC32: 0, // 0 for in-memory; populated by on-disk format header
+		FileSize:      ivfpqMeta.CompressedSize,
 	}
 }
 
