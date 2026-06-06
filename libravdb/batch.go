@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -200,6 +201,11 @@ type BatchDelete struct {
 	rollbackMutex   sync.Mutex
 	progressTracker *progressTracker
 }
+
+// errFound is a package-level sentinel used to break out of storage.Iterate
+// once a matching entry is located. Callers must check with errors.Is and
+// treat it as a non-error control-flow signal.
+var errFound = errors.New("entry found")
 
 // NewBatchInsert creates a new batch insert operation
 func (c *Collection) NewBatchInsert(entries []*VectorEntry, opts ...*BatchOptions) *BatchInsert {
@@ -966,7 +972,7 @@ func (b *BatchUpdate) processUpdateWithRetries(ctx context.Context, update *Vect
 					for k, v := range entry.Metadata {
 						originalEntry.Metadata[k] = v
 					}
-					return fmt.Errorf("found") // Use error to break iteration
+					return errFound // Sentinel to break iteration; callers filter with errors.Is
 				}
 				return nil
 			})
@@ -1288,7 +1294,7 @@ func (b *BatchDelete) processDeleteWithRetries(ctx context.Context, id string, i
 					for k, v := range entry.Metadata {
 						originalEntry.Metadata[k] = v
 					}
-					return fmt.Errorf("found") // Use error to break iteration
+					return errFound // Sentinel to break iteration; callers filter with errors.Is
 				}
 				return nil
 			})
