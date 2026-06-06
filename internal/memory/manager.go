@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,7 +65,7 @@ func NewManager(config MemoryConfig) MemoryManager {
 		mmapManager:       mmapManager,
 		pressureCallbacks: make([]func(usage MemoryUsage), 0),
 		releaseCallbacks:  make([]func(freed int64), 0),
-		done: make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 }
 
@@ -500,14 +501,11 @@ func (m *manager) enableMemoryMappingForPressure(targetBytes int64) int64 {
 	}
 	m.mu.RUnlock()
 
-	// Sort candidates by size (largest first) to maximize memory savings
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[i].size < candidates[j].size {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	// Sort candidates by size (largest first) to maximize memory savings.
+	// O(n log n) instead of the O(n²) bubble sort previously used here.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].size > candidates[j].size
+	})
 
 	// Enable memory mapping for candidates until we've freed enough memory
 	for _, candidate := range candidates {
