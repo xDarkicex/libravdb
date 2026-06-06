@@ -76,7 +76,11 @@ func CosineDistance_func(a, b []float32) float32 {
 	normB = float32(math.Sqrt(float64(normB)))
 
 	if normA == 0 || normB == 0 {
-		return 1.0 // Maximum distance for zero vectors
+		// Returning NaN surfaces zero-vector bugs in caller code rather than
+		// silently reporting a meaningless 1.0 "max distance." NaN propagates
+		// through any distance comparison and is the standard math convention
+		// (matches numpy/scipy behavior on cosine divide-by-zero).
+		return float32(math.NaN())
 	}
 
 	cosine := dotProduct / (normA * normB)
