@@ -383,7 +383,9 @@ func (idx *Index) Train(ctx context.Context, vectors [][]float32) error {
 		}
 	}
 
+	idx.mutex.Lock()
 	idx.trained = true
+	idx.mutex.Unlock()
 	return nil
 }
 
@@ -709,13 +711,16 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 			len(entry.Vector), idx.config.Dimension)
 	}
 
+	idx.mutex.RLock()
 	if !idx.trained {
+		idx.mutex.RUnlock()
 		return fmt.Errorf("index must be trained before insertion")
 	}
 
 	// Find the best cluster for this vector
 	clusterID, err := idx.assignToCluster(entry.Vector)
 	if err != nil {
+		idx.mutex.RUnlock()
 		return fmt.Errorf("failed to assign vector to cluster: %w", err)
 	}
 
@@ -724,12 +729,14 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
 		compressed, err = idx.quantizer.Compress(entry.Vector)
 		if err != nil {
+			idx.mutex.RUnlock()
 			return fmt.Errorf("failed to compress vector: %w", err)
 		}
 	}
 
 	// Add to cluster
 	cluster := idx.clusters[clusterID]
+	idx.mutex.RUnlock()
 	cluster.mutex.Lock()
 	cluster.Entries = append(cluster.Entries, entry)
 
@@ -763,6 +770,9 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	if k > 4096 {
 		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
 	}
+
+	idx.mutex.RLock()
+	defer idx.mutex.RUnlock()
 
 	if !idx.trained {
 		return nil, fmt.Errorf("index must be trained before search")
