@@ -16,7 +16,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	ivfpqMagic        uint32 = 0x49564650 // "IVFP"
+	ivfpqMagic         uint32 = 0x49564650 // "IVFP"
 	ivfpqFormatVersion uint16 = 2
 	ivfpqIndexType     uint8  = 2 // matches index.IndexType(IVFPQ)
 )
@@ -159,34 +159,81 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 	r := &sliceReader{buf: data}
 
 	// ---- Header ----
-	magic := r.u32()
+	magic, err := r.u32()
+	if err != nil {
+		return err
+	}
 	if magic != ivfpqMagic {
 		return fmt.Errorf("invalid IVF-PQ magic: got %08X, expected %08X", magic, ivfpqMagic)
 	}
-	version := r.u16()
+	version, err := r.u16()
+	if err != nil {
+		return err
+	}
 	if version == 1 {
 		return fmt.Errorf("IVF-PQ format v1 is obsolete and contained a positional compressed-code matching bug; rebuild the index from records")
 	}
 	if version != ivfpqFormatVersion {
 		return fmt.Errorf("unsupported IVF-PQ format version: %d, expected %d", version, ivfpqFormatVersion)
 	}
-	indexType := r.u8()
+	indexType, err := r.u8()
+	if err != nil {
+		return err
+	}
 	if indexType != ivfpqIndexType {
 		return fmt.Errorf("index type mismatch: stored %d, expected %d", indexType, ivfpqIndexType)
 	}
-	_ = r.u8() // flags
+	if _, err := r.u8(); err != nil { // flags
+		return err
+	}
 
 	// ---- Config (validate compatibility) ----
-	dim := int(r.u32())
-	nClusters := int(r.u32())
-	nProbes := int(r.u32())
-	metric := r.u8()
-	quantType := r.u8()
-	storedCodebooks := int(r.u32())
-	storedBits := int(r.u8())
-	storedMaxIter := int(r.u32())
-	_ = r.f64() // tolerance (restore, not validate)
-	_ = r.i64() // randomSeed (restore, not validate)
+	dimV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	dim := int(dimV)
+	nClustersV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	nClusters := int(nClustersV)
+	nProbesV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	nProbes := int(nProbesV)
+	metricV, err := r.u8()
+	if err != nil {
+		return err
+	}
+	metric := metricV
+	quantTypeV, err := r.u8()
+	if err != nil {
+		return err
+	}
+	quantType := quantTypeV
+	storedCodebooksV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	storedCodebooks := int(storedCodebooksV)
+	storedBitsV, err := r.u8()
+	if err != nil {
+		return err
+	}
+	storedBits := int(storedBitsV)
+	storedMaxIterV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	storedMaxIter := int(storedMaxIterV)
+	if _, err := r.f64(); err != nil { // tolerance (restore, not validate)
+		return err
+	}
+	if _, err := r.i64(); err != nil { // randomSeed (restore, not validate)
+		return err
+	}
 
 	if dim != idx.config.Dimension {
 		return fmt.Errorf("config mismatch: dimension stored=%d current=%d", dim, idx.config.Dimension)
@@ -230,37 +277,69 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 	idx.config.MaxIterations = storedMaxIter
 
 	// ---- Coarse centroids ----
-	clusterCount := int(r.u32())
+	clusterCountV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	clusterCount := int(clusterCountV)
 	if clusterCount != nClusters {
 		return fmt.Errorf("cluster count mismatch: stored %d, config %d", clusterCount, nClusters)
 	}
 	for i := 0; i < nClusters; i++ {
-		cid := int(r.u32())
+		cidV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		cid := int(cidV)
 		if cid != i {
 			return fmt.Errorf("cluster ID sequence broken at %d: got %d", i, cid)
 		}
-		centDims := int(r.u32())
+		centDimsV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		centDims := int(centDimsV)
 		if centDims != dim {
 			return fmt.Errorf("centroid dimension mismatch at cluster %d: %d vs %d", i, centDims, dim)
 		}
 		idx.clusters[i].Centroid = make([]float32, dim)
 		for d := 0; d < dim; d++ {
-			idx.clusters[i].Centroid[d] = r.f32()
+			c, err := r.f32()
+			if err != nil {
+				return err
+			}
+			idx.clusters[i].Centroid[d] = c
 		}
 	}
 
 	// ---- PQ codebooks ----
-	subspaceCount := int(r.u32())
+	subspaceCountV, err := r.u32()
+	if err != nil {
+		return err
+	}
+	subspaceCount := int(subspaceCountV)
 	if subspaceCount > 0 {
-		centroidsPerSS := int(r.u32())
-		subDim := int(r.u32())
+		centroidsPerSSV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		centroidsPerSS := int(centroidsPerSSV)
+		subDimV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		subDim := int(subDimV)
 		codebookData := make([][][]float32, subspaceCount)
 		for s := 0; s < subspaceCount; s++ {
 			codebookData[s] = make([][]float32, centroidsPerSS)
 			for c := 0; c < centroidsPerSS; c++ {
 				codebookData[s][c] = make([]float32, subDim)
 				for d := 0; d < subDim; d++ {
-					codebookData[s][c][d] = r.f32()
+					cb, err := r.f32()
+					if err != nil {
+						return err
+					}
+					codebookData[s][c][d] = cb
 				}
 			}
 		}
@@ -270,7 +349,11 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 	}
 
 	// ---- Inverted lists: per-cluster (ordinal, compressed) entries ----
-	nClusters2 := int(r.u32())
+	nClusters2V, err := r.u32()
+	if err != nil {
+		return err
+	}
+	nClusters2 := int(nClusters2V)
 	if nClusters2 != nClusters {
 		return fmt.Errorf("inverted list cluster count mismatch: %d vs %d", nClusters2, nClusters)
 	}
@@ -278,16 +361,36 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 		clusters: make([]ivfpqClusterMeta, nClusters),
 	}
 	for i := 0; i < nClusters; i++ {
-		_ = int(r.u32()) // cluster ID (validated above)
-		entryCount := int(r.u32())
+		clusterIDV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		_ = int(clusterIDV) // cluster ID (validated above)
+		entryCountV, err := r.u32()
+		if err != nil {
+			return err
+		}
+		entryCount := int(entryCountV)
 		meta.clusters[i].entries = make([]ivfpqEntryMeta, 0, entryCount)
 		for e := 0; e < entryCount; e++ {
-			ordinal := r.u32()
-			compressedLen := int(r.u32())
+			ordinalV, err := r.u32()
+			if err != nil {
+				return err
+			}
+			ordinal := ordinalV
+			compressedLenV, err := r.u32()
+			if err != nil {
+				return err
+			}
+			compressedLen := int(compressedLenV)
 			var compressed []byte
 			if compressedLen > 0 {
 				compressed = make([]byte, compressedLen)
-				copy(compressed, r.raw(compressedLen))
+				raw, err := r.raw(compressedLen)
+				if err != nil {
+					return err
+				}
+				copy(compressed, raw)
 			}
 			meta.clusters[i].entries = append(meta.clusters[i].entries, ivfpqEntryMeta{
 				ordinal:    ordinal,
@@ -298,7 +401,9 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 	idx.deserMeta = meta
 
 	// ---- Footer (CRC32 already validated at entry) ----
-	_ = r.u32() // checksum already validated
+	if _, err := r.u32(); err != nil { // checksum already validated
+		return err
+	}
 
 	idx.trained = true
 	return nil
@@ -441,61 +546,61 @@ type sliceReader struct {
 
 func (r *sliceReader) remaining() int { return len(r.buf) - r.pos }
 
-func (r *sliceReader) u8() uint8 {
+func (r *sliceReader) u8() (uint8, error) {
 	if r.remaining() < 1 {
-		panic(fmt.Sprintf("sliceReader: need 1 byte, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 1 byte, have %d", r.remaining())
 	}
 	v := r.buf[r.pos]
 	r.pos++
-	return v
+	return v, nil
 }
-func (r *sliceReader) u16() uint16 {
+func (r *sliceReader) u16() (uint16, error) {
 	if r.remaining() < 2 {
-		panic(fmt.Sprintf("sliceReader: need 2 bytes, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 2 bytes, have %d", r.remaining())
 	}
 	v := binary.LittleEndian.Uint16(r.buf[r.pos:])
 	r.pos += 2
-	return v
+	return v, nil
 }
-func (r *sliceReader) u32() uint32 {
+func (r *sliceReader) u32() (uint32, error) {
 	if r.remaining() < 4 {
-		panic(fmt.Sprintf("sliceReader: need 4 bytes, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 4 bytes, have %d", r.remaining())
 	}
 	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
 	r.pos += 4
-	return v
+	return v, nil
 }
-func (r *sliceReader) i64() int64 {
+func (r *sliceReader) i64() (int64, error) {
 	if r.remaining() < 8 {
-		panic(fmt.Sprintf("sliceReader: need 8 bytes, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 8 bytes, have %d", r.remaining())
 	}
 	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
 	r.pos += 8
-	return int64(v)
+	return int64(v), nil
 }
-func (r *sliceReader) f32() float32 {
+func (r *sliceReader) f32() (float32, error) {
 	if r.remaining() < 4 {
-		panic(fmt.Sprintf("sliceReader: need 4 bytes, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 4 bytes, have %d", r.remaining())
 	}
 	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
 	r.pos += 4
-	return math.Float32frombits(v)
+	return math.Float32frombits(v), nil
 }
-func (r *sliceReader) f64() float64 {
+func (r *sliceReader) f64() (float64, error) {
 	if r.remaining() < 8 {
-		panic(fmt.Sprintf("sliceReader: need 8 bytes, have %d", r.remaining()))
+		return 0, fmt.Errorf("sliceReader: truncated input, need 8 bytes, have %d", r.remaining())
 	}
 	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
 	r.pos += 8
-	return math.Float64frombits(v)
+	return math.Float64frombits(v), nil
 }
-func (r *sliceReader) raw(n int) []byte {
+func (r *sliceReader) raw(n int) ([]byte, error) {
 	if r.remaining() < n {
-		panic(fmt.Sprintf("sliceReader: need %d bytes, have %d", n, r.remaining()))
+		return nil, fmt.Errorf("sliceReader: truncated input, need %d bytes, have %d", n, r.remaining())
 	}
 	v := r.buf[r.pos : r.pos+n]
 	r.pos += n
-	return v
+	return v, nil
 }
 
 // ---------------------------------------------------------------------------
