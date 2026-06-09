@@ -234,8 +234,9 @@ func ivfDownHeap(h []ivfHeapElement, i, n int) {
 }
 
 // ivfUserDataOffset is the byte offset within a ShardedFreeList slot where user
-// data begins. The first 64 bytes are reserved for FreeList/ShardedFreeList metadata.
-const ivfUserDataOffset = 64
+// data begins. The memory package's SFL metadata occupies offsets 0–43 (Hyaline
+// chain at 0/8/16/24/32, structIdx+shardIdx at 40); 8-byte aligned to 48.
+const ivfUserDataOffset = 48
 
 // ivfHeapSlot binds an off-heap slot to its originating pool so that free()
 // routes to the correct tier by construction.
@@ -292,6 +293,18 @@ func acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
 		return &ivfHeapSlot{slot: slot, pool: tier.pool}, heapBuf
 	}
 	return nil, nil
+}
+
+// CloseQueryPools calls Free() on all initialized ivfQueryTiers pools,
+// cancelling their PID controller goroutines and releasing mmap'd memory.
+// Safe to call multiple times; uninitialized tiers are skipped.
+func CloseQueryPools() {
+	for i := range ivfQueryTiers {
+		if ivfQueryTiers[i].pool != nil {
+			ivfQueryTiers[i].pool.Free()
+			ivfQueryTiers[i].pool = nil
+		}
+	}
 }
 
 // NewIVFPQ creates a new IVF-PQ index
@@ -949,6 +962,11 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
+	}
+
+	// Warm quantizer distance tables so parallel workers only read from the cache.
+	if idx.quantizer != nil {
+		idx.quantizer.PrepareQuery(query)
 	}
 
 	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k)
