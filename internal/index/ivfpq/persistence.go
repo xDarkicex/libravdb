@@ -500,6 +500,7 @@ func (idx *Index) PopulateEntriesFromStorage(provider EntryProvider) error {
 			idx.idToCluster.Store(entry.ID, cid)
 			if len(em.compressed) > 0 {
 				cluster.CompressedVectors[entry.ID] = em.compressed
+				entry.Compressed = em.compressed
 			}
 			idx.size++
 		}

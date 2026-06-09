@@ -31,11 +31,12 @@ type Config struct {
 
 // VectorEntry represents a vector entry
 type VectorEntry struct {
-	ID       string
-	Ordinal  uint32
-	Vector   []float32
-	Metadata map[string]interface{}
-	Version  uint64
+	ID         string
+	Ordinal    uint32
+	Vector     []float32
+	Metadata   map[string]interface{}
+	Version    uint64
+	Compressed []byte // PQ-compressed codes, populated at insert for O(1) distance lookup
 }
 
 // SearchResult represents a search result
@@ -752,9 +753,8 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	}
 
 	// Compress vector if quantization is enabled
-	var compressed []byte
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		compressed, err = idx.quantizer.Compress(entry.Vector)
+		entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
 		if err != nil {
 			idx.mutex.RUnlock()
 			return fmt.Errorf("failed to compress vector: %w", err)
@@ -768,9 +768,9 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	idx.idToCluster.Store(entry.ID, clusterID)
 	cluster.Entries = append(cluster.Entries, entry)
 
-	// Store compressed version if available
-	if compressed != nil {
-		cluster.CompressedVectors[entry.ID] = compressed
+	// Store compressed version in the cluster map for persistence.
+	if entry.Compressed != nil {
+		cluster.CompressedVectors[entry.ID] = entry.Compressed
 	}
 
 	cluster.mutex.Unlock()
@@ -854,9 +854,8 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 					continue
 				}
 
-				var compressed []byte
 				if idx.quantizer != nil && idx.quantizer.IsTrained() {
-					compressed, err = idx.quantizer.Compress(entry.Vector)
+					entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
 					if err != nil {
 						processed[i].err = fmt.Errorf("failed to compress vector: %w", err)
 						continue
@@ -866,7 +865,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 				processed[i] = processedEntry{
 					entry:      entry,
 					clusterID:  clusterID,
-					compressed: compressed,
+					compressed: entry.Compressed,
 				}
 			}
 		}(start, end)
@@ -1236,15 +1235,16 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 	return candidates, nil
 }
 
-func (idx *Index) distanceToEntry(query []float32, cluster *Cluster, entry *VectorEntry) (float32, error) {
+func (idx *Index) distanceToEntry(query []float32, _ *Cluster, entry *VectorEntry) (float32, error) {
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		compressed, exists := cluster.CompressedVectors[entry.ID]
-		if !exists {
+		compressed := entry.Compressed
+		if compressed == nil {
 			var err error
 			compressed, err = idx.quantizer.Compress(entry.Vector)
 			if err != nil {
 				return 0, fmt.Errorf("failed to compress vector: %w", err)
 			}
+			entry.Compressed = compressed
 		}
 
 		distance, err := idx.quantizer.DistanceToQuery(compressed, query)
