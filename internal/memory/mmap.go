@@ -60,9 +60,9 @@ func NewMemoryMap(path string, size int64, readOnly bool) (*MemoryMap, error) {
 		size = stat.Size()
 	}
 
-	if size == 0 {
+	if size <= 0 {
 		file.Close()
-		return nil, fmt.Errorf("cannot memory map empty file")
+		return nil, fmt.Errorf("cannot memory map empty or invalid sized file")
 	}
 
 	// Memory map the file

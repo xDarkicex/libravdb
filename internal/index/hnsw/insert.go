@@ -12,8 +12,16 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 	if h.size == 1 {
 		entryID := h.findNodeID(h.entryPoint)
 		if entryID != ^uint32(0) && node.Level >= 0 {
-			appendUniqueLink(node, levelMaxLinks(h.config.M, 0), 0, entryID)
-			appendUniqueLink(h.entryPoint, levelMaxLinks(h.config.M, 0), 0, nodeID)
+			if appendUniqueLink(node, levelMaxLinks(h.config.M, 0), 0, entryID) {
+				if h.entryPoint != nil && 0 < len(h.entryPoint.Backlinks) {
+					h.entryPoint.Backlinks[0] = append(h.entryPoint.Backlinks[0], nodeID)
+				}
+			}
+			if appendUniqueLink(h.entryPoint, levelMaxLinks(h.config.M, 0), 0, nodeID) {
+				if node != nil && 0 < len(node.Backlinks) {
+					node.Backlinks[0] = append(node.Backlinks[0], entryID)
+				}
+			}
 		}
 		return nil
 	}
@@ -161,9 +169,16 @@ func (h *Index) connectBidirectional(nodeID uint32, neighbors []*util.Candidate,
 func (h *Index) connectBidirectionalOptimized(nodeID uint32, neighbors []*util.Candidate, level int) {
 	node := h.nodes[nodeID]
 	maxLinks := levelMaxLinks(h.config.M, level)
+	
 	nodeLinks := ensureLinkCapacity(node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
 	for _, neighbor := range neighbors {
 		nodeLinks = append(nodeLinks, neighbor.ID)
+		
+		// Add backlink to neighbor
+		neighborNode := h.nodes[neighbor.ID]
+		if neighborNode != nil && level < len(neighborNode.Backlinks) {
+			neighborNode.Backlinks[level] = append(neighborNode.Backlinks[level], nodeID)
+		}
 	}
 	node.Links[level] = nodeLinks
 
@@ -174,15 +189,27 @@ func (h *Index) connectBidirectionalOptimized(nodeID uint32, neighbors []*util.C
 		}
 		neighborLinks := ensureLinkCapacity(neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
 		neighborNode.Links[level] = append(neighborLinks, nodeID)
+		
+		// Add backlink to node
+		if node != nil && level < len(node.Backlinks) {
+			node.Backlinks[level] = append(node.Backlinks[level], neighbor.ID)
+		}
 	}
 }
 
 func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []util.Candidate, level int) {
 	node := h.nodes[nodeID]
 	maxLinks := levelMaxLinks(h.config.M, level)
+	
 	nodeLinks := ensureLinkCapacity(node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
 	for _, neighbor := range neighbors {
 		nodeLinks = append(nodeLinks, neighbor.ID)
+		
+		// Add backlink to neighbor
+		neighborNode := h.nodes[neighbor.ID]
+		if neighborNode != nil && level < len(neighborNode.Backlinks) {
+			neighborNode.Backlinks[level] = append(neighborNode.Backlinks[level], nodeID)
+		}
 	}
 	node.Links[level] = nodeLinks
 
@@ -193,6 +220,11 @@ func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []u
 		}
 		neighborLinks := ensureLinkCapacity(neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
 		neighborNode.Links[level] = append(neighborLinks, nodeID)
+		
+		// Add backlink to node
+		if node != nil && level < len(node.Backlinks) {
+			node.Backlinks[level] = append(node.Backlinks[level], neighbor.ID)
+		}
 	}
 }
 

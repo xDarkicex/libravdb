@@ -16,10 +16,10 @@ type restartBenchConfig struct {
 	count     int
 	indexType IndexType
 	// IVF-PQ specific
-	nClusters int
-	nProbes   int
+	nClusters  int
+	nProbes    int
 	nSubspaces int // PQ codebooks
-	bits      int // PQ bits
+	bits       int // PQ bits
 }
 
 // BenchmarkRestartPersisted measures New() time when a valid persisted index chunk

@@ -10,8 +10,11 @@ import (
 	"sync"
 	"time"
 
+	internalmemory "github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
+	"unsafe"
 )
 
 // VectorEntry represents a vector entry for HNSW indexing
@@ -56,6 +59,9 @@ type Index struct {
 	// Performance optimizations
 	neighborSelector  *NeighborSelector // Optimized neighbor selection
 	searchScratchPool sync.Pool
+	scratchPool       *sync.Pool
+	linkSFL           *memory.ShardedFreeList
+	link0SFL          *memory.ShardedFreeList
 	rawVectorStore    RawVectorStore
 	// Quantization support
 	quantizer           quant.Quantizer
@@ -65,7 +71,9 @@ type Index struct {
 	memoryMapped     bool
 	mmapPath         string
 	mmapSize         int64
-	originalMemUsage int64 // Memory usage before mapping
+	vecMmap          *internalmemory.MemoryMap // Mmap for raw vectors
+	pqMmap           *internalmemory.MemoryMap // Mmap for compressed vectors
+	originalMemUsage int64             // Memory usage before mapping
 }
 
 // Config holds HNSW configuration parameters
@@ -95,6 +103,43 @@ func NewHNSW(config *Config) (*Index, error) {
 		return nil, fmt.Errorf("unsupported distance metric: %w", err)
 	}
 
+	slack := config.M / 4
+	if slack < 4 {
+		slack = 4
+	}
+	linkSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  512 * 1024 * 1024,
+		SlotSize:  uint64(48 + (config.M+slack)*4),
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 8,
+		Prealloc:  false,
+	}, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create linkSFL: %w", err)
+	}
+
+	slack0 := (config.M * 2) / 4
+	if slack0 < 4 {
+		slack0 = 4
+	}
+	link0SFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  512 * 1024 * 1024,
+		SlotSize:  uint64(48 + (config.M*2+slack0)*4),
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 8,
+		Prealloc:  false,
+	}, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create link0SFL: %w", err)
+	}
+
+	scratchPool := &sync.Pool{
+		New: func() any {
+			a, _ := memory.NewArena(1024 * 1024)
+			return a
+		},
+	}
+
 	index := &Index{
 		config:               config,
 		nodes:                make([]*Node, 0),
@@ -107,6 +152,9 @@ func NewHNSW(config *Config) (*Index, error) {
 		trainingVectors:      make([][]float32, 0),
 		quantizationTrained:  false,
 		nextOrdinal:          0,
+		linkSFL:              linkSFL,
+		link0SFL:             link0SFL,
+		scratchPool:          scratchPool,
 	}
 	index.searchScratchPool.New = func() interface{} {
 		return &searchScratch{}
@@ -145,6 +193,16 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 
 // insertSingle handles single vector insertion (must be called with lock held)
 func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
+	if entry == nil {
+		return fmt.Errorf("entry cannot be nil")
+	}
+	if len(entry.Vector) == 0 {
+		return fmt.Errorf("vector cannot be empty")
+	}
+	if len(entry.Vector) != h.config.Dimension {
+		return fmt.Errorf("vector dimension mismatch: expected %d, got %d", h.config.Dimension, len(entry.Vector))
+	}
+
 	if entry.ID != "" {
 		if _, exists := h.idToIndex[entry.ID]; exists {
 			return fmt.Errorf("node with ID '%s' already exists", entry.ID)
@@ -178,7 +236,7 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	node := &Node{
 		Ordinal: ordinal,
 		Level:   level,
-		Links:   newNodeLinks(level, h.config.M),
+		Links:   h.newNodeLinks(level, h.config.M),
 	}
 
 	// Handle vector storage (quantized or original)
@@ -253,21 +311,30 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 	return nil
 }
 
-func newNodeLinks(level int, baseM int) [][]uint32 {
+func (h *Index) newNodeLinks(level int, baseM int) [][]uint32 {
 	links := make([][]uint32, level+1)
-	totalCapacity := 0
 	for i := 0; i <= level; i++ {
-		totalCapacity += initialNodeLinkCapacity(baseM, i)
-	}
+		capacity := levelMaxLinks(baseM, i)
+		slack := capacity / 4
+		if slack < 4 {
+			slack = 4
+		}
+		maxCapacity := capacity + slack
 
-	backing := make([]uint32, 0, totalCapacity)
-	offset := 0
-	for i := 0; i <= level; i++ {
-		capacity := initialNodeLinkCapacity(baseM, i)
-		links[i] = backing[offset : offset : offset+capacity]
-		offset += capacity
+		var slot []byte
+		var err error
+		if i == 0 {
+			slot, err = h.link0SFL.Allocate()
+		} else {
+			slot, err = h.linkSFL.Allocate()
+		}
+		if err != nil {
+			panic(fmt.Sprintf("hnsw: failed to allocate links: %v", err))
+		}
+		ptr := unsafe.Pointer(&slot[48])
+		// Slice up to maxCapacity, but start with len 0
+		links[i] = unsafe.Slice((*uint32)(ptr), maxCapacity)[:0]
 	}
-
 	return links
 }
 
@@ -285,20 +352,7 @@ func (h *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
 		return nil
 	}
 
-	// For small batches, use regular insertion
-	if len(entries) <= 10 {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-
-		for _, entry := range entries {
-			if err := h.insertSingle(ctx, entry); err != nil {
-				return fmt.Errorf("failed to insert entry %s: %w", entry.ID, err)
-			}
-		}
-		return nil
-	}
-
-	// For larger batches, use optimized batch processing
+	// Use optimized batch processing for all batch sizes
 	return h.batchInsertOptimized(ctx, entries)
 }
 
@@ -390,14 +444,10 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 			continue
 		}
 
+		// Skip eager Decompress — the collection layer hydrates vectors from
+		// storage. Standalone path reads from off-heap rawVectorStore (cheap).
 		var resultVector []float32
-		if node.CompressedVector != nil && h.quantizer != nil {
-			var err error
-			resultVector, err = h.quantizer.Decompress(node.CompressedVector)
-			if err != nil {
-				resultVector = nil
-			}
-		} else if h.provider == nil {
+		if h.provider == nil {
 			resultVector, _ = h.getNodeVector(node)
 		}
 
@@ -510,6 +560,16 @@ func (h *Index) calculateMemoryUsage() int64 {
 func (h *Index) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Free off-heap link storage.
+	if h.linkSFL != nil {
+		h.linkSFL.Free()
+		h.linkSFL = nil
+	}
+	if h.link0SFL != nil {
+		h.link0SFL.Free()
+		h.link0SFL = nil
+	}
 
 	// Clear all data structures
 	h.nodes = nil
@@ -840,14 +900,22 @@ func (h *Index) EnableMemoryMapping(basePath string) error {
 	h.memoryMapped = true
 
 	// Clear in-memory data structures to free memory
-	// Keep essential structures but clear large data
-	for _, node := range h.nodes {
-		if node != nil {
-			node.CompressedVector = nil
-		}
-	}
 	if h.rawVectorStore != nil {
+		vecMmapPath := fmt.Sprintf("%s/hnsw_vectors_%p.mmap", basePath, h)
+		mmapStore, err := h.createMmapRawVectorStore(vecMmapPath)
+		if err != nil {
+			return fmt.Errorf("failed to create memory-mapped raw vector store: %w", err)
+		}
+		h.vecMmap = mmapStore.mmap
 		_ = h.rawVectorStore.Reset()
+		h.rawVectorStore = mmapStore
+	} else if h.quantizer != nil {
+		pqMmapPath := fmt.Sprintf("%s/hnsw_pq_%p.mmap", basePath, h)
+		pqMmap, err := h.createMmapCompressedVectorStore(pqMmapPath)
+		if err != nil {
+			return fmt.Errorf("failed to create memory-mapped compressed vector store: %w", err)
+		}
+		h.pqMmap = pqMmap
 	}
 
 	// Clear training vectors
@@ -863,6 +931,25 @@ func (h *Index) DisableMemoryMapping() error {
 
 	if !h.memoryMapped {
 		return fmt.Errorf("index is not memory mapped")
+	}
+
+	// Unmap and clean up vector mmap files first so loadFromDiskImpl can create new stores
+	if h.vecMmap != nil {
+		path := h.vecMmap.Path()
+		h.vecMmap.Close()
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Failed to remove vector memory-mapped file %s: %v\n", path, err)
+		}
+		h.vecMmap = nil
+		h.rawVectorStore = nil
+	}
+	if h.pqMmap != nil {
+		path := h.pqMmap.Path()
+		h.pqMmap.Close()
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Failed to remove pq memory-mapped file %s: %v\n", path, err)
+		}
+		h.pqMmap = nil
 	}
 
 	// Reload the index from the memory-mapped file
@@ -942,7 +1029,7 @@ func (h *Index) SerializeToBytes() ([]byte, error) {
 }
 
 // DeserializeFromBytes restores the index from an in-memory byte slice.
-func (h *Index) DeserializeFromBytes(data []byte) error {
+func (h *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	reader := bufio.NewReader(bytes.NewReader(data))
 
 	if err := h.readHeader(reader); err != nil {
@@ -969,10 +1056,10 @@ func (h *Index) DeserializeFromBytes(data []byte) error {
 		}
 	}
 
-	if err := h.readNodes(reader); err != nil {
+	if err := h.readNodes(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read nodes: %w", err)
 	}
-	if err := h.readLinks(reader); err != nil {
+	if err := h.readLinks(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read links: %w", err)
 	}
 	if err := h.readMetadata(reader); err != nil {
@@ -1044,4 +1131,33 @@ func (h *Index) estimateFileSize() int64 {
 	}
 
 	return size
+}
+
+func (h *Index) freeNodeLinks(node *Node) {
+	if node == nil || len(node.Links) == 0 {
+		return
+	}
+	for i, links := range node.Links {
+		ptr := unsafe.Pointer(unsafe.SliceData(links))
+		if ptr == nil {
+			continue
+		}
+		basePtr := unsafe.Pointer(uintptr(ptr) - 48)
+		slack := h.config.M / 4
+		if slack < 4 {
+			slack = 4
+		}
+		slack0 := (h.config.M * 2) / 4
+		if slack0 < 4 {
+			slack0 = 4
+		}
+
+		if i == 0 {
+			slot := unsafe.Slice((*byte)(basePtr), int(48+(h.config.M*2+slack0)*4))
+			_ = h.link0SFL.Deallocate(slot)
+		} else {
+			slot := unsafe.Slice((*byte)(basePtr), int(48+(h.config.M+slack)*4))
+			_ = h.linkSFL.Deallocate(slot)
+		}
+	}
 }

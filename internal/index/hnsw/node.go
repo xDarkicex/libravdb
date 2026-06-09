@@ -6,5 +6,6 @@ type Node struct {
 	Ordinal          uint32
 	Level            int
 	Links            [][]uint32
+	Backlinks        [][]uint32
 	CompressedVector []byte
 }

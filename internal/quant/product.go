@@ -1,6 +1,8 @@
 package quant
 
 import (
+	"github.com/xDarkicex/memory"
+
 	"context"
 	"fmt"
 	"math"
@@ -14,6 +16,8 @@ type ProductQuantizer struct {
 
 	// Configuration
 	config *QuantizationConfig
+
+	compressedSFL *memory.ShardedFreeList
 
 	// Training state
 	trained   bool
@@ -56,6 +60,22 @@ func (pq *ProductQuantizer) Configure(config *QuantizationConfig) error {
 
 	pq.config = config
 	pq.subspaces = config.Codebooks
+
+	bitsPerCode := config.Bits
+	totalBits := pq.subspaces * bitsPerCode
+	numBytes := (totalBits + 7) / 8
+
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  64 * 1024 * 1024,
+		SlotSize:  uint64(48 + numBytes),
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 8,
+		Prealloc:  false,
+	}, 64)
+	if err != nil {
+		return fmt.Errorf("failed to init compressedSFL: %w", err)
+	}
+	pq.compressedSFL = sfl
 
 	return nil
 }
@@ -101,6 +121,31 @@ func (pq *ProductQuantizer) Train(ctx context.Context, vectors [][]float32) erro
 	numCentroids := 1 << pq.config.Bits // 2^bits centroids per codebook
 	pq.centroids = make([][][]float32, pq.subspaces)
 
+	pool, err := memory.NewPool(memory.AllocatorConfig{
+		PoolSize:  64 * 1024 * 1024, // 64MB hard limit
+		SlabSize:  2 * 1024 * 1024,  // 2MB slabs
+		SlabCount: 4,
+		Prealloc:  false,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create memory pool for kmeans: %w", err)
+	}
+	defer pool.Free()
+
+	// Pre-allocate scratch arrays off-heap once for all subspaces
+	assignments := memory.MustPoolSlice[int](pool, len(trainingVectors))
+	assignments = assignments[:len(trainingVectors)]
+
+	newCentroids := memory.MustPoolSlice[[]float32](pool, numCentroids)
+	newCentroids = newCentroids[:numCentroids]
+	for i := 0; i < numCentroids; i++ {
+		newCentroids[i] = memory.MustPoolSlice[float32](pool, pq.subDim)
+		newCentroids[i] = newCentroids[i][:pq.subDim]
+	}
+
+	counts := memory.MustPoolSlice[int](pool, numCentroids)
+	counts = counts[:numCentroids]
+
 	for s := 0; s < pq.subspaces; s++ {
 		select {
 		case <-ctx.Done():
@@ -117,7 +162,7 @@ func (pq *ProductQuantizer) Train(ctx context.Context, vectors [][]float32) erro
 		}
 
 		// Train codebook for this subspace using k-means
-		centroids, err := pq.trainCodebook(ctx, subvectors, numCentroids)
+		centroids, err := pq.trainCodebook(ctx, subvectors, numCentroids, assignments, newCentroids, counts)
 		if err != nil {
 			return fmt.Errorf("failed to train codebook for subspace %d: %w", s, err)
 		}
@@ -138,7 +183,7 @@ func (pq *ProductQuantizer) Train(ctx context.Context, vectors [][]float32) erro
 }
 
 // trainCodebook trains a single codebook using k-means clustering
-func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float32, k int) ([][]float32, error) {
+func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float32, k int, assignments []int, newCentroids [][]float32, counts []int) ([][]float32, error) {
 	if len(vectors) == 0 {
 		return nil, fmt.Errorf("no vectors to train codebook")
 	}
@@ -169,8 +214,15 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 		default:
 		}
 
+		// Zero scratch arrays instead of reallocating
+		for i := 0; i < k; i++ {
+			counts[i] = 0
+			for d := 0; d < dim; d++ {
+				newCentroids[i][d] = 0
+			}
+		}
+
 		// Assignment step: assign each vector to nearest centroid
-		assignments := make([]int, len(vectors))
 		for i, vec := range vectors {
 			minDist := float32(math.Inf(1))
 			bestCentroid := 0
@@ -186,13 +238,6 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 		}
 
 		// Update step: recompute centroids
-		newCentroids := make([][]float32, k)
-		counts := make([]int, k)
-
-		for i := 0; i < k; i++ {
-			newCentroids[i] = make([]float32, dim)
-		}
-
 		for i, vec := range vectors {
 			centroidIdx := assignments[i]
 			counts[centroidIdx]++
@@ -221,7 +266,9 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 			}
 		}
 
-		centroids = newCentroids
+		for i := 0; i < k; i++ {
+			copy(centroids[i], newCentroids[i])
+		}
 
 		if converged {
 			break
@@ -250,7 +297,11 @@ func (pq *ProductQuantizer) Compress(vector []float32) ([]byte, error) {
 	totalBits := pq.subspaces * bitsPerCode
 	numBytes := (totalBits + 7) / 8 // Round up to nearest byte
 
-	compressed := make([]byte, numBytes)
+	slot, err := pq.compressedSFL.Allocate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate compressed vector: %w", err)
+	}
+	compressed := slot[48 : 48+numBytes]
 	bitOffset := 0
 
 	// Quantize each subspace
@@ -348,8 +399,8 @@ func (pq *ProductQuantizer) Distance(compressed1, compressed2 []byte) (float32, 
 
 // DistanceToQuery computes distance from compressed vector to query vector
 func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
-	pq.mu.Lock()
-	defer pq.mu.Unlock()
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
 
 	if !pq.trained {
 		return 0, fmt.Errorf("quantizer not trained")

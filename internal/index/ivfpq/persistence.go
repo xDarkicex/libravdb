@@ -12,14 +12,12 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Binary format constants
-// ---------------------------------------------------------------------------
-
 const (
-	ivfpqMagic         uint32 = 0x49564650 // "IVFP"
 	ivfpqFormatVersion uint16 = 2
 	ivfpqIndexType     uint8  = 2 // matches index.IndexType(IVFPQ)
 )
+
+var ivfpqMagicBytes = []byte("LIBRAIVF")
 
 // ivfpqClusterMeta stores per-cluster entry metadata deserialized from the
 // inverted lists section. Each entry records its ordinal and compressed PQ codes.
@@ -55,7 +53,7 @@ func (idx *Index) SerializeToBytes() ([]byte, error) {
 	w := &sliceWriter{buf: buf}
 
 	// ---- Header ----
-	w.u32(ivfpqMagic)
+	w.bytes(ivfpqMagicBytes)
 	w.u16(ivfpqFormatVersion)
 	w.u8(ivfpqIndexType)
 	w.u8(0) // flags (reserved)
@@ -140,9 +138,15 @@ func (idx *Index) SerializeToBytes() ([]byte, error) {
 // DeserializeFromBytes restores trained IVF-PQ centroids and codebooks from
 // serialized bytes without retraining. Cluster entries and compressed vectors
 // are stored in idx.deserMeta for later population via PopulateEntriesFromStorage.
-func (idx *Index) DeserializeFromBytes(data []byte) error {
+func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	idx.mutex.Lock()
 	defer idx.mutex.Unlock()
+
+	// Clear previous idToCluster map — rebuilt by PopulateEntriesFromStorage.
+	idx.idToCluster.Range(func(key, _ any) bool {
+		idx.idToCluster.Delete(key)
+		return true
+	})
 
 	if len(data) < 20 {
 		return fmt.Errorf("IVF-PQ data too short: %d bytes", len(data))
@@ -159,12 +163,12 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 	r := &sliceReader{buf: data}
 
 	// ---- Header ----
-	magic, err := r.u32()
+	magic, err := r.bytes(8)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed reading magic: %w", err)
 	}
-	if magic != ivfpqMagic {
-		return fmt.Errorf("invalid IVF-PQ magic: got %08X, expected %08X", magic, ivfpqMagic)
+	if string(magic) != string(ivfpqMagicBytes) {
+		return fmt.Errorf("invalid IVF-PQ magic bytes: got %q, expected %q", magic, ivfpqMagicBytes)
 	}
 	version, err := r.u16()
 	if err != nil {
@@ -373,6 +377,14 @@ func (idx *Index) DeserializeFromBytes(data []byte) error {
 		entryCount := int(entryCountV)
 		meta.clusters[i].entries = make([]ivfpqEntryMeta, 0, entryCount)
 		for e := 0; e < entryCount; e++ {
+			if e%1024 == 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+			}
+
 			ordinalV, err := r.u32()
 			if err != nil {
 				return err
@@ -485,6 +497,7 @@ func (idx *Index) PopulateEntriesFromStorage(provider EntryProvider) error {
 				continue
 			}
 			cluster.Entries = append(cluster.Entries, entry)
+			idx.idToCluster.Store(entry.ID, cid)
 			if len(em.compressed) > 0 {
 				cluster.CompressedVectors[entry.ID] = em.compressed
 			}
@@ -531,6 +544,7 @@ func (w *sliceWriter) u8(v uint8)   { w.buf = append(w.buf, v) }
 func (w *sliceWriter) u16(v uint16) { w.buf = binary.LittleEndian.AppendUint16(w.buf, v) }
 func (w *sliceWriter) u32(v uint32) { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
 func (w *sliceWriter) i64(v int64)  { w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v)) }
+func (w *sliceWriter) bytes(v []byte) { w.buf = append(w.buf, v...) }
 func (w *sliceWriter) f32(v float32) {
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(v))
 }
@@ -552,6 +566,14 @@ func (r *sliceReader) u8() (uint8, error) {
 	}
 	v := r.buf[r.pos]
 	r.pos++
+	return v, nil
+}
+func (r *sliceReader) bytes(n int) ([]byte, error) {
+	if r.remaining() < n {
+		return nil, fmt.Errorf("sliceReader: truncated input, need %d bytes, have %d", n, r.remaining())
+	}
+	v := r.buf[r.pos : r.pos+n]
+	r.pos += n
 	return v, nil
 }
 func (r *sliceReader) u16() (uint16, error) {
@@ -618,10 +640,10 @@ func (idx *Index) SaveToDisk(_ context.Context, path string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-func (idx *Index) LoadFromDisk(_ context.Context, path string) error {
+func (idx *Index) LoadFromDisk(ctx context.Context, path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return idx.DeserializeFromBytes(data)
+	return idx.DeserializeFromBytes(ctx, data)
 }

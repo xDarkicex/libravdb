@@ -1381,11 +1381,11 @@ func (c *Collection) DeleteBatch(ctx context.Context, ids []string) error {
 // Get returns a persisted record by ID.
 func (c *Collection) Get(ctx context.Context, id string) (Record, error) {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
 	if c.closed {
-		c.mu.RUnlock()
 		return Record{}, ErrCollectionClosed
 	}
-	c.mu.RUnlock()
 
 	// Route to the correct shard for this ID
 	if c.shards != nil {
@@ -1431,11 +1431,11 @@ func (c *Collection) withCAS(ctx context.Context, fn func(tx Tx) error) error {
 // Iterate walks all persisted records in the collection.
 func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
 	if c.closed {
-		c.mu.RUnlock()
 		return ErrCollectionClosed
 	}
-	c.mu.RUnlock()
 
 	// Sharded path: iterate over all shards
 	if c.shards != nil {
@@ -1493,11 +1493,11 @@ func (c *Collection) ListByMetadata(ctx context.Context, field string, value int
 // Count returns the exact number of live records in the collection.
 func (c *Collection) Count(ctx context.Context) (int, error) {
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
 	if c.closed {
-		c.mu.RUnlock()
 		return 0, ErrCollectionClosed
 	}
-	c.mu.RUnlock()
 
 	// Sharded path: sum counts from all shards
 	if c.shards != nil {
@@ -1542,18 +1542,17 @@ func (c *Collection) effectiveWriteConcurrency(requested int) int {
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
 	if c.closed {
-		c.mu.RUnlock()
 		return nil, ErrCollectionClosed
 	}
-	// Snapshot the index and shard indexes under lock so concurrent tx commits
-	// that swap indexes don't race with Search reading them.
+	// Use local variables to avoid multiple pointer dereferences during inner loops
 	idx := c.index
 	shardIndexes := make([]index.Index, len(c.shards))
 	for i := range c.shards {
 		shardIndexes[i] = c.shards[i].index
 	}
-	c.mu.RUnlock()
 
 	// Validate input
 	if len(vector) != c.config.Dimension {
@@ -2416,10 +2415,13 @@ func (c *Collection) switchIndexType(ctx context.Context, newType IndexType) err
 		return fmt.Errorf("failed to build new index: %w", err)
 	}
 
-	// Close old index and switch
+	// Close old index and switch atomically under the collection lock
+	// so concurrent readers always see a consistent index/config pair.
+	c.mu.Lock()
 	c.index.Close()
 	c.index = newIndex
 	c.config.IndexType = newType
+	c.mu.Unlock()
 
 	return nil
 }

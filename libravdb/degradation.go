@@ -170,7 +170,7 @@ func (gdm *GracefulDegradationManagerImpl) SetDegradationLevel(level int) error 
 
 	// Apply or revert degradations as needed
 	if level > oldLevel {
-		return gdm.applyDegradationLevel(level, "manual_set")
+		return gdm.applyDegradationLevel(oldLevel, level, "manual_set")
 	} else if level < oldLevel {
 		return gdm.revertDegradationLevel(oldLevel, level, "manual_set")
 	}
@@ -384,18 +384,74 @@ func (gdm *GracefulDegradationManagerImpl) HandleIndexCorruption(ctx context.Con
 	return nil
 }
 
-// applyDegradationLevel applies degradation up to the specified level
-func (gdm *GracefulDegradationManagerImpl) applyDegradationLevel(level int, reason string) error {
-	// This would contain the logic to apply degradations incrementally
-	// For now, we'll just record the action
-	gdm.recordDegradationAction("level_increase", level, fmt.Sprintf("Increased degradation level to %d: %s", level, reason), true)
+// applyDegradationLevel applies degradation incrementally from oldLevel up to newLevel
+func (gdm *GracefulDegradationManagerImpl) applyDegradationLevel(oldLevel, newLevel int, reason string) error {
+	for lvl := oldLevel + 1; lvl <= newLevel; lvl++ {
+		switch lvl {
+		case 1:
+			if gdm.memoryManager != nil {
+				if err := gdm.memoryManager.TriggerGC(); err == nil {
+					gdm.recordDegradationAction("memory_gc", 1, "Triggered garbage collection", true)
+				}
+			}
+		case 2:
+			if gdm.config.EnableCacheEviction && gdm.memoryManager != nil {
+				if freed, err := gdm.memoryManager.EvictCaches(0); err == nil && freed > 0 {
+					gdm.recordDegradationAction("cache_eviction", 2, fmt.Sprintf("Evicted %d bytes from caches", freed), true)
+				}
+			}
+		case 3:
+			if gdm.config.EnableMemoryMapping && gdm.memoryManager != nil {
+				if err := gdm.memoryManager.EnableMemoryMapping(); err == nil {
+					gdm.recordDegradationAction("memory_mapping", 3, "Enabled memory mapping", true)
+				}
+			}
+		case 4:
+			if gdm.config.EnableQuantizationFallback && gdm.quantizationManager != nil {
+				if err := gdm.quantizationManager.FallbackToUncompressed("all"); err == nil {
+					gdm.recordDegradationAction("quantization_fallback", 4, "Fallback to uncompressed storage", true)
+				}
+			}
+		case 5:
+			if gdm.config.EnableIndexSimplification && gdm.indexManager != nil {
+				if err := gdm.indexManager.SimplifyIndex("all", newLevel); err == nil {
+					gdm.recordDegradationAction("index_simplification", 5, "Simplified index structures", false)
+				}
+			}
+		}
+	}
+	gdm.recordDegradationAction("level_increase", newLevel, fmt.Sprintf("Increased degradation level from %d to %d: %s", oldLevel, newLevel, reason), true)
 	return nil
 }
 
-// revertDegradationLevel reverts degradation from oldLevel to newLevel
+// revertDegradationLevel reverts degradation from oldLevel down to newLevel
 func (gdm *GracefulDegradationManagerImpl) revertDegradationLevel(oldLevel, newLevel int, reason string) error {
-	// This would contain the logic to revert degradations
-	// For now, we'll just record the action
+	for lvl := oldLevel; lvl > newLevel; lvl-- {
+		switch lvl {
+		case 5:
+			if gdm.config.EnableIndexSimplification && gdm.indexManager != nil {
+				if err := gdm.indexManager.RestoreIndex("all"); err == nil {
+					gdm.recordDegradationAction("index_restore", 4, "Restored index structures", true)
+				}
+			}
+		case 4:
+			if gdm.config.EnableQuantizationFallback && gdm.quantizationManager != nil {
+				if err := gdm.quantizationManager.RestoreQuantization("all"); err == nil {
+					gdm.recordDegradationAction("quantization_restore", 3, "Restored quantization", true)
+				}
+			}
+		case 3:
+			if gdm.config.EnableMemoryMapping && gdm.memoryManager != nil {
+				if err := gdm.memoryManager.DisableMemoryMapping(); err == nil {
+					gdm.recordDegradationAction("memory_mapping_disable", 2, "Disabled memory mapping", true)
+				}
+			}
+		case 2:
+			// Cache eviction naturally refills; no explicit revert action required
+		case 1:
+			// Garbage collection is point-in-time; no explicit revert action required
+		}
+	}
 	gdm.recordDegradationAction("level_decrease", newLevel, fmt.Sprintf("Decreased degradation level from %d to %d: %s", oldLevel, newLevel, reason), true)
 	return nil
 }

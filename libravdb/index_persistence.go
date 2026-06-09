@@ -50,8 +50,8 @@ func (b *indexPersistenceBridge) SerializeIndex(collectionName string) ([]byte, 
 		return nil, nil
 	}
 	col.mu.RLock()
+	defer col.mu.RUnlock()
 	idx := col.index
-	col.mu.RUnlock()
 	if idx == nil {
 		return nil, nil
 	}
@@ -64,7 +64,7 @@ func (b *indexPersistenceBridge) DeserializeIndex(collectionName string, indexBy
 	if err != nil {
 		return fmt.Errorf("deserialize: create index for %s: %w", collectionName, err)
 	}
-	if err := idx.DeserializeFromBytes(indexBytes); err != nil {
+	if err := idx.DeserializeFromBytes(context.Background(), indexBytes); err != nil {
 		idx.Close()
 		return fmt.Errorf("deserialize: load index for %s: %w", collectionName, err)
 	}

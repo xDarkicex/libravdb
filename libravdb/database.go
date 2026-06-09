@@ -367,6 +367,20 @@ func (db *Database) Health(ctx context.Context) (*obs.HealthStatus, error) {
 	return db.health.Check(ctx)
 }
 
+// Ping checks if the database is responsive and the storage engine is accessible.
+func (db *Database) Ping(ctx context.Context) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+
+	// A basic check to see if storage responds
+	_, err := db.storage.ListCollections()
+	return err
+}
+
 // Stats returns database statistics
 func (db *Database) Stats() *DatabaseStats {
 	db.mu.RLock()

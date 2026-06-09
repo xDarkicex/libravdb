@@ -24,13 +24,13 @@ import (
 // Using smaller dimension (32) to make HNSW construction feasible in probe time.
 // This still demonstrates asymptotic behavior: Flat is O(N*d), HNSW is O(log N * d).
 const (
-	probeDimension     = 32
-	belowThresholdN    = 9999
-	aboveThresholdN    = 10001
-	searchK            = 8
-	warmupRuns         = 1
-	measuredRuns       = 5
-	fixedSeed    int64 = 12345 // deterministic vectors
+	probeDimension        = 32
+	belowThresholdN       = 9999
+	aboveThresholdN       = 10001
+	searchK               = 8
+	warmupRuns            = 1
+	measuredRuns          = 5
+	fixedSeed       int64 = 12345 // deterministic vectors
 )
 
 // generateDeterministicVector creates a pseudo-random normalized vector.

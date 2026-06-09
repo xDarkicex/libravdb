@@ -162,6 +162,8 @@ type Index struct {
 	size         int
 	mutex        sync.RWMutex
 	rand         *rand.Rand
+	scratchPool  *sync.Pool
+	idToCluster  sync.Map // string → int (cluster index) for O(1) delete lookup
 
 	// Adaptive search parameters
 	searchStats  *SearchStats
@@ -337,6 +339,13 @@ func NewIVFPQ(config *Config) (*Index, error) {
 		}
 	}
 
+	scratchPool := &sync.Pool{
+		New: func() any {
+			a, _ := memory.NewArena(1024 * 1024)
+			return a
+		},
+	}
+
 	return &Index{
 		config:       config,
 		clusters:     clusters,
@@ -345,6 +354,7 @@ func NewIVFPQ(config *Config) (*Index, error) {
 		trained:      false,
 		size:         0,
 		rand:         rand.New(rand.NewSource(config.RandomSeed)),
+		scratchPool:  scratchPool,
 		searchStats: &SearchStats{
 			currentProbes:  config.NProbes,
 			lastAdjustment: time.Now(),
@@ -706,6 +716,10 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		return fmt.Errorf("entry cannot be nil")
 	}
 
+	if len(entry.Vector) == 0 {
+		return fmt.Errorf("vector cannot be empty")
+	}
+
 	if len(entry.Vector) != idx.config.Dimension {
 		return fmt.Errorf("vector dimension %d does not match index dimension %d",
 			len(entry.Vector), idx.config.Dimension)
@@ -738,6 +752,7 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	cluster := idx.clusters[clusterID]
 	idx.mutex.RUnlock()
 	cluster.mutex.Lock()
+	idx.idToCluster.Store(entry.ID, clusterID)
 	cluster.Entries = append(cluster.Entries, entry)
 
 	// Store compressed version if available
@@ -750,6 +765,155 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	// Update size
 	idx.mutex.Lock()
 	idx.size++
+	idx.mutex.Unlock()
+
+	return nil
+}
+
+// BatchInsert adds multiple vector entries to the index in parallel
+func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	idx.mutex.RLock()
+	if !idx.trained {
+		idx.mutex.RUnlock()
+		return fmt.Errorf("index must be trained before insertion")
+	}
+
+	workers := parallelismFor(len(entries))
+
+	type processedEntry struct {
+		entry      *VectorEntry
+		clusterID  int
+		compressed []byte
+		err        error
+	}
+
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		idx.scratchPool.Put(arena)
+	}()
+
+	processedSlice, err := memory.ArenaSlice[processedEntry](arena, len(entries))
+	if err != nil {
+		return err
+	}
+	processed := processedSlice[:len(entries)]
+	var wg sync.WaitGroup
+	chunkSize := (len(entries) + workers - 1) / workers
+
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunkSize
+		if start >= len(entries) {
+			break
+		}
+		end := min(start+chunkSize, len(entries))
+
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				select {
+				case <-ctx.Done():
+					processed[i].err = ctx.Err()
+					return
+				default:
+				}
+
+				entry := entries[i]
+				if entry == nil {
+					processed[i].err = fmt.Errorf("entry cannot be nil")
+					continue
+				}
+
+				if len(entry.Vector) != idx.config.Dimension {
+					processed[i].err = fmt.Errorf("vector dimension %d does not match index dimension %d",
+						len(entry.Vector), idx.config.Dimension)
+					continue
+				}
+
+				clusterID, err := idx.assignToCluster(entry.Vector)
+				if err != nil {
+					processed[i].err = fmt.Errorf("failed to assign vector to cluster: %w", err)
+					continue
+				}
+
+				var compressed []byte
+				if idx.quantizer != nil && idx.quantizer.IsTrained() {
+					compressed, err = idx.quantizer.Compress(entry.Vector)
+					if err != nil {
+						processed[i].err = fmt.Errorf("failed to compress vector: %w", err)
+						continue
+					}
+				}
+
+				processed[i] = processedEntry{
+					entry:      entry,
+					clusterID:  clusterID,
+					compressed: compressed,
+				}
+			}
+		}(start, end)
+	}
+
+	wg.Wait()
+	idx.mutex.RUnlock()
+
+	for _, p := range processed {
+		if p.err != nil {
+			return p.err
+		}
+	}
+
+	// Allocate counts array from Arena
+	countsSlice, _ := memory.ArenaSlice[int](arena, len(idx.clusters))
+	counts := countsSlice[:len(idx.clusters)]
+	for _, p := range processed {
+		if p.err == nil {
+			counts[p.clusterID]++
+		}
+	}
+
+	// Allocate updates arrays from Arena
+	clusterUpdatesSlice, _ := memory.ArenaSlice[[]processedEntry](arena, len(idx.clusters))
+	clusterUpdates := clusterUpdatesSlice[:len(idx.clusters)]
+	for i, c := range counts {
+		if c > 0 {
+			slice, _ := memory.ArenaSlice[processedEntry](arena, c)
+			clusterUpdates[i] = slice[:0]
+		}
+	}
+
+	for _, p := range processed {
+		if p.err == nil {
+			clusterUpdates[p.clusterID] = append(clusterUpdates[p.clusterID], p)
+		}
+	}
+
+	for clusterID, updates := range clusterUpdates {
+		if len(updates) == 0 {
+			continue
+		}
+
+		cluster := idx.clusters[clusterID]
+		cluster.mutex.Lock()
+
+		for _, p := range updates {
+			idx.idToCluster.Store(p.entry.ID, clusterID)
+			cluster.Entries = append(cluster.Entries, p.entry)
+			if p.compressed != nil {
+				cluster.CompressedVectors[p.entry.ID] = p.compressed
+			}
+		}
+
+		cluster.mutex.Unlock()
+	}
+
+	idx.mutex.Lock()
+	idx.size += len(entries)
 	idx.mutex.Unlock()
 
 	return nil
@@ -1219,32 +1383,35 @@ func (idx *Index) Delete(ctx context.Context, id string) error {
 	}
 
 	idx.mutex.Lock()
-	defer idx.mutex.Unlock()
 
-	// Search all clusters for the entry
-	for _, cluster := range idx.clusters {
-		cluster.mutex.Lock()
+	clusterIDVal, ok := idx.idToCluster.Load(id)
+	if !ok {
+		idx.mutex.Unlock()
+		return fmt.Errorf("entry with id %s not found", id)
+	}
+	clusterID := clusterIDVal.(int)
+	idx.idToCluster.Delete(id)
+	idx.mutex.Unlock()
 
-		for i, entry := range cluster.Entries {
-			if entry.ID == id {
-				// Remove entry by swapping with last element
-				cluster.Entries[i] = cluster.Entries[len(cluster.Entries)-1]
-				cluster.Entries = cluster.Entries[:len(cluster.Entries)-1]
+	cluster := idx.clusters[clusterID]
+	cluster.mutex.Lock()
 
-				// Remove compressed vector if it exists
-				delete(cluster.CompressedVectors, id)
+	for i, entry := range cluster.Entries {
+		if entry.ID == id {
+			cluster.Entries[i] = cluster.Entries[len(cluster.Entries)-1]
+			cluster.Entries = cluster.Entries[:len(cluster.Entries)-1]
+			delete(cluster.CompressedVectors, id)
+			cluster.mutex.Unlock()
 
-				cluster.mutex.Unlock()
-
-				idx.size--
-				return nil
-			}
+			idx.mutex.Lock()
+			idx.size--
+			idx.mutex.Unlock()
+			return nil
 		}
-
-		cluster.mutex.Unlock()
 	}
 
-	return fmt.Errorf("entry with id %s not found", id)
+	cluster.mutex.Unlock()
+	return fmt.Errorf("entry with id %s not found in cluster %d", id, clusterID)
 }
 
 // Size returns the number of vectors in the index
@@ -1311,6 +1478,7 @@ func (idx *Index) Close() error {
 	idx.trained = false
 	idx.size = 0
 	idx.deserMeta = nil
+	idx.idToCluster = sync.Map{}
 
 	return nil
 }

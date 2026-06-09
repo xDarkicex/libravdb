@@ -17,15 +17,15 @@ import (
 )
 
 type contentionResult struct {
-	name            string
-	workers         int
-	totalOps        int
-	duration        time.Duration
-	opsPerSec       float64
-	p50Latency      time.Duration
-	p95Latency      time.Duration
-	p99Latency      time.Duration
-	avgLatency      time.Duration
+	name       string
+	workers    int
+	totalOps   int
+	duration   time.Duration
+	opsPerSec  float64
+	p50Latency time.Duration
+	p95Latency time.Duration
+	p99Latency time.Duration
+	avgLatency time.Duration
 }
 
 func (r contentionResult) String() string {
@@ -48,9 +48,9 @@ func TestWriteContentionBenchmark(t *testing.T) {
 	}
 
 	const (
-		dim            = 128
-		totalVectors   = 20000
-		batchSize      = 100
+		dim             = 128
+		totalVectors    = 20000
+		batchSize       = 100
 		vectorsPerBatch = totalVectors / batchSize // 200 entries per batch
 	)
 

@@ -16,9 +16,10 @@ import (
 
 const (
 	// File format constants
-	HNSWMagicNumber = 0x484E5357 // "HNSW" in hex
-	ChunkSize       = 1000       // Process nodes in batches
+	ChunkSize       = 1000 // Process nodes in batches
 )
+
+var HNSWMagicBytes = []byte("LIBRAHNS")
 
 // Core serialization functions
 func (h *Index) saveToDiskImpl(ctx context.Context, path string) error {
@@ -102,11 +103,11 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 		}
 	}
 
-	if err := h.readNodes(reader); err != nil {
+	if err := h.readNodes(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read nodes: %w", err)
 	}
 
-	if err := h.readLinks(reader); err != nil {
+	if err := h.readLinks(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read links: %w", err)
 	}
 
@@ -123,8 +124,8 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 }
 
 func (h *Index) writeHeader(writer io.Writer) error {
-	// Magic number (4 bytes)
-	if err := binary.Write(writer, binary.LittleEndian, uint32(HNSWMagicNumber)); err != nil {
+	// Magic bytes (8 bytes)
+	if _, err := writer.Write(HNSWMagicBytes); err != nil {
 		return err
 	}
 
@@ -366,14 +367,14 @@ func validateFileFormat(path string) error {
 	}
 	defer file.Close()
 
-	// Read and validate magic number
-	var magic uint32
-	if err := binary.Read(file, binary.LittleEndian, &magic); err != nil {
-		return fmt.Errorf("failed to read magic number: %w", err)
+	// Read and validate magic bytes
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return fmt.Errorf("failed to read magic bytes: %w", err)
 	}
 
-	if magic != HNSWMagicNumber {
-		return fmt.Errorf("invalid magic number: expected %x, got %x", HNSWMagicNumber, magic)
+	if string(magic) != string(HNSWMagicBytes) {
+		return fmt.Errorf("invalid magic number: expected %q, got %q", HNSWMagicBytes, magic)
 	}
 
 	// Read and validate version
@@ -391,9 +392,9 @@ func validateFileFormat(path string) error {
 
 // Read functions for loading from disk
 func (h *Index) readHeader(reader io.Reader) error {
-	// Read magic number (already validated)
-	var magic uint32
-	if err := binary.Read(reader, binary.LittleEndian, &magic); err != nil {
+	// Read magic bytes (already validated, but we must consume them from the reader)
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(reader, magic); err != nil {
 		return err
 	}
 
@@ -457,7 +458,7 @@ func (h *Index) readConfig(reader io.Reader) error {
 	return nil
 }
 
-func (h *Index) readNodes(reader io.Reader) error {
+func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 	// Read total node count
 	var nodeCount uint32
 	if err := binary.Read(reader, binary.LittleEndian, &nodeCount); err != nil {
@@ -469,6 +470,14 @@ func (h *Index) readNodes(reader io.Reader) error {
 
 	// Read nodes
 	for i := uint32(0); i < nodeCount; i++ {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// Read node marker
 		var marker uint8
 		if err := binary.Read(reader, binary.LittleEndian, &marker); err != nil {
@@ -541,7 +550,7 @@ func (h *Index) readNodes(reader io.Reader) error {
 	return nil
 }
 
-func (h *Index) readLinks(reader io.Reader) error {
+func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 	// Read total node count with links
 	var nodeCount uint32
 	if err := binary.Read(reader, binary.LittleEndian, &nodeCount); err != nil {
@@ -550,6 +559,14 @@ func (h *Index) readLinks(reader io.Reader) error {
 
 	// Read links for each node
 	for i := uint32(0); i < nodeCount; i++ {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// Read node index
 		var nodeIndex uint32
 		if err := binary.Read(reader, binary.LittleEndian, &nodeIndex); err != nil {
@@ -648,6 +665,27 @@ func (h *Index) rebuildIndexState() error {
 			// Set entry point (highest level node, or first high-level node found)
 			if h.entryPoint == nil || node.Level > h.entryPoint.Level {
 				h.entryPoint = node
+			}
+		}
+	}
+
+	// Rebuild Backlinks
+	for _, node := range h.nodes {
+		if node != nil {
+			node.Backlinks = make([][]uint32, len(node.Links))
+		}
+	}
+	for i, node := range h.nodes {
+		if node != nil {
+			for level, links := range node.Links {
+				for _, linkID := range links {
+					if int(linkID) < len(h.nodes) {
+						linkNode := h.nodes[linkID]
+						if linkNode != nil && level < len(linkNode.Backlinks) {
+							linkNode.Backlinks[level] = append(linkNode.Backlinks[level], uint32(i))
+						}
+					}
+				}
 			}
 		}
 	}

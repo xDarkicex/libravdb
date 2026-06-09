@@ -44,12 +44,12 @@ type WriteStats struct {
 type EngineStatus int32
 
 const (
-	StatusStarting          EngineStatus = iota // New() called, not yet opened
-	StatusRecoveringSnapshot                    // loading snapshot from disk
-	StatusRecoveringIndexes                     // loading or rebuilding indexes
-	StatusReplayingWAL                          // replaying WAL from last checkpoint LSN
-	StatusReady                                 // fully operational, queries accepted
-	StatusFailed                                // fatal recovery error, engine unusable
+	StatusStarting           EngineStatus = iota // New() called, not yet opened
+	StatusRecoveringSnapshot                     // loading snapshot from disk
+	StatusRecoveringIndexes                      // loading or rebuilding indexes
+	StatusReplayingWAL                           // replaying WAL from last checkpoint LSN
+	StatusReady                                  // fully operational, queries accepted
+	StatusFailed                                 // fatal recovery error, engine unusable
 )
 
 // WriteStatsProvider is an optional interface for engines that expose write-path counters.

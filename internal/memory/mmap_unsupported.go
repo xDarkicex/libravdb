@@ -4,7 +4,6 @@ package memory
 
 import (
 	"errors"
-	"fmt"
 )
 
 // ErrPlatformUnsupported is returned when mmap is not supported on the platform

@@ -134,10 +134,26 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 	}
 
 	selected := make([]*util.Candidate, 0, maxM)
-	selectedVectors := make([][]float32, 0, min(maxM, 4))
+	var selectedVectorBuf [4][]float32
+	selectedVectors := selectedVectorBuf[:0]
+
+	// Stack-allocated bitset for up to 32768 candidates
+	var picked [512]uint64
+	setPicked := func(idx int) {
+		if idx < len(picked)*64 {
+			picked[idx/64] |= (1 << (idx % 64))
+		}
+	}
+	isPicked := func(idx int) bool {
+		if idx < len(picked)*64 {
+			return (picked[idx/64] & (1 << (idx % 64))) != 0
+		}
+		return false
+	}
 
 	// Always select the closest candidate
 	selected = append(selected, candidates[0])
+	setPicked(0)
 	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
 		selectedVectors = append(selectedVectors, vector)
 	} else {
@@ -174,7 +190,8 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 
 		if shouldSelect {
 			selected = append(selected, candidate)
-			if len(selectedVectors) < maxM {
+			setPicked(i)
+			if len(selectedVectors) < 4 {
 				selectedVectors = append(selectedVectors, candidateVector)
 			}
 		}
@@ -182,17 +199,9 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 
 	// If we still need more candidates and have remaining ones, just take them by distance
 	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
-		candidate := candidates[i]
-		// Check if already selected
-		alreadySelected := false
-		for _, sel := range selected {
-			if sel.ID == candidate.ID {
-				alreadySelected = true
-				break
-			}
-		}
-		if !alreadySelected {
-			selected = append(selected, candidate)
+		if !isPicked(i) {
+			selected = append(selected, candidates[i])
+			setPicked(i)
 		}
 	}
 
@@ -212,6 +221,20 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 	selectedCount := 1
 	var selectedVectorBuf [4][]float32
 	selectedVectors := selectedVectorBuf[:0]
+
+	var picked [512]uint64
+	setPicked := func(idx int) {
+		if idx < len(picked)*64 {
+			picked[idx/64] |= (1 << (idx % 64))
+		}
+	}
+	isPicked := func(idx int) bool {
+		if idx < len(picked)*64 {
+			return (picked[idx/64] & (1 << (idx % 64))) != 0
+		}
+		return false
+	}
+	setPicked(0)
 
 	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
 		selectedVectors = append(selectedVectors, vector)
@@ -242,24 +265,18 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 
 		if shouldSelect {
 			candidates[selectedCount] = candidate
+			setPicked(i)
 			selectedCount++
-			if len(selectedVectors) < len(selectedVectorBuf) {
+			if len(selectedVectors) < 4 {
 				selectedVectors = append(selectedVectors, candidateVector)
 			}
 		}
 	}
 
 	for i := 1; i < len(candidates) && selectedCount < maxM; i++ {
-		candidate := candidates[i]
-		alreadySelected := false
-		for j := 0; j < selectedCount; j++ {
-			if candidates[j].ID == candidate.ID {
-				alreadySelected = true
-				break
-			}
-		}
-		if !alreadySelected {
-			candidates[selectedCount] = candidate
+		if !isPicked(i) {
+			candidates[selectedCount] = candidates[i]
+			setPicked(i)
 			selectedCount++
 		}
 	}

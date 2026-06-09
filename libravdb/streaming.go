@@ -26,6 +26,7 @@ type StreamingBatchInsert struct {
 	backpressure *BackpressureController
 	started      int32
 	stopped      int32
+	closeMu      sync.RWMutex
 }
 
 // StreamingOptions configures streaming batch operations
@@ -211,6 +212,8 @@ func (s *StreamingBatchInsert) Start() error {
 // Send adds a vector entry to the streaming pipeline
 // Returns an error if backpressure is active or the operation is stopped
 func (s *StreamingBatchInsert) Send(entry *VectorEntry) error {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
 		return fmt.Errorf("streaming operation is stopped")
 	}
@@ -318,8 +321,10 @@ func (s *StreamingBatchInsert) Close() error {
 	// Cancel context first to signal all goroutines to stop
 	s.cancel()
 
+	s.closeMu.Lock()
 	// Close input channel to signal workers to finish
 	close(s.inputChan)
+	s.closeMu.Unlock()
 
 	// Wait for all workers to complete with timeout
 	done := make(chan struct{})
@@ -737,6 +742,7 @@ type StreamingBatchUpdate struct {
 	backpressure *BackpressureController
 	started      int32
 	stopped      int32
+	closeMu      sync.RWMutex
 }
 
 // StreamingBatchDelete provides a streaming interface for large-scale delete operations
@@ -754,6 +760,7 @@ type StreamingBatchDelete struct {
 	backpressure *BackpressureController
 	started      int32
 	stopped      int32
+	closeMu      sync.RWMutex
 }
 
 // NewStreamingBatchUpdate creates a new streaming batch update operation
@@ -886,6 +893,8 @@ func (s *StreamingBatchDelete) Start() error {
 
 // Send adds an update to the streaming pipeline
 func (s *StreamingBatchUpdate) Send(update *VectorUpdate) error {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
 		return fmt.Errorf("streaming operation has been stopped")
 	}
@@ -919,6 +928,8 @@ func (s *StreamingBatchUpdate) Send(update *VectorUpdate) error {
 
 // Send adds an ID to delete to the streaming pipeline
 func (s *StreamingBatchDelete) Send(id string) error {
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
 		return fmt.Errorf("streaming operation has been stopped")
 	}
@@ -1245,14 +1256,17 @@ func (s *StreamingBatchUpdate) updateStats() {
 	s.stats.LastUpdate = now
 	s.stats.ElapsedTime = now.Sub(s.stats.StartTime)
 
-	// Calculate rates
+	totalProcessed := atomic.LoadInt64(&s.stats.TotalProcessed)
+	totalSuccessful := atomic.LoadInt64(&s.stats.TotalSuccessful)
+	totalFailed := atomic.LoadInt64(&s.stats.TotalFailed)
+
 	if s.stats.ElapsedTime > 0 {
-		s.stats.ItemsPerSecond = float64(s.stats.TotalProcessed) / s.stats.ElapsedTime.Seconds()
+		s.stats.ItemsPerSecond = float64(totalProcessed) / s.stats.ElapsedTime.Seconds()
 	}
 
-	if s.stats.TotalProcessed > 0 {
-		s.stats.SuccessRate = float64(s.stats.TotalSuccessful) / float64(s.stats.TotalProcessed)
-		s.stats.ErrorRate = float64(s.stats.TotalFailed) / float64(s.stats.TotalProcessed)
+	if totalProcessed > 0 {
+		s.stats.SuccessRate = float64(totalSuccessful) / float64(totalProcessed)
+		s.stats.ErrorRate = float64(totalFailed) / float64(totalProcessed)
 	}
 
 	// Buffer utilization
@@ -1276,14 +1290,17 @@ func (s *StreamingBatchDelete) updateStats() {
 	s.stats.LastUpdate = now
 	s.stats.ElapsedTime = now.Sub(s.stats.StartTime)
 
-	// Calculate rates
+	totalProcessed := atomic.LoadInt64(&s.stats.TotalProcessed)
+	totalSuccessful := atomic.LoadInt64(&s.stats.TotalSuccessful)
+	totalFailed := atomic.LoadInt64(&s.stats.TotalFailed)
+
 	if s.stats.ElapsedTime > 0 {
-		s.stats.ItemsPerSecond = float64(s.stats.TotalProcessed) / s.stats.ElapsedTime.Seconds()
+		s.stats.ItemsPerSecond = float64(totalProcessed) / s.stats.ElapsedTime.Seconds()
 	}
 
-	if s.stats.TotalProcessed > 0 {
-		s.stats.SuccessRate = float64(s.stats.TotalSuccessful) / float64(s.stats.TotalProcessed)
-		s.stats.ErrorRate = float64(s.stats.TotalFailed) / float64(s.stats.TotalProcessed)
+	if totalProcessed > 0 {
+		s.stats.SuccessRate = float64(totalSuccessful) / float64(totalProcessed)
+		s.stats.ErrorRate = float64(totalFailed) / float64(totalProcessed)
 	}
 
 	// Buffer utilization
@@ -1404,8 +1421,10 @@ func (s *StreamingBatchUpdate) Close() error {
 	s.stats.Status = "stopping"
 	s.stats.mutex.Unlock()
 
+	s.closeMu.Lock()
 	// Close input channel to signal workers to finish
 	close(s.inputChan)
+	s.closeMu.Unlock()
 
 	// Cancel context
 	s.cancel()
@@ -1440,8 +1459,10 @@ func (s *StreamingBatchDelete) Close() error {
 	s.stats.Status = "stopping"
 	s.stats.mutex.Unlock()
 
+	s.closeMu.Lock()
 	// Close input channel to signal workers to finish
 	close(s.inputChan)
+	s.closeMu.Unlock()
 
 	// Cancel context
 	s.cancel()

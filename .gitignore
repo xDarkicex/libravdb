@@ -234,3 +234,6 @@ examples/*/
 # Claude Code
 CLAUDE.md
 .claude/
+
+# Lynx Codex analysis tool config
+lynx.toml
