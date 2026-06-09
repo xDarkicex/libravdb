@@ -1455,9 +1455,10 @@ func (idx *Index) Delete(ctx context.Context, id string) error {
 	}
 	clusterID := clusterIDVal.(int)
 	idx.idToCluster.Delete(id)
-	idx.mutex.Unlock()
 
+	// Capture cluster reference under the lock to prevent races with Close.
 	cluster := idx.clusters[clusterID]
+	idx.mutex.Unlock()
 	cluster.mutex.Lock()
 
 	for i, entry := range cluster.Entries {
