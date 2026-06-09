@@ -252,9 +252,9 @@ func downHeap(h []heapElement, i, n int) {
 }
 
 // userDataOffset is the byte offset within a ShardedFreeList slot where user
-// data begins. The first 64 bytes are reserved for FreeList/ShardedFreeList
-// metadata (next ptr at 0, structIdx at 24, homeShard at 40, Hyaline chain).
-const userDataOffset = 64
+// data begins. The memory package's SFL metadata occupies offsets 0–43
+// (Hyaline chain at 0/8/16/24/32, structIdx+shardIdx at 40); 8-byte aligned to 48.
+const userDataOffset = 48
 
 // heapSlot binds an off-heap slot to its originating pool so that free()
 // routes to the correct tier by construction — no runtime lookup, no ignored

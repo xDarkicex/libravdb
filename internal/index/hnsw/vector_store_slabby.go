@@ -12,7 +12,7 @@ const (
 	RawVectorStoreSlabby = "slabby"
 
 	defaultSlabbySegmentCapacity = 4096
-	userDataOffset               = 64
+	userDataOffset               = 48
 )
 
 type slabbySlot struct {

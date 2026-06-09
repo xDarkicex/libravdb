@@ -1,6 +1,7 @@
 package hnsw
 
 import (
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -10,6 +11,7 @@ type searchScratch struct {
 	maxHeapBuf   []util.Candidate
 	minHeapBuf   []util.Candidate
 	pruneBuf     []util.Candidate
+	arena        *memory.Arena
 }
 
 type candidateMinHeap struct {
@@ -143,21 +145,29 @@ func (h *candidateMaxHeap) siftDown(idx int) {
 func (h *Index) acquireSearchScratch() *searchScratch {
 	scratch := h.searchScratchPool.Get().(*searchScratch)
 	nodeCount := len(h.nodes)
-	if cap(scratch.visitedMarks) < nodeCount {
-		newCap := cap(scratch.visitedMarks)
-		if newCap == 0 {
-			newCap = 1024
-		}
-		for newCap < nodeCount {
-			newCap *= 2
-		}
 
-		grown := make([]uint32, nodeCount, newCap)
-		copy(grown, scratch.visitedMarks)
-		scratch.visitedMarks = grown
+	// Ensure the Arena is sized for visitedMarks + heap bufs (~320 KB headroom).
+	needed := uint64(nodeCount*4 + 320*1024)
+	if scratch.arena == nil || scratch.arena.Remaining() < needed {
+		if scratch.arena != nil {
+			scratch.arena.Free()
+		}
+		a, err := memory.NewArena(needed)
+		if err != nil {
+			// mmap failure is fatal — the scratch is unusable.
+			panic("hnsw: failed to allocate search scratch arena: " + err.Error())
+		}
+		scratch.arena = a
 	} else {
-		scratch.visitedMarks = scratch.visitedMarks[:nodeCount]
+		scratch.arena.Reset()
 	}
+
+	marks, err := memory.ArenaSlice[uint32](scratch.arena, nodeCount)
+	if err != nil {
+		panic("hnsw: failed to allocate visited marks from arena: " + err.Error())
+	}
+	scratch.visitedMarks = marks
+
 	scratch.visitMark++
 	if scratch.visitMark == 0 {
 		for i := range scratch.visitedMarks {
@@ -169,6 +179,9 @@ func (h *Index) acquireSearchScratch() *searchScratch {
 }
 
 func (h *Index) releaseSearchScratch(scratch *searchScratch) {
+	// Arena.Reset() rewinds the bump pointer, keeping the mmap'd region
+	// so the next acquireSearchScratch can reuse it without a new mmap.
+	scratch.arena.Reset()
 	h.searchScratchPool.Put(scratch)
 }
 
@@ -355,18 +368,21 @@ func (h *Index) searchLevelScratchValues(query []float32, entryPoint *Node, ef i
 
 	visited := scratch.visitedMarks[:len(h.nodes)]
 	visitMark := scratch.visitMark
+	// ArenaSlice always re-allocates from the arena because the previous
+	// search's arena was Reset() in releaseSearchScratch — old slice
+	// pointers are stale after the arena is rewound.
 	maxCap := ef * 2
-	if cap(scratch.maxHeapBuf) < maxCap {
-		scratch.maxHeapBuf = make([]util.Candidate, 0, maxCap)
-	} else {
-		scratch.maxHeapBuf = scratch.maxHeapBuf[:0]
+	maxHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, maxCap)
+	if err != nil {
+		panic("hnsw: arena maxHeapBuf: " + err.Error())
 	}
+	scratch.maxHeapBuf = maxHeap
 	minCap := max(maxCap, ef*8)
-	if cap(scratch.minHeapBuf) < minCap {
-		scratch.minHeapBuf = make([]util.Candidate, 0, minCap)
-	} else {
-		scratch.minHeapBuf = scratch.minHeapBuf[:0]
+	minHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, minCap)
+	if err != nil {
+		panic("hnsw: arena minHeapBuf: " + err.Error())
 	}
+	scratch.minHeapBuf = minHeap
 	candidates := &candidateMaxHeap{items: scratch.maxHeapBuf}
 	w := &candidateMinHeap{items: scratch.minHeapBuf}
 

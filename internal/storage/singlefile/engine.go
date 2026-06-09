@@ -955,9 +955,10 @@ func (e *Engine) applyRecordPutOwned(payload recordPutPayload, lsn uint64, adopt
 }
 
 // sflMetadataOverhead is the minimum reserved bytes at the start of each
-// ShardedFreeList slot. The SFL stores structIdx at offset 24 and homeShard
-// at offset 40. We align to 64 to match the slabby vector store precedent.
-const sflMetadataOverhead = 64
+// ShardedFreeList slot. The memory package's SFL metadata occupies offsets
+// 0–43 (Hyaline chain at 0/8/16/24/32, structIdx+shardIdx at 40); rounded
+// up to the nearest 8-byte boundary: 48.
+const sflMetadataOverhead = 48
 
 // initVectorSFL lazily initializes the ShardedFreeList for off-heap vector storage.
 func (c *persistedCollection) initVectorSFL() error {
