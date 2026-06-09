@@ -958,8 +958,16 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	// Adjust probe count if adaptive mode is enabled
 	idx.adjustProbeCount()
 
+	// Acquire a scratch arena for search-scoped allocations (same pool
+	// used by BatchInsert). Reset + return on exit.
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		idx.scratchPool.Put(arena)
+	}()
+
 	// Find clusters to probe with enhanced strategy
-	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query)
+	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query, arena)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
 	}
@@ -969,7 +977,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		idx.quantizer.PrepareQuery(query)
 	}
 
-	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k)
+	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena)
 	if err != nil {
 		return nil, err
 	}
@@ -1002,14 +1010,18 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
+func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena) ([]candidate, error) {
 	workers := parallelismFor(len(probeClusters))
 	if workers == 1 {
-		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k)
+		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena)
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
-	results := make([][]candidate, workers)
+	results, err := memory.ArenaSlice[[]candidate](arena, workers)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate results: %w", err)
+	}
+	results = results[:workers]
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -1024,7 +1036,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		go func(worker, start, end int) {
 			defer wg.Done()
 
-			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k)
+			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena)
 			if err != nil {
 				errCh <- err
 				return
@@ -1046,7 +1058,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 	// Each worker already produced ascending-distance output. Instead of
 	// re-heaping element-by-element (O(W·k log k)), a min-heap of size W
 	// performs a linear merge in O(W·k log W).
-	candidates := mergeSortedWorkerResults(results, k)
+	candidates := mergeSortedWorkerResults(results, k, arena)
 	return candidates, nil
 }
 
@@ -1079,7 +1091,7 @@ func mergeDownHeap(h []mergeElem, i, n int) {
 // mergeSortedWorkerResults merges W pre-sorted (ascending distance) candidate
 // arrays into a single top-k candidate slice via k-way merge.
 // Complexity: O(W·k log W) instead of the previous O(W·k log k) re-heaping.
-func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
+func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena) []candidate {
 	// Count non-empty workers and compute total available results.
 	active := 0
 	total := 0
@@ -1096,10 +1108,16 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 		k = total
 	}
 
-	// Allocate a small merge heap on the Go heap — size is bounded by W (workers),
-	// typically ≤ GOMAXPROCS, not by k. This is a trivial allocation.
-	mergeHeap := make([]mergeElem, 0, active)
-	pos := make([]int, len(results))
+	mergeHeap, err := memory.ArenaSlice[mergeElem](arena, active)
+	if err != nil {
+		return nil
+	}
+	mergeHeap = mergeHeap[:0]
+	pos, err := memory.ArenaSlice[int](arena, len(results))
+	if err != nil {
+		return nil
+	}
+	pos = pos[:len(results)]
 
 	for w, batch := range results {
 		if len(batch) == 0 {
@@ -1116,7 +1134,11 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 		mergeDownHeap(mergeHeap, i, len(mergeHeap))
 	}
 
-	candidates := make([]candidate, 0, k)
+	candidates, err := memory.ArenaSlice[candidate](arena, k)
+	if err != nil {
+		return nil
+	}
+	candidates = candidates[:0]
 	for len(candidates) < k && len(mergeHeap) > 0 {
 		root := mergeHeap[0]
 		w := root.worker
@@ -1142,12 +1164,17 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 	return candidates
 }
 
-func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
+func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena) ([]candidate, error) {
 	hs, heapBuf := acquireIVFHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
 	} else {
-		heapBuf = make([]ivfHeapElement, k)
+		var err error
+		heapBuf, err = memory.ArenaSlice[ivfHeapElement](arena, k)
+		if err != nil {
+			return nil, fmt.Errorf("arena allocate heap buf: %w", err)
+		}
+		heapBuf = heapBuf[:k]
 	}
 
 	count := 0
@@ -1185,7 +1212,11 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 	}
 
 	// Extract results in ascending distance order (smallest first).
-	candidates := make([]candidate, count)
+	candidates, err := memory.ArenaSlice[candidate](arena, count)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate candidates: %w", err)
+	}
+	candidates = candidates[:count]
 	for i := count - 1; i >= 0; i-- {
 		elem := heapBuf[0]
 		count--
@@ -1224,7 +1255,7 @@ func (idx *Index) distanceToEntry(query []float32, cluster *Cluster, entry *Vect
 }
 
 // findProbeClustersWithDistances finds probe clusters and returns their distances to query
-func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []float32, error) {
+func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.Arena) ([]int, []float32, error) {
 	if !idx.trained {
 		return nil, nil, fmt.Errorf("index must be trained before search")
 	}
@@ -1234,7 +1265,11 @@ func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []floa
 		distance float32
 	}
 
-	distances := make([]clusterDistance, len(idx.clusters))
+	distances, err := memory.ArenaSlice[clusterDistance](arena, len(idx.clusters))
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate distances: %w", err)
+	}
+	distances = distances[:len(idx.clusters)]
 	workers := parallelismFor(len(idx.clusters))
 	if workers == 1 {
 		for i, cluster := range idx.clusters {
@@ -1279,8 +1314,16 @@ func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []floa
 		probeCount = min(idx.config.NProbes, len(distances))
 	}
 
-	probes := make([]int, probeCount)
-	probeDists := make([]float32, probeCount)
+	probes, err := memory.ArenaSlice[int](arena, probeCount)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate probes: %w", err)
+	}
+	probes = probes[:probeCount]
+	probeDists, err := memory.ArenaSlice[float32](arena, probeCount)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate probeDists: %w", err)
+	}
+	probeDists = probeDists[:probeCount]
 
 	for i := 0; i < probeCount; i++ {
 		probes[i] = distances[i].id
