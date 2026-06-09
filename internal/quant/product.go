@@ -246,7 +246,7 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 			bestCentroid := 0
 
 			for j, centroid := range centroids {
-				dist := pq.euclideanDistance(vec, centroid)
+				dist := pq.squaredEuclideanDistance(vec, centroid)
 				if dist < minDist {
 					minDist = dist
 					bestCentroid = j
@@ -329,12 +329,13 @@ func (pq *ProductQuantizer) Compress(vector []float32) ([]byte, error) {
 		end := start + pq.subDim
 		subvector := vector[start:end]
 
-		// Find nearest centroid
+		// Find nearest centroid using squared distance — sqrt is
+		// monotonic, so argmin(sqrt(d)) ≡ argmin(d).
 		minDist := float32(math.Inf(1))
 		bestCode := 0
 
 		for c, centroid := range pq.centroids[s] {
-			dist := pq.euclideanDistance(subvector, centroid)
+			dist := pq.squaredEuclideanDistance(subvector, centroid)
 			if dist < minDist {
 				minDist = dist
 				bestCode = c
@@ -490,6 +491,22 @@ func (pq *ProductQuantizer) euclideanDistance(a, b []float32) float32 {
 		sum += diff * diff
 	}
 	return float32(math.Sqrt(float64(sum)))
+}
+
+// squaredEuclideanDistance returns the squared Euclidean distance.
+// sqrt is monotonic, so argmin(sqrt(d)) ≡ argmin(d). Dropping sqrt
+// saves one instruction per centroid per subspace in Compress and
+// k-means assignment.
+func (pq *ProductQuantizer) squaredEuclideanDistance(a, b []float32) float32 {
+	if len(a) != len(b) {
+		return float32(math.Inf(1))
+	}
+	sum := float32(0)
+	for i := range a {
+		diff := a[i] - b[i]
+		sum += diff * diff
+	}
+	return sum
 }
 
 func (pq *ProductQuantizer) vectorsEqual(a, b []float32) bool {
