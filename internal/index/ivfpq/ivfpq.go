@@ -949,14 +949,19 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	}
 
 	idx.mutex.RLock()
-	defer idx.mutex.RUnlock()
-
 	if !idx.trained {
+		idx.mutex.RUnlock()
 		return nil, fmt.Errorf("index must be trained before search")
 	}
 
-	// Adjust probe count if adaptive mode is enabled
+	// Adjust probe count if adaptive mode is enabled (touches searchStats).
 	idx.adjustProbeCount()
+
+	// Capture a local reference to clusters under the lock so that a
+	// concurrent Close (which takes Lock and nils idx.clusters) cannot
+	// cause a nil-pointer dereference after we release RLock.
+	clusters := idx.clusters
+	idx.mutex.RUnlock()
 
 	// Acquire a scratch arena for search-scoped allocations (same pool
 	// used by BatchInsert). Reset + return on exit.
@@ -967,7 +972,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	}()
 
 	// Find clusters to probe with enhanced strategy
-	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query, arena)
+	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query, arena, clusters)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
 	}
@@ -977,7 +982,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		idx.quantizer.PrepareQuery(query)
 	}
 
-	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena)
+	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena, clusters)
 	if err != nil {
 		return nil, err
 	}
@@ -1000,8 +1005,6 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	// Estimate accuracy based on result quality (simplified metric)
 	accuracy := 1.0
 	if len(results) > 0 {
-		// Simple accuracy estimation: if we found results, assume good accuracy
-		// In practice, this could be more sophisticated
 		accuracy = math.Min(1.0, float64(len(results))/float64(k))
 	}
 
@@ -1010,10 +1013,10 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena) ([]candidate, error) {
+func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster) ([]candidate, error) {
 	workers := parallelismFor(len(probeClusters))
 	if workers == 1 {
-		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena)
+		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena, clusters)
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
@@ -1036,7 +1039,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		go func(worker, start, end int) {
 			defer wg.Done()
 
-			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena)
+			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena, clusters)
 			if err != nil {
 				errCh <- err
 				return
@@ -1164,7 +1167,7 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 	return candidates
 }
 
-func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena) ([]candidate, error) {
+func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster) ([]candidate, error) {
 	hs, heapBuf := acquireIVFHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
@@ -1186,7 +1189,7 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 		default:
 		}
 
-		cluster := idx.clusters[clusterID]
+		cluster := clusters[clusterID]
 		cluster.mutex.RLock()
 		clusterDist := clusterDistances[i]
 
@@ -1255,7 +1258,7 @@ func (idx *Index) distanceToEntry(query []float32, cluster *Cluster, entry *Vect
 }
 
 // findProbeClustersWithDistances finds probe clusters and returns their distances to query
-func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.Arena) ([]int, []float32, error) {
+func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.Arena, clusters []*Cluster) ([]int, []float32, error) {
 	if !idx.trained {
 		return nil, nil, fmt.Errorf("index must be trained before search")
 	}
@@ -1265,32 +1268,32 @@ func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.
 		distance float32
 	}
 
-	distances, err := memory.ArenaSlice[clusterDistance](arena, len(idx.clusters))
+	distances, err := memory.ArenaSlice[clusterDistance](arena, len(clusters))
 	if err != nil {
 		return nil, nil, fmt.Errorf("arena allocate distances: %w", err)
 	}
-	distances = distances[:len(idx.clusters)]
-	workers := parallelismFor(len(idx.clusters))
+	distances = distances[:len(clusters)]
+	workers := parallelismFor(len(clusters))
 	if workers == 1 {
-		for i, cluster := range idx.clusters {
+		for i, cluster := range clusters {
 			distance := idx.distanceFunc(query, cluster.Centroid)
 			distances[i] = clusterDistance{id: i, distance: distance}
 		}
 	} else {
-		chunkSize := (len(idx.clusters) + workers - 1) / workers
+		chunkSize := (len(clusters) + workers - 1) / workers
 		var wg sync.WaitGroup
 		for worker := 0; worker < workers; worker++ {
 			start := worker * chunkSize
-			if start >= len(idx.clusters) {
+			if start >= len(clusters) {
 				break
 			}
-			end := min(start+chunkSize, len(idx.clusters))
+			end := min(start+chunkSize, len(clusters))
 
 			wg.Add(1)
 			go func(start, end int) {
 				defer wg.Done()
 				for i := start; i < end; i++ {
-					cluster := idx.clusters[i]
+					cluster := clusters[i]
 					distance := idx.distanceFunc(query, cluster.Centroid)
 					distances[i] = clusterDistance{id: i, distance: distance}
 				}
