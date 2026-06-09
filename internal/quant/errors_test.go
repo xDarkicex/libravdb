@@ -422,6 +422,8 @@ func (mq *mockQuantizerForErrors) Distance(compressed1, compressed2 []byte) (flo
 	return 0.5, nil
 }
 
+func (mq *mockQuantizerForErrors) PrepareQuery(query []float32) {}
+
 func (mq *mockQuantizerForErrors) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
 	return 0.3, nil
 }

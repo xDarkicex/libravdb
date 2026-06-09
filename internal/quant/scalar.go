@@ -248,6 +248,9 @@ func (sq *ScalarQuantizer) Distance(compressed1, compressed2 []byte) (float32, e
 }
 
 // DistanceToQuery computes distance from compressed vector to query vector
+// PrepareQuery is a no-op for ScalarQuantizer — no query-dependent cache to warm.
+func (sq *ScalarQuantizer) PrepareQuery(query []float32) {}
+
 func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
 	sq.mu.RLock()
 	defer sq.mu.RUnlock()

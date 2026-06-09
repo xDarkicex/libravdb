@@ -29,9 +29,27 @@ type ProductQuantizer struct {
 	// Distance lookup tables for fast computation
 	distanceTables [][]float32 // [subspace][centroid] -> distance to query subvector
 	queryVector    []float32   // Current query vector for distance tables
+	cacheMu        sync.Mutex  // Protects queryVector + distanceTables during update
 
 	// Memory usage tracking
 	memoryUsage int64
+}
+
+// PrepareQuery precomputes distance tables for a query so that concurrent
+// DistanceToQuery calls with the same query only read from the cache.
+func (pq *ProductQuantizer) PrepareQuery(query []float32) {
+	pq.cacheMu.Lock()
+	defer pq.cacheMu.Unlock()
+	if pq.vectorsEqual(pq.queryVector, query) {
+		return
+	}
+	pq.updateDistanceTables(query)
+	if cap(pq.queryVector) < len(query) {
+		pq.queryVector = make([]float32, len(query))
+	} else {
+		pq.queryVector = pq.queryVector[:len(query)]
+	}
+	copy(pq.queryVector, query)
 }
 
 // NewProductQuantizer creates a new Product Quantizer instance
@@ -397,25 +415,33 @@ func (pq *ProductQuantizer) Distance(compressed1, compressed2 []byte) (float32, 
 	return float32(math.Sqrt(float64(distance))), nil
 }
 
-// DistanceToQuery computes distance from compressed vector to query vector
+// DistanceToQuery computes distance from compressed vector to query vector.
+// PrepareQuery must be called before concurrent access for a given query;
+// otherwise the cache is updated under a write lock which serializes callers.
 func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
 	pq.mu.RLock()
-	defer pq.mu.RUnlock()
-
 	if !pq.trained {
+		pq.mu.RUnlock()
 		return 0, fmt.Errorf("quantizer not trained")
 	}
+	pq.mu.RUnlock()
 
-	if len(query) != pq.dimension {
-		return 0, fmt.Errorf("query dimension %d does not match expected %d",
-			len(query), pq.dimension)
-	}
-
-	// Update distance tables if query changed
+	// Update cache if needed — serialised via cacheMu so parallel workers
+	// only hit this path once per unique query.
+	pq.cacheMu.Lock()
 	if !pq.vectorsEqual(pq.queryVector, query) {
 		pq.updateDistanceTables(query)
 		pq.queryVector = make([]float32, len(query))
 		copy(pq.queryVector, query)
+	}
+	pq.cacheMu.Unlock()
+
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+
+	if len(query) != pq.dimension {
+		return 0, fmt.Errorf("query dimension %d does not match expected %d",
+			len(query), pq.dimension)
 	}
 
 	distance := float32(0)

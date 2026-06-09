@@ -114,6 +114,11 @@ type Quantizer interface {
 	// DistanceToQuery computes distance from compressed vector to query vector
 	DistanceToQuery(compressed []byte, query []float32) (float32, error)
 
+	// PrepareQuery precomputes distance tables for a query. Must be called
+	// before concurrent DistanceToQuery calls with the same query. Safe to
+	// call multiple times — subsequent calls with unchanged query are no-ops.
+	PrepareQuery(query []float32)
+
 	// CompressionRatio returns the compression ratio achieved
 	CompressionRatio() float32
 
