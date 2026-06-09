@@ -702,12 +702,20 @@ func (c *Collection) StreamFromReader(reader StreamingReader, opts ...*Streaming
 		return nil, fmt.Errorf("failed to start streaming: %w", err)
 	}
 
-	// Start a goroutine to read from the reader and send to the stream
+	// Start a goroutine to read from the reader and send to the stream.
+	stream.wg.Add(1)
 	go func() {
+		defer stream.wg.Done()
 		defer stream.Close()
 		defer reader.Close()
 
 		for {
+			select {
+			case <-stream.ctx.Done():
+				return
+			default:
+			}
+
 			entry, err := reader.Read()
 			if err == io.EOF {
 				break

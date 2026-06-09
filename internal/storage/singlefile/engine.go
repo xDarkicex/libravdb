@@ -2015,21 +2015,23 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 
 // flushNow forces an immediate flush of the batch buffer and waits for completion.
 // This is used by single-record Insert to ensure immediate durability.
-// Returns the error from the flush operation, or nil on success.
-func (e *Engine) flushNow() error {
+// Respects context cancellation — returns ctx.Err() if the context is cancelled
+// before the flush completes.
+func (e *Engine) flushNow(ctx context.Context) error {
 	done := make(chan error)
 	e.batchBuffer.mu.Lock()
-	// Only add to pending flushes if there's actually something to flush
-	// or if we want to ensure any in-progress flush completes
 	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
 	e.batchBuffer.mu.Unlock()
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 
-	// Signal the flusher once for the current commit window.
 	e.requestBatchFlush()
 
-	// Wait for flush to complete and return the error
-	return <-done
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (e *Engine) deleteRecord(name, id string) error {
@@ -2463,7 +2465,7 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 	if flushed {
 		return nil
 	}
-	return c.engine.flushNow()
+	return c.engine.flushNow(ctx)
 }
 
 // InsertBatch persists multiple vector entries.
@@ -2481,7 +2483,7 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 	if flushed {
 		return nil
 	}
-	return c.engine.flushNow()
+	return c.engine.flushNow(ctx)
 }
 
 // Get returns a persisted entry by ID.
