@@ -18,6 +18,8 @@ type SystemHealthMonitorImpl struct {
 	cancel       context.CancelFunc
 	interval     time.Duration
 	callbacks    []HealthStatusCallback
+	callbackWg   sync.WaitGroup
+	done         chan struct{}
 }
 
 // HealthStatusCallback is called when health status changes
@@ -29,6 +31,7 @@ func NewSystemHealthMonitor(interval time.Duration) *SystemHealthMonitorImpl {
 		healthChecks: make(map[string]HealthCheck),
 		interval:     interval,
 		callbacks:    make([]HealthStatusCallback, 0),
+		done:         make(chan struct{}),
 		lastStatus: HealthStatus{
 			Overall:    HealthUnknown,
 			Components: make(map[string]HealthLevel),
@@ -75,6 +78,7 @@ func (shm *SystemHealthMonitorImpl) Start(ctx context.Context) error {
 
 	shm.ctx, shm.cancel = context.WithCancel(ctx)
 	shm.running = true
+	shm.done = make(chan struct{})
 
 	go shm.monitorLoop()
 	return nil
@@ -83,14 +87,20 @@ func (shm *SystemHealthMonitorImpl) Start(ctx context.Context) error {
 // Stop stops health monitoring
 func (shm *SystemHealthMonitorImpl) Stop() error {
 	shm.mu.Lock()
-	defer shm.mu.Unlock()
-
 	if !shm.running {
+		shm.mu.Unlock()
 		return fmt.Errorf("health monitor not running")
 	}
 
 	shm.cancel()
 	shm.running = false
+	shm.mu.Unlock()
+
+	// Wait for monitorLoop to exit (no more callbacks will be launched),
+	// then wait for any in-flight callbacks to finish.
+	<-shm.done
+	shm.callbackWg.Wait()
+
 	return nil
 }
 
@@ -120,6 +130,7 @@ func (shm *SystemHealthMonitorImpl) GetHealthStatus() HealthStatus {
 
 // monitorLoop runs the health monitoring loop
 func (shm *SystemHealthMonitorImpl) monitorLoop() {
+	defer close(shm.done)
 	ticker := time.NewTicker(shm.interval)
 	defer ticker.Stop()
 
@@ -184,7 +195,11 @@ func (shm *SystemHealthMonitorImpl) performHealthCheck() {
 	// Notify callbacks if status changed
 	if statusChanged {
 		for _, callback := range callbacks {
-			go callback(newStatus)
+			shm.callbackWg.Add(1)
+			go func(cb HealthStatusCallback) {
+				defer shm.callbackWg.Done()
+				cb(newStatus)
+			}(callback)
 		}
 	}
 }
