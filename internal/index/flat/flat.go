@@ -60,12 +60,13 @@ type PersistenceMetadata struct {
 
 // Index implements a flat (brute-force) vector index
 type Index struct {
-	config    *Config
-	vectors   []*VectorEntry
-	idToIndex map[string]int
-	quantizer quant.Quantizer
-	mu        sync.RWMutex
-	vectorSFL *memory.ShardedFreeList
+	config      *Config
+	vectors     []*VectorEntry
+	idToIndex   map[string]int
+	quantizer   quant.Quantizer
+	mu          sync.RWMutex
+	vectorSFL   *memory.ShardedFreeList
+	scratchPool *sync.Pool
 }
 
 // NewFlat creates a new flat index
@@ -90,6 +91,12 @@ func NewFlat(config *Config) (*Index, error) {
 		vectors:   make([]*VectorEntry, 0),
 		idToIndex: make(map[string]int),
 		vectorSFL: sfl,
+		scratchPool: &sync.Pool{
+			New: func() any {
+				a, _ := memory.NewArena(1024 * 1024)
+				return a
+			},
+		},
 	}
 
 	// Initialize quantizer if configured
@@ -352,15 +359,27 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 
 	limit := k
 
-	// Acquire off-heap buffer for the heap. Gracefully degrades to Go heap
-	// if k exceeds the largest tier or the pool is exhausted.
+	// Acquire an arena for search-scoped scratch, released on return.
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		idx.scratchPool.Put(arena)
+	}()
+
+	// Acquire off-heap buffer for the heap. Gracefully degrades to arena
+	// allocation if k exceeds the largest tier or the SFL pool is exhausted.
 	var heapBuf []heapElement
 	hs, buf := acquireHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
 		heapBuf = buf
 	} else {
-		heapBuf = make([]heapElement, k)
+		var err error
+		heapBuf, err = memory.ArenaSlice[heapElement](arena, k)
+		if err != nil {
+			return nil, fmt.Errorf("arena allocate heap buf: %w", err)
+		}
+		heapBuf = heapBuf[:k]
 	}
 
 	count := 0

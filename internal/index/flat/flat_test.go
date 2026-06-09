@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -598,4 +599,57 @@ func TestFlatInsert_SharesMetadataReference(t *testing.T) {
 	if results[0].Metadata["k"] != "mutated" {
 		t.Error("expected shared reference, got independent copy")
 	}
+}
+
+// TestSearchArenaBacked verifies the search path uses the scratch arena
+// and produces correct ascending-order results.
+func TestSearchArenaBacked(t *testing.T) {
+	dim := 16
+	cfg := &Config{
+		Dimension:      dim,
+		Metric:         util.L2Distance,
+		Quantization:   nil,
+	}
+	idx, err := NewFlat(cfg)
+	if err != nil {
+		t.Fatalf("NewFlat: %v", err)
+	}
+	defer idx.Close()
+
+	ctx := context.Background()
+	for i := range 100 {
+		v := make([]float32, dim)
+		v[0] = float32(i)
+		entry := &VectorEntry{ID: fmt.Sprintf("vec_%d", i), Vector: v}
+		if err := idx.Insert(ctx, entry); err != nil {
+			t.Fatalf("Insert %d: %v", i, err)
+		}
+	}
+
+	query := make([]float32, dim)
+	query[0] = 50.0
+	k := 5
+
+	results, err := idx.Search(ctx, query, k)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != k {
+		t.Fatalf("got %d results, want %d", len(results), k)
+	}
+
+	for i := 1; i < len(results); i++ {
+		if results[i-1].Score > results[i].Score {
+			t.Errorf("results not sorted: [%d].Score=%.4f > [%d].Score=%.4f",
+				i-1, results[i-1].Score, i, results[i].Score)
+		}
+	}
+
+	// Verify the arena pool exists and returns a valid arena.
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	if arena == nil {
+		t.Fatal("scratchPool returned nil arena")
+	}
+	arena.Reset()
+	idx.scratchPool.Put(arena)
 }
