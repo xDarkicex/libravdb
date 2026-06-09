@@ -196,7 +196,10 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	}
 
 	// Precompute all distances between valid neighbors
-	validNeighbors := make([]uint32, 0, len(neighbors))
+	validNeighbors, err := memory.ArenaSlice[uint32](arena, len(neighbors))
+	if err != nil {
+		return fmt.Errorf("arena allocate validNeighbors: %w", err)
+	}
 	for _, neighborID := range neighbors {
 		if neighborID < uint32(len(h.nodes)) && h.nodes[neighborID] != nil {
 			validNeighbors = append(validNeighbors, neighborID)

@@ -1,8 +1,10 @@
 package hnsw
 
 import (
+	"fmt"
 	"slices"
 
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -315,13 +317,18 @@ func (ns *NeighborSelector) PruneConnections(
 	originalLinks := node.Links[level]
 
 	// Create candidates from current live connections and compact stale links.
-	if cap(scratch.pruneBuf) < len(originalLinks) {
-		scratch.pruneBuf = make([]util.Candidate, 0, len(originalLinks))
-	} else {
-		scratch.pruneBuf = scratch.pruneBuf[:0]
+	// Always re-allocate from the arena — the previous buffer is stale after Reset.
+	pruneBuf, err := memory.ArenaSlice[util.Candidate](scratch.arena, len(originalLinks))
+	if err != nil {
+		return fmt.Errorf("arena allocate pruneBuf: %w", err)
 	}
+	scratch.pruneBuf = pruneBuf[:0]
 	candidates := scratch.pruneBuf
-	liveLinks := make([]uint32, 0, len(originalLinks))
+	liveLinks, err := memory.ArenaSlice[uint32](scratch.arena, len(originalLinks))
+	if err != nil {
+		return fmt.Errorf("arena allocate liveLinks: %w", err)
+	}
+	liveLinks = liveLinks[:0]
 	for _, linkID := range originalLinks {
 		if int(linkID) >= len(index.nodes) {
 			continue
