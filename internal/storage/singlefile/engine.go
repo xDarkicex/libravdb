@@ -1961,16 +1961,24 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, e
 	return nil
 }
 
-func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, error) {
+func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (bool, error) {
 	if e.closed {
 		return false, fmt.Errorf("database is closed")
 	}
 
-	// Pre-encode recordPut payloads before acquiring any locks. This hoists
-	// CPU-bound JSON metadata serialisation + binary framing out of the
-	// batchBuffer.mu and e.mu critical sections.
+	// Pre-encode recordPut payloads before acquiring any locks.
 	encoded := make([]encodedPayload, len(entries))
 	for i, entry := range entries {
+		if i%100 == 0 {
+			select {
+			case <-ctx.Done():
+				for j := 0; j < i; j++ {
+					releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+				}
+				return false, ctx.Err()
+			default:
+			}
+		}
 		payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
 			Collection: name,
 			ID:         entry.ID,
@@ -2458,7 +2466,7 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
 		return err
 	}
-	flushed, err := c.engine.putRecords(c.name, []*index.VectorEntry{entry})
+	flushed, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
 	if err != nil {
 		return err
 	}
@@ -2476,7 +2484,7 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 	if err := c.assignOrdinals(entries); err != nil {
 		return err
 	}
-	flushed, err := c.engine.putRecords(c.name, entries)
+	flushed, err := c.engine.putRecords(ctx, c.name, entries)
 	if err != nil {
 		return err
 	}
