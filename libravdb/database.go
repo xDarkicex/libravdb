@@ -25,15 +25,16 @@ type Logger interface {
 
 // Database represents the main vector database instance
 type Database struct {
-	mu          sync.RWMutex
-	collections map[string]*Collection
-	storage     storage.Engine
-	bridge      *indexPersistenceBridge // cached indexes from recovery, used for lazy-loading
-	metrics     *obs.Metrics
-	health      *obs.HealthChecker
-	config      *Config
-	logger      Logger
-	closed      bool
+	mu            sync.RWMutex
+	collections   map[string]*Collection
+	storage       storage.Engine
+	bridge        *indexPersistenceBridge // cached indexes from recovery, used for lazy-loading
+	metrics       *obs.Metrics
+	health        *obs.HealthChecker
+	healthMonitor *SystemHealthMonitorImpl
+	config        *Config
+	logger        Logger
+	closed        bool
 }
 
 // Config holds database-wide configuration
@@ -98,6 +99,21 @@ func New(opts ...Option) (*Database, error) {
 
 	// Initialize health checker
 	db.health = obs.NewHealthChecker(db)
+
+	// Start the background health monitor. Registers a storage engine
+	// liveness check and begins periodic monitoring with callbacks.
+	db.healthMonitor = NewSystemHealthMonitor(30 * time.Second)
+	db.healthMonitor.RegisterHealthCheck("storage", func(ctx context.Context) (HealthLevel, error) {
+		_, err := storageEngine.ListCollections()
+		if err != nil {
+			return HealthCritical, fmt.Errorf("storage list: %w", err)
+		}
+		return HealthHealthy, nil
+	})
+	if err := db.healthMonitor.Start(context.Background()); err != nil {
+		storageEngine.Close()
+		return nil, fmt.Errorf("failed to start health monitor: %w", err)
+	}
 
 	// Load existing collections from storage, preferring cached indexes
 	// that were deserialized or rebuilt during recovery.
@@ -365,6 +381,12 @@ func (db *Database) DeleteCollections(ctx context.Context, names []string) error
 // Health returns the current health status
 func (db *Database) Health(ctx context.Context) (*obs.HealthStatus, error) {
 	return db.health.Check(ctx)
+}
+
+// HealthMonitor returns the background system health monitor. Callers can
+// register additional health checks and status-change callbacks.
+func (db *Database) HealthMonitor() SystemHealthMonitor {
+	return db.healthMonitor
 }
 
 // Ping checks if the database is responsive and the storage engine is accessible.
@@ -660,6 +682,14 @@ func (db *Database) Close() error {
 	}
 
 	var errors []error
+
+	// Stop the background health monitor before tearing down collections
+	// so health checks don't access closing state.
+	if db.healthMonitor != nil {
+		if err := db.healthMonitor.Stop(); err != nil {
+			errors = append(errors, fmt.Errorf("health monitor stop: %w", err))
+		}
+	}
 
 	// Close all collections
 	for _, collection := range db.collections {
