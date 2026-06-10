@@ -364,16 +364,17 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 
 	// Fallback: scan all nodes for highest level
 	var fallbackEntryPoint *Node
+	var fallbackOrdinal uint32
 	newMaxLevel := -1
 
 	for i, node := range h.nodes {
 		if node == nil || uint32(i) == deletedID {
 			continue
 		}
-
 		if node.Level > newMaxLevel {
 			newMaxLevel = node.Level
 			fallbackEntryPoint = node
+			fallbackOrdinal = uint32(i)
 		}
 	}
 
@@ -384,8 +385,9 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 	h.entryPoint = fallbackEntryPoint
 	h.maxLevel = newMaxLevel
 
-	// Rebuild entry point candidates list
-	h.rebuildEntryPointCandidates()
+	// Add the fallback to the candidate list. The list is maintained
+	// incrementally during Insert/Delete; a full O(N) rebuild is unnecessary.
+	h.entryPointCandidates = append(h.entryPointCandidates, fallbackOrdinal)
 
 	return nil
 }
@@ -418,19 +420,6 @@ func (h *Index) removeFromEntryPointCandidates(nodeID uint32) {
 			h.entryPointCandidates[i] = h.entryPointCandidates[len(h.entryPointCandidates)-1]
 			h.entryPointCandidates = h.entryPointCandidates[:len(h.entryPointCandidates)-1]
 			break
-		}
-	}
-}
-
-// rebuildEntryPointCandidates rebuilds the entry point candidates list
-func (h *Index) rebuildEntryPointCandidates() {
-	h.entryPointCandidates = h.entryPointCandidates[:0] // Clear existing
-
-	// Add nodes with level >= threshold (e.g., level 2+) as candidates
-	levelThreshold := 2
-	for i, node := range h.nodes {
-		if node != nil && node.Level >= levelThreshold {
-			h.entryPointCandidates = append(h.entryPointCandidates, uint32(i))
 		}
 	}
 }
