@@ -534,45 +534,53 @@ func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float
 }
 
 // initializeCentroids initializes cluster centroids using k-means++
+// with running-min tracking: O(N·k·dim) instead of O(N·k²·dim).
 func (idx *Index) initializeCentroids(vectors [][]float32) error {
-	if len(vectors) < idx.config.NClusters {
+	nClusters := idx.config.NClusters
+	if len(vectors) < nClusters {
 		return fmt.Errorf("not enough vectors for initialization")
 	}
 
-	// Choose first centroid randomly
+	// Choose first centroid randomly.
 	firstIdx := idx.rand.Intn(len(vectors))
 	copy(idx.clusters[0].Centroid, vectors[firstIdx])
 
-	// Choose remaining centroids using k-means++ (proportional to squared distance)
-	for k := 1; k < idx.config.NClusters; k++ {
-		distances := make([]float64, len(vectors))
-		totalDistance := float64(0)
+	// minDist[i] tracks the squared distance from vector i to its nearest
+	// already-chosen centroid. Updated incrementally as each new centroid
+	// is selected — we only compute distance to the new centroid, not all k.
+	minDist := make([]float64, len(vectors))
+	totalDist := float64(0)
+	for i, vec := range vectors {
+		d := float64(idx.distanceFunc(vec, idx.clusters[0].Centroid))
+		minDist[i] = d * d
+		totalDist += minDist[i]
+	}
 
-		// Compute distance to nearest existing centroid for each vector
-		for i, vec := range vectors {
-			minDistance := float32(math.Inf(1))
-
-			for j := 0; j < k; j++ {
-				distance := idx.distanceFunc(vec, idx.clusters[j].Centroid)
-				if distance < minDistance {
-					minDistance = distance
-				}
-			}
-
-			distances[i] = float64(minDistance * minDistance) // Squared distance
-			totalDistance += distances[i]
-		}
-
-		// Choose next centroid with probability proportional to squared distance
-		target := idx.rand.Float64() * totalDistance
+	// Choose remaining centroids using k-means++ (proportional to squared distance).
+	for k := 1; k < nClusters; k++ {
+		// Select next centroid via roulette-wheel selection.
+		target := idx.rand.Float64() * totalDist
 		cumulative := float64(0)
-
-		for i, distance := range distances {
-			cumulative += distance
+		chosenIdx := 0
+		for i, d := range minDist {
+			cumulative += d
 			if cumulative >= target {
-				copy(idx.clusters[k].Centroid, vectors[i])
+				chosenIdx = i
 				break
 			}
+		}
+		copy(idx.clusters[k].Centroid, vectors[chosenIdx])
+
+		// Update running-min distances: only compare against the new centroid.
+		totalDist = 0
+		newCentroid := idx.clusters[k].Centroid
+		for i, vec := range vectors {
+			d := float64(idx.distanceFunc(vec, newCentroid))
+			d2 := d * d
+			if d2 < minDist[i] {
+				minDist[i] = d2
+			}
+			totalDist += minDist[i]
 		}
 	}
 

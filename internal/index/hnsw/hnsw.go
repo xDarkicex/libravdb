@@ -429,7 +429,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 	}
 
 	// Phase 2: Search level 0 with ef
-	ef := max(h.config.EfSearch, k) // Using builtin max function
+	ef := max(h.config.EfSearch, k)
 	candidates := h.searchLevel(query, ep, ef, 0)
 
 	// Convert to results and limit to k
@@ -444,8 +444,8 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 			continue
 		}
 
-		// Skip eager Decompress — the collection layer hydrates vectors from
-		// storage. Standalone path reads from off-heap rawVectorStore (cheap).
+		// Decompression is off the hot path — the collection layer hydrates
+		// vectors from storage. Standalone path reads from off-heap rawVectorStore.
 		var resultVector []float32
 		if h.provider == nil {
 			resultVector, _ = h.getNodeVector(node)
@@ -1082,7 +1082,7 @@ func (h *Index) GetPersistenceMetadata() *HNSWPersistenceMetadata {
 		Version:       FormatVersion,
 		NodeCount:     h.size,
 		Dimension:     h.config.Dimension,
-		MaxLevel:      h.getMaxLevel(),
+		MaxLevel:      h.maxLevel,
 		CreatedAt:     time.Now(),
 		ChecksumCRC32: h.calculateCRC32(),
 		FileSize:      h.estimateFileSize(),
@@ -1090,16 +1090,6 @@ func (h *Index) GetPersistenceMetadata() *HNSWPersistenceMetadata {
 }
 
 // Helper methods for metadata
-func (h *Index) getMaxLevel() int {
-	maxLevel := 0
-	for _, node := range h.nodes {
-		if node != nil && node.Level > maxLevel {
-			maxLevel = node.Level
-		}
-	}
-	return maxLevel
-}
-
 func (h *Index) estimateFileSize() int64 {
 	// Rough estimate of serialized size
 	var size int64
