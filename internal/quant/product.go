@@ -302,7 +302,7 @@ func (pq *ProductQuantizer) Compress(vector []float32) ([]byte, error) {
 	defer pq.mu.RUnlock()
 
 	if !pq.trained {
-		return nil, fmt.Errorf("quantizer not trained")
+		return nil, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
 	}
 
 	if len(vector) != pq.dimension {
@@ -356,7 +356,7 @@ func (pq *ProductQuantizer) Decompress(data []byte) ([]float32, error) {
 	defer pq.mu.RUnlock()
 
 	if !pq.trained {
-		return nil, fmt.Errorf("quantizer not trained")
+		return nil, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
 	}
 
 	vector := make([]float32, pq.dimension)
@@ -388,7 +388,7 @@ func (pq *ProductQuantizer) Distance(compressed1, compressed2 []byte) (float32, 
 	defer pq.mu.RUnlock()
 
 	if !pq.trained {
-		return 0, fmt.Errorf("quantizer not trained")
+		return 0, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
 	}
 
 	distance := float32(0)
@@ -423,7 +423,7 @@ func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32) 
 	pq.mu.RLock()
 	if !pq.trained {
 		pq.mu.RUnlock()
-		return 0, fmt.Errorf("quantizer not trained")
+		return 0, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
 	}
 	pq.mu.RUnlock()
 

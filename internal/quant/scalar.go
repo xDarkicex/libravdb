@@ -148,7 +148,7 @@ func (sq *ScalarQuantizer) Compress(vector []float32) ([]byte, error) {
 	defer sq.mu.RUnlock()
 
 	if !sq.trained {
-		return nil, fmt.Errorf("quantizer not trained")
+		return nil, NewQuantizationError(ErrQuantNotTrained, "ScalarQuantizer", "", "quantizer not trained")
 	}
 
 	if len(vector) != sq.dimension {
@@ -197,7 +197,7 @@ func (sq *ScalarQuantizer) Decompress(data []byte) ([]float32, error) {
 	defer sq.mu.RUnlock()
 
 	if !sq.trained {
-		return nil, fmt.Errorf("quantizer not trained")
+		return nil, NewQuantizationError(ErrQuantNotTrained, "ScalarQuantizer", "", "quantizer not trained")
 	}
 
 	vector := make([]float32, sq.dimension)
@@ -224,7 +224,7 @@ func (sq *ScalarQuantizer) Distance(compressed1, compressed2 []byte) (float32, e
 	defer sq.mu.RUnlock()
 
 	if !sq.trained {
-		return 0, fmt.Errorf("quantizer not trained")
+		return 0, NewQuantizationError(ErrQuantNotTrained, "ScalarQuantizer", "", "quantizer not trained")
 	}
 
 	distance := float32(0)
@@ -256,7 +256,7 @@ func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32) (
 	defer sq.mu.RUnlock()
 
 	if !sq.trained {
-		return 0, fmt.Errorf("quantizer not trained")
+		return 0, NewQuantizationError(ErrQuantNotTrained, "ScalarQuantizer", "", "quantizer not trained")
 	}
 
 	if len(query) != sq.dimension {
