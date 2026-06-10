@@ -143,8 +143,11 @@ func (h *candidateMaxHeap) siftDown(idx int) {
 }
 
 func (h *Index) acquireSearchScratch() *searchScratch {
+	return h.acquireSearchScratchWithNodeCount(len(h.nodes))
+}
+
+func (h *Index) acquireSearchScratchWithNodeCount(nodeCount int) *searchScratch {
 	scratch := h.searchScratchPool.Get().(*searchScratch)
-	nodeCount := len(h.nodes)
 
 	// Ensure the Arena is sized for visitedMarks + heap bufs (~320 KB headroom).
 	needed := uint64(nodeCount*4 + 320*1024)
