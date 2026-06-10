@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -469,6 +470,14 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 	// Initialize nodes slice
 	h.nodes = make([]*Node, nodeCount)
 
+	// Use the scratch arena for temporary per-node buffers (id bytes, vector
+	// data) so deserialization doesn't allocate on the Go heap.
+	arena := h.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		h.scratchPool.Put(arena)
+	}()
+
 	// Read nodes
 	for i := uint32(0); i < nodeCount; i++ {
 		if i%1024 == 0 {
@@ -500,7 +509,11 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 		if err := binary.Read(reader, binary.LittleEndian, &idLen); err != nil {
 			return err
 		}
-		idBytes := make([]byte, idLen)
+		idBytes, err := memory.ArenaSlice[byte](arena, int(idLen))
+		if err != nil {
+			return fmt.Errorf("arena allocate id bytes: %w", err)
+		}
+		idBytes = idBytes[:idLen]
 		if _, err := io.ReadFull(reader, idBytes); err != nil {
 			return err
 		}
@@ -512,9 +525,13 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			return err
 		}
 
-		// Read vector data — bulk-read into bytes and cast to float32
-		// instead of binary.Read per element (reflection overhead × dim).
-		vector := make([]float32, vectorLen)
+		// Read vector data — arena-backed bulk read instead of
+		// binary.Read per element (reflection overhead × dim).
+		vector, err := memory.ArenaSlice[float32](arena, int(vectorLen))
+		if err != nil {
+			return fmt.Errorf("arena allocate vector: %w", err)
+		}
+		vector = vector[:vectorLen]
 		raw := unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), int(vectorLen)*4)
 		if _, err := io.ReadFull(reader, raw); err != nil {
 			return err
@@ -537,7 +554,8 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			}
 		}
 		if int(ordinal) >= len(h.nodes) {
-			grown := make([]*Node, ordinal+1)
+			newCap := nextNodeCapacity(len(h.nodes), int(ordinal)+1)
+			grown := make([]*Node, int(ordinal)+1, newCap)
 			copy(grown, h.nodes)
 			h.nodes = grown
 		}
