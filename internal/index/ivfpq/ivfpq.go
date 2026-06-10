@@ -452,23 +452,38 @@ func (idx *Index) trainCoarseQuantizer(ctx context.Context, vectors [][]float32)
 }
 
 func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float32, assignments []int) (float64, error) {
+	// Precompute ||c_j||² for each centroid so the inner loop can use
+	// ||x - c||² = ||x||² + ||c||² - 2·dot(x,c). The ||x||² term is
+	// constant per vector and can be dropped from the argmin.
+	centroidNorm2 := make([]float32, len(idx.clusters))
+	for j, cluster := range idx.clusters {
+		var sum float32
+		for _, v := range cluster.Centroid {
+			sum += v * v
+		}
+		centroidNorm2[j] = sum
+	}
+
 	workers := parallelismFor(len(vectors))
 	if workers == 1 {
 		totalInertia := float64(0)
 		for i, vec := range vectors {
 			bestCluster := 0
-			bestDistance := float32(math.Inf(1))
+			bestScore := float32(math.Inf(-1)) // max of dot(x,c) - ||c||²/2
 
 			for j, cluster := range idx.clusters {
-				distance := idx.distanceFunc(vec, cluster.Centroid)
-				if distance < bestDistance {
-					bestDistance = distance
+				dot := dotProduct(vec, cluster.Centroid)
+				// ||x-c||² = ||x||² + ||c||² - 2·dot
+				// argmin(||x-c||²) ≡ argmax(dot - ||c||²/2)
+				score := dot - centroidNorm2[j]*0.5
+				if score > bestScore {
+					bestScore = score
 					bestCluster = j
 				}
 			}
 
 			assignments[i] = bestCluster
-			totalInertia += float64(bestDistance)
+			totalInertia += float64(idx.distanceFunc(vec, idx.clusters[bestCluster].Centroid))
 		}
 		return totalInertia, nil
 	}
@@ -500,17 +515,18 @@ func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float
 
 				vec := vectors[i]
 				bestCluster := 0
-				bestDistance := float32(math.Inf(1))
+				bestScore := float32(math.Inf(-1))
 				for j, cluster := range idx.clusters {
-					distance := idx.distanceFunc(vec, cluster.Centroid)
-					if distance < bestDistance {
-						bestDistance = distance
+					dot := dotProduct(vec, cluster.Centroid)
+					score := dot - centroidNorm2[j]*0.5
+					if score > bestScore {
+						bestScore = score
 						bestCluster = j
 					}
 				}
 
 				assignments[i] = bestCluster
-				localInertia += float64(bestDistance)
+				localInertia += float64(idx.distanceFunc(vec, idx.clusters[bestCluster].Centroid))
 			}
 
 			inertias[worker] = localInertia
@@ -730,6 +746,14 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func dotProduct(a, b []float32) float32 {
+	var sum float32
+	for i := range a {
+		sum += a[i] * b[i]
+	}
+	return sum
 }
 
 // Insert adds a vector entry to the index with enhanced quantization support
