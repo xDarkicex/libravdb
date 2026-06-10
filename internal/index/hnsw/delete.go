@@ -3,6 +3,7 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -209,10 +210,32 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	if len(validNeighbors) < 2 {
 		return nil
 	}
+	D := len(validNeighbors)
+
+	// Precompute a D×D distance matrix so each node's distance to every
+	// other node is computed once, not once per ordered pair.
+	distMat, err := memory.ArenaSlice[float32](arena, D*D)
+	if err != nil {
+		return fmt.Errorf("arena allocate distance matrix: %w", err)
+	}
+	distMat = distMat[:D*D]
+	for i := 0; i < D; i++ {
+		ni := validNeighbors[i]
+		nodeI := h.nodes[ni]
+		for j := i + 1; j < D; j++ {
+			nj := validNeighbors[j]
+			nodeJ := h.nodes[nj]
+			d, err := h.computeDistance(nil, nil, nodeI, nodeJ)
+			if err != nil {
+				d = float32(math.Inf(1))
+			}
+			distMat[i*D+j] = d
+			distMat[j*D+i] = d
+		}
+	}
 
 	// For each neighbor, try to connect it to other neighbors
-	for _, neighborID := range validNeighbors {
-		// Check for cancellation between neighbors
+	for ni, neighborID := range validNeighbors {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -224,43 +247,39 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 			continue
 		}
 
-		// Current number of connections for this neighbor
 		currentConnections := len(neighborNode.Links[level])
 
-		// Only reconnect if connections drop below M/2 to prevent O(N^2) repairs
 		minConnections := maxM / 2
 		if minConnections < 1 {
 			minConnections = 1
 		}
 
 		if currentConnections >= minConnections {
-			continue // Still has enough connections
+			continue
 		}
 
-		// Find potential new connections from remaining neighbors
-		arena.Reset() // Reset arena per neighbor to reuse memory
+		// Find potential new connections from remaining neighbors.
+		// Distances come from the precomputed matrix — no per-pair recompute.
+		arena.Reset()
 		candidatesSlice, _ := memory.ArenaSlice[*util.Candidate](arena, len(validNeighbors))
 		candidates := candidatesSlice[:0]
-		for _, otherID := range validNeighbors {
-			if neighborID == otherID || h.nodes[otherID] == nil {
+		for nj, otherID := range validNeighbors {
+			if ni == nj || h.nodes[otherID] == nil {
 				continue
 			}
 
-			// Check if already connected
 			if h.hasConnection(neighborID, otherID, level) {
 				continue
 			}
 
-			// Lazy distance computation
-			otherNode := h.nodes[otherID]
-			dist, err := h.computeDistance(nil, nil, neighborNode, otherNode)
-			if err != nil {
+			d := distMat[ni*D+nj]
+			if d == float32(math.Inf(1)) {
 				continue
 			}
 
 			candidates = append(candidates, &util.Candidate{
 				ID:       otherID,
-				Distance: dist,
+				Distance: d,
 			})
 		}
 
