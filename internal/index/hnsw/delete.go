@@ -260,7 +260,6 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 
 		// Find potential new connections from remaining neighbors.
 		// Distances come from the precomputed matrix — no per-pair recompute.
-		arena.Reset()
 		candidatesSlice, _ := memory.ArenaSlice[*util.Candidate](arena, len(validNeighbors))
 		candidates := candidatesSlice[:0]
 		for nj, otherID := range validNeighbors {

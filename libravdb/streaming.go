@@ -215,7 +215,7 @@ func (s *StreamingBatchInsert) Send(entry *VectorEntry) error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
-		return fmt.Errorf("streaming operation is stopped")
+		return fmt.Errorf("%w", ErrStreamingStopped)
 	}
 
 	// Respect timeout/cancellation before attempting a buffered send.
@@ -904,7 +904,7 @@ func (s *StreamingBatchUpdate) Send(update *VectorUpdate) error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
-		return fmt.Errorf("streaming operation has been stopped")
+		return fmt.Errorf("%w", ErrStreamingStopped)
 	}
 
 	// Apply backpressure if enabled
@@ -939,7 +939,7 @@ func (s *StreamingBatchDelete) Send(id string) error {
 	s.closeMu.RLock()
 	defer s.closeMu.RUnlock()
 	if atomic.LoadInt32(&s.stopped) == 1 {
-		return fmt.Errorf("streaming operation has been stopped")
+		return fmt.Errorf("%w", ErrStreamingStopped)
 	}
 
 	// Apply backpressure if enabled
