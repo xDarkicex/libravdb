@@ -668,11 +668,6 @@ func (idx *Index) findProbeClusters(query []float32) ([]int, error) {
 		return nil, fmt.Errorf("index must be trained before search")
 	}
 
-	type clusterDistance struct {
-		id       int
-		distance float32
-	}
-
 	distances := make([]clusterDistance, len(idx.clusters))
 
 	for i, cluster := range idx.clusters {
@@ -754,6 +749,30 @@ func dotProduct(a, b []float32) float32 {
 		sum += a[i] * b[i]
 	}
 	return sum
+}
+
+type clusterDistance struct {
+	id       int
+	distance float32
+}
+
+func siftDownClusterDist(h []clusterDistance, i, n int) {
+	for {
+		largest := i
+		left := 2*i + 1
+		right := 2*i + 2
+		if left < n && h[left].distance > h[largest].distance {
+			largest = left
+		}
+		if right < n && h[right].distance > h[largest].distance {
+			largest = right
+		}
+		if largest == i {
+			return
+		}
+		h[i], h[largest] = h[largest], h[i]
+		i = largest
+	}
 }
 
 // Insert adds a vector entry to the index with enhanced quantization support
@@ -1295,11 +1314,6 @@ func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.
 		return nil, nil, fmt.Errorf("index must be trained before search")
 	}
 
-	type clusterDistance struct {
-		id       int
-		distance float32
-	}
-
 	distances, err := memory.ArenaSlice[clusterDistance](arena, len(clusters))
 	if err != nil {
 		return nil, nil, fmt.Errorf("arena allocate distances: %w", err)
@@ -1334,11 +1348,6 @@ func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.
 		wg.Wait()
 	}
 
-	// Sort by distance and take top NProbes
-	sort.Slice(distances, func(i, j int) bool {
-		return distances[i].distance < distances[j].distance
-	})
-
 	// Use adaptive probe count if enabled, otherwise use configured value
 	var probeCount int
 	if idx.adaptiveMode {
@@ -1347,6 +1356,22 @@ func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.
 		idx.searchStats.mutex.RUnlock()
 	} else {
 		probeCount = min(idx.config.NProbes, len(distances))
+	}
+
+	// Select top probeCount using a bounded max-heap instead of full sort.
+	// O(NClusters log NProbes) instead of O(NClusters log NClusters).
+	// The distances array is reused as heap storage.
+	heap := distances[:probeCount]
+	// Heapify: build max-heap from first probeCount elements.
+	for i := probeCount/2 - 1; i >= 0; i-- {
+		siftDownClusterDist(heap, i, probeCount)
+	}
+	// Process remaining elements.
+	for i := probeCount; i < len(distances); i++ {
+		if distances[i].distance < heap[0].distance {
+			heap[0] = distances[i]
+			siftDownClusterDist(heap, 0, probeCount)
+		}
 	}
 
 	probes, err := memory.ArenaSlice[int](arena, probeCount)
@@ -1360,9 +1385,13 @@ func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.
 	}
 	probeDists = probeDists[:probeCount]
 
-	for i := 0; i < probeCount; i++ {
-		probes[i] = distances[i].id
-		probeDists[i] = distances[i].distance
+	// Extract in ascending order by repeatedly popping the max.
+	for i := probeCount - 1; i >= 0; i-- {
+		probes[i] = heap[0].id
+		probeDists[i] = heap[0].distance
+		heap[0] = heap[probeCount-1]
+		probeCount--
+		siftDownClusterDist(heap, 0, probeCount)
 	}
 
 	return probes, probeDists, nil
