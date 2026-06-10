@@ -148,6 +148,7 @@ func AutoTuneConfig(dimension int, estimatedVectors int, targetMemoryMB int) *Co
 type Cluster struct {
 	ID                int               // Cluster ID
 	Centroid          []float32         // Cluster centroid
+	centroidNorm2     float32           // ||Centroid||², precomputed after centroid update
 	Entries           []*VectorEntry    // Vectors assigned to this cluster
 	CompressedVectors map[string][]byte // Compressed vectors for quantized storage
 	mutex             sync.RWMutex      // Protects concurrent access
@@ -636,6 +637,12 @@ func (idx *Index) updateCentroids(vectors [][]float32, assignments []int) error 
 			randomIdx := idx.rand.Intn(len(vectors))
 			copy(cluster.Centroid, vectors[randomIdx])
 		}
+		// Precompute ||c||² for fast dot-product argmin in assignToCluster.
+		var norm2 float32
+		for _, v := range cluster.Centroid {
+			norm2 += v * v
+		}
+		cluster.centroidNorm2 = norm2
 	}
 
 	return nil
@@ -647,14 +654,16 @@ func (idx *Index) assignToCluster(vector []float32) (int, error) {
 		return 0, fmt.Errorf("index must be trained before assignment")
 	}
 
+	// argmin(||x - c||²) = argmax(dot(x,c) - ||c||²/2) — ||x||² is constant.
+	// Using dot product + precomputed centroid norm² avoids the full L2
+	// distance computation (no sqrt, no per-cluster vector norm).
 	bestCluster := 0
-	bestDistance := float32(math.Inf(1))
+	bestScore := float32(math.Inf(-1))
 
 	for i, cluster := range idx.clusters {
-		distance := idx.distanceFunc(vector, cluster.Centroid)
-
-		if distance < bestDistance {
-			bestDistance = distance
+		score := dotProduct(vector, cluster.Centroid) - cluster.centroidNorm2*0.5
+		if score > bestScore {
+			bestScore = score
 			bestCluster = i
 		}
 	}

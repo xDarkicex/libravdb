@@ -307,13 +307,16 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 			return fmt.Errorf("centroid dimension mismatch at cluster %d: %d vs %d", i, centDims, dim)
 		}
 		idx.clusters[i].Centroid = make([]float32, dim)
+		var norm2 float32
 		for d := 0; d < dim; d++ {
 			c, err := r.f32()
 			if err != nil {
 				return err
 			}
 			idx.clusters[i].Centroid[d] = c
+			norm2 += c * c
 		}
+		idx.clusters[i].centroidNorm2 = norm2
 	}
 
 	// ---- PQ codebooks ----
