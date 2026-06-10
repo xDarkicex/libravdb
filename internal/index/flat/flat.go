@@ -24,10 +24,11 @@ var FlatMagicBytes = []byte("LIBRAFLT")
 
 // VectorEntry represents a vector entry in the flat index
 type VectorEntry struct {
-	ID       string                 `json:"id"`
-	Vector   []float32              `json:"vector"`
-	Metadata map[string]interface{} `json:"metadata"`
-	Version  uint64                 `json:"version"`
+	ID           string                 `json:"id"`
+	Vector       []float32              `json:"vector"`
+	Metadata     map[string]interface{} `json:"metadata"`
+	Version      uint64                 `json:"version"`
+	metadataSize int64                  // cached estimate, summed by MemoryUsage
 }
 
 // SearchResult represents a search result from the flat index
@@ -166,7 +167,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		newEntries[i] = &VectorEntry{
 			ID:       entry.ID,
 			Vector:   offHeapVec,
-			Metadata: entry.Metadata, // Shared reference (see doc comment)
+			Metadata: entry.Metadata, metadataSize: estimateMetadataSize(entry.Metadata),
 		}
 	}
 
@@ -202,10 +203,12 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	offHeapVec := unsafe.Slice((*float32)(vecPtr), idx.config.Dimension)
 	copy(offHeapVec, entry.Vector)
 
+	mdSize := estimateMetadataSize(entry.Metadata)
 	newEntry := &VectorEntry{
-		ID:       entry.ID,
-		Vector:   offHeapVec,
-		Metadata: entry.Metadata, // Shared reference (see doc comment)
+		ID:           entry.ID,
+		Vector:       offHeapVec,
+		Metadata:     entry.Metadata,
+		metadataSize: mdSize,
 	}
 
 	if existingIndex, exists := idx.idToIndex[entry.ID]; exists {
@@ -474,11 +477,9 @@ func (idx *Index) MemoryUsage() int64 {
 	// Index map overhead (estimate 32 bytes per entry)
 	usage += int64(len(idx.idToIndex)) * 32
 
-	// Metadata storage (rough estimate)
+	// Metadata storage (cached per-entry, computed at insert)
 	for _, entry := range idx.vectors {
-		for k, v := range entry.Metadata {
-			usage += int64(len(k)) + estimateValueSize(v)
-		}
+		usage += entry.metadataSize
 	}
 
 	return usage
@@ -681,10 +682,11 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 			return fmt.Errorf("read entry %d metadata: %w", i, err)
 		}
 		vectors[i] = &VectorEntry{
-			ID:       id,
-			Version:  ver,
-			Vector:   vec,
-			Metadata: metadata,
+			ID:           id,
+			Version:      ver,
+			Vector:       vec,
+			Metadata:     metadata,
+			metadataSize: estimateMetadataSize(metadata),
 		}
 	}
 
@@ -737,6 +739,14 @@ func (idx *Index) computeDistance(v1, v2 []float32) (float32, error) {
 	default:
 		return 0, fmt.Errorf("unsupported distance metric: %v", idx.config.Metric)
 	}
+}
+
+func estimateMetadataSize(md map[string]interface{}) int64 {
+	var size int64
+	for k, v := range md {
+		size += int64(len(k)) + estimateValueSize(v)
+	}
+	return size
 }
 
 // estimateValueSize estimates the memory size of a metadata value
