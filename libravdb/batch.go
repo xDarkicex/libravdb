@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/index"
 )
 
@@ -396,6 +397,12 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	arena, err := memory.NewArena(1024 * 1024)
+	if err != nil {
+		return nil, fmt.Errorf("arena create: %w", err)
+	}
+	defer arena.Free()
+
 	type chunkOutcome struct {
 		chunkIdx int
 		result   *chunkResult
@@ -433,8 +440,16 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 		close(waitDone)
 	}()
 
-	chunkResults := make([]*chunkResult, totalChunks)
-	chunkErrors := make([]error, totalChunks)
+	chunkResults, err := memory.ArenaSlice[*chunkResult](arena, totalChunks)
+	if err != nil {
+		return nil, fmt.Errorf("arena chunkResults: %w", err)
+	}
+	chunkResults = chunkResults[:totalChunks]
+	chunkErrors, err := memory.ArenaSlice[error](arena, totalChunks)
+	if err != nil {
+		return nil, fmt.Errorf("arena chunkErrors: %w", err)
+	}
+	chunkErrors = chunkErrors[:totalChunks]
 
 	completedChunks := 0
 	for completedChunks < totalChunks {
