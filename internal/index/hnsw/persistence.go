@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -511,12 +512,12 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			return err
 		}
 
-		// Read vector data
+		// Read vector data — bulk-read into bytes and cast to float32
+		// instead of binary.Read per element (reflection overhead × dim).
 		vector := make([]float32, vectorLen)
-		for j := uint32(0); j < vectorLen; j++ {
-			if err := binary.Read(reader, binary.LittleEndian, &vector[j]); err != nil {
-				return err
-			}
+		raw := unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), int(vectorLen)*4)
+		if _, err := io.ReadFull(reader, raw); err != nil {
+			return err
 		}
 
 		// Read level
