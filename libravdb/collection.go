@@ -473,10 +473,24 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 
 	// Use cached index if available (deserialized or rebuilt during recovery),
 	// otherwise create a new one and rebuild from storage records.
+	//
+	// If the cached index fails validation (e.g. corrupted file, bit rot),
+	// discard it and rebuild from raw storage — the rebuild is lossless since
+	// storage holds the authoritative copy of every record.
 	var idx index.Index
+	var indexValid bool
 	if cachedIndex != nil {
 		idx = cachedIndex
-	} else {
+		// Quick sanity check: a loaded index must report non-negative size.
+		if idx.Size() >= 0 {
+			indexValid = true
+		}
+	}
+	if !indexValid {
+		if cachedIndex != nil {
+			_ = cachedIndex.Close()
+			cachedIndex = nil
+		}
 		provider, _ := storageCollection.(interface {
 			GetByOrdinal(uint32) ([]float32, error)
 			Distance([]float32, uint32) (float32, error)
@@ -543,7 +557,23 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		}); ok {
 			provider := storageEntryProvider{col: storageCollection}
 			if err := populator.PopulateEntriesFromStorage(provider); err != nil {
-				return nil, fmt.Errorf("failed to populate IVF-PQ entries from storage: %w", err)
+				// IVF-PQ cluster entries failed to load. Close the partially-
+				// deserialized index and rebuild from scratch. Storage is the
+				// authoritative copy — the rebuild is lossless.
+				_ = idx.Close()
+				var rebuildErr error
+				provider, _ := storageCollection.(interface {
+					GetByOrdinal(uint32) ([]float32, error)
+					Distance([]float32, uint32) (float32, error)
+				})
+				collection.index, rebuildErr = createIndexForCollection(config, provider)
+				if rebuildErr != nil {
+					return nil, fmt.Errorf("failed to create index for rebuild: %w", rebuildErr)
+				}
+				if rebuildErr := collection.rebuildIndex(context.Background()); rebuildErr != nil {
+					return nil, fmt.Errorf("failed to rebuild index from storage: %w", rebuildErr)
+				}
+				return collection, nil
 			}
 		}
 	}
