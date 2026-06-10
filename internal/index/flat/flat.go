@@ -119,8 +119,8 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		return fmt.Errorf("vector cannot be empty")
 	}
 	if len(entry.Vector) != idx.config.Dimension {
-		return fmt.Errorf("vector dimension mismatch: expected %d, got %d",
-			idx.config.Dimension, len(entry.Vector))
+		return fmt.Errorf("dimension mismatch: expected %d, got %d: %w",
+			idx.config.Dimension, len(entry.Vector), util.ErrDimension)
 	}
 
 	idx.mu.Lock()
@@ -144,8 +144,8 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 			return fmt.Errorf("vector at index %d cannot be empty", i)
 		}
 		if len(entry.Vector) != idx.config.Dimension {
-			return fmt.Errorf("vector dimension mismatch: expected %d, got %d",
-				idx.config.Dimension, len(entry.Vector))
+			return fmt.Errorf("dimension mismatch: expected %d, got %d: %w",
+				idx.config.Dimension, len(entry.Vector), util.ErrDimension)
 		}
 	}
 

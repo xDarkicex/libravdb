@@ -651,7 +651,7 @@ func (idx *Index) updateCentroids(vectors [][]float32, assignments []int) error 
 // assignToCluster finds the best cluster for a vector
 func (idx *Index) assignToCluster(vector []float32) (int, error) {
 	if !idx.trained {
-		return 0, fmt.Errorf("index must be trained before assignment")
+		return 0, fmt.Errorf("assignToCluster: %w", util.ErrNotTrained)
 	}
 
 	// argmin(||x - c||²) = argmax(dot(x,c) - ||c||²/2) — ||x||² is constant.
@@ -674,7 +674,7 @@ func (idx *Index) assignToCluster(vector []float32) (int, error) {
 // findProbeClusters finds the top-k closest clusters for search probing
 func (idx *Index) findProbeClusters(query []float32) ([]int, error) {
 	if !idx.trained {
-		return nil, fmt.Errorf("index must be trained before search")
+		return nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
 	distances := make([]clusterDistance, len(idx.clusters))
@@ -802,7 +802,7 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	idx.mutex.RLock()
 	if !idx.trained {
 		idx.mutex.RUnlock()
-		return fmt.Errorf("index must be trained before insertion")
+		return fmt.Errorf("Insert: %w", util.ErrNotTrained)
 	}
 
 	// Find the best cluster for this vector
@@ -852,7 +852,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 	idx.mutex.RLock()
 	if !idx.trained {
 		idx.mutex.RUnlock()
-		return fmt.Errorf("index must be trained before insertion")
+		return fmt.Errorf("Insert: %w", util.ErrNotTrained)
 	}
 
 	workers := parallelismFor(len(entries))
@@ -1001,7 +1001,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	}
 
 	if k <= 0 {
-		return nil, fmt.Errorf("k must be positive, got %d", k)
+		return nil, fmt.Errorf("k must be positive, got %d: %w", k, util.ErrInvalidK)
 	}
 	if k > 4096 {
 		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
@@ -1010,7 +1010,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	idx.mutex.RLock()
 	if !idx.trained {
 		idx.mutex.RUnlock()
-		return nil, fmt.Errorf("index must be trained before search")
+		return nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
 	// Adjust probe count if adaptive mode is enabled (touches searchStats).
@@ -1320,7 +1320,7 @@ func (idx *Index) distanceToEntry(query []float32, _ *Cluster, entry *VectorEntr
 // findProbeClustersWithDistances finds probe clusters and returns their distances to query
 func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.Arena, clusters []*Cluster) ([]int, []float32, error) {
 	if !idx.trained {
-		return nil, nil, fmt.Errorf("index must be trained before search")
+		return nil, nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
 	distances, err := memory.ArenaSlice[clusterDistance](arena, len(clusters))
