@@ -729,3 +729,21 @@ func (db *Database) Close() error {
 
 	return nil
 }
+
+// Vacuum reclaims disk space by rewriting the underlying storage file, dropping
+// deleted records and obsolete WAL frames. This is a non-blocking operation
+// that only briefly pauses the database during the final swap.
+func (db *Database) Vacuum(ctx context.Context) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	if v, ok := db.storage.(interface{ Vacuum(context.Context) error }); ok {
+		return v.Vacuum(ctx)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Vacuum")
+}

@@ -1343,6 +1343,297 @@ func (e *Engine) checkpointLocked() error {
 	return nil
 }
 
+func captureState(e *Engine) *persistedState {
+	cloned := &persistedState{
+		NextCollectionID: e.state.NextCollectionID,
+		Collections:      make(map[string]*persistedCollection, len(e.state.Collections)),
+	}
+	for name, coll := range e.state.Collections {
+		c := &persistedCollection{
+			ID:          coll.ID,
+			Config:      coll.Config,
+			CreatedLSN:  coll.CreatedLSN,
+			UpdatedLSN:  coll.UpdatedLSN,
+			LiveCount:   coll.LiveCount,
+			NextOrdinal: coll.NextOrdinal,
+			Deleted:     coll.Deleted,
+			Records:     make(map[string]*recordValue, len(coll.Records)),
+		}
+		for id, rec := range coll.Records {
+			r := &recordValue{
+				Vector:     append([]float32(nil), rec.Vector...),
+				Version:    rec.Version,
+				CreatedLSN: rec.CreatedLSN,
+				UpdatedLSN: rec.UpdatedLSN,
+				Ordinal:    rec.Ordinal,
+				Deleted:    rec.Deleted,
+			}
+			if rec.Metadata != nil {
+				r.Metadata = make(map[string]interface{}, len(rec.Metadata))
+				for k, v := range rec.Metadata {
+					r.Metadata[k] = v
+				}
+			}
+			c.Records[id] = r
+		}
+		cloned.Collections[name] = c
+	}
+	return cloned
+}
+
+// Vacuum reclaims disk space by writing a compacted database to a temporary file
+// and atomically replacing the active file. It minimizes lock contention by
+// performing heavy serialization unlocked, then copying only the appended WAL
+// deltas during a brief final lock.
+func (e *Engine) Vacuum(ctx context.Context) error {
+	// Phase 1: flush + snapshot (brief lock)
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("engine closed")
+	}
+	if err := e.checkpointLocked(); err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum pre-checkpoint: %w", err)
+	}
+	
+	// Snapshot vectors for indexes safely
+	if e.indexProvider != nil {
+		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("vacuum snapshot vectors: %w", err)
+		}
+	}
+
+	stat, err := e.file.Stat()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum stat: %w", err)
+	}
+	phase1Size := stat.Size()
+	snapshotState := captureState(e)
+	origHeader, err := e.readHeader()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum read header: %w", err)
+	}
+	phase1LSN := e.lastLSN
+	e.mu.Unlock()
+
+	// Phase 2: Serialization and writing temp file (Unlocked)
+	snapshotBytes, err := encodeStateBinary(snapshotState)
+	if err != nil {
+		return fmt.Errorf("vacuum encode state: %w", err)
+	}
+	if len(snapshotBytes) > maxChunkSize {
+		return fmt.Errorf("vacuum snapshot size %d exceeds limit %d", len(snapshotBytes), maxChunkSize)
+	}
+
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(snapshotState.Collections))
+		for name := range snapshotState.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("vacuum serialize index %s: %w", name, err)
+			}
+			if indexBytes == nil {
+				continue
+			}
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+
+	tmpPath := e.path + ".vacuum"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("vacuum create temp file: %w", err)
+	}
+	
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	const snapshotOffset = uint64(3 * pageSize)
+	indexOffset := snapshotOffset + 16 + uint64(len(snapshotBytes))
+	indexLength := uint64(len(indexBlock))
+	totalSize := int64(indexOffset)
+	if len(indexBlock) > 0 {
+		totalSize += 16 + int64(indexLength)
+	}
+	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
+
+	fh := &fileHeader{
+		FormatVersion:     origHeader.FormatVersion,
+		PageSize:          origHeader.PageSize,
+		FeatureFlags:      origHeader.FeatureFlags,
+		FileID:            origHeader.FileID,
+		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		LastCheckpointLSN: phase1LSN,
+		ActiveMetaPage:    1,
+		WALStartPage:      pageCount,
+		WALHeadPage:       pageCount,
+		WALTailPage:       pageCount,
+	}
+	copy(fh.Magic[:], origHeader.Magic[:])
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write header: %w", err)
+	}
+
+	meta := &metaPage{
+		Magic:           metaMagicV2,
+		MetaEpoch:       1,
+		RootCatalog:     3,
+		RootFreelist:    0,
+		LastAppliedLSN:  phase1LSN,
+		PageCount:       pageCount,
+		CollectionCount: uint64(len(snapshotState.Collections)),
+		SnapshotOffset:  snapshotOffset,
+		SnapshotLength:  uint64(len(snapshotBytes)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
+	}
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write meta A: %w", err)
+	}
+	
+	meta.RootFreelist = math.MaxUint64
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write meta B: %w", err)
+	}
+	pagePool.Put(bufPtr)
+
+	var chunkHdr [16]byte
+	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
+	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
+	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
+	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
+	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
+	if _, err := tmpFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+		return fmt.Errorf("vacuum write chunk header: %w", err)
+	}
+	if _, err := tmpFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+		return fmt.Errorf("vacuum write snapshot payload: %w", err)
+	}
+
+	if len(indexBlock) > 0 {
+		var idxHdr [16]byte
+		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
+		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
+		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
+		if _, err := tmpFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+			return fmt.Errorf("vacuum write index chunk header: %w", err)
+		}
+		if _, err := tmpFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+			return fmt.Errorf("vacuum write index payload: %w", err)
+		}
+	}
+
+	// Phase 3: Catch-up & Swap (Brief Lock)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return fmt.Errorf("engine closed during vacuum")
+	}
+
+	// Flush any in-flight writes
+	if err := e.checkpointLocked(); err != nil {
+		return fmt.Errorf("vacuum final checkpoint: %w", err)
+	}
+
+	stat, err = e.file.Stat()
+	if err != nil {
+		return fmt.Errorf("vacuum final stat: %w", err)
+	}
+	currentSize := stat.Size()
+
+	if currentSize > phase1Size {
+		// Copy WAL bytes that landed during Phase 2
+		// Seek temp file to end (should be at totalSize)
+		if _, err := tmpFile.Seek(0, io.SeekEnd); err != nil {
+			return fmt.Errorf("vacuum seek temp file: %w", err)
+		}
+		
+		// Create section reader for the delta
+		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
+		if _, err := io.Copy(tmpFile, deltaReader); err != nil {
+			return fmt.Errorf("vacuum copy WAL deltas: %w", err)
+		}
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("vacuum final sync: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("vacuum close temp: %w", err)
+	}
+
+	if err := e.file.Close(); err != nil {
+		// reopen guard
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("vacuum close original: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
+		return fmt.Errorf("vacuum close original: %w", err)
+	}
+
+	e.file = nil // Safety before rename
+	if err := os.Rename(tmpPath, e.path); err != nil {
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("vacuum rename: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
+		return fmt.Errorf("vacuum rename: %w", err)
+	}
+	
+	f, err := os.OpenFile(e.path, os.O_RDWR, 0644)
+	if err != nil {
+		e.status.Store(int32(storage.StatusFailed))
+		return fmt.Errorf("vacuum open new file: %w", err)
+	}
+	e.file = f
+	e.dirty = false
+	cleanup = false // Successfully swapped, defer won't remove it
+	return nil
+}
+
 // compactFile rewrites the database into a fresh temp file containing only the
 // current snapshot, then atomically renames it over the original. Caller must
 // hold e.mu. The checkpoint that precedes this call must already be fsynced.

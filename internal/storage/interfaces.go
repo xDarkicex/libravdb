@@ -29,6 +29,7 @@ type Engine interface {
 	ListCollections() ([]string, error)
 	DeleteCollection(name string) error
 	Close() error
+	Vacuum(ctx context.Context) error
 }
 
 // WriteStats captures coarse write-path instrumentation for benchmarking.

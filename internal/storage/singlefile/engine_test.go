@@ -1597,3 +1597,82 @@ func TestOrdinalPreReservation_ConcurrentAssignments(t *testing.T) {
 	t.Logf("concurrent: %d goroutines x %d = %d unique ordinals [%d,%d]",
 		numG, perG, expected, minO, maxO)
 }
+
+func TestEngine_Vacuum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vacuum.libravdb")
+	db, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	engine := db.(*Engine)
+
+	coll, err := engine.CreateCollection("test_coll", &storage.CollectionConfig{Dimension: 2, Metric: 0})
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	// Insert 1000 records
+	var entries []*index.VectorEntry
+	for i := 0; i < 1000; i++ {
+		entries = append(entries, &index.VectorEntry{
+			ID:      fmt.Sprintf("id-%d", i),
+			Ordinal: uint32(i + 1),
+			Vector:  []float32{1.0, float32(i)},
+		})
+	}
+	// Bypass missing InsertBatch and use loop
+	for _, entry := range entries {
+		if err := coll.Insert(context.Background(), entry); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	// Delete 500 records
+	for i := 0; i < 500; i++ {
+		if err := coll.Delete(context.Background(), fmt.Sprintf("id-%d", i)); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+
+	// Force checkpoint
+	engine.mu.Lock()
+	if err := engine.checkpointLocked(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	engine.mu.Unlock()
+
+	stat, _ := os.Stat(path)
+	preVacuumSize := stat.Size()
+
+	// Run Vacuum
+	if err := engine.Vacuum(context.Background()); err != nil {
+		t.Fatalf("Vacuum: %v", err)
+	}
+
+	stat, _ = os.Stat(path)
+	postVacuumSize := stat.Size()
+
+	if postVacuumSize > preVacuumSize {
+		t.Fatalf("Vacuum did not shrink or maintain file size: pre=%d, post=%d", preVacuumSize, postVacuumSize)
+	}
+
+	// Verify remaining records are accessible
+	for i := 500; i < 1000; i++ {
+		exists, err := coll.Exists(context.Background(), fmt.Sprintf("id-%d", i))
+		if err != nil || !exists {
+			t.Fatalf("Expected record id-%d to exist", i)
+		}
+	}
+
+	// Verify deleted records are gone
+	for i := 0; i < 500; i++ {
+		exists, err := coll.Exists(context.Background(), fmt.Sprintf("id-%d", i))
+		if err != nil || exists {
+			t.Fatalf("Expected record id-%d to be deleted", i)
+		}
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
