@@ -3,6 +3,7 @@ package libravdb
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -22,71 +23,53 @@ import (
 
 // Collection represents a named collection of vectors with a specific schema
 type Collection struct {
-	mu            sync.RWMutex
-	db            *Database
-	name          string
-	config        *CollectionConfig
-	index         index.Index        // used for non-sharded collections only
-	storage       storage.Collection // used for non-sharded collections only
-	shards        []shard            // nil for non-sharded collections (IVFPQ not supported for sharding)
-	writes        *writeController
-	metrics       *obs.Metrics
-	memoryManager memory.MemoryManager
-	closed        bool
-
-	// Runtime optimization state
-	optimizationInProgress bool
 	lastOptimization       time.Time
-
-	// Non-sharded mutation stripes reduce contention while preserving same-ID serialization.
-	mutationStripes [64]sync.Mutex
+	index                  index.Index
+	memoryManager          memory.MemoryManager
+	storage                storage.Collection
+	config                 *CollectionConfig
+	writes                 *writeController
+	metrics                *obs.Metrics
+	db                     *Database
+	name                   string
+	shards                 []shard
+	mutationStripes        [64]sync.Mutex
+	mu                     sync.RWMutex
+	closed                 bool
+	optimizationInProgress bool
 }
 
 // CollectionConfig holds collection-specific configuration
 type CollectionConfig struct {
-	Dimension int            `json:"dimension"`
-	Metric    DistanceMetric `json:"metric"`
-	IndexType IndexType      `json:"index_type"`
-	// HNSW specific parameters
-	M              int     `json:"m"`               // Max connections per node
-	EfConstruction int     `json:"ef_construction"` // Size of dynamic candidate list during construction
-	EfSearch       int     `json:"ef_search"`       // Size of dynamic candidate list during search
-	NClusters      int     `json:"n_clusters,omitempty"`
-	NProbes        int     `json:"n_probes,omitempty"`
-	ML             float64 `json:"ml"`      // Level generation factor
-	Version        int     `json:"version"` // Config version for future compatibility
-	RawVectorStore string  `json:"raw_vector_store,omitempty"`
-	RawStoreCap    int     `json:"raw_store_cap,omitempty"`
-	// Persistence configuration
-	AutoSave     bool          `json:"auto_save"`     // Enable automatic index saving
-	SaveInterval time.Duration `json:"save_interval"` // Interval between automatic saves
-	SavePath     string        `json:"save_path"`     // Path for automatic saves
-	// Quantization configuration (optional)
-	Quantization *quant.QuantizationConfig `json:"quantization,omitempty"`
-	// Automatic index selection based on collection size
-	AutoIndexSelection bool `json:"auto_index_selection,omitempty"`
-	// AutoIndexThresholds overrides the default thresholds for auto-index selection.
-	// If set to zero values, DefaultHNSWThreshold and DefaultIVFPQThreshold are used.
+	MetadataSchema      MetadataSchema            `json:"metadata_schema,omitempty"`
+	MemoryConfig        *memory.MemoryConfig      `json:"memory_config,omitempty"`
+	Quantization        *quant.QuantizationConfig `json:"quantization,omitempty"`
+	RawVectorStore      string                    `json:"raw_vector_store,omitempty"`
+	SavePath            string                    `json:"save_path"`
+	IndexedFields       []string                  `json:"indexed_fields,omitempty"`
+	BatchConfig         BatchConfig               `json:"batch_config,omitempty"`
 	AutoIndexThresholds struct {
 		HNSWThreshold  int `json:"hnsw_threshold,omitempty"`
 		IVFPQThreshold int `json:"ivfpq_threshold,omitempty"`
 	} `json:"auto_index_thresholds,omitempty"`
-
-	// NEW: Memory management configuration
-	MemoryLimit    int64                `json:"memory_limit,omitempty"`    // Maximum memory usage in bytes (0 = no limit)
-	CachePolicy    CachePolicy          `json:"cache_policy,omitempty"`    // Cache eviction policy
-	EnableMMapping bool                 `json:"enable_mmapping,omitempty"` // Enable memory mapping for large indices
-	MemoryConfig   *memory.MemoryConfig `json:"memory_config,omitempty"`   // Advanced memory management settings
-
-	// Sharding configuration - must be explicitly enabled
-	Sharded bool `json:"sharded,omitempty"` // Enable sharding for this collection
-
-	// NEW: Metadata schema and filtering configuration
-	MetadataSchema MetadataSchema `json:"metadata_schema,omitempty"` // Schema definition for metadata fields
-	IndexedFields  []string       `json:"indexed_fields,omitempty"`  // Fields to create indices for (for faster filtering)
-
-	// NEW: Batch processing configuration
-	BatchConfig BatchConfig `json:"batch_config,omitempty"` // Batch operation settings
+	MemoryLimit        int64          `json:"memory_limit,omitempty"`
+	EfSearch           int            `json:"ef_search"`
+	ML                 float64        `json:"ml"`
+	RawStoreCap        int            `json:"raw_store_cap,omitempty"`
+	Metric             DistanceMetric `json:"metric"`
+	SaveInterval       time.Duration  `json:"save_interval"`
+	NProbes            int            `json:"n_probes,omitempty"`
+	NClusters          int            `json:"n_clusters,omitempty"`
+	IndexType          IndexType      `json:"index_type"`
+	Version            int            `json:"version"`
+	Dimension          int            `json:"dimension"`
+	CachePolicy        CachePolicy    `json:"cache_policy,omitempty"`
+	M                  int            `json:"m"`
+	EfConstruction     int            `json:"ef_construction"`
+	Sharded            bool           `json:"sharded,omitempty"`
+	EnableMMapping     bool           `json:"enable_mmapping,omitempty"`
+	AutoIndexSelection bool           `json:"auto_index_selection,omitempty"`
+	AutoSave           bool           `json:"auto_save"`
 }
 
 // DistanceMetric defines the distance function to use
@@ -303,7 +286,7 @@ func selectOptimalIndexType(vectorCount int, hnswThreshold, ivfpqThreshold int) 
 }
 
 // newCollection creates a new collection instance
-func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metrics, writes *writeController, opts ...CollectionOption) (*Collection, error) {
+func newCollection(ctx context.Context, name string, storageEngine storage.Engine, metrics *obs.Metrics, writes *writeController, opts ...CollectionOption) (*Collection, error) {
 	config := &CollectionConfig{
 		Dimension:      768, // Default for common embeddings
 		Metric:         CosineDistance,
@@ -372,7 +355,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		NClusters:      config.NClusters,
 		NProbes:        config.NProbes,
 		ML:             config.ML,
-		Version:        1,
+		Version:        2,
 		RawVectorStore: config.RawVectorStore,
 		RawStoreCap:    config.RawStoreCap,
 	}
@@ -392,7 +375,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 		memManager = memory.NewManager(memConfig)
 
 		// Start memory monitoring
-		if err := memManager.Start(context.Background()); err != nil {
+		if err := memManager.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start memory manager: %w", err)
 		}
 	}
@@ -448,7 +431,7 @@ func newCollection(name string, storageEngine storage.Engine, metrics *obs.Metri
 }
 
 // newCollectionFromStorage creates a collection instance from existing storage
-func newCollectionFromStorage(name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index) (*Collection, error) {
+func newCollectionFromStorage(ctx context.Context, name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index) (*Collection, error) {
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
 		Dimension:      engineConfig.Dimension,
@@ -519,12 +502,20 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 		// Register the index as a memory-mappable component if supported
 		if mappable, ok := idx.(memory.MemoryMappable); ok {
 			if err := memManager.RegisterMemoryMappable(fmt.Sprintf("index_%s", name), mappable); err != nil {
+				if !indexValid && cachedIndex == nil {
+					idx.Close()
+				}
+				storageCollection.Close()
 				return nil, fmt.Errorf("failed to register index for memory management: %w", err)
 			}
 		}
 
 		// Start memory monitoring
-		if err := memManager.Start(context.Background()); err != nil {
+		if err := memManager.Start(ctx); err != nil {
+			if !indexValid && cachedIndex == nil {
+				idx.Close()
+			}
+			storageCollection.Close()
 			return nil, fmt.Errorf("failed to start memory manager: %w", err)
 		}
 	}
@@ -541,7 +532,7 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 
 	// Rebuild index from storage data (skipped if cached index was used).
 	if cachedIndex == nil {
-		if err := collection.rebuildIndex(context.Background()); err != nil {
+		if err := collection.rebuildIndex(ctx); err != nil {
 			return nil, fmt.Errorf("failed to rebuild index: %w", err)
 		}
 	} else if hasMeta, ok := idx.(interface{ HasDeserializedMeta() bool }); ok && hasMeta.HasDeserializedMeta() {
@@ -570,7 +561,7 @@ func newCollectionFromStorage(name string, storageCollection storage.Collection,
 				if rebuildErr != nil {
 					return nil, fmt.Errorf("failed to create index for rebuild: %w", rebuildErr)
 				}
-				if rebuildErr := collection.rebuildIndex(context.Background()); rebuildErr != nil {
+				if rebuildErr := collection.rebuildIndex(ctx); rebuildErr != nil {
 					return nil, fmt.Errorf("failed to rebuild index from storage: %w", rebuildErr)
 				}
 				return collection, nil
@@ -595,7 +586,7 @@ func (p storageEntryProvider) IterateEntries(fn func(id string, ordinal uint32, 
 }
 
 // newShardedCollectionFromStorage creates a sharded collection from existing shard storages
-func newShardedCollectionFromStorage(name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController) (*Collection, error) {
+func newShardedCollectionFromStorage(ctx context.Context, name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController) (*Collection, error) {
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
 		Dimension:      engineConfig.Dimension,
@@ -637,8 +628,11 @@ func newShardedCollectionFromStorage(name string, shardStorages []storage.Collec
 
 		idx, err := createIndexForCollection(config, provider)
 		if err != nil {
-			// Close already-opened shards
+			// Close already-opened shards and their indexes
 			for j := 0; j < i; j++ {
+				if c.shards[j].index != nil {
+					c.shards[j].index.Close()
+				}
 				shardStorages[j].Close()
 			}
 			return nil, fmt.Errorf("failed to create shard %d index: %w", i, err)
@@ -653,7 +647,7 @@ func newShardedCollectionFromStorage(name string, shardStorages []storage.Collec
 
 	// Rebuild each shard's index from its storage
 	for i := range c.shards {
-		if err := c.rebuildShardIndex(context.Background(), i); err != nil {
+		if err := c.rebuildShardIndex(ctx, i); err != nil {
 			return nil, fmt.Errorf("failed to rebuild shard %d index: %w", i, err)
 		}
 	}
@@ -742,7 +736,9 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 		if err := c.index.Insert(ctx, storageEntry); err != nil {
-			_ = c.storage.Delete(ctx, id)
+			if delErr := c.storage.Delete(ctx, id); delErr != nil {
+				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
+			}
 			return fmt.Errorf("failed to insert into index: %w", err)
 		}
 
@@ -769,7 +765,9 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
 	if err := shard.index.Insert(ctx, storageEntry); err != nil {
-		_ = shard.storage.Delete(ctx, id)
+		if delErr := shard.storage.Delete(ctx, id); delErr != nil {
+			return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
+		}
 		return fmt.Errorf("failed to insert into index: %w", err)
 	}
 
@@ -864,14 +862,26 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
 	if err := prepareIndexForEntries(ctx, c.index, entries); err != nil {
+		var rollbackErrs []error
 		for _, storedEntry := range entries {
-			_ = c.storage.Delete(ctx, storedEntry.ID)
+			if delErr := c.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+				rollbackErrs = append(rollbackErrs, delErr)
+			}
+		}
+		if len(rollbackErrs) > 0 {
+			return fmt.Errorf("failed to prepare index: %w (CRITICAL: %d rollback failures, e.g., %v)", err, len(rollbackErrs), rollbackErrs[0])
 		}
 		return fmt.Errorf("failed to prepare index for batch insert: %w", err)
 	}
 	if err := insertEntriesIntoIndex(ctx, c.index, entries); err != nil {
+		var rollbackErrs []error
 		for _, storedEntry := range entries {
-			_ = c.storage.Delete(ctx, storedEntry.ID)
+			if delErr := c.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+				rollbackErrs = append(rollbackErrs, delErr)
+			}
+		}
+		if len(rollbackErrs) > 0 {
+			return fmt.Errorf("failed to insert into index: %w (CRITICAL: %d rollback failures, e.g., %v)", err, len(rollbackErrs), rollbackErrs[0])
 		}
 		return fmt.Errorf("failed to insert into index: %w", err)
 	}
@@ -926,17 +936,31 @@ func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.Ve
 				return
 			}
 			if err := prepareIndexForEntries(ctx, s.index, shardEntries); err != nil {
+				var rollbackErrs []error
 				for _, storedEntry := range shardEntries {
-					_ = s.storage.Delete(ctx, storedEntry.ID)
+					if delErr := s.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+						rollbackErrs = append(rollbackErrs, delErr)
+					}
 				}
-				errCh <- fmt.Errorf("failed to prepare shard %d index for batch insert: %w", shardIdx, err)
+				if len(rollbackErrs) > 0 {
+					errCh <- fmt.Errorf("failed to prepare index: %w (CRITICAL: %d rollback failures, e.g., %v)", err, len(rollbackErrs), rollbackErrs[0])
+				} else {
+					errCh <- fmt.Errorf("failed to prepare index for batch insert: %w", err)
+				}
 				return
 			}
 			if err := insertEntriesIntoIndex(ctx, s.index, shardEntries); err != nil {
+				var rollbackErrs []error
 				for _, storedEntry := range shardEntries {
-					_ = s.storage.Delete(ctx, storedEntry.ID)
+					if delErr := s.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+						rollbackErrs = append(rollbackErrs, delErr)
+					}
 				}
-				errCh <- fmt.Errorf("failed to insert into shard %d index: %w", shardIdx, err)
+				if len(rollbackErrs) > 0 {
+					errCh <- fmt.Errorf("failed to insert into index: %w (CRITICAL: %d rollback failures, e.g., %v)", err, len(rollbackErrs), rollbackErrs[0])
+				} else {
+					errCh <- fmt.Errorf("failed to insert into index: %w", err)
+				}
 				return
 			}
 		}(shardIdx, shardRef, shardEntries)
@@ -1108,7 +1132,9 @@ func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []f
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 		if err := c.index.Insert(ctx, entry); err != nil {
-			_ = c.storage.Delete(ctx, id)
+			if delErr := c.storage.Delete(ctx, id); delErr != nil {
+				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
+			}
 			return fmt.Errorf("failed to insert into index: %w", err)
 		}
 		if c.metrics != nil {
@@ -1151,9 +1177,12 @@ func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []f
 }
 
 func (c *Collection) updateSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	unlock := c.lockMutationIDs([]string{id})
+	defer unlock()
+
 	shard := c.getShard(id)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
 	existingEntry, err := shard.storage.Get(ctx, id)
 	if err != nil {
@@ -1213,9 +1242,12 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 }
 
 func (c *Collection) upsertSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	unlock := c.lockMutationIDs([]string{id})
+	defer unlock()
+
 	shard := c.getShard(id)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
 	exists, err := shard.storage.Exists(ctx, id)
 	if err != nil {
@@ -1233,7 +1265,9 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 		if err := shard.index.Insert(ctx, entry); err != nil {
-			_ = shard.storage.Delete(ctx, id)
+			if delErr := shard.storage.Delete(ctx, id); delErr != nil {
+				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
+			}
 			return fmt.Errorf("failed to insert into index: %w", err)
 		}
 		if c.metrics != nil {
@@ -1329,10 +1363,13 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	}
 
 	// Sharded path: route to the correct shard for this ID
+	unlock := c.lockMutationIDs([]string{id})
+	defer unlock()
+
 	shard := c.getShard(id)
-	shard.mu.Lock()
+	shard.mu.RLock()
 	defer c.mu.RUnlock()
-	defer shard.mu.Unlock()
+	defer shard.mu.RUnlock()
 
 	var indexErr error
 	if entry, err := shard.storage.Get(ctx, id); err == nil {
@@ -1378,6 +1415,9 @@ func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, util.ErrNotFound) || errors.Is(err, util.ErrEmptyIndex) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not found") ||
 		strings.Contains(msg, "does not exist") ||
@@ -1412,7 +1452,7 @@ func (c *Collection) DeleteBatch(ctx context.Context, ids []string) error {
 func (c *Collection) Get(ctx context.Context, id string) (Record, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	if c.closed {
 		return Record{}, ErrCollectionClosed
 	}
@@ -1462,7 +1502,7 @@ func (c *Collection) withCAS(ctx context.Context, fn func(tx Tx) error) error {
 func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	if c.closed {
 		return ErrCollectionClosed
 	}
@@ -1524,7 +1564,7 @@ func (c *Collection) ListByMetadata(ctx context.Context, field string, value int
 func (c *Collection) Count(ctx context.Context) (int, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	if c.closed {
 		return 0, ErrCollectionClosed
 	}
@@ -1573,7 +1613,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	if c.closed {
 		return nil, ErrCollectionClosed
 	}
@@ -1599,8 +1639,8 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 
 	// Search all shards in parallel and collect results
 	type shardResult struct {
-		results []*index.SearchResult
 		err     error
+		results []*index.SearchResult
 	}
 
 	var resultsCh chan shardResult
@@ -1799,7 +1839,7 @@ func (c *Collection) Query(ctx context.Context) *QueryBuilder {
 }
 
 // Stats returns collection statistics
-func (c *Collection) Stats() *CollectionStats {
+func (c *Collection) Stats(ctx context.Context) *CollectionStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -1810,14 +1850,14 @@ func (c *Collection) Stats() *CollectionStats {
 	if c.shards != nil {
 		// Aggregate stats from all shards
 		for i := range c.shards {
-			if su, err := c.shards[i].storage.MemoryUsage(context.Background()); err == nil {
+			if su, err := c.shards[i].storage.MemoryUsage(ctx); err == nil {
 				storageUsage += su
 			}
 			indexUsage += c.shards[i].index.MemoryUsage()
 			vectorCount += c.shards[i].index.Size()
 		}
 	} else {
-		storageUsage = c.storageMemoryUsageLocked()
+		storageUsage = c.storageMemoryUsageLocked(ctx)
 		indexUsage = c.index.MemoryUsage()
 		vectorCount = c.index.Size()
 	}
@@ -1845,7 +1885,7 @@ func (c *Collection) Stats() *CollectionStats {
 			MemoryMapped:  usage.MemoryMapped,
 			Limit:         usage.Limit,
 			Available:     usage.Available,
-			PressureLevel: "normal", // TODO: Calculate actual pressure level
+			PressureLevel: calculatePressureLevel(storageUsage+usage.Total, usage.Limit),
 			Timestamp:     usage.Timestamp,
 		}
 	} else {
@@ -1853,7 +1893,8 @@ func (c *Collection) Stats() *CollectionStats {
 			Total:         storageUsage + indexUsage,
 			Storage:       storageUsage,
 			Index:         indexUsage,
-			PressureLevel: "normal",
+			Limit:         c.config.MemoryLimit,
+			PressureLevel: calculatePressureLevel(storageUsage+indexUsage, c.config.MemoryLimit),
 			Timestamp:     time.Now(),
 		}
 	}
@@ -1886,10 +1927,10 @@ func (c *Collection) Stats() *CollectionStats {
 		var liveCount int
 		var nextOrdinal uint32
 		for i := range c.shards {
-			if cnt, err := c.shards[i].storage.Count(context.Background()); err == nil {
+			if cnt, err := c.shards[i].storage.Count(ctx); err == nil {
 				liveCount += cnt
 			}
-			if no, err := c.shards[i].storage.NextOrdinal(context.Background()); err == nil && no > nextOrdinal {
+			if no, err := c.shards[i].storage.NextOrdinal(ctx); err == nil && no > nextOrdinal {
 				nextOrdinal = no
 			}
 		}
@@ -1899,10 +1940,10 @@ func (c *Collection) Stats() *CollectionStats {
 			stats.OrdinalUtilization = float64(liveCount) / float64(nextOrdinal)
 		}
 	} else {
-		if cnt, err := c.storage.Count(context.Background()); err == nil {
+		if cnt, err := c.storage.Count(ctx); err == nil {
 			stats.LiveRecordCount = cnt
 		}
-		if no, err := c.storage.NextOrdinal(context.Background()); err == nil {
+		if no, err := c.storage.NextOrdinal(ctx); err == nil {
 			stats.NextOrdinal = no
 			if no > 0 {
 				stats.OrdinalUtilization = float64(stats.LiveRecordCount) / float64(no)
@@ -1914,7 +1955,7 @@ func (c *Collection) Stats() *CollectionStats {
 }
 
 // GetMemoryUsage returns current memory usage statistics for the collection
-func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
+func (c *Collection) GetMemoryUsage(ctx context.Context) (*memory.MemoryUsage, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -1928,13 +1969,13 @@ func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
 	if c.shards != nil {
 		// Aggregate memory usage from all shards
 		for i := range c.shards {
-			if su, err := c.shards[i].storage.MemoryUsage(context.Background()); err == nil {
+			if su, err := c.shards[i].storage.MemoryUsage(ctx); err == nil {
 				totalStorage += su
 			}
 			totalIndex += c.shards[i].index.MemoryUsage()
 		}
 	} else {
-		totalStorage = c.storageMemoryUsageLocked()
+		totalStorage = c.storageMemoryUsageLocked(ctx)
 		totalIndex = c.index.MemoryUsage()
 	}
 
@@ -1955,11 +1996,11 @@ func (c *Collection) GetMemoryUsage() (*memory.MemoryUsage, error) {
 	return &usage, nil
 }
 
-func (c *Collection) storageMemoryUsageLocked() int64 {
+func (c *Collection) storageMemoryUsageLocked(ctx context.Context) int64 {
 	if c.storage == nil {
 		return 0
 	}
-	usage, err := c.storage.MemoryUsage(context.Background())
+	usage, err := c.storage.MemoryUsage(ctx)
 	if err != nil {
 		return 0
 	}

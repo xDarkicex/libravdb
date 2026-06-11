@@ -116,13 +116,13 @@ func TestAutoTuneConfigMemoryConstraints(t *testing.T) {
 
 	// Test different memory constraints
 	memoryConstraints := []struct {
+		description  string
 		targetMB     int
 		expectedBits int
-		description  string
 	}{
-		{50, 6, "Aggressive compression"}, // Adjusted based on actual algorithm
-		{200, 8, "Moderate compression"},  // Adjusted based on actual algorithm
-		{500, 8, "Light compression"},
+		{targetMB: 50, expectedBits: 6, description: "Aggressive compression"}, // Adjusted based on actual algorithm
+		{targetMB: 200, expectedBits: 8, description: "Moderate compression"},  // Adjusted based on actual algorithm
+		{targetMB: 500, expectedBits: 8, description: "Light compression"},
 	}
 
 	for _, constraint := range memoryConstraints {

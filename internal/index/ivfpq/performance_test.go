@@ -47,8 +47,8 @@ func TestIVFPQvsHNSWPerformance(t *testing.T) {
 
 			// Test IVF-PQ with different configurations
 			ivfpqConfigs := []struct {
-				name   string
 				config *Config
+				name   string
 			}{
 				{
 					name:   "IVF-PQ_Default",
@@ -278,8 +278,8 @@ func TestQuantizationEffectiveness(t *testing.T) {
 
 	// Test different quantization configurations
 	quantConfigs := []struct {
-		name   string
 		config *quant.QuantizationConfig
+		name   string
 	}{
 		{
 			name:   "No_Quantization",

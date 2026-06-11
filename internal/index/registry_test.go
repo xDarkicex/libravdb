@@ -12,9 +12,9 @@ func TestIndexFactory_CreateIndex(t *testing.T) {
 	factory := NewIndexFactory()
 
 	tests := []struct {
+		config      interface{}
 		name        string
 		indexType   IndexType
-		config      interface{}
 		expectError bool
 	}{
 		{

@@ -6,8 +6,6 @@ import (
 
 // Binary format constants
 const (
-	// Magic number for HNSW index files: "HNSWVIDX"
-	IndexFileMagic = "HNSWVIDX"
 
 	// Current binary format version
 	FormatVersion = uint32(1)
@@ -25,24 +23,18 @@ const (
 // IndexFileHeader defines the binary file format header
 // Total size: 128 bytes (cache-line friendly)
 type IndexFileHeader struct {
-	Magic     [8]byte // "HNSWVIDX" magic identifier
-	Version   uint32  // Binary format version
-	NodeCount uint32  // Total number of nodes in index
-	Dimension uint32  // Vector dimension
-	MaxLevel  int32   // Maximum graph level
-
-	// Section sizes (for efficient seeking)
-	ConfigSize uint32 // Config section size in bytes
-	NodesSize  uint64 // Nodes section size in bytes
-	LinksSize  uint64 // Links section size in bytes
-	MetaSize   uint32 // Metadata section size in bytes
-
-	// Integrity and performance
-	ChecksumCRC uint32 // Header + all sections CRC32
-	Compressed  uint32 // Compression flags (reserved for future)
-
-	// Reserved space for future extensions
-	Reserved [32]byte // Must be zero-filled
+	NodesSize   uint64
+	LinksSize   uint64
+	Version     uint32
+	NodeCount   uint32
+	Dimension   uint32
+	MaxLevel    int32
+	ConfigSize  uint32
+	MetaSize    uint32
+	ChecksumCRC uint32
+	Compressed  uint32
+	Reserved    [32]byte
+	Magic       [8]byte
 }
 
 // NodeEntry represents a single node in the binary format
@@ -96,13 +88,13 @@ type MetadataEntry struct {
 
 // HNSWPersistenceMetadata holds metadata about persisted HNSW index
 type HNSWPersistenceMetadata struct {
-	Version       uint32    `json:"version"`
+	CreatedAt     time.Time `json:"created_at"`
 	NodeCount     int       `json:"node_count"`
 	Dimension     int       `json:"dimension"`
 	MaxLevel      int       `json:"max_level"`
-	CreatedAt     time.Time `json:"created_at"`
-	ChecksumCRC32 uint32    `json:"checksum_crc32"`
 	FileSize      int64     `json:"file_size"`
+	Version       uint32    `json:"version"`
+	ChecksumCRC32 uint32    `json:"checksum_crc32"`
 }
 
 // File layout specification:

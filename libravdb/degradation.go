@@ -9,28 +9,30 @@ import (
 
 // GracefulDegradationManagerImpl implements GracefulDegradationManager
 type GracefulDegradationManagerImpl struct {
-	mu                  sync.RWMutex
-	degradationLevel    int
-	maxDegradationLevel int
 	memoryManager       MemoryManager
 	quantizationManager QuantizationManager
 	indexManager        IndexManager
-	config              DegradationConfig
 	activeDegradations  map[string]DegradationAction
+	callbackSem         chan struct{}
 	degradationHistory  []DegradationEvent
 	callbacks           []DegradationCallback
+	config              DegradationConfig
+	callbackWg          sync.WaitGroup
+	degradationLevel    int
+	maxDegradationLevel int
+	mu                  sync.RWMutex
 }
 
 // DegradationConfig configures graceful degradation behavior
 type DegradationConfig struct {
+	MaxDegradationLevel        int           `json:"max_degradation_level"`
+	RecoveryTimeout            time.Duration `json:"recovery_timeout"`
+	RecoveryCheckInterval      time.Duration `json:"recovery_check_interval"`
 	EnableQuantizationFallback bool          `json:"enable_quantization_fallback"`
 	EnableMemoryMapping        bool          `json:"enable_memory_mapping"`
 	EnableCacheEviction        bool          `json:"enable_cache_eviction"`
 	EnableIndexSimplification  bool          `json:"enable_index_simplification"`
-	MaxDegradationLevel        int           `json:"max_degradation_level"`
-	RecoveryTimeout            time.Duration `json:"recovery_timeout"`
 	AutoRecoveryEnabled        bool          `json:"auto_recovery_enabled"`
-	RecoveryCheckInterval      time.Duration `json:"recovery_check_interval"`
 }
 
 // DefaultDegradationConfig returns sensible defaults
@@ -49,24 +51,24 @@ func DefaultDegradationConfig() DegradationConfig {
 
 // DegradationAction represents an active degradation
 type DegradationAction struct {
-	Type        string                 `json:"type"`
-	Level       int                    `json:"level"`
 	StartTime   time.Time              `json:"start_time"`
-	Description string                 `json:"description"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Type        string                 `json:"type"`
+	Description string                 `json:"description"`
+	Level       int                    `json:"level"`
 	Reversible  bool                   `json:"reversible"`
 }
 
 // DegradationEvent represents a degradation event in history
 type DegradationEvent struct {
 	Timestamp time.Time              `json:"timestamp"`
-	Action    string                 `json:"action"` // "apply" or "revert"
-	Type      string                 `json:"type"`
-	Level     int                    `json:"level"`
-	Reason    string                 `json:"reason"`
-	Success   bool                   `json:"success"`
-	Duration  time.Duration          `json:"duration"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	Action    string                 `json:"action"`
+	Type      string                 `json:"type"`
+	Reason    string                 `json:"reason"`
+	Level     int                    `json:"level"`
+	Duration  time.Duration          `json:"duration"`
+	Success   bool                   `json:"success"`
 }
 
 // DegradationCallback is called when degradation actions are applied or reverted
@@ -84,6 +86,7 @@ type MemoryManager interface {
 
 // MemoryUsage represents memory usage statistics
 type MemoryUsage struct {
+	Timestamp    time.Time `json:"timestamp"`
 	Total        int64     `json:"total"`
 	Indices      int64     `json:"indices"`
 	Caches       int64     `json:"caches"`
@@ -91,7 +94,6 @@ type MemoryUsage struct {
 	MemoryMapped int64     `json:"memory_mapped"`
 	Available    int64     `json:"available"`
 	Limit        int64     `json:"limit"`
-	Timestamp    time.Time `json:"timestamp"`
 }
 
 // QuantizationManager interface for degradation
@@ -118,6 +120,7 @@ func NewGracefulDegradationManager(config DegradationConfig) *GracefulDegradatio
 		activeDegradations:  make(map[string]DegradationAction),
 		degradationHistory:  make([]DegradationEvent, 0),
 		callbacks:           make([]DegradationCallback, 0),
+		callbackSem:         make(chan struct{}, 100),
 	}
 }
 
@@ -473,7 +476,17 @@ func (gdm *GracefulDegradationManagerImpl) recordDegradationAction(actionType st
 // notifyCallbacks notifies all registered callbacks
 func (gdm *GracefulDegradationManagerImpl) notifyCallbacks(event DegradationEvent) {
 	for _, callback := range gdm.callbacks {
-		go callback(event)
+		select {
+		case gdm.callbackSem <- struct{}{}:
+			gdm.callbackWg.Add(1)
+			go func(cb DegradationCallback) {
+				defer gdm.callbackWg.Done()
+				defer func() { <-gdm.callbackSem }()
+				cb(event)
+			}(callback)
+		default:
+			// If overloaded, skip to avoid unbounded goroutine spawn
+		}
 	}
 }
 

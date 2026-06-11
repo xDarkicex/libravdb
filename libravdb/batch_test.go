@@ -1151,7 +1151,7 @@ func TestShardedBatchInsertParallelizesAcrossShards(t *testing.T) {
 	}
 
 	// Verify collection has the expected total count (200 entries * 2 batches)
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.VectorCount != entryCount*2 {
 		t.Errorf("Expected collection count %d, got %d", entryCount*2, stats.VectorCount)
 	}

@@ -151,13 +151,13 @@ func TestCalculateMemoryTrend(t *testing.T) {
 
 func TestTrendDirectionString(t *testing.T) {
 	tests := []struct {
-		direction TrendDirection
 		expected  string
+		direction TrendDirection
 	}{
-		{TrendUnknown, "unknown"},
-		{TrendIncreasing, "increasing"},
-		{TrendDecreasing, "decreasing"},
-		{TrendStable, "stable"},
+		{expected: "unknown", direction: TrendUnknown},
+		{expected: "increasing", direction: TrendIncreasing},
+		{expected: "decreasing", direction: TrendDecreasing},
+		{expected: "stable", direction: TrendStable},
 	}
 
 	for _, test := range tests {

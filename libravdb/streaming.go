@@ -13,105 +13,72 @@ import (
 // StreamingBatchInsert provides a streaming interface for large dataset ingestion
 // with memory-efficient processing and backpressure handling
 type StreamingBatchInsert struct {
-	collection   *Collection
-	options      *StreamingOptions
-	inputChan    chan *VectorEntry
+	ctx          context.Context
 	resultChan   chan *StreamingResult
+	inputChan    chan *VectorEntry
+	collection   *Collection
 	errorChan    chan error
 	doneChan     chan struct{}
-	ctx          context.Context
+	options      *StreamingOptions
 	cancel       context.CancelFunc
-	wg           sync.WaitGroup
 	stats        *StreamingStats
 	backpressure *BackpressureController
+	wg           sync.WaitGroup
+	closeMu      sync.RWMutex
 	started      int32
 	stopped      int32
-	closeMu      sync.RWMutex
 }
 
 // StreamingOptions configures streaming batch operations
 type StreamingOptions struct {
-	// BufferSize is the size of the input buffer channel
-	BufferSize int `json:"buffer_size"`
-
-	// ChunkSize is the number of items to process in each batch
-	ChunkSize int `json:"chunk_size"`
-
-	// MaxConcurrency is the maximum number of concurrent workers
-	MaxConcurrency int `json:"max_concurrency"`
-
-	// FlushInterval is how often to flush pending items
-	FlushInterval time.Duration `json:"flush_interval"`
-
-	// MaxMemoryUsage is the maximum memory usage before applying backpressure
-	MaxMemoryUsage int64 `json:"max_memory_usage"`
-
-	// BackpressureThreshold is the buffer fill percentage that triggers backpressure
-	BackpressureThreshold float64 `json:"backpressure_threshold"`
-
-	// Timeout is the overall timeout for the streaming operation
-	Timeout time.Duration `json:"timeout"`
-
-	// EnableBackpressure determines if backpressure handling is enabled
-	EnableBackpressure bool `json:"enable_backpressure"`
-
-	// ProgressCallback is called periodically with progress updates
-	ProgressCallback func(stats *StreamingStats) `json:"-"`
-
-	// ErrorCallback is called when errors occur during processing
-	ErrorCallback func(err error, entry *VectorEntry) `json:"-"`
-
-	// CompletionCallback is called when streaming completes
-	CompletionCallback func(finalStats *StreamingStats) `json:"-"`
+	ProgressCallback      func(stats *StreamingStats)         `json:"-"`
+	ErrorCallback         func(err error, entry *VectorEntry) `json:"-"`
+	CompletionCallback    func(finalStats *StreamingStats)    `json:"-"`
+	BufferSize            int                                 `json:"buffer_size"`
+	ChunkSize             int                                 `json:"chunk_size"`
+	MaxConcurrency        int                                 `json:"max_concurrency"`
+	FlushInterval         time.Duration                       `json:"flush_interval"`
+	MaxMemoryUsage        int64                               `json:"max_memory_usage"`
+	BackpressureThreshold float64                             `json:"backpressure_threshold"`
+	Timeout               time.Duration                       `json:"timeout"`
+	EnableBackpressure    bool                                `json:"enable_backpressure"`
 }
 
 // StreamingResult represents the result of processing a batch of items
 type StreamingResult struct {
+	Timestamp  time.Time          `json:"timestamp"`
+	Errors     []error            `json:"errors,omitempty"`
+	Items      []*BatchItemResult `json:"items,omitempty"`
 	BatchID    int                `json:"batch_id"`
 	Processed  int                `json:"processed"`
 	Successful int                `json:"successful"`
 	Failed     int                `json:"failed"`
-	Errors     []error            `json:"errors,omitempty"`
-	Items      []*BatchItemResult `json:"items,omitempty"`
 	Duration   time.Duration      `json:"duration"`
-	Timestamp  time.Time          `json:"timestamp"`
 }
 
 // StreamingStats provides real-time statistics for streaming operations
 type StreamingStats struct {
-	// Counters
-	TotalReceived   int64 `json:"total_received"`
-	TotalProcessed  int64 `json:"total_processed"`
-	TotalSuccessful int64 `json:"total_successful"`
-	TotalFailed     int64 `json:"total_failed"`
-
-	// Rates
-	ItemsPerSecond float64 `json:"items_per_second"`
-	SuccessRate    float64 `json:"success_rate"`
-	ErrorRate      float64 `json:"error_rate"`
-
-	// Memory and backpressure
-	CurrentMemoryUsage int64   `json:"current_memory_usage"`
-	BufferUtilization  float64 `json:"buffer_utilization"`
-	BackpressureActive bool    `json:"backpressure_active"`
-
-	// Timing
-	StartTime    time.Time     `json:"start_time"`
-	LastUpdate   time.Time     `json:"last_update"`
-	ElapsedTime  time.Duration `json:"elapsed_time"`
-	EstimatedETA time.Duration `json:"estimated_eta,omitempty"`
-
-	// Current state
-	ActiveWorkers int    `json:"active_workers"`
-	QueuedItems   int    `json:"queued_items"`
-	Status        string `json:"status"`
-
-	// Errors
-	LastError    error            `json:"last_error,omitempty"`
-	ErrorsByType map[string]int64 `json:"errors_by_type,omitempty"`
-	RecentErrors []error          `json:"recent_errors,omitempty"`
-
-	mutex sync.RWMutex
+	StartTime          time.Time        `json:"start_time"`
+	LastUpdate         time.Time        `json:"last_update"`
+	LastError          error            `json:"last_error,omitempty"`
+	ErrorsByType       map[string]int64 `json:"errors_by_type,omitempty"`
+	Status             string           `json:"status"`
+	RecentErrors       []error          `json:"recent_errors,omitempty"`
+	SuccessRate        float64          `json:"success_rate"`
+	EstimatedETA       time.Duration    `json:"estimated_eta,omitempty"`
+	BufferUtilization  float64          `json:"buffer_utilization"`
+	TotalProcessed     int64            `json:"total_processed"`
+	ErrorRate          float64          `json:"error_rate"`
+	TotalReceived      int64            `json:"total_received"`
+	ElapsedTime        time.Duration    `json:"elapsed_time"`
+	CurrentMemoryUsage int64            `json:"current_memory_usage"`
+	ActiveWorkers      int              `json:"active_workers"`
+	QueuedItems        int              `json:"queued_items"`
+	ItemsPerSecond     float64          `json:"items_per_second"`
+	TotalFailed        int64            `json:"total_failed"`
+	TotalSuccessful    int64            `json:"total_successful"`
+	mutex              sync.RWMutex
+	BackpressureActive bool `json:"backpressure_active"`
 }
 
 // BackpressureController manages backpressure for streaming operations
@@ -147,9 +114,12 @@ func (c *Collection) NewStreamingBatchInsert(opts ...*StreamingOptions) *Streami
 		options = opts[0]
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if options.Timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		ctx, cancel = context.WithTimeout(context.Background(), options.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
 	}
 
 	stats := &StreamingStats{
@@ -737,38 +707,38 @@ func (c *Collection) StreamFromReader(reader StreamingReader, opts ...*Streaming
 
 // StreamingBatchUpdate provides a streaming interface for large-scale update operations
 type StreamingBatchUpdate struct {
-	collection   *Collection
-	options      *StreamingOptions
-	inputChan    chan *VectorUpdate
+	ctx          context.Context
 	resultChan   chan *StreamingResult
+	inputChan    chan *VectorUpdate
+	collection   *Collection
 	errorChan    chan error
 	doneChan     chan struct{}
-	ctx          context.Context
+	options      *StreamingOptions
 	cancel       context.CancelFunc
-	wg           sync.WaitGroup
 	stats        *StreamingStats
 	backpressure *BackpressureController
+	wg           sync.WaitGroup
+	closeMu      sync.RWMutex
 	started      int32
 	stopped      int32
-	closeMu      sync.RWMutex
 }
 
 // StreamingBatchDelete provides a streaming interface for large-scale delete operations
 type StreamingBatchDelete struct {
-	collection   *Collection
-	options      *StreamingOptions
-	inputChan    chan string // Channel for IDs to delete
+	ctx          context.Context
 	resultChan   chan *StreamingResult
+	inputChan    chan string
+	collection   *Collection
 	errorChan    chan error
 	doneChan     chan struct{}
-	ctx          context.Context
+	options      *StreamingOptions
 	cancel       context.CancelFunc
-	wg           sync.WaitGroup
 	stats        *StreamingStats
 	backpressure *BackpressureController
+	wg           sync.WaitGroup
+	closeMu      sync.RWMutex
 	started      int32
 	stopped      int32
-	closeMu      sync.RWMutex
 }
 
 // NewStreamingBatchUpdate creates a new streaming batch update operation
@@ -778,9 +748,12 @@ func (c *Collection) NewStreamingBatchUpdate(opts ...*StreamingOptions) *Streami
 		options = opts[0]
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if options.Timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		ctx, cancel = context.WithTimeout(context.Background(), options.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
 	}
 
 	stats := &StreamingStats{
@@ -818,9 +791,12 @@ func (c *Collection) NewStreamingBatchDelete(opts ...*StreamingOptions) *Streami
 		options = opts[0]
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if options.Timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, options.Timeout)
+		ctx, cancel = context.WithTimeout(context.Background(), options.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
 	}
 
 	stats := &StreamingStats{

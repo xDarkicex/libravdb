@@ -378,12 +378,12 @@ func TestValidateQuantizationHealth(t *testing.T) {
 
 // Mock quantizer for testing
 type mockQuantizerForErrors struct {
-	trained         bool
 	config          *QuantizationConfig
 	memoryUsage     int64
-	trainShouldFail bool
 	trainFailCount  int
 	trainCallCount  int
+	trained         bool
+	trainShouldFail bool
 }
 
 func (mq *mockQuantizerForErrors) Train(ctx context.Context, vectors [][]float32) error {
@@ -422,9 +422,9 @@ func (mq *mockQuantizerForErrors) Distance(compressed1, compressed2 []byte) (flo
 	return 0.5, nil
 }
 
-func (mq *mockQuantizerForErrors) PrepareQuery(query []float32) {}
+func (mq *mockQuantizerForErrors) PrepareQuery(query []float32) any { return nil }
 
-func (mq *mockQuantizerForErrors) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
+func (mq *mockQuantizerForErrors) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {
 	return 0.3, nil
 }
 
@@ -440,8 +440,12 @@ func (mq *mockQuantizerForErrors) IsTrained() bool {
 	return mq.trained
 }
 
-func (mq *mockQuantizerForErrors) Config() *QuantizationConfig {
-	return mq.config
+func (m *mockQuantizerForErrors) Config() *QuantizationConfig {
+	return m.config
+}
+
+func (m *mockQuantizerForErrors) Close() error {
+	return nil
 }
 
 // Helper function to generate test vectors

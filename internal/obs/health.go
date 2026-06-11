@@ -6,14 +6,14 @@ import (
 
 // HealthStatus represents the health status of the database
 type HealthStatus struct {
-	Status string                  `json:"status"`
 	Checks map[string]*CheckResult `json:"checks"`
+	Status string                  `json:"status"`
 }
 
 // CheckResult represents the result of a single health check
 type CheckResult struct {
-	Healthy bool   `json:"healthy"`
 	Message string `json:"message"`
+	Healthy bool   `json:"healthy"`
 }
 
 // HealthChecker performs health checks

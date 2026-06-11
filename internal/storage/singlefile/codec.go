@@ -13,8 +13,8 @@ const (
 )
 
 type encodedPayload struct {
-	bytes   []byte
 	encoder *util.BinaryEncoder
+	bytes   []byte
 }
 
 func emptyPayload() encodedPayload {
@@ -208,6 +208,11 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 	enc.WriteUint32(uint32(config.Version))
 	enc.WriteString(config.RawVectorStore)
 	enc.WriteUint32(uint32(config.RawStoreCap))
+	if config.Version >= 2 {
+		// Calculate size of optional fields (NClusters, NProbes)
+		optSize := uint32(4 + 4)
+		enc.WriteUint32(optSize)
+	}
 	enc.WriteUint32(uint32(config.NClusters))
 	enc.WriteUint32(uint32(config.NProbes))
 	return nil
@@ -269,7 +274,11 @@ func estimateCollectionSize(collection *persistedCollection) int {
 }
 
 func estimateCollectionConfigSize(config storage.CollectionConfig) int {
-	return 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4 + 4 + 4
+	size := 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4 + 4 + 4
+	if config.Version >= 2 {
+		size += 4 // length prefix
+	}
+	return size
 }
 
 func estimateCollectionCreatePayloadSize(payload collectionCreatePayload) int {
@@ -323,20 +332,49 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	}
 
 	var nClusters uint32
-	if dec.Off+4 <= len(dec.Data) {
-		nClusters, err = dec.ReadUint32()
-		if err != nil {
-			return storage.CollectionConfig{}, err
+	var nProbes uint32
+
+	if version >= 2 {
+		if dec.Off+4 <= len(dec.Data) {
+			optSize, err := dec.ReadUint32()
+			if err != nil {
+				return storage.CollectionConfig{}, err
+			}
+			// Only read if we have exactly the optSize bytes remaining, or limit the read
+			// For now, we know the two fields take 8 bytes.
+			if optSize >= 4 && dec.Off+4 <= len(dec.Data) {
+				nClusters, err = dec.ReadUint32()
+				if err != nil {
+					return storage.CollectionConfig{}, err
+				}
+			}
+			if optSize >= 8 && dec.Off+4 <= len(dec.Data) {
+				nProbes, err = dec.ReadUint32()
+				if err != nil {
+					return storage.CollectionConfig{}, err
+				}
+			}
+			// Skip any trailing unknown optional fields based on the length prefix
+			if optSize > 8 {
+				dec.Off += int(optSize) - 8
+			}
+		}
+	} else {
+		if dec.Off+4 <= len(dec.Data) {
+			nClusters, err = dec.ReadUint32()
+			if err != nil {
+				return storage.CollectionConfig{}, err
+			}
+		}
+
+		if dec.Off+4 <= len(dec.Data) {
+			nProbes, err = dec.ReadUint32()
+			if err != nil {
+				return storage.CollectionConfig{}, err
+			}
 		}
 	}
 
-	var nProbes uint32
-	if dec.Off+4 <= len(dec.Data) {
-		nProbes, err = dec.ReadUint32()
-		if err != nil {
-			return storage.CollectionConfig{}, err
-		}
-	}
 	return storage.CollectionConfig{
 		Dimension:      int(dimension),
 		Metric:         int(metric),

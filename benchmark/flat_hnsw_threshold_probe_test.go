@@ -249,8 +249,8 @@ func TestFlatHNSWThresholdProbe(t *testing.T) {
 	defer cleanup()
 
 	// Observe index types after collection stabilization
-	belowStats := belowCol.Stats()
-	aboveStats := aboveCol.Stats()
+	belowStats := belowCol.Stats(context.Background())
+	aboveStats := aboveCol.Stats(context.Background())
 	t.Logf("Below-threshold index type: %s", belowStats.IndexType)
 	t.Logf("Above-threshold index type: %s", aboveStats.IndexType)
 	t.Logf("Below-threshold vector count: %d", belowStats.VectorCount)

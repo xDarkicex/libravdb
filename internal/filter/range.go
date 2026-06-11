@@ -8,9 +8,9 @@ import (
 
 // RangeFilter implements range-based filtering for numeric and date fields
 type RangeFilter struct {
+	Min   interface{}
+	Max   interface{}
 	Field string
-	Min   interface{} // nil means no lower bound
-	Max   interface{} // nil means no upper bound
 }
 
 // NewRangeFilter creates a new range filter

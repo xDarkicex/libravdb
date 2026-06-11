@@ -15,21 +15,21 @@ import (
 
 // WAL implements write-ahead logging for durability
 type WAL struct {
-	mu     sync.RWMutex
 	file   *os.File
 	writer *bufio.Writer
 	path   string
 	offset int64
+	mu     sync.RWMutex
 	closed bool
 }
 
 // Entry represents a single WAL entry
 type Entry struct {
-	Timestamp uint64
-	Operation Operation
+	Metadata  map[string]interface{}
 	ID        string
 	Vector    []float32
-	Metadata  map[string]interface{}
+	Timestamp uint64
+	Operation Operation
 }
 
 // Operation defines the type of operation

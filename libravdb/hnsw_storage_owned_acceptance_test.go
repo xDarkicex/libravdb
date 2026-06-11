@@ -296,7 +296,7 @@ func TestHNSW2500MemoryAcceptance(t *testing.T) {
 		t.Fatalf("expected no raw vector duplication profile, got %v", raw)
 	}
 
-	usage, err := collection.GetMemoryUsage()
+	usage, err := collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("get memory usage: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestHNSW2500MemoryAcceptance(t *testing.T) {
 		t.Fatalf("expected positive total memory usage, got %d", usage.Total)
 	}
 
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.MemoryStats == nil {
 		t.Fatalf("expected memory stats")
 	}

@@ -14,7 +14,8 @@ func TestAppendUniqueLinkPreventsDuplicates(t *testing.T) {
 		Links: [][]uint32{{1, 2}},
 	}
 
-	if added := appendUniqueLink(node, 8, 0, 2); added {
+	idx := &Index{config: &Config{M: 8}}
+	if added := idx.appendUniqueLink(node, 8, 0, 2); added {
 		t.Fatal("expected duplicate link append to be skipped")
 	}
 
@@ -22,7 +23,7 @@ func TestAppendUniqueLinkPreventsDuplicates(t *testing.T) {
 		t.Fatalf("expected link count to remain 2, got %d", len(node.Links[0]))
 	}
 
-	if added := appendUniqueLink(node, 8, 0, 3); !added {
+	if added := idx.appendUniqueLink(node, 8, 0, 3); !added {
 		t.Fatal("expected unique link to be appended")
 	}
 

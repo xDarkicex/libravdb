@@ -101,8 +101,8 @@ func TestEqualityFilter_NumericTypeConversion(t *testing.T) {
 
 func TestEqualityFilter_Validate(t *testing.T) {
 	tests := []struct {
-		name      string
 		filter    *EqualityFilter
+		name      string
 		wantError bool
 	}{
 		{

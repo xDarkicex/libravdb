@@ -76,7 +76,7 @@ func TestQuantizationIntegration(t *testing.T) {
 		}
 
 		// Verify collection stats
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != 50 {
 			t.Errorf("Expected 50 vectors, got %d", stats.VectorCount)
 		}
@@ -200,8 +200,8 @@ func TestQuantizationIntegration(t *testing.T) {
 		}
 
 		// Compare memory usage
-		unquantizedStats := unquantizedCollection.Stats()
-		quantizedStats := quantizedCollection.Stats()
+		unquantizedStats := unquantizedCollection.Stats(context.Background())
+		quantizedStats := quantizedCollection.Stats(context.Background())
 
 		t.Logf("Unquantized memory: %d bytes", unquantizedStats.MemoryUsage)
 		t.Logf("Quantized memory: %d bytes", quantizedStats.MemoryUsage)

@@ -8,14 +8,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 func TestNewFlat(t *testing.T) {
 	tests := []struct {
-		name      string
 		config    *Config
+		name      string
 		expectErr bool
 	}{
 		{
@@ -588,8 +588,8 @@ func BenchmarkFlatSearch(b *testing.B) {
 func TestFlatInsert_SharesMetadataReference(t *testing.T) {
 	idx, _ := NewFlat(&Config{Dimension: 1, Metric: util.L2Distance})
 	entry := &VectorEntry{
-		ID: "x", 
-		Vector: []float32{1}, 
+		ID:       "x",
+		Vector:   []float32{1},
 		Metadata: map[string]interface{}{"k": "v"},
 	}
 	ctx := context.Background()
@@ -606,9 +606,9 @@ func TestFlatInsert_SharesMetadataReference(t *testing.T) {
 func TestSearchArenaBacked(t *testing.T) {
 	dim := 16
 	cfg := &Config{
-		Dimension:      dim,
-		Metric:         util.L2Distance,
-		Quantization:   nil,
+		Dimension:    dim,
+		Metric:       util.L2Distance,
+		Quantization: nil,
 	}
 	idx, err := NewFlat(cfg)
 	if err != nil {

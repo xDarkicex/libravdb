@@ -27,16 +27,16 @@ const (
 
 // MemoryError represents a memory management specific error
 type MemoryError struct {
-	Code        MemoryErrorCode        `json:"code"`
+	Timestamp   time.Time              `json:"timestamp"`
+	Cause       error                  `json:"cause,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Usage       *MemoryUsage           `json:"usage,omitempty"`
 	Message     string                 `json:"message"`
 	Component   string                 `json:"component"`
 	Operation   string                 `json:"operation"`
+	Code        MemoryErrorCode        `json:"code"`
 	Retryable   bool                   `json:"retryable"`
 	Recoverable bool                   `json:"recoverable"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-	Cause       error                  `json:"cause,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
-	Usage       *MemoryUsage           `json:"usage,omitempty"`
 }
 
 func (me *MemoryError) Error() string {

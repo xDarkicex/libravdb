@@ -8,6 +8,7 @@ import (
 
 // CollectionConfig is the engine-level persisted collection configuration.
 type CollectionConfig struct {
+	RawVectorStore string
 	Dimension      int
 	Metric         int
 	IndexType      int
@@ -18,7 +19,6 @@ type CollectionConfig struct {
 	NProbes        int
 	ML             float64
 	Version        int
-	RawVectorStore string
 	RawStoreCap    int
 }
 
@@ -67,13 +67,13 @@ const (
 
 // TxOperation represents one row-level mutation in a transactional batch.
 type TxOperation struct {
-	Type               TxOperationType
+	Metadata           map[string]interface{}
 	Collection         string
 	ID                 string
-	Ordinal            uint32
 	Vector             []float32
-	Metadata           map[string]interface{}
 	ExpectedVersion    uint64
+	Ordinal            uint32
+	Type               TxOperationType
 	HasExpectedVersion bool
 }
 

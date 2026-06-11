@@ -32,14 +32,14 @@ func TestFlatIndexIntegration(t *testing.T) {
 
 	// Insert some test vectors
 	testVectors := []struct {
+		metadata map[string]interface{}
 		id       string
 		vector   []float32
-		metadata map[string]interface{}
 	}{
-		{"v1", []float32{1.0, 0.0, 0.0}, map[string]interface{}{"category": "A"}},
-		{"v2", []float32{0.0, 1.0, 0.0}, map[string]interface{}{"category": "B"}},
-		{"v3", []float32{0.0, 0.0, 1.0}, map[string]interface{}{"category": "A"}},
-		{"v4", []float32{1.0, 1.0, 0.0}, map[string]interface{}{"category": "C"}},
+		{id: "v1", vector: []float32{1.0, 0.0, 0.0}, metadata: map[string]interface{}{"category": "A"}},
+		{id: "v2", vector: []float32{0.0, 1.0, 0.0}, metadata: map[string]interface{}{"category": "B"}},
+		{id: "v3", vector: []float32{0.0, 0.0, 1.0}, metadata: map[string]interface{}{"category": "A"}},
+		{id: "v4", vector: []float32{0.5, 0.5, 0.0}, metadata: map[string]interface{}{"category": "C"}},
 	}
 
 	for _, tv := range testVectors {
@@ -66,7 +66,7 @@ func TestFlatIndexIntegration(t *testing.T) {
 	}
 
 	// Test that we can get stats
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.VectorCount != 4 {
 		t.Errorf("expected 4 vectors, got %d", stats.VectorCount)
 	}
@@ -98,7 +98,7 @@ func TestAutoIndexSelection(t *testing.T) {
 	}
 
 	// Initially should use Flat index for small collections
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.IndexType != "Flat" {
 		t.Errorf("expected Flat index for small collection, got %s", stats.IndexType)
 	}
@@ -113,7 +113,7 @@ func TestAutoIndexSelection(t *testing.T) {
 	}
 
 	// Should still be Flat
-	stats = collection.Stats()
+	stats = collection.Stats(context.Background())
 	if stats.IndexType != "Flat" {
 		t.Errorf("expected Flat index for small collection, got %s", stats.IndexType)
 	}

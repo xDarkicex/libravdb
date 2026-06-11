@@ -34,33 +34,33 @@ type Index interface {
 
 // VectorEntry represents a vector entry (avoid circular imports)
 type VectorEntry struct {
-	ID       string
-	Ordinal  uint32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
 }
 
 // SearchResult represents a search result (avoid circular imports)
 type SearchResult struct {
-	Ordinal  uint32
-	ID       string
-	Score    float32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
+	Score    float32
 }
 
 // NEW: PersistenceMetadata holds metadata about persisted index
 type PersistenceMetadata struct {
-	Version       uint32    `json:"version"`        // Binary format version
-	NodeCount     int       `json:"node_count"`     // Total number of nodes
-	Dimension     int       `json:"dimension"`      // Vector dimension
-	MaxLevel      int       `json:"max_level"`      // Maximum graph level
-	IndexType     string    `json:"index_type"`     // Index algorithm (HNSW, etc.)
-	CreatedAt     time.Time `json:"created_at"`     // When index was persisted
-	ChecksumCRC32 uint32    `json:"checksum_crc32"` // File integrity checksum
-	FileSize      int64     `json:"file_size"`      // Total file size in bytes
+	CreatedAt     time.Time `json:"created_at"`
+	IndexType     string    `json:"index_type"`
+	NodeCount     int       `json:"node_count"`
+	Dimension     int       `json:"dimension"`
+	MaxLevel      int       `json:"max_level"`
+	FileSize      int64     `json:"file_size"`
+	Version       uint32    `json:"version"`
+	ChecksumCRC32 uint32    `json:"checksum_crc32"`
 }
 
 // IndexType represents different index algorithms
@@ -88,26 +88,25 @@ func (it IndexType) String() string {
 
 // HNSWConfig holds configuration for HNSW index
 type HNSWConfig struct {
+	Provider       hnsw.VectorProvider
+	Quantization   *quant.QuantizationConfig
+	RawVectorStore string
 	Dimension      int
 	M              int
 	EfConstruction int
 	EfSearch       int
 	ML             float64
 	Metric         util.DistanceMetric
-	Provider       hnsw.VectorProvider
-	RawVectorStore string
 	RawStoreCap    int
-	// Quantization configuration (optional)
-	Quantization *quant.QuantizationConfig
 }
 
 // IVFPQConfig holds configuration for IVF-PQ index
 type IVFPQConfig struct {
+	Quantization  *quant.QuantizationConfig
 	Dimension     int
 	NClusters     int
 	NProbes       int
 	Metric        util.DistanceMetric
-	Quantization  *quant.QuantizationConfig
 	MaxIterations int
 	Tolerance     float64
 	RandomSeed    int64
@@ -115,9 +114,9 @@ type IVFPQConfig struct {
 
 // FlatConfig holds configuration for Flat index
 type FlatConfig struct {
+	Quantization *quant.QuantizationConfig
 	Dimension    int
 	Metric       util.DistanceMetric
-	Quantization *quant.QuantizationConfig
 }
 
 // hnswWrapper wraps the HNSW index to adapt between interface types

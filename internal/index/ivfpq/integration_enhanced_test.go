@@ -12,6 +12,9 @@ import (
 
 // TestEnhancedIVFPQIntegration tests all the enhanced features working together
 func TestEnhancedIVFPQIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
 	ctx := context.Background()
 	dimension := 64
 	datasetSize := 2000
@@ -179,6 +182,9 @@ func TestEnhancedIVFPQIntegration(t *testing.T) {
 
 // TestAutoTuningEffectiveness compares auto-tuned vs default configurations
 func TestAutoTuningEffectiveness(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
 	ctx := context.Background()
 	dimension := 32
 	datasetSize := 1000
@@ -215,17 +221,18 @@ func TestAutoTuningEffectiveness(t *testing.T) {
 
 	// Insert data into both indices
 	for i, vec := range vectors {
-		entry := &VectorEntry{
+		err := defaultIdx.Insert(ctx, &VectorEntry{
 			ID:     fmt.Sprintf("vec_%d", i),
 			Vector: vec,
-		}
-
-		err := defaultIdx.Insert(ctx, entry)
+		})
 		if err != nil {
 			t.Fatalf("Failed to insert into default index: %v", err)
 		}
 
-		err = autoIdx.Insert(ctx, entry)
+		err = autoIdx.Insert(ctx, &VectorEntry{
+			ID:     fmt.Sprintf("vec_%d", i),
+			Vector: vec,
+		})
 		if err != nil {
 			t.Fatalf("Failed to insert into auto-tuned index: %v", err)
 		}
@@ -274,6 +281,9 @@ func TestAutoTuningEffectiveness(t *testing.T) {
 
 // TestQuantizationIntegration tests the integration between coarse and fine quantization
 func TestQuantizationIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
 	ctx := context.Background()
 	dimension := 16 // Small dimension for easier testing
 	datasetSize := 500

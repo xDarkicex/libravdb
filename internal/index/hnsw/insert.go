@@ -12,12 +12,12 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 	if h.size == 1 {
 		entryID := h.findNodeID(h.entryPoint)
 		if entryID != ^uint32(0) && node.Level >= 0 {
-			if appendUniqueLink(node, levelMaxLinks(h.config.M, 0), 0, entryID) {
+			if h.appendUniqueLink(node, levelMaxLinks(h.config.M, 0), 0, entryID) {
 				if h.entryPoint != nil && 0 < len(h.entryPoint.Backlinks) {
 					h.entryPoint.Backlinks[0] = append(h.entryPoint.Backlinks[0], nodeID)
 				}
 			}
-			if appendUniqueLink(h.entryPoint, levelMaxLinks(h.config.M, 0), 0, nodeID) {
+			if h.appendUniqueLink(h.entryPoint, levelMaxLinks(h.config.M, 0), 0, nodeID) {
 				if node != nil && 0 < len(node.Backlinks) {
 					node.Backlinks[0] = append(node.Backlinks[0], entryID)
 				}
@@ -33,6 +33,12 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
 	var singleEntry [1]util.Candidate
+	
+	var queryState any
+	if h.quantizer != nil {
+		queryState = h.quantizer.PrepareQuery(searchVector)
+	}
+	
 	entryPoints := h.appendFallbackEntryPoint(nil, searchVector, h.entryPoint, &singleEntry)
 
 	for level := h.maxLevel; level > node.Level; level-- {
@@ -40,7 +46,10 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 		if currentNode == nil {
 			currentNode = h.entryPoint
 		}
-		greedy, ok := h.greedySearchLevelValue(searchVector, currentNode, level)
+		greedy, ok, err := h.greedySearchLevelValue(context.Background(), searchVector, currentNode, level, queryState)
+		if err != nil {
+			return err
+		}
 		if ok {
 			entryPoints = singleEntry[:1]
 			entryPoints[0] = greedy
@@ -61,14 +70,18 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 		if currentNode == nil {
 			currentNode = h.entryPoint
 		}
-		selected := h.searchAndSelectForConstructionWithScratch(
+		selected, err := h.searchAndSelectForConstructionWithScratch(
 			searchVector,
 			currentNode,
 			h.config.EfConstruction,
 			level,
 			levelMaxLinks(h.config.M, level),
 			scratch,
+			queryState,
 		)
+		if err != nil {
+			return err
+		}
 		if len(selected) == 0 {
 			selected = h.appendFallbackEntryPoint(selected[:0], searchVector, currentNode, &singleEntry)
 		}
@@ -109,7 +122,10 @@ func (h *Index) fallbackEntryPoints(searchVector []float32, node *Node) []*util.
 		return nil
 	}
 
-	distance := h.computeDistanceOptimized(searchVector, node)
+	distance, err := h.computeDistanceOptimized(searchVector, node, nil)
+	if err != nil {
+		return nil
+	}
 	if distance < 0 {
 		distance = 0
 	}
@@ -135,7 +151,10 @@ func (h *Index) appendFallbackEntryPoint(dst []util.Candidate, searchVector []fl
 		return nil
 	}
 
-	distance := h.computeDistanceOptimized(searchVector, node)
+	distance, err := h.computeDistanceOptimized(searchVector, node, nil)
+	if err != nil {
+		return nil
+	}
 	if distance < 0 {
 		distance = 0
 	}
@@ -170,7 +189,7 @@ func (h *Index) connectBidirectionalOptimized(nodeID uint32, neighbors []*util.C
 	node := h.nodes[nodeID]
 	maxLinks := levelMaxLinks(h.config.M, level)
 	
-	nodeLinks := ensureLinkCapacity(node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
+	nodeLinks := h.ensureLinkCapacity(level, node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
 	for _, neighbor := range neighbors {
 		nodeLinks = append(nodeLinks, neighbor.ID)
 		
@@ -187,7 +206,7 @@ func (h *Index) connectBidirectionalOptimized(nodeID uint32, neighbors []*util.C
 		if level >= len(neighborNode.Links) {
 			continue
 		}
-		neighborLinks := ensureLinkCapacity(neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
+		neighborLinks := h.ensureLinkCapacity(level, neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
 		neighborNode.Links[level] = append(neighborLinks, nodeID)
 		
 		// Add backlink to node
@@ -201,7 +220,7 @@ func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []u
 	node := h.nodes[nodeID]
 	maxLinks := levelMaxLinks(h.config.M, level)
 	
-	nodeLinks := ensureLinkCapacity(node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
+	nodeLinks := h.ensureLinkCapacity(level, node.Links[level], len(node.Links[level])+len(neighbors), maxLinks)
 	for _, neighbor := range neighbors {
 		nodeLinks = append(nodeLinks, neighbor.ID)
 		
@@ -218,7 +237,7 @@ func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []u
 		if level >= len(neighborNode.Links) {
 			continue
 		}
-		neighborLinks := ensureLinkCapacity(neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
+		neighborLinks := h.ensureLinkCapacity(level, neighborNode.Links[level], len(neighborNode.Links[level])+1, maxLinks)
 		neighborNode.Links[level] = append(neighborLinks, nodeID)
 		
 		// Add backlink to node
@@ -289,7 +308,7 @@ func levelOverflowSlack(maxLinks int) int {
 	return max(4, maxLinks/4)
 }
 
-func appendUniqueLink(node *Node, maxLinks int, level int, linkID uint32) bool {
+func (h *Index) appendUniqueLink(node *Node, maxLinks int, level int, linkID uint32) bool {
 	if node == nil || level >= len(node.Links) {
 		return false
 	}
@@ -305,6 +324,7 @@ func appendUniqueLink(node *Node, maxLinks int, level int, linkID uint32) bool {
 		newCap := len(links) + max(maxLinks, 1)
 		newLinks := make([]uint32, len(links), newCap)
 		copy(newLinks, links)
+		h.freeLinkSliceIfSFL(level, links)
 		links = newLinks
 	}
 
@@ -313,7 +333,7 @@ func appendUniqueLink(node *Node, maxLinks int, level int, linkID uint32) bool {
 	return true
 }
 
-func ensureLinkCapacity(links []uint32, needed int, maxLinks int) []uint32 {
+func (h *Index) ensureLinkCapacity(level int, links []uint32, needed int, maxLinks int) []uint32 {
 	if cap(links) >= needed {
 		return links
 	}
@@ -326,5 +346,6 @@ func ensureLinkCapacity(links []uint32, needed int, maxLinks int) []uint32 {
 	}
 	newLinks := make([]uint32, len(links), newCap)
 	copy(newLinks, links)
+	h.freeLinkSliceIfSFL(level, links)
 	return newLinks
 }

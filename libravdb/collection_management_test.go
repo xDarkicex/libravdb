@@ -30,7 +30,7 @@ func TestCollectionMemoryManagement(t *testing.T) {
 	}
 
 	// Test memory usage reporting
-	usage, err := collection.GetMemoryUsage()
+	usage, err := collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get memory usage: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestCollectionMemoryManagement(t *testing.T) {
 		t.Fatalf("Failed to set memory limit: %v", err)
 	}
 
-	usage, err = collection.GetMemoryUsage()
+	usage, err = collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get memory usage after limit update: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestDatabaseGlobalMemoryManagement(t *testing.T) {
 	}
 
 	// Test global memory usage
-	usage, err := db.GetGlobalMemoryUsage()
+	usage, err := db.GetGlobalMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get global memory usage: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestCollectionStatsEnhancement(t *testing.T) {
 	}
 
 	// Get enhanced stats
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 
 	// Verify enhanced fields
 	if !stats.HasQuantization {
@@ -308,7 +308,7 @@ func TestCollectionConfigurationValidation(t *testing.T) {
 	}
 
 	// Verify configuration was applied
-	usage, err := collection.GetMemoryUsage()
+	usage, err := collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to get memory usage: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestCollectionLifecycleWithMemoryManagement(t *testing.T) {
 		context.Background(),
 		"test_lifecycle",
 		WithDimension(64),
-		WithMemoryLimit(25*1024*1024), // 25MB limit
+		WithMemoryLimit(100*1024*1024), // 100MB limit
 	)
 	if err != nil {
 		t.Fatalf("Failed to create collection: %v", err)
@@ -354,7 +354,7 @@ func TestCollectionLifecycleWithMemoryManagement(t *testing.T) {
 
 		// Check memory usage periodically
 		if i%10 == 0 {
-			usage, err := collection.GetMemoryUsage()
+			usage, err := collection.GetMemoryUsage(context.Background())
 			if err != nil {
 				t.Fatalf("Failed to get memory usage at vector %d: %v", i, err)
 			}

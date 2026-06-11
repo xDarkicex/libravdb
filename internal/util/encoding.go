@@ -97,8 +97,9 @@ func (enc *BinaryEncoder) Bytes() []byte {
 	return enc.Buf
 }
 
-func (enc *BinaryEncoder) WriteByte(value byte) {
+func (enc *BinaryEncoder) WriteByte(value byte) error {
 	enc.Buf = append(enc.Buf, value)
+	return nil
 }
 
 func (enc *BinaryEncoder) WriteBool(value bool) {
@@ -388,6 +389,9 @@ func (dec *BinaryDecoder) ReadBytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if size > MaxStringLen {
+		return nil, fmt.Errorf("string/bytes size %d exceeds limit %d", size, MaxStringLen)
+	}
 	if dec.Off+int(size) > len(dec.Data) {
 		return nil, fmt.Errorf("unexpected end of data")
 	}
@@ -408,6 +412,9 @@ func (dec *BinaryDecoder) ReadVector() ([]float32, error) {
 	size, err := dec.ReadUint32()
 	if err != nil {
 		return nil, err
+	}
+	if uint64(size)*4 > MaxVectorSize {
+		return nil, fmt.Errorf("vector size %d exceeds limit", size)
 	}
 	vector := make([]float32, int(size))
 	for i := range vector {

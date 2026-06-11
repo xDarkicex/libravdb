@@ -27,8 +27,8 @@ type ivfpqClusterMeta struct {
 
 // ivfpqEntryMeta pairs an ordinal with its compressed PQ representation.
 type ivfpqEntryMeta struct {
-	ordinal    uint32
 	compressed []byte
+	ordinal    uint32
 }
 
 // deserializedMeta stores per-cluster entry metadata between DeserializeFromBytes
@@ -544,10 +544,10 @@ func injectCodebooks(q quant.Quantizer, codebooks [][][]float32, dimension, subs
 
 type sliceWriter struct{ buf []byte }
 
-func (w *sliceWriter) u8(v uint8)   { w.buf = append(w.buf, v) }
-func (w *sliceWriter) u16(v uint16) { w.buf = binary.LittleEndian.AppendUint16(w.buf, v) }
-func (w *sliceWriter) u32(v uint32) { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
-func (w *sliceWriter) i64(v int64)  { w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v)) }
+func (w *sliceWriter) u8(v uint8)     { w.buf = append(w.buf, v) }
+func (w *sliceWriter) u16(v uint16)   { w.buf = binary.LittleEndian.AppendUint16(w.buf, v) }
+func (w *sliceWriter) u32(v uint32)   { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
+func (w *sliceWriter) i64(v int64)    { w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v)) }
 func (w *sliceWriter) bytes(v []byte) { w.buf = append(w.buf, v...) }
 func (w *sliceWriter) f32(v float32) {
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(v))

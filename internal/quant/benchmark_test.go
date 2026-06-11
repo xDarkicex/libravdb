@@ -76,7 +76,7 @@ func BenchmarkProductQuantizer_DistanceToQuery(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := pq.DistanceToQuery(compressed, query)
+		_, err := pq.DistanceToQuery(compressed, query, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

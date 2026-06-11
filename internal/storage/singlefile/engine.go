@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	pageSize      = 4096
-	formatVersion = uint16(1) // On-disk file layout (header page, metapage, chunk framing)
-	fileMagic     = "LIBRAVDB"
+	pageSize             = 4096
+	formatVersion        = uint16(1) // On-disk file layout (header page, metapage, chunk framing)
+	fileMagic            = "LIBRAVDB"
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
 	metaMagicV2   uint32 = 0x4C56444E // V2 metapage includes index persistence fields
@@ -132,46 +132,39 @@ type walFrameHeader struct {
 }
 
 type walRecord struct {
-	Header         walFrameHeader
-	Payload        []byte
 	PayloadEncoder *util.BinaryEncoder
+	Payload        []byte
+	Header         walFrameHeader
 }
 
 type persistedState struct {
-	NextCollectionID uint64                          `json:"next_collection_id"`
 	Collections      map[string]*persistedCollection `json:"collections"`
+	NextCollectionID uint64                          `json:"next_collection_id"`
 }
 
 type persistedCollection struct {
-	ID          uint64                   `json:"id"`
-	Config      storage.CollectionConfig `json:"config"`
-	CreatedLSN  uint64                   `json:"created_lsn"`
-	UpdatedLSN  uint64                   `json:"updated_lsn"`
-	Deleted     bool                     `json:"deleted"`
-	LiveCount   uint64                   `json:"live_count"`
-	NextOrdinal uint32                   `json:"next_ordinal"`
-	Records     map[string]*recordValue  `json:"records"`
-	ordinalToID []string
-
-	// Off-heap vector storage: each ordinal owns a fixed-size slot in the SFL.
-	// vectorSlots is nil until the SFL is lazily initialized on first insert.
-	vectorSFL   *memory.ShardedFreeList
-	vectorSlots [][]byte
-
-	// reservedNextOrdinal is an ephemeral pre-reservation counter for ordinal
-	// assignment. It is not persisted; after recovery it is re-initialised from
-	// NextOrdinal (which reflects committed state).
+	Records             map[string]*recordValue `json:"records"`
+	vectorSFL           *memory.ShardedFreeList
+	Config              storage.CollectionConfig `json:"config"`
+	ordinalToID         []string
+	vectorSlots         [][]byte
+	ID                  uint64 `json:"id"`
+	CreatedLSN          uint64 `json:"created_lsn"`
+	UpdatedLSN          uint64 `json:"updated_lsn"`
+	LiveCount           uint64 `json:"live_count"`
+	NextOrdinal         uint32 `json:"next_ordinal"`
 	reservedNextOrdinal atomic.Uint32
+	Deleted             bool `json:"deleted"`
 }
 
 type recordValue struct {
+	Metadata   map[string]interface{} `json:"metadata"`
+	Vector     []float32              `json:"vector"`
 	Version    uint64                 `json:"version"`
 	CreatedLSN uint64                 `json:"created_lsn"`
 	UpdatedLSN uint64                 `json:"updated_lsn"`
-	Deleted    bool                   `json:"deleted"`
 	Ordinal    uint32                 `json:"ordinal"`
-	Vector     []float32              `json:"vector"`
-	Metadata   map[string]interface{} `json:"metadata"`
+	Deleted    bool                   `json:"deleted"`
 }
 
 type collectionCreatePayload struct {
@@ -184,11 +177,11 @@ type collectionDeletePayload struct {
 }
 
 type recordPutPayload struct {
+	Metadata   map[string]interface{} `json:"metadata"`
 	Collection string                 `json:"collection"`
 	ID         string                 `json:"id"`
-	Ordinal    uint32                 `json:"ordinal"`
 	Vector     []float32              `json:"vector"`
-	Metadata   map[string]interface{} `json:"metadata"`
+	Ordinal    uint32                 `json:"ordinal"`
 }
 
 type recordDeletePayload struct {
@@ -225,29 +218,38 @@ type IndexSnapshotProvider interface {
 // indexBlockEntry is a single collection's serialized index within the index chunk.
 type indexBlockEntry struct {
 	name            string
-	indexType       uint8
-	indexVersion    uint16
 	payload         []byte
 	payloadChecksum uint32
+	indexVersion    uint16
+	indexType       uint8
 }
 
 // Engine is the single-file storage engine.
 type Engine struct {
-	mu               sync.RWMutex
-	ctx              context.Context
-	cancel           context.CancelFunc
-	path             string
-	file             *os.File
-	state            *persistedState
-	collections      map[string]*Collection
-	fileID           uint64
-	metaEpoch        uint64
-	activeMetaPage   uint64
-	lastLSN          uint64
-	lastTxID         uint64
-	dirty            bool
-	dirtyBytes       uint64
+	recoveryErr   atomic.Value
+	ctx           context.Context
+	indexProvider IndexSnapshotProvider
+	cancel        context.CancelFunc
+	file          *os.File
+	state         *persistedState
+	collections   map[string]*Collection
+	path          string
+	batchBuffer   struct {
+		mu       sync.Mutex
+		entries  []batchEntry
+		flusher  chan struct{}
+		flushNow []chan// accumulated entries awaiting flush
+		// signal to wake up flusher
+		error
+		flushSignalPending int32
+		pendingWaiters     int32
+	}
 	dirtyOps         int
+	compactionErrors uint64
+	lastTxID         uint64
+	fileID           uint64
+	dirtyBytes       uint64
+	metaEpoch        uint64
 	walTransactions  uint64
 	walBytes         uint64
 	batchFlushes     uint64
@@ -255,22 +257,12 @@ type Engine struct {
 	checkpoints      uint64
 	replayedTxs      uint64
 	discardedTxs     uint64
-	compactionErrors uint64
-	closed           bool
-	status           atomic.Int32 // EngineStatus: Starting → Recovering* → Ready | Failed
-	recoveryErr      atomic.Value // error, set when status transitions to Failed
-	indexProvider    IndexSnapshotProvider
-
-	// WAL batch buffer: accumulates entries across multiple putRecords calls
-	// and flushes them together to reduce fsync overhead.
-	batchBuffer struct {
-		mu                 sync.Mutex
-		entries            []batchEntry  // accumulated entries awaiting flush
-		flusher            chan struct{} // signal to wake up flusher
-		flushNow           []chan error // completion channels for foreground flushes
-		flushSignalPending int32
-		pendingWaiters     int32
-	}
+	lastLSN          uint64
+	activeMetaPage   uint64
+	mu               sync.RWMutex
+	status           atomic.Int32
+	closed           atomic.Bool
+	dirty            bool // completion channels for foreground flushes
 }
 
 // batchEntry holds a buffered record pending WAL flush.
@@ -604,34 +596,38 @@ func (e *Engine) writeInitialPages() error {
 		WALTailPage:     3,
 	}
 	copy(header.Magic[:], []byte(fileMagic))
-	if err := writeFixedPage(e.file, 0, encodeHeader(header)); err != nil {
+	if err := writeFixedPage(e.file, 0, encodeHeader(header, make([]byte, pageSize))); err != nil {
 		return err
 	}
 
 	metaA := &metaPage{Magic: metaMagic, RootFreelist: 0}
 	metaB := &metaPage{Magic: metaMagic, RootFreelist: math.MaxUint64}
-	if err := writeFixedPage(e.file, 1, encodeMeta(metaA)); err != nil {
+	if err := writeFixedPage(e.file, 1, encodeMeta(metaA, make([]byte, pageSize))); err != nil {
 		return err
 	}
-	if err := writeFixedPage(e.file, 2, encodeMeta(metaB)); err != nil {
+	if err := writeFixedPage(e.file, 2, encodeMeta(metaB, make([]byte, pageSize))); err != nil {
 		return err
 	}
 
 	return e.file.Sync()
 }
 
+var pagePool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, pageSize)
+		return &buf
+	},
+}
+
 func writeFixedPage(file *os.File, page uint64, data []byte) error {
 	if len(data) > pageSize {
 		return fmt.Errorf("page payload too large: %d", len(data))
 	}
-	buf := make([]byte, pageSize)
-	copy(buf, data)
-	_, err := file.WriteAt(buf, int64(page)*pageSize)
+	_, err := file.WriteAt(data, int64(page)*pageSize)
 	return err
 }
 
-func encodeHeader(header *fileHeader) []byte {
-	buf := make([]byte, pageSize)
+func encodeHeader(header *fileHeader, buf []byte) []byte {
 	copy(buf[:8], header.Magic[:])
 	binary.LittleEndian.PutUint16(buf[8:10], header.FormatVersion)
 	binary.LittleEndian.PutUint16(buf[10:12], header.PageSize)
@@ -648,8 +644,7 @@ func encodeHeader(header *fileHeader) []byte {
 	return buf
 }
 
-func encodeMeta(meta *metaPage) []byte {
-	buf := make([]byte, pageSize)
+func encodeMeta(meta *metaPage, buf []byte) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], metaMagicV2)
 	binary.LittleEndian.PutUint64(buf[4:12], meta.MetaEpoch)
 	binary.LittleEndian.PutUint64(buf[12:20], meta.RootCatalog)
@@ -668,7 +663,9 @@ func encodeMeta(meta *metaPage) []byte {
 }
 
 func (e *Engine) readHeader() (*fileHeader, error) {
-	buf := make([]byte, pageSize)
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
 	if _, err := e.file.ReadAt(buf, 0); err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
@@ -696,7 +693,9 @@ func (e *Engine) readHeader() (*fileHeader, error) {
 }
 
 func (e *Engine) readMetaPage(page uint64) (*metaPage, error) {
-	buf := make([]byte, pageSize)
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
 	if _, err := e.file.ReadAt(buf, int64(page)*pageSize); err != nil {
 		return nil, err
 	}
@@ -841,18 +840,24 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 				return err
 			}
 			e.replayedTxs++
+			if record.Header.LSN > e.lastLSN {
+				e.lastLSN = record.Header.LSN
+			}
+			if record.Header.TxID > e.lastTxID {
+				e.lastTxID = record.Header.TxID
+			}
 			delete(pending, record.Header.TxID)
 		case recordTypeTxAbort:
 			e.discardedTxs++
+			if record.Header.LSN > e.lastLSN {
+				e.lastLSN = record.Header.LSN
+			}
+			if record.Header.TxID > e.lastTxID {
+				e.lastTxID = record.Header.TxID
+			}
 			delete(pending, record.Header.TxID)
 		default:
 			pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
-		}
-		if record.Header.LSN > e.lastLSN {
-			e.lastLSN = record.Header.LSN
-		}
-		if record.Header.TxID > e.lastTxID {
-			e.lastTxID = record.Header.TxID
 		}
 		offset += int64(16 + chunk.PayloadLen)
 	}
@@ -1288,8 +1293,15 @@ func (e *Engine) checkpointLocked() error {
 		IndexLength:     indexLength,
 		IndexChecksum:   indexChecksum,
 	}
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
+
+	for i := range buf {
+		buf[i] = 0
+	}
 	// STEP 4: fsync (durable: snapshot + index + metapage)
-	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta)); err != nil {
+	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta, buf)); err != nil {
 		return err
 	}
 	if err := e.file.Sync(); err != nil {
@@ -1304,7 +1316,11 @@ func (e *Engine) checkpointLocked() error {
 	header.LastCheckpointLSN = e.lastLSN
 	header.ActiveMetaPage = nextMetaPage
 	header.WALHeadPage = pageCount
-	if err := writeFixedPage(e.file, 0, encodeHeader(header)); err != nil {
+
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(e.file, 0, encodeHeader(header, buf)); err != nil {
 		return err
 	}
 	if err := e.file.Sync(); err != nil {
@@ -1425,7 +1441,15 @@ func (e *Engine) compactFileLocked() error {
 		WALTailPage:       pageCount,
 	}
 	copy(fh.Magic[:], origHeader.Magic[:])
-	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh)); err != nil {
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
+	for i := range buf {
+		buf[i] = 0
+	}
+
+	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
 		return fmt.Errorf("compact: write header: %w", err)
 	}
 
@@ -1447,11 +1471,18 @@ func (e *Engine) compactFileLocked() error {
 	if len(indexBlock) > maxChunkSize {
 		return fmt.Errorf("compact: index block size %d exceeds limit %d", len(indexBlock), maxChunkSize)
 	}
-	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta)); err != nil {
+
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
 		return fmt.Errorf("compact: write meta A: %w", err)
 	}
 	meta.RootFreelist = math.MaxUint64 // meta B marker
-	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta)); err != nil {
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
 		return fmt.Errorf("compact: write meta B: %w", err)
 	}
 
@@ -1497,13 +1528,23 @@ func (e *Engine) compactFileLocked() error {
 	// ── Atomic rename ─────────────────────────────────────────────────────
 	// Close original before rename; if anything fails, reopen original.
 	if err := e.file.Close(); err != nil {
-		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("compact: close original: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
 		return fmt.Errorf("compact: close original: %w", err)
 	}
 	e.file = nil
 
 	if err := os.Rename(tmpPath, e.path); err != nil {
-		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("compact: rename: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
 		return fmt.Errorf("compact: rename: %w", err)
 	}
 
@@ -1540,7 +1581,7 @@ func (e *Engine) Compact() error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("compact: database is closed")
 	}
 	return e.compactFile()
@@ -1696,7 +1737,7 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	if collection := e.state.Collections[name]; collection != nil && !collection.Deleted {
@@ -1829,7 +1870,7 @@ func (e *Engine) flushBatch() error {
 		}
 	}
 
-	if e.closed {
+	if e.closed.Load() {
 		// Signal any waiting flushes with error
 		signalErr(fmt.Errorf("database is closed"))
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
@@ -1962,7 +2003,7 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, e
 }
 
 func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (bool, error) {
-	if e.closed {
+	if e.closed.Load() {
 		return false, fmt.Errorf("database is closed")
 	}
 
@@ -1997,6 +2038,13 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 
 	// Add entries to batch buffer
 	e.batchBuffer.mu.Lock()
+	if e.closed.Load() {
+		e.batchBuffer.mu.Unlock()
+		for j := 0; j < len(entries); j++ {
+			releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+		}
+		return false, fmt.Errorf("database is closed")
+	}
 	bufferedEntries := 0
 	for _, batch := range e.batchBuffer.entries {
 		bufferedEntries += len(batch.entries)
@@ -2026,7 +2074,7 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 // Respects context cancellation — returns ctx.Err() if the context is cancelled
 // before the flush completes.
 func (e *Engine) flushNow(ctx context.Context) error {
-	done := make(chan error)
+	done := make(chan error, 1)
 	e.batchBuffer.mu.Lock()
 	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
 	e.batchBuffer.mu.Unlock()
@@ -2046,7 +2094,7 @@ func (e *Engine) deleteRecord(name, id string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	collection := e.state.Collections[name]
@@ -2090,7 +2138,7 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 
@@ -2148,7 +2196,7 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 
@@ -2237,7 +2285,7 @@ func (e *Engine) GetCollection(name string) (storage.Collection, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 	persisted := e.state.Collections[name]
@@ -2272,7 +2320,7 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *stor
 func (e *Engine) ListCollections() ([]string, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 	names := make([]string, 0, len(e.state.Collections))
@@ -2290,7 +2338,7 @@ func (e *Engine) DeleteCollection(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	collection := e.state.Collections[name]
@@ -2333,7 +2381,7 @@ func (e *Engine) Close() error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed.Load() {
 		return nil
 	}
 	// Free all off-heap vector storage. Individual slot deallocation is
@@ -2350,7 +2398,7 @@ func (e *Engine) Close() error {
 			return err
 		}
 	}
-	e.closed = true
+	e.closed.Store(true)
 	return e.file.Close()
 }
 
@@ -2424,7 +2472,7 @@ func cloneEntry(record *recordValue) *index.VectorEntry {
 func (c *Collection) persisted() (*persistedCollection, error) {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2438,7 +2486,7 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 	_ = ctx
 	c.engine.mu.Lock()
 	defer c.engine.mu.Unlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2499,7 +2547,7 @@ func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, er
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2519,7 +2567,7 @@ func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return false, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2533,7 +2581,7 @@ func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
 func (c *Collection) GetByOrdinal(ordinal uint32) ([]float32, error) {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2574,7 +2622,7 @@ func (c *Collection) GetIDByOrdinal(ctx context.Context, ordinal uint32) (string
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return "", fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2599,7 +2647,7 @@ func (c *Collection) MemoryUsage(ctx context.Context) (int64, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2630,7 +2678,7 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 // Iterate walks all live records.
 func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error {
 	c.engine.mu.RLock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		c.engine.mu.RUnlock()
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
@@ -2700,7 +2748,7 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2726,7 +2774,7 @@ func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2745,7 +2793,7 @@ func (c *Collection) Close() error {
 func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]

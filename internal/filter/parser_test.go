@@ -20,10 +20,10 @@ func TestFilterParser_ParseValue(t *testing.T) {
 	parser := NewFilterParser(schema)
 
 	tests := []struct {
+		expected  interface{}
 		name      string
 		field     string
 		value     string
-		expected  interface{}
 		wantError bool
 	}{
 		{
@@ -155,9 +155,9 @@ func TestFilterParser_NoSchema(t *testing.T) {
 	parser := NewFilterParser(nil)
 
 	tests := []struct {
+		expected interface{}
 		name     string
 		value    string
-		expected interface{}
 	}{
 		{
 			name:     "infer boolean",

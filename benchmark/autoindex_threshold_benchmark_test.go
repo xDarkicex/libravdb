@@ -166,8 +166,8 @@ func TestAutoIndexThresholdBenchmark(t *testing.T) {
 
 	type probeResult struct {
 		indexType string
-		mean      float64
 		raw       []float64
+		mean      float64
 	}
 	results := make(map[string]map[int]probeResult)
 

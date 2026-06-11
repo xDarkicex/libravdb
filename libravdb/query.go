@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"time"
 
 	"github.com/xDarkicex/libravdb/internal/filter"
+	"github.com/xDarkicex/memory"
 )
 
 // QueryBuilder provides a fluent interface for building vector queries
@@ -23,9 +23,9 @@ type QueryBuilder struct {
 
 // Filter represents a metadata filter condition (deprecated, use filter package)
 type Filter struct {
+	Value    interface{}
 	Field    string
 	Operator FilterOperator
-	Value    interface{}
 }
 
 // FilterOperator defines filter comparison operations (deprecated, use filter package)
@@ -122,8 +122,8 @@ func (qb *QueryBuilder) NotEq(field string, value interface{}) *QueryBuilder {
 type FilterChain struct {
 	queryBuilder *QueryBuilder
 	parentChain  *FilterChain
-	operator     filter.LogicalOperator
 	filters      []filter.Filter
+	operator     filter.LogicalOperator
 	negated      bool
 	applied      bool
 }
@@ -367,8 +367,6 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 // List executes a metadata-only or vector-backed query and returns stable record rows.
 // When no vector is provided, it scans the collection and applies metadata filters and limit.
 func (qb *QueryBuilder) List() ([]Record, error) {
-	start := time.Now()
-
 	var records []Record
 	if qb.vector == nil {
 		all, err := qb.collection.ListAll(qb.ctx)
@@ -400,7 +398,6 @@ func (qb *QueryBuilder) List() ([]Record, error) {
 		filtered = filtered[:qb.limit]
 	}
 
-	_ = start
 	return filtered, nil
 }
 
@@ -426,14 +423,33 @@ func (qb *QueryBuilder) optimizeFilters() []filter.Filter {
 
 // applyFilters applies metadata filters to search results
 func (qb *QueryBuilder) applyFilters(results []*SearchResult, filters []filter.Filter) ([]*SearchResult, error) {
+	arena := qb.collection.db.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		qb.collection.db.scratchPool.Put(arena)
+	}()
+
 	// Convert libravdb.SearchResult to filter.VectorEntry
-	filterEntries := make([]*filter.VectorEntry, len(results))
+	// Allocate the structs in the arena to avoid heap allocations
+	entriesSlice, err := memory.ArenaSlice[filter.VectorEntry](arena, len(results))
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate entries: %w", err)
+	}
+	entries := entriesSlice[:len(results)]
+
+	filterEntriesSlice, err := memory.ArenaSlice[*filter.VectorEntry](arena, len(results))
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate filter entries: %w", err)
+	}
+	filterEntries := filterEntriesSlice[:len(results)]
+
 	for i, result := range results {
-		filterEntries[i] = &filter.VectorEntry{
+		entries[i] = filter.VectorEntry{
 			ID:       result.ID,
 			Vector:   result.Vector,
 			Metadata: result.Metadata,
 		}
+		filterEntries[i] = &entries[i]
 	}
 
 	// Apply each filter sequentially
@@ -459,6 +475,8 @@ func (qb *QueryBuilder) applyFilters(results []*SearchResult, filters []filter.F
 		versionMap[result.ID] = result.Version
 	}
 
+	// Note: We cannot use ArenaSlice for the final filteredResults if we return it
+	// to the user, because the arena is reset and returned to the pool immediately.
 	filteredResults := make([]*SearchResult, len(filterEntries))
 	for i, entry := range filterEntries {
 		filteredResults[i] = &SearchResult{
@@ -494,6 +512,7 @@ func (qb *QueryBuilder) applyFiltersToRecords(records []Record, filters []filter
 		return nil, err
 	}
 
+	// This is the final output returned to the user, so we cannot use an Arena
 	filteredRecords := make([]Record, 0, len(filteredEntries))
 	for _, entry := range filteredEntries {
 		filteredRecords = append(filteredRecords, Record{

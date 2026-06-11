@@ -8,48 +8,33 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"time"
 )
 
 // ProductQuantizer implements Product Quantization (PQ) algorithm
 type ProductQuantizer struct {
-	mu sync.RWMutex
-
-	// Configuration
-	config *QuantizationConfig
-
+	config        *QuantizationConfig
 	compressedSFL *memory.ShardedFreeList
-
-	// Training state
-	trained   bool
-	dimension int
-	subspaces int           // Number of subspaces (codebooks)
-	subDim    int           // Dimension of each subspace
-	centroids [][][]float32 // [subspace][centroid][dimension]
-
-	// Distance lookup tables for fast computation
-	distanceTables [][]float32 // [subspace][centroid] -> distance to query subvector
-	queryVector    []float32   // Current query vector for distance tables
-	cacheMu        sync.Mutex  // Protects queryVector + distanceTables during update
-
-	// Memory usage tracking
-	memoryUsage int64
+	centroids     [][][]float32
+	dimension     int
+	subspaces     int
+	subDim        int
+	memoryUsage   int64
+	mu            sync.RWMutex
+	trained       bool
 }
 
 // PrepareQuery precomputes distance tables for a query so that concurrent
 // DistanceToQuery calls with the same query only read from the cache.
-func (pq *ProductQuantizer) PrepareQuery(query []float32) {
-	pq.cacheMu.Lock()
-	defer pq.cacheMu.Unlock()
-	if pq.vectorsEqual(pq.queryVector, query) {
-		return
+func (pq *ProductQuantizer) PrepareQuery(query []float32) any {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+
+	if !pq.trained || len(query) != pq.dimension {
+		return nil
 	}
-	pq.updateDistanceTables(query)
-	if cap(pq.queryVector) < len(query) {
-		pq.queryVector = make([]float32, len(query))
-	} else {
-		pq.queryVector = pq.queryVector[:len(query)]
-	}
-	copy(pq.queryVector, query)
+
+	return pq.buildDistanceTables(query)
 }
 
 // NewProductQuantizer creates a new Product Quantizer instance
@@ -92,6 +77,10 @@ func (pq *ProductQuantizer) Configure(config *QuantizationConfig) error {
 	}, 64)
 	if err != nil {
 		return fmt.Errorf("failed to init compressedSFL: %w", err)
+	}
+
+	if pq.compressedSFL != nil {
+		pq.compressedSFL.Free()
 	}
 	pq.compressedSFL = sfl
 
@@ -188,11 +177,7 @@ func (pq *ProductQuantizer) Train(ctx context.Context, vectors [][]float32) erro
 		pq.centroids[s] = centroids
 	}
 
-	// Initialize distance tables
-	pq.distanceTables = make([][]float32, pq.subspaces)
-	for s := 0; s < pq.subspaces; s++ {
-		pq.distanceTables[s] = make([]float32, numCentroids)
-	}
+	// Initialization of distance tables is removed since they are now computed dynamically
 
 	pq.trained = true
 	pq.updateMemoryUsage()
@@ -214,10 +199,12 @@ func (pq *ProductQuantizer) trainCodebook(ctx context.Context, vectors [][]float
 	// Initialize centroids randomly
 	centroids := make([][]float32, k)
 
+	localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for i := 0; i < k; i++ {
 		centroids[i] = make([]float32, dim)
 		// Initialize with random vector from training set
-		randIdx := rand.Intn(len(vectors))
+		randIdx := localRand.Intn(len(vectors))
 		copy(centroids[i], vectors[randIdx])
 	}
 
@@ -320,6 +307,9 @@ func (pq *ProductQuantizer) Compress(vector []float32) ([]byte, error) {
 		return nil, fmt.Errorf("failed to allocate compressed vector: %w", err)
 	}
 	compressed := slot[48 : 48+numBytes]
+	for i := range compressed {
+		compressed[i] = 0
+	}
 	bitOffset := 0
 
 	// Quantize each subspace
@@ -366,7 +356,10 @@ func (pq *ProductQuantizer) Decompress(data []byte) ([]float32, error) {
 	// Decompress each subspace
 	for s := 0; s < pq.subspaces; s++ {
 		// Extract code from compressed data
-		code := pq.unpackBits(data, bitOffset, bitsPerCode)
+		code, err := pq.unpackBits(data, bitOffset, bitsPerCode)
+		if err != nil {
+			return nil, err
+		}
 		bitOffset += bitsPerCode
 
 		if int(code) >= len(pq.centroids[s]) {
@@ -398,8 +391,14 @@ func (pq *ProductQuantizer) Distance(compressed1, compressed2 []byte) (float32, 
 	// Compute distance for each subspace
 	for s := 0; s < pq.subspaces; s++ {
 		// Extract codes from both compressed vectors
-		code1 := pq.unpackBits(compressed1, bitOffset, bitsPerCode)
-		code2 := pq.unpackBits(compressed2, bitOffset, bitsPerCode)
+		code1, err := pq.unpackBits(compressed1, bitOffset, bitsPerCode)
+		if err != nil {
+			return 0, err
+		}
+		code2, err := pq.unpackBits(compressed2, bitOffset, bitsPerCode)
+		if err != nil {
+			return 0, err
+		}
 		bitOffset += bitsPerCode
 
 		if int(code1) >= len(pq.centroids[s]) || int(code2) >= len(pq.centroids[s]) {
@@ -417,32 +416,29 @@ func (pq *ProductQuantizer) Distance(compressed1, compressed2 []byte) (float32, 
 }
 
 // DistanceToQuery computes distance from compressed vector to query vector.
-// PrepareQuery must be called before concurrent access for a given query;
-// otherwise the cache is updated under a write lock which serializes callers.
-func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
-	pq.mu.RLock()
-	if !pq.trained {
-		pq.mu.RUnlock()
-		return 0, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
-	}
-	pq.mu.RUnlock()
-
-	// Update cache if needed — serialised via cacheMu so parallel workers
-	// only hit this path once per unique query.
-	pq.cacheMu.Lock()
-	if !pq.vectorsEqual(pq.queryVector, query) {
-		pq.updateDistanceTables(query)
-		pq.queryVector = make([]float32, len(query))
-		copy(pq.queryVector, query)
-	}
-	pq.cacheMu.Unlock()
-
+// state is an optional precomputed distance table returned by PrepareQuery.
+func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {
 	pq.mu.RLock()
 	defer pq.mu.RUnlock()
+
+	if !pq.trained {
+		return 0, NewQuantizationError(ErrQuantNotTrained, "ProductQuantizer", "", "quantizer not trained")
+	}
 
 	if len(query) != pq.dimension {
 		return 0, fmt.Errorf("query dimension %d does not match expected %d",
 			len(query), pq.dimension)
+	}
+
+	var distanceTables [][]float32
+	if state != nil {
+		if dt, ok := state.([][]float32); ok {
+			distanceTables = dt
+		}
+	}
+
+	if distanceTables == nil {
+		distanceTables = pq.buildDistanceTablesUnsafe(query)
 	}
 
 	distance := float32(0)
@@ -451,31 +447,43 @@ func (pq *ProductQuantizer) DistanceToQuery(compressed []byte, query []float32) 
 
 	// Compute distance using precomputed tables
 	for s := 0; s < pq.subspaces; s++ {
-		code := pq.unpackBits(compressed, bitOffset, bitsPerCode)
+		code, err := pq.unpackBits(compressed, bitOffset, bitsPerCode)
+		if err != nil {
+			return 0, err
+		}
 		bitOffset += bitsPerCode
 
-		if int(code) >= len(pq.distanceTables[s]) {
+		if int(code) >= len(distanceTables[s]) {
 			return 0, fmt.Errorf("invalid code %d for subspace %d", code, s)
 		}
 
-		subDist := pq.distanceTables[s][code]
+		subDist := distanceTables[s][code]
 		distance += subDist * subDist // Squared distance
 	}
 
 	return float32(math.Sqrt(float64(distance))), nil
 }
 
-// updateDistanceTables precomputes distance tables for fast query processing
-func (pq *ProductQuantizer) updateDistanceTables(query []float32) {
+// buildDistanceTables precomputes distance tables for fast query processing
+func (pq *ProductQuantizer) buildDistanceTables(query []float32) [][]float32 {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	return pq.buildDistanceTablesUnsafe(query)
+}
+
+func (pq *ProductQuantizer) buildDistanceTablesUnsafe(query []float32) [][]float32 {
+	tables := make([][]float32, pq.subspaces)
 	for s := 0; s < pq.subspaces; s++ {
+		tables[s] = make([]float32, len(pq.centroids[s]))
 		start := s * pq.subDim
 		end := start + pq.subDim
 		querySubvector := query[start:end]
 
 		for c, centroid := range pq.centroids[s] {
-			pq.distanceTables[s][c] = pq.euclideanDistance(querySubvector, centroid)
+			tables[s][c] = pq.euclideanDistance(querySubvector, centroid)
 		}
 	}
+	return tables
 }
 
 // Helper functions
@@ -545,27 +553,30 @@ func (pq *ProductQuantizer) packBits(data []byte, bitOffset, numBits int, value 
 			return
 		}
 
+		mask := byte(1 << bitIdx)
 		if (value>>i)&1 == 1 {
-			data[byteIdx] |= 1 << bitIdx
+			data[byteIdx] |= mask
+		} else {
+			data[byteIdx] &= ^mask
 		}
 	}
 }
 
-func (pq *ProductQuantizer) unpackBits(data []byte, bitOffset, numBits int) uint32 {
+func (pq *ProductQuantizer) unpackBits(data []byte, bitOffset, numBits int) (uint32, error) {
 	value := uint32(0)
 	for i := 0; i < numBits; i++ {
 		byteIdx := (bitOffset + i) / 8
 		bitIdx := (bitOffset + i) % 8
 
 		if byteIdx >= len(data) {
-			break
+			return 0, fmt.Errorf("insufficient data: expected %d bits, got %d bytes", numBits, len(data))
 		}
 
 		if (data[byteIdx]>>bitIdx)&1 == 1 {
 			value |= 1 << i
 		}
 	}
-	return value
+	return value, nil
 }
 
 func (pq *ProductQuantizer) updateMemoryUsage() {
@@ -578,15 +589,7 @@ func (pq *ProductQuantizer) updateMemoryUsage() {
 		}
 	}
 
-	// Distance tables memory
-	for _, table := range pq.distanceTables {
-		usage += int64(len(table) * 4) // 4 bytes per float32
-	}
-
-	// Query vector memory
-	if pq.queryVector != nil {
-		usage += int64(len(pq.queryVector) * 4)
-	}
+	// distanceTables and queryVector are now removed so they don't consume memory here
 
 	pq.memoryUsage = usage
 }
@@ -626,6 +629,17 @@ func (pq *ProductQuantizer) Config() *QuantizationConfig {
 	// Return a copy to prevent external modification
 	configCopy := *pq.config
 	return &configCopy
+}
+
+// Close releases resources used by the quantizer
+func (pq *ProductQuantizer) Close() error {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	if pq.compressedSFL != nil {
+		pq.compressedSFL.Free()
+		pq.compressedSFL = nil
+	}
+	return nil
 }
 
 // ProductQuantizerFactory creates ProductQuantizer instances
@@ -676,12 +690,7 @@ func (pq *ProductQuantizer) SetCodebooks(codebooks [][][]float32, dimension, sub
 	pq.subDim = subDim
 	pq.centroids = codebooks
 
-	// Rebuild distance tables.
-	numCentroids := len(codebooks[0])
-	pq.distanceTables = make([][]float32, subspaces)
-	for s := 0; s < subspaces; s++ {
-		pq.distanceTables[s] = make([]float32, numCentroids)
-	}
+	// distanceTables are no longer pre-allocated here
 	pq.trained = true
 	pq.updateMemoryUsage()
 }

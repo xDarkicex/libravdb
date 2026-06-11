@@ -20,10 +20,10 @@ const shardSeparator = "__shard__"
 // shard represents one independent write lane with its own storage and index.
 // Each shard owns its own storage collection and index, providing true parallelism.
 type shard struct {
-	mu      sync.Mutex
-	name    string
 	storage storage.Collection
 	index   index.Index
+	name    string
+	mu      sync.RWMutex
 }
 
 // shardForID returns the shard index for a given vector ID.
@@ -38,32 +38,6 @@ func shardForID(id string) int {
 // Format: parent + "__shard__" + index
 func shardName(parent string, shardIdx int) string {
 	return fmt.Sprintf("%s%s%d", parent, shardSeparator, shardIdx)
-}
-
-// isShardName checks if a name is a hidden shard collection name.
-// Returns the parent collection name, shard index, and ok=true if it's a shard name.
-func isShardName(name string) (parent string, shardIdx int, ok bool) {
-	prefix := shardSeparator
-	if !strings.HasPrefix(name, prefix) {
-		return "", 0, false
-	}
-
-	// Find the shard index after the separator
-	idxStr := strings.TrimPrefix(name, prefix)
-	if idxStr == "" {
-		return "", 0, false
-	}
-
-	// Parse the shard index
-	var idx int
-	for _, c := range idxStr {
-		if c < '0' || c > '9' {
-			return "", 0, false
-		}
-		idx = idx*10 + int(c-'0')
-	}
-
-	return "", idx, false
 }
 
 // parseShardName parses a shard collection name and returns parent and shard index.

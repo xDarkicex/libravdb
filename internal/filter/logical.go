@@ -8,8 +8,8 @@ import (
 
 // LogicalFilter implements logical operations (AND, OR, NOT) on other filters
 type LogicalFilter struct {
-	Operator LogicalOperator
 	Filters  []Filter
+	Operator LogicalOperator
 }
 
 // NewAndFilter creates a filter that requires all child filters to match

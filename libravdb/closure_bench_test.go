@@ -46,6 +46,9 @@ func TestClosure1K(t *testing.T) {
 }
 
 func TestClosure10K(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 10K in short mode")
+	}
 	p, r := closureSize(t, restartBenchConfig{dim: 128, count: 10000, indexType: HNSW})
 	fmt.Printf("CLOSURE|HNSW|10000|persisted=%v|rebuild=%v\n", p, r)
 	pf, rf := closureSize(t, restartBenchConfig{dim: 128, count: 10000, indexType: Flat})

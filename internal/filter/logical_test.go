@@ -154,8 +154,8 @@ func TestLogicalFilter_Validate(t *testing.T) {
 	invalidFilter := NewEqualityFilter("", "value") // Invalid: empty field
 
 	tests := []struct {
-		name      string
 		filter    *LogicalFilter
+		name      string
 		wantError bool
 	}{
 		{
@@ -206,8 +206,8 @@ func TestLogicalFilter_EstimateSelectivity(t *testing.T) {
 	filter2 := NewEqualityFilter("field2", "value2") // 0.1 selectivity
 
 	tests := []struct {
-		name     string
 		filter   *LogicalFilter
+		name     string
 		expected float64
 	}{
 		{

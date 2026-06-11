@@ -10,26 +10,16 @@ import (
 // ScalarQuantizer implements Scalar Quantization algorithm
 // Uses linear quantization to map floating-point values to fixed-point representation
 type ScalarQuantizer struct {
-	mu sync.RWMutex
-
-	// Configuration
-	config *QuantizationConfig
-
-	// Training state
-	trained   bool
-	dimension int
-
-	// Quantization parameters per dimension
-	minValues []float32 // Minimum value per dimension
-	maxValues []float32 // Maximum value per dimension
-	scales    []float32 // Scale factor per dimension: (max - min) / (2^bits - 1)
-	offsets   []float32 // Offset per dimension: min value
-
-	// Quantization levels
-	maxLevel uint32 // Maximum quantization level: 2^bits - 1
-
-	// Memory usage tracking
+	config      *QuantizationConfig
+	minValues   []float32
+	maxValues   []float32
+	scales      []float32
+	offsets     []float32
+	dimension   int
 	memoryUsage int64
+	mu          sync.RWMutex
+	maxLevel    uint32
+	trained     bool
 }
 
 // NewScalarQuantizer creates a new Scalar Quantizer instance
@@ -207,7 +197,10 @@ func (sq *ScalarQuantizer) Decompress(data []byte) ([]float32, error) {
 	// Decompress each dimension
 	for d := 0; d < sq.dimension; d++ {
 		// Extract quantized value from compressed data
-		quantized := sq.unpackBits(data, bitOffset, bitsPerValue)
+		quantized, err := sq.unpackBits(data, bitOffset, bitsPerValue)
+		if err != nil {
+			return nil, err
+		}
 		bitOffset += bitsPerValue
 
 		// Dequantize: offset + quantized * scale
@@ -234,8 +227,14 @@ func (sq *ScalarQuantizer) Distance(compressed1, compressed2 []byte) (float32, e
 	// Compute distance for each dimension using quantized values directly
 	for d := 0; d < sq.dimension; d++ {
 		// Extract quantized values from both compressed vectors
-		q1 := sq.unpackBits(compressed1, bitOffset, bitsPerValue)
-		q2 := sq.unpackBits(compressed2, bitOffset, bitsPerValue)
+		q1, err := sq.unpackBits(compressed1, bitOffset, bitsPerValue)
+		if err != nil {
+			return 0, err
+		}
+		q2, err := sq.unpackBits(compressed2, bitOffset, bitsPerValue)
+		if err != nil {
+			return 0, err
+		}
 		bitOffset += bitsPerValue
 
 		// Compute distance in quantized space and scale back
@@ -249,9 +248,11 @@ func (sq *ScalarQuantizer) Distance(compressed1, compressed2 []byte) (float32, e
 
 // DistanceToQuery computes distance from compressed vector to query vector
 // PrepareQuery is a no-op for ScalarQuantizer — no query-dependent cache to warm.
-func (sq *ScalarQuantizer) PrepareQuery(query []float32) {}
+func (sq *ScalarQuantizer) PrepareQuery(query []float32) any {
+	return nil
+}
 
-func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
+func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {
 	sq.mu.RLock()
 	defer sq.mu.RUnlock()
 
@@ -271,7 +272,10 @@ func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32) (
 	// Compute distance for each dimension
 	for d := 0; d < sq.dimension; d++ {
 		// Extract quantized value from compressed vector
-		quantized := sq.unpackBits(compressed, bitOffset, bitsPerValue)
+		quantized, err := sq.unpackBits(compressed, bitOffset, bitsPerValue)
+		if err != nil {
+			return 0, err
+		}
 		bitOffset += bitsPerValue
 
 		// Dequantize the compressed value
@@ -321,21 +325,21 @@ func (sq *ScalarQuantizer) packBits(data []byte, bitOffset, numBits int, value u
 	}
 }
 
-func (sq *ScalarQuantizer) unpackBits(data []byte, bitOffset, numBits int) uint32 {
+func (sq *ScalarQuantizer) unpackBits(data []byte, bitOffset, numBits int) (uint32, error) {
 	value := uint32(0)
 	for i := 0; i < numBits; i++ {
 		byteIdx := (bitOffset + i) / 8
 		bitIdx := (bitOffset + i) % 8
 
 		if byteIdx >= len(data) {
-			break
+			return 0, fmt.Errorf("insufficient data: expected %d bits, got %d bytes", numBits, len(data))
 		}
 
 		if (data[byteIdx]>>bitIdx)&1 == 1 {
 			value |= 1 << i
 		}
 	}
-	return value
+	return value, nil
 }
 
 func (sq *ScalarQuantizer) updateMemoryUsage() {
@@ -385,6 +389,11 @@ func (sq *ScalarQuantizer) Config() *QuantizationConfig {
 	// Return a copy to prevent external modification
 	configCopy := *sq.config
 	return &configCopy
+}
+
+// Close releases resources used by the quantizer
+func (sq *ScalarQuantizer) Close() error {
+	return nil
 }
 
 // ScalarQuantizerFactory creates ScalarQuantizer instances

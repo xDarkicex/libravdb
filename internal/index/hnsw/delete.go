@@ -19,7 +19,7 @@ func (h *Index) deleteNode(ctx context.Context, id string) error {
 	}
 	nodeID, node := h.findNodeByID(id)
 	if nodeID == ^uint32(0) {
-		return fmt.Errorf("node with ID '%s' not found", id)
+		return fmt.Errorf("node with ID '%s': %w", id, util.ErrNotFound)
 	}
 	return h.deleteNodeLocked(ctx, nodeID, node, id)
 }
@@ -31,7 +31,7 @@ func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
 		return fmt.Errorf("cannot delete from empty index")
 	}
 	if ordinal >= uint32(len(h.nodes)) || h.nodes[ordinal] == nil {
-		return fmt.Errorf("node with ordinal %d not found", ordinal)
+		return fmt.Errorf("node with ordinal %d: %w", ordinal, util.ErrNotFound)
 	}
 	return h.deleteNodeLocked(ctx, ordinal, h.nodes[ordinal], h.ordinalToID[ordinal])
 }
@@ -347,7 +347,7 @@ func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int
 	node2 := h.nodes[nodeID2]
 
 	if node1 != nil && level < len(node1.Links) {
-		if appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2) {
+		if h.appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2) {
 			if node2 != nil && level < len(node2.Backlinks) {
 				node2.Backlinks[level] = append(node2.Backlinks[level], nodeID1)
 			}
@@ -355,7 +355,7 @@ func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int
 	}
 
 	if node2 != nil && level < len(node2.Links) {
-		if appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1) {
+		if h.appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1) {
 			if node1 != nil && level < len(node1.Backlinks) {
 				node1.Backlinks[level] = append(node1.Backlinks[level], nodeID2)
 			}
@@ -463,7 +463,7 @@ func (h *Index) deleteStoredVector(node *Node) {
 	}
 	_ = h.rawVectorStore.Delete(VectorRef{
 		Kind:  VectorEncodingRaw,
-		Slot:  node.Ordinal,
+		Slot:  node.Slot,
 		Bytes: uint32(h.config.Dimension * 4),
 		Valid: true,
 	})

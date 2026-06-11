@@ -28,19 +28,19 @@ const (
 
 // BatchError represents a batch operation specific error
 type BatchError struct {
-	Code        BatchErrorCode         `json:"code"`
+	Timestamp   time.Time              `json:"timestamp"`
+	Cause       error                  `json:"cause,omitempty"`
+	ItemErrors  map[int]error          `json:"item_errors,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 	Message     string                 `json:"message"`
 	Operation   string                 `json:"operation"`
 	BatchSize   int                    `json:"batch_size"`
-	Processed   int                    `json:"processed"`
 	Failed      int                    `json:"failed"`
-	Retryable   bool                   `json:"retryable"`
-	Recoverable bool                   `json:"recoverable"`
-	ItemErrors  map[int]error          `json:"item_errors,omitempty"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-	Cause       error                  `json:"cause,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
+	Processed   int                    `json:"processed"`
+	Code        BatchErrorCode         `json:"code"`
 	Duration    time.Duration          `json:"duration"`
+	Recoverable bool                   `json:"recoverable"`
+	Retryable   bool                   `json:"retryable"`
 }
 
 func (be *BatchError) Error() string {
@@ -143,11 +143,11 @@ func (be *BatchError) GetSuccessfulItems() []int {
 type BatchRecoveryManager struct {
 	maxRetries          int
 	retryBackoff        time.Duration
+	maxChunkSize        int
+	maxConcurrency      int
 	allowPartialSuccess bool
 	enableChunking      bool
-	maxChunkSize        int
 	enableConcurrency   bool
-	maxConcurrency      int
 }
 
 // NewBatchRecoveryManager creates a new batch recovery manager
@@ -358,23 +358,23 @@ func (brm *BatchRecoveryManager) retryBatchOperation(
 
 // BatchOperationTracker tracks batch operations and their errors
 type BatchOperationTracker struct {
-	mu         sync.RWMutex
 	operations map[string]*BatchOperationStatus
+	mu         sync.RWMutex
 }
 
 // BatchOperationStatus represents the status of a batch operation
 type BatchOperationStatus struct {
+	StartTime time.Time              `json:"start_time"`
+	EndTime   *time.Time             `json:"end_time,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 	ID        string                 `json:"id"`
 	Operation string                 `json:"operation"`
+	Status    string                 `json:"status"`
+	Errors    []*BatchError          `json:"errors,omitempty"`
 	BatchSize int                    `json:"batch_size"`
 	Processed int                    `json:"processed"`
 	Failed    int                    `json:"failed"`
-	StartTime time.Time              `json:"start_time"`
-	EndTime   *time.Time             `json:"end_time,omitempty"`
 	Duration  time.Duration          `json:"duration"`
-	Status    string                 `json:"status"` // "running", "completed", "failed", "partial"
-	Errors    []*BatchError          `json:"errors,omitempty"`
-	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // NewBatchOperationTracker creates a new batch operation tracker

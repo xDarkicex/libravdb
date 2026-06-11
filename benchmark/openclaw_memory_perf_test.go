@@ -83,7 +83,7 @@ func TestOpenClawMemoryProfile(t *testing.T) {
 			searchDuration := time.Since(searchStart)
 			searchQPS := float64(len(queries)) / searchDuration.Seconds()
 
-			memUsage, memErr := collection.GetMemoryUsage()
+			memUsage, memErr := collection.GetMemoryUsage(context.Background())
 			if memErr != nil {
 				t.Fatalf("failed to get memory usage: %v", memErr)
 			}

@@ -139,8 +139,8 @@ func TestRangeFilter_NumericTypeConversion(t *testing.T) {
 
 func TestRangeFilter_Validate(t *testing.T) {
 	tests := []struct {
-		name      string
 		filter    *RangeFilter
+		name      string
 		wantError bool
 	}{
 		{
@@ -192,8 +192,8 @@ func TestRangeFilter_Validate(t *testing.T) {
 
 func TestRangeFilter_EstimateSelectivity(t *testing.T) {
 	tests := []struct {
-		name     string
 		filter   *RangeFilter
+		name     string
 		expected float64
 	}{
 		{

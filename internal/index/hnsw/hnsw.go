@@ -19,21 +19,21 @@ import (
 
 // VectorEntry represents a vector entry for HNSW indexing
 type VectorEntry struct {
-	ID       string
-	Ordinal  uint32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
 }
 
 // SearchResult represents a search result from HNSW
 type SearchResult struct {
-	Ordinal  uint32
-	ID       string
-	Score    float32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
+	Score    float32
 }
 
 type VectorProvider interface {
@@ -43,53 +43,49 @@ type VectorProvider interface {
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
-	mu                   sync.RWMutex
-	config               *Config
-	nodes                []*Node
-	entryPoint           *Node
-	maxLevel             int
-	levelGenerator       *rand.Rand
-	distance             util.DistanceFunc
-	size                 int
-	nextOrdinal          uint32 // monotonic counter for standalone (no-provider) inserts
+	searchScratchPool    sync.Pool
 	provider             VectorProvider
-	idToIndex            map[string]uint32 // Legacy standalone HNSW path
-	ordinalToID          map[uint32]string // Legacy standalone HNSW path
-	entryPointCandidates []uint32          // High-level nodes for entry point selection
-	// Performance optimizations
-	neighborSelector  *NeighborSelector // Optimized neighbor selection
-	searchScratchPool sync.Pool
-	scratchPool       *sync.Pool
-	linkSFL           *memory.ShardedFreeList
-	link0SFL          *memory.ShardedFreeList
-	rawVectorStore    RawVectorStore
-	// Quantization support
-	quantizer           quant.Quantizer
-	trainingVectors     [][]float32 // Vectors collected for quantizer training
-	quantizationTrained bool
-	// Memory mapping support
-	memoryMapped     bool
-	mmapPath         string
-	mmapSize         int64
-	vecMmap          *internalmemory.MemoryMap // Mmap for raw vectors
-	pqMmap           *internalmemory.MemoryMap // Mmap for compressed vectors
-	originalMemUsage int64             // Memory usage before mapping
+	quantizer            quant.Quantizer
+	rawVectorStore       RawVectorStore
+	idToIndex            map[string]uint32
+	entryPoint           *Node
+	distance             util.DistanceFunc
+	vecMmap              *internalmemory.MemoryMap
+	config               *Config
+	pqMmap               *internalmemory.MemoryMap
+	link0SFL             *memory.ShardedFreeList
+	ordinalToID          map[uint32]string
+	linkSFL              *memory.ShardedFreeList
+	neighborSelector     *NeighborSelector
+	levelGenerator       *rand.Rand
+	scratchPool          *sync.Pool
+	mmapPath             string
+	entryPointCandidates []uint32
+	trainingVectors      [][]float32
+	nodes                []*Node
+	size                 int
+	mmapSize             int64
+	maxLevel             int
+	originalMemUsage     int64
+	mu                   sync.RWMutex
+	nextOrdinal          uint32
+	quantizationTrained  bool
+	memoryMapped         bool
 }
 
 // Config holds HNSW configuration parameters
 type Config struct {
-	Dimension      int
-	M              int     // Maximum number of bi-directional links for each node
-	EfConstruction int     // Size of dynamic candidate list
-	EfSearch       int     // Size of dynamic candidate list during search
-	ML             float64 // Level generation factor (1/ln(2))
-	Metric         util.DistanceMetric
-	RandomSeed     int64 // For reproducible tests
 	Provider       VectorProvider
+	Quantization   *quant.QuantizationConfig
 	RawVectorStore string
+	Dimension      int
+	M              int
+	EfConstruction int
+	EfSearch       int
+	ML             float64
+	Metric         util.DistanceMetric
+	RandomSeed     int64
 	RawStoreCap    int
-	// Quantization configuration (optional)
-	Quantization *quant.QuantizationConfig
 }
 
 // NewHNSW creates a new HNSW index
@@ -248,10 +244,11 @@ func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
 		}
 		node.CompressedVector = compressed
 	} else if h.rawVectorStore != nil {
-		_, err := h.rawVectorStore.Put(entry.Vector)
+		ref, err := h.rawVectorStore.Put(entry.Vector)
 		if err != nil {
 			return fmt.Errorf("failed to store raw vector: %w", err)
 		}
+		node.Slot = ref.Slot
 	}
 
 	nodeID := node.Ordinal
@@ -419,10 +416,18 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 			len(query), h.config.Dimension)
 	}
 
+	var queryState any
+	if h.quantizer != nil {
+		queryState = h.quantizer.PrepareQuery(query)
+	}
+
 	// Phase 1: Search from top level to level 1
 	ep := h.entryPoint
 	for level := h.maxLevel; level > 0; level-- {
-		candidate := h.greedySearchLevel(query, ep, level)
+		candidate, err := h.greedySearchLevel(ctx, query, ep, level, queryState)
+		if err != nil {
+			return nil, err
+		}
 		if candidate != nil {
 			ep = h.nodes[candidate.ID]
 		}
@@ -430,7 +435,10 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 
 	// Phase 2: Search level 0 with ef
 	ef := max(h.config.EfSearch, k)
-	candidates := h.searchLevel(query, ep, ef, 0)
+	candidates, err := h.searchLevel(ctx, query, ep, ef, 0, queryState)
+	if err != nil {
+		return nil, err
+	}
 
 	// Convert to results and limit to k
 	results := make([]*SearchResult, 0, min(k, len(candidates)))
@@ -579,7 +587,10 @@ func (h *Index) Close() error {
 	h.idToIndex = make(map[string]uint32)
 	h.ordinalToID = make(map[uint32]string)
 	if h.rawVectorStore != nil {
-		_ = h.rawVectorStore.Reset()
+		_ = h.rawVectorStore.Close()
+	}
+	if h.quantizer != nil {
+		h.quantizer.Close()
 	}
 
 	return nil
@@ -726,7 +737,7 @@ func (h *Index) getNodeVector(node *Node) ([]float32, error) {
 	if h.rawVectorStore != nil {
 		ref := VectorRef{
 			Kind:  VectorEncodingRaw,
-			Slot:  node.Ordinal,
+			Slot:  node.Slot,
 			Bytes: uint32(h.config.Dimension * 4),
 			Valid: true,
 		}
@@ -749,7 +760,7 @@ func (h *Index) getNodeVectorLocal(node *Node) ([]float32, error) {
 	if h.rawVectorStore != nil {
 		ref := VectorRef{
 			Kind:  VectorEncodingRaw,
-			Slot:  node.Ordinal,
+			Slot:  node.Slot,
 			Bytes: uint32(h.config.Dimension * 4),
 			Valid: true,
 		}
@@ -817,7 +828,7 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 
 	// If one is a query vector and the other is quantized
 	if node2 != nil && node2.CompressedVector != nil && h.quantizer != nil {
-		return h.quantizer.DistanceToQuery(node2.CompressedVector, vec1)
+		return h.quantizer.DistanceToQuery(node2.CompressedVector, vec1, nil)
 	}
 
 	if vec1 == nil && node1 != nil {
@@ -941,6 +952,10 @@ func (h *Index) DisableMemoryMapping() error {
 			fmt.Printf("Failed to remove vector memory-mapped file %s: %v\n", path, err)
 		}
 		h.vecMmap = nil
+		if h.quantizer != nil {
+			h.quantizer.Close()
+			h.quantizer = nil
+		}
 		h.rawVectorStore = nil
 	}
 	if h.pqMmap != nil {
@@ -1124,30 +1139,53 @@ func (h *Index) estimateFileSize() int64 {
 }
 
 func (h *Index) freeNodeLinks(node *Node) {
-	if node == nil || len(node.Links) == 0 {
+	if node == nil || node.Links == nil {
 		return
 	}
 	for i, links := range node.Links {
-		ptr := unsafe.Pointer(unsafe.SliceData(links))
-		if ptr == nil {
-			continue
-		}
-		basePtr := unsafe.Pointer(uintptr(ptr) - 48)
-		slack := h.config.M / 4
-		if slack < 4 {
-			slack = 4
-		}
-		slack0 := (h.config.M * 2) / 4
-		if slack0 < 4 {
-			slack0 = 4
-		}
+		h.freeLinkSliceIfSFL(i, links)
+	}
+}
 
-		if i == 0 {
-			slot := unsafe.Slice((*byte)(basePtr), int(48+(h.config.M*2+slack0)*4))
-			_ = h.link0SFL.Deallocate(slot)
+// freeLinkSliceIfSFL checks if a slice came from the SFL allocator and deallocates it.
+// It uses capacity to detect SFL vs heap slices.
+func (h *Index) freeLinkSliceIfSFL(level int, links []uint32) {
+	if len(links) == 0 && cap(links) == 0 {
+		return
+	}
+
+	ptr := unsafe.Pointer(unsafe.SliceData(links))
+	if ptr == nil {
+		return
+	}
+
+	slack := h.config.M / 4
+	if slack < 4 {
+		slack = 4
+	}
+	slack0 := (h.config.M * 2) / 4
+	if slack0 < 4 {
+		slack0 = 4
+	}
+
+	expectedCap := h.config.M + slack
+	if level == 0 {
+		expectedCap = h.config.M*2 + slack0
+	}
+
+	// Only deallocate if it was originally an SFL slice
+	if cap(links) == expectedCap {
+		basePtr := unsafe.Pointer(uintptr(ptr) - 48)
+		if level == 0 {
+			if h.link0SFL != nil {
+				slot := unsafe.Slice((*byte)(basePtr), int(48+expectedCap*4))
+				_ = h.link0SFL.Deallocate(slot)
+			}
 		} else {
-			slot := unsafe.Slice((*byte)(basePtr), int(48+(h.config.M+slack)*4))
-			_ = h.linkSFL.Deallocate(slot)
+			if h.linkSFL != nil {
+				slot := unsafe.Slice((*byte)(basePtr), int(48+expectedCap*4))
+				_ = h.linkSFL.Deallocate(slot)
+			}
 		}
 	}
 }

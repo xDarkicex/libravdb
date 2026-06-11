@@ -71,7 +71,7 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 	}
 
 	// Verify configuration was applied correctly
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.Dimension != 128 {
 		t.Errorf("Expected dimension 128, got %d", stats.Dimension)
 	}
@@ -79,9 +79,9 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 	// Test inserting vectors with metadata that matches the schema
 
 	testVectors := []struct {
+		metadata map[string]interface{}
 		id       string
 		vector   []float32
-		metadata map[string]interface{}
 	}{
 		{
 			id:     "vec1",
@@ -269,7 +269,7 @@ func TestShardedCollectionStatsAggregation(t *testing.T) {
 	}
 
 	// Stats should not panic and should return aggregated values
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats == nil {
 		t.Fatal("Stats() returned nil")
 	}
@@ -311,7 +311,7 @@ func TestShardedCollectionGetMemoryUsage(t *testing.T) {
 	}
 
 	// GetMemoryUsage should not panic and should return aggregate usage
-	usage, err := collection.GetMemoryUsage()
+	usage, err := collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("GetMemoryUsage failed: %v", err)
 	}

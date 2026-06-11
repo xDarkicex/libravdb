@@ -35,6 +35,7 @@ func TestMemoryMappingIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create HNSW index: %v", err)
 	}
+	defer index.Close()
 
 	// Create memory manager
 	memManager := memory.NewManager(memory.MemoryConfig{
@@ -213,6 +214,7 @@ func TestMemoryPressureHandling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create HNSW index %d: %v", i, err)
 		}
+		defer index.Close()
 		indices[i] = index
 
 		// Register with memory manager

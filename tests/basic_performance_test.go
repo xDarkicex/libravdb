@@ -99,7 +99,7 @@ func TestBasicPerformance(t *testing.T) {
 		}
 
 		// Verify collection stats
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != vectorCount {
 			t.Errorf("Expected %d vectors, got %d", vectorCount, stats.VectorCount)
 		}
@@ -235,7 +235,7 @@ func TestBasicPerformance(t *testing.T) {
 			float64(batchSize)/batchDuration.Seconds())
 
 		// Verify all vectors were inserted
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != batchSize {
 			t.Errorf("Expected %d vectors, got %d", batchSize, stats.VectorCount)
 		}

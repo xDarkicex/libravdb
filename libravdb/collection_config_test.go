@@ -11,10 +11,10 @@ import (
 
 func TestCollectionConfigValidation(t *testing.T) {
 	tests := []struct {
-		name        string
 		config      *CollectionConfig
-		expectError bool
+		name        string
 		errorMsg    string
+		expectError bool
 	}{
 		{
 			name: "valid basic config",
@@ -218,10 +218,10 @@ func TestCollectionConfigValidation(t *testing.T) {
 
 func TestMetadataSchemaValidation(t *testing.T) {
 	tests := []struct {
-		name        string
 		schema      MetadataSchema
-		expectError bool
+		name        string
 		errorMsg    string
+		expectError bool
 	}{
 		{
 			name: "valid schema",
@@ -270,10 +270,10 @@ func TestMetadataSchemaValidation(t *testing.T) {
 
 func TestCollectionOptionsValidation(t *testing.T) {
 	tests := []struct {
-		name        string
 		option      CollectionOption
-		expectError bool
+		name        string
 		errorMsg    string
+		expectError bool
 	}{
 		{
 			name:        "valid memory limit",
@@ -406,18 +406,18 @@ func TestBackwardCompatibility(t *testing.T) {
 
 func TestFieldTypeString(t *testing.T) {
 	tests := []struct {
-		fieldType FieldType
 		expected  string
+		fieldType FieldType
 	}{
-		{StringField, "string"},
-		{IntField, "int"},
-		{FloatField, "float"},
-		{BoolField, "bool"},
-		{TimeField, "time"},
-		{StringArrayField, "string_array"},
-		{IntArrayField, "int_array"},
-		{FloatArrayField, "float_array"},
-		{FieldType(999), "unknown"},
+		{expected: "string", fieldType: StringField},
+		{expected: "int", fieldType: IntField},
+		{expected: "float", fieldType: FloatField},
+		{expected: "bool", fieldType: BoolField},
+		{expected: "time", fieldType: TimeField},
+		{expected: "string_array", fieldType: StringArrayField},
+		{expected: "int_array", fieldType: IntArrayField},
+		{expected: "float_array", fieldType: FloatArrayField},
+		{expected: "unknown", fieldType: FieldType(999)},
 	}
 
 	for _, tt := range tests {
@@ -432,13 +432,13 @@ func TestFieldTypeString(t *testing.T) {
 
 func TestCachePolicyString(t *testing.T) {
 	tests := []struct {
-		policy   CachePolicy
 		expected string
+		policy   CachePolicy
 	}{
-		{LRUCache, "lru"},
-		{LFUCache, "lfu"},
-		{FIFOCache, "fifo"},
-		{CachePolicy(999), "unknown"},
+		{expected: "lru", policy: LRUCache},
+		{expected: "lfu", policy: LFUCache},
+		{expected: "fifo", policy: FIFOCache},
+		{expected: "unknown", policy: CachePolicy(999)},
 	}
 
 	for _, tt := range tests {

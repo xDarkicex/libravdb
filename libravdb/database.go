@@ -15,6 +15,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
+	"github.com/xDarkicex/memory"
 )
 
 // Logger is the logging interface accepted by the database.
@@ -25,27 +26,28 @@ type Logger interface {
 
 // Database represents the main vector database instance
 type Database struct {
-	mu            sync.RWMutex
-	collections   map[string]*Collection
 	storage       storage.Engine
-	bridge        *indexPersistenceBridge // cached indexes from recovery, used for lazy-loading
+	logger        Logger
+	collections   map[string]*Collection
+	bridge        *indexPersistenceBridge
 	metrics       *obs.Metrics
 	health        *obs.HealthChecker
 	healthMonitor *SystemHealthMonitorImpl
 	config        *Config
-	logger        Logger
+	scratchPool   *sync.Pool
+	mu            sync.RWMutex
 	closed        bool
 }
 
 // Config holds database-wide configuration
 type Config struct {
+	Logger              Logger
 	StoragePath         string
-	MetricsEnabled      bool
-	TracingEnabled      bool
 	MaxCollections      int
 	MaxConcurrentWrites int
 	MaxWriteQueueDepth  int
-	Logger              Logger
+	MetricsEnabled      bool
+	TracingEnabled      bool
 }
 
 // New creates a new Database instance with the given options
@@ -89,6 +91,15 @@ func New(opts ...Option) (*Database, error) {
 		metrics:     metrics,
 		config:      config,
 		logger:      config.Logger,
+		scratchPool: &sync.Pool{
+			New: func() interface{} {
+				arena, err := memory.NewArena(1024 * 1024)
+				if err != nil {
+					panic(fmt.Sprintf("failed to allocate scratch arena: %v", err))
+				}
+				return arena
+			},
+		},
 	}
 
 	// Wire the bridge back to the database so SerializeIndex can access
@@ -118,6 +129,8 @@ func New(opts ...Option) (*Database, error) {
 	// Load existing collections from storage, preferring cached indexes
 	// that were deserialized or rebuilt during recovery.
 	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
+		db.healthMonitor.Stop()
+		storageEngine.Close()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 
@@ -148,7 +161,7 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, ErrTooManyCollections
 	}
 
-	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
+	collection, err := newCollection(ctx, name, db.storage, db.metrics, db.newWriteController(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
@@ -188,7 +201,7 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 		// Fall through to create.
 	}
 
-	col, err := db.createCollectionLocked(name, opts...)
+	col, err := db.createCollectionLocked(ctx, name, opts...)
 	if err == nil {
 		return col, nil
 	}
@@ -205,8 +218,8 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 }
 
 // createCollectionLocked creates a collection. Caller must hold db.mu.
-func (db *Database) createCollectionLocked(name string, opts ...CollectionOption) (*Collection, error) {
-	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
+func (db *Database) createCollectionLocked(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error) {
+	collection, err := newCollection(ctx, name, db.storage, db.metrics, db.newWriteController(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
@@ -267,7 +280,7 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 	}); ok {
 		var err error
-		collection, err = db.loadCollectionFromStorage(name, fileEngine, db.bridge)
+		collection, err = db.loadCollectionFromStorage(context.Background(), name, fileEngine, db.bridge)
 		if err != nil {
 			return nil, err
 		}
@@ -404,7 +417,7 @@ func (db *Database) Ping(ctx context.Context) error {
 }
 
 // Stats returns database statistics
-func (db *Database) Stats() *DatabaseStats {
+func (db *Database) Stats(ctx context.Context) *DatabaseStats {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -415,7 +428,7 @@ func (db *Database) Stats() *DatabaseStats {
 
 	var totalMemory int64
 	for name, collection := range db.collections {
-		collectionStats := collection.Stats()
+		collectionStats := collection.Stats(ctx)
 		stats.Collections[name] = collectionStats
 		totalMemory += collectionStats.MemoryUsage
 	}
@@ -489,7 +502,7 @@ func (db *Database) SetGlobalMemoryLimit(bytes int64) error {
 }
 
 // GetGlobalMemoryUsage returns total memory usage across all collections
-func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
+func (db *Database) GetGlobalMemoryUsage(ctx context.Context) (*GlobalMemoryUsage, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -503,7 +516,7 @@ func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
 	}
 
 	for name, collection := range db.collections {
-		memUsage, err := collection.GetMemoryUsage()
+		memUsage, err := collection.GetMemoryUsage(ctx)
 		if err != nil {
 			continue // Skip collections with errors
 		}
@@ -516,7 +529,7 @@ func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
 			MemoryMapped:  memUsage.MemoryMapped,
 			Limit:         memUsage.Limit,
 			Available:     memUsage.Available,
-			PressureLevel: "normal", // TODO: Calculate pressure level
+			PressureLevel: calculatePressureLevel(memUsage.Total, memUsage.Limit),
 			Timestamp:     memUsage.Timestamp,
 		}
 
@@ -584,8 +597,11 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 			continue
 		}
 
-		collection, err := db.loadCollectionFromStorage(name, fileEngine, bridge)
+		collection, err := db.loadCollectionFromStorage(ctx, name, fileEngine, bridge)
 		if err != nil {
+			for _, c := range loadedCollections {
+				c.Close()
+			}
 			return err
 		}
 
@@ -599,11 +615,10 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 	}
 	db.mu.Unlock()
 
-	_ = ctx
 	return nil
 }
 
-func (db *Database) loadCollectionFromStorage(name string, engine interface {
+func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, engine interface {
 	GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 }, bridge *indexPersistenceBridge) (*Collection, error) {
 	// Check if this is a shard collection name - if so, skip it
@@ -623,11 +638,14 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 		for i := 1; i < shardCount; i++ {
 			shardStorages[i], _, err = engine.GetCollectionWithConfig(shardNames[i])
 			if err != nil {
+				for j := 0; j < i; j++ {
+					shardStorages[j].Close()
+				}
 				return nil, fmt.Errorf("collection %s is missing shard %d: %w", name, i, err)
 			}
 		}
 
-		collection, err := newShardedCollectionFromStorage(name, shardStorages, config, db.metrics, db.newWriteController())
+		collection, err := newShardedCollectionFromStorage(ctx, name, shardStorages, config, db.metrics, db.newWriteController())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
@@ -648,7 +666,7 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 		cachedIndex = bridge.takeCachedIndex(name)
 	}
 
-	collection, err := newCollectionFromStorage(name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
+	collection, err := newCollectionFromStorage(ctx, name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}

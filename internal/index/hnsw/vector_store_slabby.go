@@ -21,11 +21,11 @@ type slabbySlot struct {
 }
 
 type SlabbyRawVectorStore struct {
+	sfl             *memory.ShardedFreeList
+	slots           []slabbySlot
 	dim             int
 	bytesPerVector  int
 	segmentCapacity int
-	sfl             *memory.ShardedFreeList
-	slots           []slabbySlot
 	activeCount     int
 }
 

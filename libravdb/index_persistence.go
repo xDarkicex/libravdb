@@ -12,10 +12,10 @@ import (
 // indexPersistenceBridge implements singlefile.IndexSnapshotProvider to bridge
 // the storage engine's checkpoint/recovery with the libravdb index layer.
 type indexPersistenceBridge struct {
-	mu     sync.Mutex
 	engine storage.Engine
 	db     *Database
-	cache  map[string]index.Index // populated during recovery, consumed by loadExistingCollections
+	cache  map[string]index.Index
+	mu     sync.Mutex
 }
 
 func (b *indexPersistenceBridge) SetEngine(e storage.Engine) {

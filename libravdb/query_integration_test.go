@@ -466,8 +466,8 @@ func TestQueryBuilderErrorHandling(t *testing.T) {
 
 func TestFilterSelectivityEstimation(t *testing.T) {
 	tests := []struct {
-		name                string
 		filter              filter.Filter
+		name                string
 		expectedSelectivity float64
 		tolerance           float64
 	}{

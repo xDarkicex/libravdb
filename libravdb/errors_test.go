@@ -342,10 +342,10 @@ func TestGracefulDegradationManager(t *testing.T) {
 // Mock implementations for testing
 
 type mockRecoveryStrategy struct {
-	canRecover    bool
-	shouldFail    bool
 	delay         time.Duration
 	recoverCalled atomic.Bool
+	canRecover    bool
+	shouldFail    bool
 }
 
 func (mrs *mockRecoveryStrategy) CanRecover(err *VectorDBError) bool {
@@ -375,12 +375,12 @@ func (mrs *mockRecoveryStrategy) GetRecoveryAction() RecoveryAction {
 }
 
 type mockMemoryManager struct {
-	mu                sync.RWMutex
 	usage             MemoryUsage
-	handleLimitCalled bool
 	handleLimitError  error
-	gcTriggered       bool
 	cachesEvicted     int64
+	mu                sync.RWMutex
+	handleLimitCalled bool
+	gcTriggered       bool
 	mmapEnabled       bool
 	shouldFailGC      bool
 	shouldFailEvict   bool

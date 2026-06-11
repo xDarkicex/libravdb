@@ -31,9 +31,9 @@ func (m *mockQuantizer) Distance(compressed1, compressed2 []byte) (float32, erro
 	return 0.5, nil
 }
 
-func (m *mockQuantizer) PrepareQuery(query []float32) {}
+func (m *mockQuantizer) PrepareQuery(query []float32) any { return nil }
 
-func (m *mockQuantizer) DistanceToQuery(compressed []byte, query []float32) (float32, error) {
+func (m *mockQuantizer) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {
 	return 0.3, nil
 }
 
@@ -51,6 +51,10 @@ func (m *mockQuantizer) IsTrained() bool {
 
 func (m *mockQuantizer) Config() *QuantizationConfig {
 	return m.config
+}
+
+func (m *mockQuantizer) Close() error {
+	return nil
 }
 
 // Mock factory for testing

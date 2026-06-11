@@ -16,8 +16,8 @@ func TestIVFPQWithQuantizationIntegration(t *testing.T) {
 
 	// Test both quantization types
 	quantTypes := []struct {
-		name   string
 		config *quant.QuantizationConfig
+		name   string
 	}{
 		{
 			name: "Product Quantization",

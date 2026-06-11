@@ -8,8 +8,8 @@ import (
 
 // EqualityFilter implements exact equality matching for metadata fields
 type EqualityFilter struct {
-	Field string
 	Value interface{}
+	Field string
 }
 
 // NewEqualityFilter creates a new equality filter

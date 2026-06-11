@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 	"unsafe"
@@ -24,50 +25,51 @@ var FlatMagicBytes = []byte("LIBRAFLT")
 
 // VectorEntry represents a vector entry in the flat index
 type VectorEntry struct {
+	Metadata     map[string]interface{} `json:"metadata"`
 	ID           string                 `json:"id"`
 	Vector       []float32              `json:"vector"`
-	Metadata     map[string]interface{} `json:"metadata"`
 	Version      uint64                 `json:"version"`
-	metadataSize int64                  // cached estimate, summed by MemoryUsage
+	metadataSize int64
 }
 
 // SearchResult represents a search result from the flat index
 type SearchResult struct {
-	ID       string                 `json:"id"`
-	Score    float32                `json:"score"`
-	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata"`
+	ID       string                 `json:"id"`
+	Vector   []float32              `json:"vector"`
 	Version  uint64                 `json:"version"`
+	Score    float32                `json:"score"`
 }
 
 // Config holds configuration for the flat index
 type Config struct {
+	Quantization *quant.QuantizationConfig `json:"quantization,omitempty"`
 	Dimension    int                       `json:"dimension"`
 	Metric       util.DistanceMetric       `json:"metric"`
-	Quantization *quant.QuantizationConfig `json:"quantization,omitempty"`
 }
 
 // PersistenceMetadata holds metadata about persisted flat index
 type PersistenceMetadata struct {
-	Version       uint32    `json:"version"`
+	CreatedAt     time.Time `json:"created_at"`
+	IndexType     string    `json:"index_type"`
 	NodeCount     int       `json:"node_count"`
 	Dimension     int       `json:"dimension"`
-	MaxLevel      int       `json:"max_level"` // Always 0 for flat index
-	IndexType     string    `json:"index_type"`
-	CreatedAt     time.Time `json:"created_at"`
-	ChecksumCRC32 uint32    `json:"checksum_crc32"`
+	MaxLevel      int       `json:"max_level"`
 	FileSize      int64     `json:"file_size"`
+	Version       uint32    `json:"version"`
+	ChecksumCRC32 uint32    `json:"checksum_crc32"`
 }
 
 // Index implements a flat (brute-force) vector index
 type Index struct {
-	config      *Config
-	vectors     []*VectorEntry
-	idToIndex   map[string]int
 	quantizer   quant.Quantizer
-	mu          sync.RWMutex
+	config      *Config
+	idToIndex   map[string]int
 	vectorSFL   *memory.ShardedFreeList
 	scratchPool *sync.Pool
+	vectors     []*VectorEntry
+	mu          sync.RWMutex
+	queryTiers  [4]poolTier
 }
 
 // NewFlat creates a new flat index
@@ -97,6 +99,12 @@ func NewFlat(config *Config) (*Index, error) {
 				a, _ := memory.NewArena(1024 * 1024)
 				return a
 			},
+		},
+		queryTiers: [4]poolTier{
+			{maxK: 16},
+			{maxK: 128},
+			{maxK: 1024},
+			{maxK: 4096},
 		},
 	}
 
@@ -182,6 +190,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 
 	for _, newEntry := range newEntries {
 		if existingIndex, exists := idx.idToIndex[newEntry.ID]; exists {
+			idx.deallocateVector(idx.vectors[existingIndex].Vector)
 			idx.vectors[existingIndex] = newEntry
 		} else {
 			idx.idToIndex[newEntry.ID] = len(idx.vectors)
@@ -212,6 +221,7 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	}
 
 	if existingIndex, exists := idx.idToIndex[entry.ID]; exists {
+		idx.deallocateVector(idx.vectors[existingIndex].Vector)
 		idx.vectors[existingIndex] = newEntry
 		return nil
 	}
@@ -270,44 +280,28 @@ const userDataOffset = 48
 // routes to the correct tier by construction — no runtime lookup, no ignored
 // error from a mismatched Deallocate.
 type heapSlot struct {
-	slot []byte
 	pool *memory.ShardedFreeList
+	slot []byte
 }
 
 func (hs *heapSlot) free() { hs.pool.Deallocate(hs.slot) }
 
-// Power-of-2 tier table. Each tier's slot is sized for its maxK, bounding
-// waste to <8× in the worst case (k=17 uses a k=128 slot).
-//
-//	k=1–16    → 320 bytes
-//	k=17–128  → 2,112 bytes
-//	k=129–1024 → 16,448 bytes
-//	k=1025–4096 → 65,600 bytes
-//
-// k > 4096 falls back to Go heap.
 type poolTier struct {
-	maxK int
 	pool *memory.ShardedFreeList
+	maxK int
 	once sync.Once
-}
-
-var queryTiers = [...]poolTier{
-	{maxK: 16},
-	{maxK: 128},
-	{maxK: 1024},
-	{maxK: 4096},
 }
 
 // acquireHeapSlot returns a heapSlot paired with a []heapElement buffer backed
 // by the appropriate off-heap tier. The buffer has len=k and cap=tierMaxK.
 // Returns nil, nil if k exceeds the largest tier — caller must fall back to
 // Go heap allocation.
-func acquireHeapSlot(k int) (*heapSlot, []heapElement) {
-	for i := range queryTiers {
-		if k > queryTiers[i].maxK {
+func (idx *Index) acquireHeapSlot(k int) (*heapSlot, []heapElement) {
+	for i := range idx.queryTiers {
+		if k > idx.queryTiers[i].maxK {
 			continue
 		}
-		tier := &queryTiers[i]
+		tier := &idx.queryTiers[i]
 		tier.once.Do(func() {
 			slotSize := uint64(userDataOffset + tier.maxK*16)
 			pool, err := memory.NewShardedFreeList(memory.FreeListConfig{
@@ -372,7 +366,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	// Acquire off-heap buffer for the heap. Gracefully degrades to arena
 	// allocation if k exceeds the largest tier or the SFL pool is exhausted.
 	var heapBuf []heapElement
-	hs, buf := acquireHeapSlot(k)
+	hs, buf := idx.acquireHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
 		heapBuf = buf
@@ -387,24 +381,37 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 
 	count := 0
 
-	for vecIdx, entry := range idx.vectors {
+	for i := 0; i < len(idx.vectors); i++ {
+		// Periodically yield the lock to prevent write starvation
+		if i > 0 && i%1024 == 0 {
+			idx.mu.RUnlock()
+			runtime.Gosched() // Yield to allow waiting writers to acquire the lock
+			idx.mu.RLock()
+			// If elements were deleted, ensure we don't go out of bounds
+			if i >= len(idx.vectors) {
+				break
+			}
+		}
+
 		select {
 		case <-ctx.Done():
+			// The deferred RUnlock will handle the unlock
 			return nil, ctx.Err()
 		default:
 		}
 
+		entry := idx.vectors[i]
 		distance, err := idx.computeDistance(query, entry.Vector)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compute distance: %w", err)
 		}
 
 		if count < limit {
-			heapBuf[count] = heapElement{vecIdx: vecIdx, score: distance}
+			heapBuf[count] = heapElement{vecIdx: i, score: distance}
 			upHeap(heapBuf, count)
 			count++
 		} else if distance < heapBuf[0].score {
-			heapBuf[0] = heapElement{vecIdx: vecIdx, score: distance}
+			heapBuf[0] = heapElement{vecIdx: i, score: distance}
 			downHeap(heapBuf, 0, count)
 		}
 	}
@@ -431,7 +438,6 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-
 // Delete removes a vector from the index
 func (idx *Index) Delete(ctx context.Context, id string) error {
 	idx.mu.Lock()
@@ -439,8 +445,11 @@ func (idx *Index) Delete(ctx context.Context, id string) error {
 
 	index, exists := idx.idToIndex[id]
 	if !exists {
-		return fmt.Errorf("vector with ID %s not found", id)
+		return fmt.Errorf("vector with ID %s: %w", id, util.ErrNotFound)
 	}
+
+	// Deallocate the off-heap vector before dropping the reference
+	idx.deallocateVector(idx.vectors[index].Vector)
 
 	// Remove from vectors slice
 	idx.vectors = append(idx.vectors[:index], idx.vectors[index+1:]...)
@@ -492,7 +501,21 @@ func (idx *Index) Close() error {
 
 	idx.vectors = nil
 	idx.idToIndex = nil
-	idx.quantizer = nil
+	if idx.quantizer != nil {
+		idx.quantizer.Close()
+		idx.quantizer = nil
+	}
+	if idx.vectorSFL != nil {
+		idx.vectorSFL.Free()
+		idx.vectorSFL = nil
+	}
+
+	for i := range idx.queryTiers {
+		if idx.queryTiers[i].pool != nil {
+			idx.queryTiers[i].pool.Free()
+			idx.queryTiers[i].pool = nil
+		}
+	}
 
 	return nil
 }

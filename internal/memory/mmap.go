@@ -14,11 +14,11 @@ import (
 
 // MemoryMap represents a memory-mapped file
 type MemoryMap struct {
-	mu       sync.RWMutex
 	file     *os.File
+	path     string
 	data     []byte
 	size     int64
-	path     string
+	mu       sync.RWMutex
 	readOnly bool
 }
 
@@ -195,9 +195,9 @@ func (m *MemoryMap) Resize(newSize int64) error {
 
 // MemoryMapManager manages multiple memory mappings
 type MemoryMapManager struct {
-	mu       sync.RWMutex
 	mappings map[string]*MemoryMap
 	basePath string
+	mu       sync.RWMutex
 }
 
 // NewMemoryMapManager creates a new memory map manager

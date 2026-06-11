@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -229,8 +230,9 @@ func (h *Index) writeNodes(writer io.Writer) error {
 			if err := binary.Write(writer, binary.LittleEndian, uint32(len(vector))); err != nil {
 				return err
 			}
-			for _, val := range vector {
-				if err := binary.Write(writer, binary.LittleEndian, val); err != nil {
+			if len(vector) > 0 {
+				vectorBytes := unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4)
+				if _, err := writer.Write(vectorBytes); err != nil {
 					return err
 				}
 			}
@@ -517,7 +519,9 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 		if _, err := io.ReadFull(reader, idBytes); err != nil {
 			return err
 		}
-		nodeID := string(idBytes)
+		// Clone to heap: idBytes is arena-backed and will be invalidated
+		// when the arena is Reset+returned to scratchPool below.
+		nodeID := strings.Clone(string(idBytes))
 
 		// Read vector dimension
 		var vectorLen uint32
@@ -549,9 +553,11 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			Level:   int(level),
 		}
 		if h.rawVectorStore != nil {
-			if _, err := h.rawVectorStore.Put(vector); err != nil {
+			ref, err := h.rawVectorStore.Put(vector)
+			if err != nil {
 				return fmt.Errorf("failed to restore raw vector into store: %w", err)
 			}
+			node.Slot = ref.Slot
 		}
 		if int(ordinal) >= len(h.nodes) {
 			newCap := nextNodeCapacity(len(h.nodes), int(ordinal)+1)
@@ -605,32 +611,54 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 			return err
 		}
 
-		// Initialize links for this node
-		node.Links = make([][]uint32, levelCount)
+		// Initialize links for this node. Allocate from SFL (not Go heap)
+	// so freeNodeLinks can safely deallocate them during Delete.
+	node.Links = make([][]uint32, levelCount)
 
-		// Read each level's connections
-		for j := uint32(0); j < levelCount; j++ {
-			var level uint32
-			if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
+	// Read each level's connections
+	for j := uint32(0); j < levelCount; j++ {
+		var level uint32
+		if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
+			return err
+		}
+
+		var connectionCount uint32
+		if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
+			return err
+		}
+
+		// Use the same SFL allocation as newNodeLinks: level 0 uses
+		// link0SFL (larger slot for 2×M connections), higher levels
+		// use linkSFL.
+		var slot []byte
+		var slotErr error
+		if level == 0 {
+			slot, slotErr = h.link0SFL.Allocate()
+		} else {
+			slot, slotErr = h.linkSFL.Allocate()
+		}
+		if slotErr != nil {
+			return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
+		}
+
+		// Data starts at offset 48. Capacity matches what newNodeLinks
+		// configures (capacity + slack).
+		maxCap := (len(slot) - 48) / 4
+		if uint32(maxCap) < connectionCount {
+			return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
+				nodeIndex, level, connectionCount, maxCap)
+		}
+		connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[48])), maxCap)[:connectionCount]
+		for k := uint32(0); k < connectionCount; k++ {
+			if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
 				return err
-			}
-
-			var connectionCount uint32
-			if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
-				return err
-			}
-
-			connections := make([]uint32, connectionCount)
-			for k := uint32(0); k < connectionCount; k++ {
-				if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
-					return err
-				}
-			}
-
-			if int(level) < len(node.Links) {
-				node.Links[level] = connections
 			}
 		}
+
+		if int(level) < len(node.Links) {
+			node.Links[level] = connections
+		}
+	}
 	}
 
 	return nil

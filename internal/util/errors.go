@@ -8,4 +8,5 @@ var (
 	ErrInvalidK    = errors.New("k must be positive")
 	ErrNotTrained  = errors.New("index must be trained before operation")
 	ErrDimension   = errors.New("vector dimension does not match index dimension")
+	ErrNotFound    = errors.New("not found")
 )

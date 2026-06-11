@@ -8,19 +8,18 @@ import (
 
 // LRUCache implements a thread-safe LRU (Least Recently Used) cache
 type LRUCache struct {
+	items    map[string]*list.Element
+	order    *list.List
 	name     string
 	capacity int64
 	size     int64
-
-	mu    sync.RWMutex
-	items map[string]*list.Element
-	order *list.List
+	mu       sync.RWMutex
 }
 
 // cacheItem represents an item in the LRU cache
 type cacheItem struct {
-	key   string
 	value interface{}
+	key   string
 	size  int64
 }
 

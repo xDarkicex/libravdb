@@ -7,15 +7,15 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 func TestNewIVFPQ(t *testing.T) {
 	tests := []struct {
-		name        string
 		config      *Config
+		name        string
 		expectError bool
 	}{
 		{
@@ -340,8 +340,8 @@ func TestInsertErrors(t *testing.T) {
 	// }
 
 	tests := []struct {
-		name  string
 		entry *VectorEntry
+		name  string
 		train bool
 	}{
 		{

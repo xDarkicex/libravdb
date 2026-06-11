@@ -7,11 +7,12 @@ import (
 
 // workerPool manages a pool of workers for concurrent batch processing
 type workerPool struct {
-	workers int
-	jobs    chan func() error
-	wg      sync.WaitGroup
-	closed  bool
-	mu      sync.Mutex
+	jobs     chan func() error
+	wg       sync.WaitGroup
+	submitWg sync.WaitGroup
+	workers  int
+	mu       sync.Mutex
+	closed   bool
 }
 
 // newWorkerPool creates a new worker pool with the specified number of workers
@@ -46,12 +47,14 @@ func (p *workerPool) worker() {
 // submit submits a job to the worker pool
 func (p *workerPool) submit(job func() error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
+	p.submitWg.Add(1)
+	p.mu.Unlock()
 
+	defer p.submitWg.Done()
 	p.jobs <- job
 }
 
@@ -61,9 +64,13 @@ func (p *workerPool) wait(ctx context.Context) error {
 	p.mu.Lock()
 	if !p.closed {
 		p.closed = true
+		p.mu.Unlock()
+
+		p.submitWg.Wait()
 		close(p.jobs)
+	} else {
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
 
 	// Wait for all workers to finish
 	done := make(chan struct{})
@@ -83,13 +90,14 @@ func (p *workerPool) wait(ctx context.Context) error {
 // close shuts down the worker pool
 func (p *workerPool) close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
-
 	p.closed = true
+	p.mu.Unlock()
+
+	p.submitWg.Wait()
 	close(p.jobs)
 	p.wg.Wait()
 }
