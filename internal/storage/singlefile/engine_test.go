@@ -1676,3 +1676,97 @@ func TestEngine_Vacuum(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestEngine_Backup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backup_source.libravdb")
+	backupPath := filepath.Join(t.TempDir(), "backup_dest.libravdb")
+	
+	db, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	engine := db.(*Engine)
+
+	coll, err := engine.CreateCollection("test_coll", &storage.CollectionConfig{Dimension: 2, Metric: 0})
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	// Insert 10 records
+	for i := 0; i < 10; i++ {
+		entry := &index.VectorEntry{
+			ID:      fmt.Sprintf("id-%d", i),
+			Ordinal: uint32(i + 1),
+			Vector:  []float32{1.0, float32(i)},
+		}
+		if err := coll.Insert(context.Background(), entry); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	// Create backup
+	if err := engine.Backup(context.Background(), backupPath); err != nil {
+		t.Fatalf("Backup failed: %v", err)
+	}
+
+	// Verify original engine still works
+	exists, _ := coll.Exists(context.Background(), "id-5")
+	if !exists {
+		t.Fatalf("Original engine lost record after backup")
+	}
+	
+	if err := engine.Close(); err != nil {
+		t.Fatalf("Close original: %v", err)
+	}
+
+	// Verify backup engine works
+	backupDB, err := New(backupPath)
+	if err != nil {
+		t.Fatalf("Failed to open backup: %v", err)
+	}
+	backupEngine := backupDB.(*Engine)
+	defer backupEngine.Close()
+	
+	backupColl, err := backupEngine.GetCollection("test_coll")
+	if err != nil {
+		t.Fatalf("Failed to get collection from backup: %v", err)
+	}
+	
+	for i := 0; i < 10; i++ {
+		exists, err := backupColl.Exists(context.Background(), fmt.Sprintf("id-%d", i))
+		if err != nil || !exists {
+			t.Fatalf("Backup missing record id-%d", i)
+		}
+	}
+}
+
+func TestEngine_Drop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drop.libravdb")
+	
+	db, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	engine := db.(*Engine)
+	
+	// Create some data
+	coll, err := engine.CreateCollection("test_coll", &storage.CollectionConfig{Dimension: 2, Metric: 0})
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	
+	// Drop engine
+	if err := engine.Drop(context.Background()); err != nil {
+		t.Fatalf("Drop failed: %v", err)
+	}
+	
+	// Verify file is gone
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("Database file still exists after Drop")
+	}
+	
+	// Verify ops fail
+	if err := coll.Insert(context.Background(), &index.VectorEntry{ID: "test"}); err == nil {
+		t.Fatalf("Expected Insert to fail on dropped engine")
+	}
+}

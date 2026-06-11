@@ -30,6 +30,8 @@ type Engine interface {
 	DeleteCollection(name string) error
 	Close() error
 	Vacuum(ctx context.Context) error
+	Backup(ctx context.Context, destPath string) error
+	Drop(ctx context.Context) error
 }
 
 // WriteStats captures coarse write-path instrumentation for benchmarking.

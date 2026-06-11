@@ -747,3 +747,51 @@ func (db *Database) Vacuum(ctx context.Context) error {
 	
 	return fmt.Errorf("underlying storage engine does not support Vacuum")
 }
+
+// Backup creates a point-in-time copy of the database to the specified destination
+// path. It uses a non-blocking fast-forward design to ensure the copy is consistent
+// without interrupting active database operations.
+func (db *Database) Backup(ctx context.Context, destPath string) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	if v, ok := db.storage.(interface{ Backup(context.Context, string) error }); ok {
+		return v.Backup(ctx, destPath)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Backup")
+}
+
+// Drop completely closes the database and destroys its underlying files from disk.
+// Once a database is dropped, it cannot be recovered without a backup.
+func (db *Database) Drop(ctx context.Context) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	// Close all collections safely
+	for _, collection := range db.collections {
+		collection.Close()
+	}
+	db.collections = make(map[string]*Collection)
+	
+	// Stop health monitor
+	if db.healthMonitor != nil {
+		db.healthMonitor.Stop()
+	}
+	
+	db.closed = true
+	
+	if v, ok := db.storage.(interface{ Drop(context.Context) error }); ok {
+		return v.Drop(ctx)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Drop")
+}

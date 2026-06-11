@@ -1634,6 +1634,240 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 	return nil
 }
 
+// Backup creates a point-in-time copy of the active database to destPath.
+// It uses the same non-blocking fast-forward logic as Vacuum.
+func (e *Engine) Backup(ctx context.Context, destPath string) error {
+	// Phase 1: flush + snapshot (brief lock)
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("engine closed")
+	}
+	if err := e.checkpointLocked(); err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup pre-checkpoint: %w", err)
+	}
+	
+	if e.indexProvider != nil {
+		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("backup snapshot vectors: %w", err)
+		}
+	}
+
+	stat, err := e.file.Stat()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup stat: %w", err)
+	}
+	phase1Size := stat.Size()
+	snapshotState := captureState(e)
+	origHeader, err := e.readHeader()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup read header: %w", err)
+	}
+	phase1LSN := e.lastLSN
+	e.mu.Unlock()
+
+	// Phase 2: Serialization and writing backup file (Unlocked)
+	snapshotBytes, err := encodeStateBinary(snapshotState)
+	if err != nil {
+		return fmt.Errorf("backup encode state: %w", err)
+	}
+	if len(snapshotBytes) > maxChunkSize {
+		return fmt.Errorf("backup snapshot size %d exceeds limit %d", len(snapshotBytes), maxChunkSize)
+	}
+
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(snapshotState.Collections))
+		for name := range snapshotState.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("backup serialize index %s: %w", name, err)
+			}
+			if indexBytes == nil { continue }
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+
+	destFile, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("backup create file: %w", err)
+	}
+	
+	cleanup := true
+	defer func() {
+		if cleanup {
+			destFile.Close()
+			os.Remove(destPath)
+		}
+	}()
+
+	const snapshotOffset = uint64(3 * pageSize)
+	indexOffset := snapshotOffset + 16 + uint64(len(snapshotBytes))
+	indexLength := uint64(len(indexBlock))
+	totalSize := int64(indexOffset)
+	if len(indexBlock) > 0 {
+		totalSize += 16 + int64(indexLength)
+	}
+	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
+
+	fh := &fileHeader{
+		FormatVersion:     origHeader.FormatVersion,
+		PageSize:          origHeader.PageSize,
+		FeatureFlags:      origHeader.FeatureFlags,
+		FileID:            origHeader.FileID,
+		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		LastCheckpointLSN: phase1LSN,
+		ActiveMetaPage:    1,
+		WALStartPage:      pageCount,
+		WALHeadPage:       pageCount,
+		WALTailPage:       pageCount,
+	}
+	copy(fh.Magic[:], origHeader.Magic[:])
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 0, encodeHeader(fh, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write header: %w", err)
+	}
+
+	meta := &metaPage{
+		Magic:           metaMagicV2,
+		MetaEpoch:       1,
+		RootCatalog:     3,
+		RootFreelist:    0,
+		LastAppliedLSN:  phase1LSN,
+		PageCount:       pageCount,
+		CollectionCount: uint64(len(snapshotState.Collections)),
+		SnapshotOffset:  snapshotOffset,
+		SnapshotLength:  uint64(len(snapshotBytes)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
+	}
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 1, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write meta A: %w", err)
+	}
+	
+	meta.RootFreelist = math.MaxUint64
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 2, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write meta B: %w", err)
+	}
+	pagePool.Put(bufPtr)
+
+	var chunkHdr [16]byte
+	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
+	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
+	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
+	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
+	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
+	if _, err := destFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+		return fmt.Errorf("backup write chunk header: %w", err)
+	}
+	if _, err := destFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+		return fmt.Errorf("backup write snapshot payload: %w", err)
+	}
+
+	if len(indexBlock) > 0 {
+		var idxHdr [16]byte
+		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
+		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
+		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
+		if _, err := destFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+			return fmt.Errorf("backup write index chunk header: %w", err)
+		}
+		if _, err := destFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+			return fmt.Errorf("backup write index payload: %w", err)
+		}
+	}
+
+	// Phase 3: Catch-up (Brief Lock)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return fmt.Errorf("engine closed during backup")
+	}
+
+	if err := e.checkpointLocked(); err != nil {
+		return fmt.Errorf("backup final checkpoint: %w", err)
+	}
+
+	stat, err = e.file.Stat()
+	if err != nil {
+		return fmt.Errorf("backup final stat: %w", err)
+	}
+	currentSize := stat.Size()
+
+	if currentSize > phase1Size {
+		if _, err := destFile.Seek(0, io.SeekEnd); err != nil {
+			return fmt.Errorf("backup seek temp file: %w", err)
+		}
+		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
+		if _, err := io.Copy(destFile, deltaReader); err != nil {
+			return fmt.Errorf("backup copy WAL deltas: %w", err)
+		}
+	}
+
+	if err := destFile.Sync(); err != nil {
+		return fmt.Errorf("backup final sync: %w", err)
+	}
+	if err := destFile.Close(); err != nil {
+		return fmt.Errorf("backup close dest: %w", err)
+	}
+
+	cleanup = false
+	return nil
+}
+
+// Drop destroys the storage engine by closing its file descriptor and removing it
+// from the filesystem.
+func (e *Engine) Drop(ctx context.Context) error {
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("database already closed")
+	}
+	e.mu.Unlock()
+	
+	if err := e.Close(); err != nil {
+		return fmt.Errorf("drop close: %w", err)
+	}
+	
+	if err := os.Remove(e.path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("drop remove: %w", err)
+	}
+	
+	return nil
+}
+
 // compactFile rewrites the database into a fresh temp file containing only the
 // current snapshot, then atomically renames it over the original. Caller must
 // hold e.mu. The checkpoint that precedes this call must already be fsynced.
