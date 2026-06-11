@@ -570,6 +570,9 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			h.idToIndex[nodeID] = ordinal
 			h.ordinalToID[ordinal] = nodeID
 		}
+		
+		// Reset the arena after each node to prevent exhaustion on large files
+		arena.Reset()
 	}
 
 	return nil

@@ -16,7 +16,7 @@ func closureSize(tb testing.TB, cfg restartBenchConfig) (persisted, rebuild time
 	_ = createAndCompact(tb, ctx, path, cfg)
 
 	t0 := time.Now()
-	db2, err := New(WithStoragePath(path))
+	db2, err := Open(WithStoragePath(path))
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func closureSize(tb testing.TB, cfg restartBenchConfig) (persisted, rebuild time
 	corruptIndexChunk(tb, rebuildPath)
 
 	t0 = time.Now()
-	db3, err := New(WithStoragePath(rebuildPath))
+	db3, err := Open(WithStoragePath(rebuildPath))
 	if err != nil {
 		tb.Fatal(err)
 	}

@@ -185,7 +185,7 @@ func TestCosinePublicScoreContract_IVFPQPersistence(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestCosinePublicScoreContract_IVFPQPersistence(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestCosinePublicScoreContract_BackendTopResultAgreement(t *testing.T) {
 func newCosineContractCollection(t *testing.T, name string, extraOpts ...CollectionOption) *Collection {
 	t.Helper()
 
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
@@ -331,7 +331,7 @@ func newCosineContractCollection(t *testing.T, name string, extraOpts ...Collect
 func newCosineCollectionWithEntries(t *testing.T, name string, entries []VectorEntry, extraOpts ...CollectionOption) *Collection {
 	t.Helper()
 
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}

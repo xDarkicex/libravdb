@@ -118,7 +118,7 @@ func benchmarkRestartPersisted(b *testing.B, cfg restartBenchConfig) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		db, err := New(WithStoragePath(path))
+		db, err := Open(WithStoragePath(path))
 		if err != nil {
 			b.Fatalf("reopen: %v", err)
 		}
@@ -150,7 +150,7 @@ func benchmarkRestartRebuild(b *testing.B, cfg restartBenchConfig) {
 		copyFile(b, path, copyPath)
 
 		b.StartTimer()
-		db, err := New(WithStoragePath(copyPath))
+		db, err := Open(WithStoragePath(copyPath))
 		if err != nil {
 			b.Fatalf("reopen: %v", err)
 		}
@@ -171,7 +171,7 @@ func benchmarkRestartRebuild(b *testing.B, cfg restartBenchConfig) {
 func createAndCompact(tb testing.TB, ctx context.Context, path string, cfg restartBenchConfig) *Database {
 	tb.Helper()
 
-	db, err := New(WithStoragePath(path))
+	db, err := Open(WithStoragePath(path))
 	if err != nil {
 		tb.Fatalf("new db: %v", err)
 	}

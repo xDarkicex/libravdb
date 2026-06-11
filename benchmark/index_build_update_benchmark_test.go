@@ -53,7 +53,7 @@ func measureIndexBuild(tb testing.TB, ctx context.Context, size int, idxType lib
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/buildbench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)
@@ -106,7 +106,7 @@ func measureIndexUpdate(tb testing.TB, ctx context.Context, size int, idxType li
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/updatebench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)

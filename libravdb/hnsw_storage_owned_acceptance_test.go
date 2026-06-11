@@ -17,7 +17,7 @@ func TestHNSWStorageOwnedReopenAndMetadataRegression(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestHNSWStorageOwnedReopenAndMetadataRegression(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestHNSWStableOrdinalAcrossUpdateDeleteInsert(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestHNSWProviderBackedQuantizationRegression(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestHNSWProviderBackedQuantizationRegression(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestHNSW2500MemoryAcceptance(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}

@@ -10,7 +10,7 @@ import (
 
 func TestCollectionCRUDOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestCollectionCRUDOperations(t *testing.T) {
 
 func TestBatchUpdateOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestBatchUpdateOperations(t *testing.T) {
 
 func TestBatchDeleteOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestBatchDeleteOperations(t *testing.T) {
 
 func TestStreamingUpdateOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestStreamingUpdateOperations(t *testing.T) {
 
 func TestStreamingDeleteOperations(t *testing.T) {
 	// Create a test database
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestStreamingDeleteOperations(t *testing.T) {
 // TestInsertPreflightNoPartialWrite verifies that Insert with an invalid-dimension
 // vector does not produce a partial write: the collection must not contain the entry.
 func TestInsertPreflightNoPartialWrite(t *testing.T) {
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestInsertPreflightNoPartialWrite(t *testing.T) {
 // dimension entry records the failure per-item but does not commit partial work
 // for the invalid entry; the valid entry should still be committed.
 func TestBatchInsertPreflightNoPartialWrite(t *testing.T) {
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestBatchInsertPreflightNoPartialWrite(t *testing.T) {
 // The key invariant is: after the batch, we must not have MORE than one entry
 // with that ID committed (no ghost entries).
 func TestBatchInsertDuplicateIDPreflight(t *testing.T) {
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

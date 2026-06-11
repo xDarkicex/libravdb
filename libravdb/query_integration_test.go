@@ -12,7 +12,7 @@ import (
 func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 	// Create temporary directory for test database
 	// Create test database and collection
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestQueryBuilderAdvancedFiltering(t *testing.T) {
 func TestQueryBuilderErrorHandling(t *testing.T) {
 	// Create temporary directory for test database
 	// Create test database and collection
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -539,7 +539,7 @@ func TestFilterSelectivityEstimation(t *testing.T) {
 
 func BenchmarkQueryBuilderFiltering(b *testing.B) {
 	// Create test database and collection
-	db, err := New(WithStoragePath(filepath.Join(b.TempDir(), "query_bench.libravdb")))
+	db, err := Open(WithStoragePath(filepath.Join(b.TempDir(), "query_bench.libravdb")))
 	if err != nil {
 		b.Fatalf("Failed to create database: %v", err)
 	}

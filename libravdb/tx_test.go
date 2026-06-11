@@ -10,7 +10,7 @@ import (
 
 func TestCASSuccessIncrementsVersion(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestCASSuccessIncrementsVersion(t *testing.T) {
 
 func TestTxListByMetadataReadsStagedView(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestTxListByMetadataReadsStagedView(t *testing.T) {
 
 func TestCASStaleConflictLeavesRowIntact(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestCASStaleConflictLeavesRowIntact(t *testing.T) {
 
 func TestCASMetadataAndVectorOnlyUpdates(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestCASMetadataAndVectorOnlyUpdates(t *testing.T) {
 
 func TestCASDeleteSuccessAndStaleConflict(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestCASDeleteSuccessAndStaleConflict(t *testing.T) {
 
 func TestWithTxCommitsAcrossCollectionsAtomically(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestWithTxCommitsAcrossCollectionsAtomically(t *testing.T) {
 
 func TestTransactionRollbackLeavesNoVisibleWrites(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestTransactionDurabilityAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestTransactionDurabilityAcrossReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestTransactionDurabilityAcrossReopen(t *testing.T) {
 
 func TestTransactionSameKeySemantics(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestTransactionSameKeySemantics(t *testing.T) {
 
 func TestTransactionStagedInsertOverwriteIsDeterministic(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestTransactionStagedInsertOverwriteIsDeterministic(t *testing.T) {
 
 func TestTransactionReadersNeverObserveOddCounts(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestTransactionManyCommitsRemainCorrectAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestTransactionManyCommitsRemainCorrectAfterReopen(t *testing.T) {
 		t.Fatalf("close db: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestTransactionManyCommitsRemainCorrectAfterReopen(t *testing.T) {
 
 func TestCASConflictAbortsWholeTransaction(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -650,7 +650,7 @@ func TestCASConflictAbortsWholeTransaction(t *testing.T) {
 
 func TestCASConcurrentWritersOnlyOneSucceeds(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestCASVersionPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new db: %v", err)
 	}
@@ -717,7 +717,7 @@ func TestCASVersionPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("close db: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen db: %v", err)
 	}
@@ -741,7 +741,7 @@ func TestCASVersionPersistsAcrossReopen(t *testing.T) {
 
 func TestCASSameKeyConflictingExpectedVersionsInOneTxFails(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new db: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestCASSameKeyConflictingExpectedVersionsInOneTxFails(t *testing.T) {
 
 func TestTransactionDeleteThenUpsertPreservesOrdinal(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -825,7 +825,7 @@ func TestTransactionDeleteThenUpsertPreservesOrdinal(t *testing.T) {
 
 func TestCASSameKeyRepeatedSameExpectedVersionInOneTxSucceeds(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new db: %v", err)
 	}

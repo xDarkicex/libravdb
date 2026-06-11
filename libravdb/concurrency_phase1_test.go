@@ -10,7 +10,7 @@ import (
 )
 
 func TestCollectionWriteQueueFull(t *testing.T) {
-	db, err := New(
+	db, err := Open(
 		WithStoragePath(testDBPath(t)),
 		WithMaxConcurrentWrites(1),
 		WithMaxWriteQueueDepth(1),
@@ -67,7 +67,7 @@ func TestCollectionWriteQueueFull(t *testing.T) {
 }
 
 func TestCollectionWriteWaitRespectsContextCancellation(t *testing.T) {
-	db, err := New(
+	db, err := Open(
 		WithStoragePath(testDBPath(t)),
 		WithMaxConcurrentWrites(1),
 		WithMaxWriteQueueDepth(2),
@@ -98,7 +98,7 @@ func TestCollectionWriteWaitRespectsContextCancellation(t *testing.T) {
 }
 
 func TestNonShardedConcurrentSingleInserts(t *testing.T) {
-	db, err := New(
+	db, err := Open(
 		WithStoragePath(testDBPath(t)),
 		WithMaxConcurrentWrites(16),
 		WithMaxWriteQueueDepth(16),

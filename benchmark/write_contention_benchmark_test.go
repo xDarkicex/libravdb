@@ -73,7 +73,7 @@ func benchShardedInsertBatch(tb testing.TB, ctx context.Context, dim, totalVecto
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/sharded_batch_bench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)
@@ -163,7 +163,7 @@ func benchConcurrentDirectInsert(tb testing.TB, ctx context.Context, dim, totalV
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/concurrent_insert_bench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)

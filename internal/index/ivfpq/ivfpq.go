@@ -855,6 +855,22 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		return nil
 	}
 
+	// Maximum entries to process in one arena to prevent memory exhaustion
+	const maxChunkSize = 1000
+
+	for i := 0; i < len(entries); i += maxChunkSize {
+		end := min(i+maxChunkSize, len(entries))
+		chunk := entries[i:end]
+
+		if err := idx.batchInsertChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) error {
 	idx.mutex.RLock()
 	if !idx.trained {
 		idx.mutex.RUnlock()
@@ -878,6 +894,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 
 	processedSlice, err := memory.ArenaSlice[processedEntry](arena, len(entries))
 	if err != nil {
+		idx.mutex.RUnlock()
 		return err
 	}
 	processed := processedSlice[:len(entries)]
@@ -952,6 +969,8 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		return fmt.Errorf("arena allocate counts: %w", err)
 	}
 	counts := countsSlice[:len(idx.clusters)]
+	clear(counts) // Zero out memory from previous arena uses
+
 	for _, p := range processed {
 		if p.err == nil {
 			counts[p.clusterID]++
@@ -964,6 +983,8 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		return fmt.Errorf("arena allocate cluster updates: %w", err)
 	}
 	clusterUpdates := clusterUpdatesSlice[:len(idx.clusters)]
+	clear(clusterUpdates) // Zero out memory from previous arena uses
+
 	for i, c := range counts {
 		if c > 0 {
 			slice, err := memory.ArenaSlice[processedEntry](arena, c)

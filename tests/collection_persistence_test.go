@@ -16,7 +16,7 @@ func TestCollectionPersistence(t *testing.T) {
 	indexPath := filepath.Join(testDir, "test_index.bin")
 
 	// Create database and collection
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {

@@ -38,7 +38,7 @@ func benchmarkCollectionInsert(b *testing.B, logDelta bool) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			ctx := context.Background()
-			db, err := New(WithStoragePath(testDBPathBench(b)))
+			db, err := Open(WithStoragePath(testDBPathBench(b)))
 			if err != nil {
 				b.Fatalf("new db: %v", err)
 			}
@@ -119,7 +119,7 @@ func benchmarkCollectionInsertSteadyStateBatch(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			ctx := context.Background()
-			db, err := New(WithStoragePath(testDBPathBench(b)))
+			db, err := Open(WithStoragePath(testDBPathBench(b)))
 			if err != nil {
 				b.Fatalf("new db: %v", err)
 			}
@@ -206,7 +206,7 @@ func BenchmarkCollectionSearch(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			ctx := context.Background()
-			db, err := New(WithStoragePath(testDBPathBench(b)))
+			db, err := Open(WithStoragePath(testDBPathBench(b)))
 			if err != nil {
 				b.Fatalf("new db: %v", err)
 			}

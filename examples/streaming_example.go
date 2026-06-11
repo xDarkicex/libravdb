@@ -15,7 +15,7 @@ import (
 
 func main() {
 	// Create database
-	db, err := libravdb.New(libravdb.WithStoragePath("./streaming_example_data"))
+	db, err := libravdb.Open(libravdb.WithStoragePath("./streaming_example_data"))
 	if err != nil {
 		log.Fatalf("Failed to create database: %v", err)
 	}

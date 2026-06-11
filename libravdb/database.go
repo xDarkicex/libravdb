@@ -50,8 +50,8 @@ type Config struct {
 	TracingEnabled      bool
 }
 
-// New creates a new Database instance with the given options
-func New(opts ...Option) (*Database, error) {
+// Open opens a Database at the configured path, creating it if necessary.
+func Open(opts ...Option) (*Database, error) {
 	config := &Config{
 		StoragePath:         "./data",
 		MetricsEnabled:      true,

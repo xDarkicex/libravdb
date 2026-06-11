@@ -13,7 +13,7 @@ func TestRestartDebugHNSW(t *testing.T) {
 	ctx := context.Background()
 
 	t.Log("step 1: create db with HNSW, 1000 vectors")
-	db, err := New(WithStoragePath(path))
+	db, err := Open(WithStoragePath(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestRestartDebugHNSW(t *testing.T) {
 
 	t.Log("step 4: reopen")
 	start = time.Now()
-	db2, err := New(WithStoragePath(path))
+	db2, err := Open(WithStoragePath(path))
 	if err != nil {
 		t.Fatal(err)
 	}

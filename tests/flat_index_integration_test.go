@@ -11,7 +11,7 @@ import (
 
 func TestFlatIndexIntegration(t *testing.T) {
 	// Create a database
-	db, err := libravdb.New(libravdb.WithStoragePath(":memory:basic"))
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:basic"))
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestFlatIndexIntegration(t *testing.T) {
 
 func TestAutoIndexSelection(t *testing.T) {
 	// Create a database with a different path
-	db, err := libravdb.New(libravdb.WithStoragePath(":memory:auto"))
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:auto"))
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestAutoIndexSelection(t *testing.T) {
 
 func TestFlatIndexPerformance(t *testing.T) {
 	// Create a database with a different path
-	db, err := libravdb.New(libravdb.WithStoragePath(":memory:perf"))
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:perf"))
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}

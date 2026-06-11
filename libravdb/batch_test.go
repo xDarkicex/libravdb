@@ -18,7 +18,7 @@ func createTestDB(t *testing.T) *Database {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	db, err := New(WithStoragePath(filepath.Join(tmpDir, "test.libravdb")))
+	db, err := Open(WithStoragePath(filepath.Join(tmpDir, "test.libravdb")))
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create database: %v", err)

@@ -59,7 +59,7 @@ func prepareThresholdProbe(t *testing.T) (*libravdb.Collection, *libravdb.Collec
 	// Create temporary database for probe
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/probe.libravdb"
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)

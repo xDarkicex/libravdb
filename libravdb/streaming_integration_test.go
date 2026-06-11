@@ -12,7 +12,7 @@ import (
 func TestStreamingIntegration_MemoryUsage(t *testing.T) {
 	requireStressMode(t)
 
-	db, err := New(WithStoragePath(":memory:"))
+	db, err := Open(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestStreamingIntegration_MemoryUsage(t *testing.T) {
 func TestStreamingIntegration_ContextTimeout(t *testing.T) {
 	requireStressMode(t)
 
-	db, err := New(WithStoragePath(":memory:"))
+	db, err := Open(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestStreamingIntegration_ContextTimeout(t *testing.T) {
 func TestStreamingIntegration_ErrorRecovery(t *testing.T) {
 	requireStressMode(t)
 
-	db, err := New(WithStoragePath(":memory:"))
+	db, err := Open(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

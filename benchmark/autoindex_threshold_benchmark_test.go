@@ -60,7 +60,7 @@ func measureThreshold(tb testing.TB, size int, threshold int) ([]float64, string
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/bench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)
