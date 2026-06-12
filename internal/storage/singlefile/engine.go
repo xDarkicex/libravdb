@@ -1008,6 +1008,9 @@ func (c *persistedCollection) initVectorSFL() error {
 // storeVectorOffHeap allocates an SFL slot, copies vector data into it, and
 // returns a []float32 view of the off-heap slot. frees any previous slot at ordinal.
 func (c *persistedCollection) storeVectorOffHeap(ordinal uint32, vector []float32) ([]float32, error) {
+	if len(vector) != c.Config.Dimension {
+		return nil, fmt.Errorf("vector dimension %d != collection dimension %d", len(vector), c.Config.Dimension)
+	}
 	if err := c.initVectorSFL(); err != nil {
 		return nil, err
 	}

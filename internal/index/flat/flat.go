@@ -95,7 +95,10 @@ func NewFlat(config *Config) (*Index, error) {
 		vectorSFL: sfl,
 		scratchPool: &sync.Pool{
 			New: func() any {
-				a, _ := memory.NewArena(1024 * 1024)
+				a, err := memory.NewArena(1024 * 1024)
+				if err != nil {
+					return nil
+				}
 				return a
 			},
 		},
@@ -172,9 +175,11 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		copy(offHeapVec, entry.Vector)
 
 		newEntries[i] = &VectorEntry{
-			ID:       entry.ID,
-			Vector:   offHeapVec,
-			Metadata: cloneMetadata(entry.Metadata), metadataSize: estimateMetadataSize(entry.Metadata),
+			ID:           entry.ID,
+			Vector:       offHeapVec,
+			Metadata:     cloneMetadata(entry.Metadata),
+			Version:      entry.Version,
+			metadataSize: estimateMetadataSize(entry.Metadata),
 		}
 	}
 
@@ -216,6 +221,7 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 		ID:           entry.ID,
 		Vector:       offHeapVec,
 		Metadata:     cloneMetadata(entry.Metadata),
+		Version:      entry.Version,
 		metadataSize: mdSize,
 	}
 
@@ -357,6 +363,13 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 
 	// Acquire an arena for search-scoped scratch, released on return.
 	arena := idx.scratchPool.Get().(*memory.Arena)
+	if arena == nil {
+		a, err := memory.NewArena(1024 * 1024)
+		if err != nil {
+			return nil, fmt.Errorf("arena allocate for search: %w", err)
+		}
+		arena = a
+	}
 	defer func() {
 		arena.Reset()
 		idx.scratchPool.Put(arena)
@@ -702,13 +715,9 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 		}
 	}
 
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	idx.config = cfg
-	idx.vectors = vectors
-	// Move deserialized vectors off-heap
-	for _, entry := range idx.vectors {
+	// Move deserialized vectors off-heap before mutating the live index.
+	// If any allocation fails, the index is untouched.
+	for _, entry := range vectors {
 		slot, err := idx.vectorSFL.Allocate()
 		if err != nil {
 			return err
@@ -718,10 +727,17 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 		copy(offHeapVec, entry.Vector)
 		entry.Vector = offHeapVec
 	}
-	idx.idToIndex = make(map[string]int, len(vectors))
+	newIDToIndex := make(map[string]int, len(vectors))
 	for i, entry := range vectors {
-		idx.idToIndex[entry.ID] = i
+		newIDToIndex[entry.ID] = i
 	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.config = cfg
+	idx.vectors = vectors
+	idx.idToIndex = newIDToIndex
 
 	if cfg.Quantization != nil {
 		var err error
@@ -787,7 +803,7 @@ func estimateValueSize(v interface{}) int64 {
 	}
 }
 
-// cloneMetadata returns a shallow copy of the metadata map so callers
+// cloneMetadata returns a deep copy of the metadata map so callers
 // cannot mutate the index's internal state through a stored reference.
 func cloneMetadata(src map[string]interface{}) map[string]interface{} {
 	if src == nil {
@@ -795,9 +811,28 @@ func cloneMetadata(src map[string]interface{}) map[string]interface{} {
 	}
 	dst := make(map[string]interface{}, len(src))
 	for k, v := range src {
-		dst[k] = v
+		dst[k] = deepCloneValue(v)
 	}
 	return dst
+}
+
+func deepCloneValue(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		return cloneMetadata(typed)
+	case []interface{}:
+		clone := make([]interface{}, len(typed))
+		for i, item := range typed {
+			clone[i] = deepCloneValue(item)
+		}
+		return clone
+	case []string:
+		clone := make([]string, len(typed))
+		copy(clone, typed)
+		return clone
+	default:
+		return v
+	}
 }
 
 // deallocateVector returns the off-heap slice back to the ShardedFreeList.

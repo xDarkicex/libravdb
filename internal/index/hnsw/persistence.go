@@ -644,14 +644,14 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 			return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
 		}
 
-		// Data starts at offset 48. Capacity matches what newNodeLinks
-		// configures (capacity + slack).
-		maxCap := (len(slot) - 48) / 4
+		// Data starts after SFLMetadataOverhead. Capacity matches what
+		// newNodeLinks configures (capacity + slack).
+		maxCap := (len(slot) - SFLMetadataOverhead) / 4
 		if uint32(maxCap) < connectionCount {
 			return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
 				nodeIndex, level, connectionCount, maxCap)
 		}
-		connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[48])), maxCap)[:connectionCount]
+		connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[SFLMetadataOverhead])), maxCap)[:connectionCount]
 		for k := uint32(0); k < connectionCount; k++ {
 			if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
 				return err

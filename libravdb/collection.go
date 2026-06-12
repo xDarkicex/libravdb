@@ -819,6 +819,10 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	c.mu.RLock()
 	closed := c.closed
 	shards := c.shards
+	// Snapshot backend handles before releasing the read lock so concurrent
+	// Close or switchIndexType cannot swap them under us.
+	storage := c.storage
+	index := c.index
 	if closed {
 		c.mu.RUnlock()
 		return ErrCollectionClosed
@@ -849,7 +853,7 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	defer unlock()
 	// Check existence against persisted storage
 	for _, entry := range entries {
-		exists, err := c.storage.Exists(ctx, entry.ID)
+		exists, err := storage.Exists(ctx, entry.ID)
 		if err != nil {
 			return fmt.Errorf("failed to check existing vector: %w", err)
 		}
@@ -858,13 +862,13 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		}
 	}
 
-	if err := c.storage.InsertBatch(ctx, entries); err != nil {
+	if err := storage.InsertBatch(ctx, entries); err != nil {
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
-	if err := prepareIndexForEntries(ctx, c.index, entries); err != nil {
+	if err := prepareIndexForEntries(ctx, index, entries); err != nil {
 		var rollbackErrs []error
 		for _, storedEntry := range entries {
-			if delErr := c.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+			if delErr := storage.Delete(ctx, storedEntry.ID); delErr != nil {
 				rollbackErrs = append(rollbackErrs, delErr)
 			}
 		}
@@ -873,10 +877,10 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		}
 		return fmt.Errorf("failed to prepare index for batch insert: %w", err)
 	}
-	if err := insertEntriesIntoIndex(ctx, c.index, entries); err != nil {
+	if err := insertEntriesIntoIndex(ctx, index, entries); err != nil {
 		var rollbackErrs []error
 		for _, storedEntry := range entries {
-			if delErr := c.storage.Delete(ctx, storedEntry.ID); delErr != nil {
+			if delErr := storage.Delete(ctx, storedEntry.ID); delErr != nil {
 				rollbackErrs = append(rollbackErrs, delErr)
 			}
 		}

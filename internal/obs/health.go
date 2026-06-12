@@ -57,6 +57,7 @@ func (hc *HealthChecker) Check(ctx context.Context) (*HealthStatus, error) {
 			}
 		}
 	} else {
+		status.Status = "unhealthy"
 		status.Checks["db_ping"] = &CheckResult{
 			Healthy: false,
 			Message: "Database instance does not support Ping",

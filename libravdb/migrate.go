@@ -18,8 +18,12 @@ func Migrate(ctx context.Context, path string) error {
 	}
 
 	migratingPath := path + ".migrating"
-	// Ensure cleanup if migration fails midway
-	defer os.Remove(migratingPath)
+	stagedPath := path + ".staged"
+	backupPath := path + ".v1.bak"
+
+	// Clean up any stale leftovers from a previous interrupted migration.
+	os.Remove(migratingPath)
+	os.Remove(stagedPath)
 
 	v2DB, err := Open(WithStoragePath(migratingPath))
 	if err != nil {
@@ -35,62 +39,62 @@ func Migrate(ctx context.Context, path string) error {
 	}
 
 	for _, name := range colNames {
-		colInfo, config, err := v1Engine.GetCollectionWithConfig(name)
-		if err != nil {
-			v1Engine.Close()
-			v2DB.Close()
-			return fmt.Errorf("failed to read collection info %s: %w", name, err)
-		}
+		err := func() error {
+			colInfo, config, err := v1Engine.GetCollectionWithConfig(name)
+			if err != nil {
+				return fmt.Errorf("failed to read collection info %s: %w", name, err)
+			}
+			defer colInfo.Close()
 
-		v2Col, err := v2DB.CreateCollection(ctx, name, func(c *CollectionConfig) error {
-			c.Dimension = config.Dimension
-			c.Metric = DistanceMetric(config.Metric)
-			c.IndexType = IndexType(config.IndexType)
-			c.M = config.M
-			c.EfConstruction = config.EfConstruction
-			c.EfSearch = config.EfSearch
-			c.NClusters = config.NClusters
-			c.NProbes = config.NProbes
-			c.ML = config.ML
-			c.Version = config.Version
-			c.RawVectorStore = config.RawVectorStore
-			c.RawStoreCap = config.RawStoreCap
-			return nil
-		})
-		if err != nil {
-			v1Engine.Close()
-			v2DB.Close()
-			return fmt.Errorf("failed to create v2 collection %s: %w", name, err)
-		}
-
-		// Stream entries
-		var batch []VectorEntry
-		err = colInfo.Iterate(ctx, func(entry *index.VectorEntry) error {
-			batch = append(batch, VectorEntry{
-				ID:       entry.ID,
-				Vector:   entry.Vector,
-				Metadata: entry.Metadata,
+			v2Col, err := v2DB.CreateCollection(ctx, name, func(c *CollectionConfig) error {
+				c.Dimension = config.Dimension
+				c.Metric = DistanceMetric(config.Metric)
+				c.IndexType = IndexType(config.IndexType)
+				c.M = config.M
+				c.EfConstruction = config.EfConstruction
+				c.EfSearch = config.EfSearch
+				c.NClusters = config.NClusters
+				c.NProbes = config.NProbes
+				c.ML = config.ML
+				c.Version = config.Version
+				c.RawVectorStore = config.RawVectorStore
+				c.RawStoreCap = config.RawStoreCap
+				return nil
 			})
-			if len(batch) >= 1000 {
-				if err := v2Col.InsertBatch(ctx, batch); err != nil {
-					return err
+			if err != nil {
+				return fmt.Errorf("failed to create v2 collection %s: %w", name, err)
+			}
+
+			var batch []VectorEntry
+			err = colInfo.Iterate(ctx, func(entry *index.VectorEntry) error {
+				batch = append(batch, VectorEntry{
+					ID:       entry.ID,
+					Vector:   entry.Vector,
+					Metadata: entry.Metadata,
+				})
+				if len(batch) >= 1000 {
+					if err := v2Col.InsertBatch(ctx, batch); err != nil {
+						return err
+					}
+					batch = batch[:0]
 				}
-				batch = batch[:0]
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("failed to iterate collection %s: %w", name, err)
+			}
+
+			if len(batch) > 0 {
+				if err := v2Col.InsertBatch(ctx, batch); err != nil {
+					return fmt.Errorf("failed to insert final batch into collection %s: %w", name, err)
+				}
 			}
 			return nil
-		})
+		}()
 		if err != nil {
 			v1Engine.Close()
 			v2DB.Close()
-			return fmt.Errorf("failed to iterate collection %s: %w", name, err)
-		}
-
-		if len(batch) > 0 {
-			if err := v2Col.InsertBatch(ctx, batch); err != nil {
-				v1Engine.Close()
-				v2DB.Close()
-				return fmt.Errorf("failed to insert final batch into collection %s: %w", name, err)
-			}
+			return err
 		}
 	}
 
@@ -103,16 +107,27 @@ func Migrate(ctx context.Context, path string) error {
 		return fmt.Errorf("failed to close v2 database: %w", err)
 	}
 
-	backupPath := path + ".v1.bak"
+	// Three-step atomic swap so an interrupted migration is resumable:
+	// 1. migrating → staged (mark ready)
+	// 2. path → backup (preserve original)
+	// 3. staged → path (activate)
+	if err := os.Rename(migratingPath, stagedPath); err != nil {
+		return fmt.Errorf("failed to stage migration: %w", err)
+	}
 	if err := os.Rename(path, backupPath); err != nil {
+		os.Rename(stagedPath, migratingPath)
 		return fmt.Errorf("failed to backup v1 database: %w", err)
 	}
-
-	if err := os.Rename(migratingPath, path); err != nil {
-		// Attempt rollback
+	if err := os.Rename(stagedPath, path); err != nil {
 		os.Rename(backupPath, path)
-		return fmt.Errorf("failed to rename migrating database: %w", err)
+		return fmt.Errorf("failed to activate migration: %w", err)
 	}
-
 	return nil
+}
+
+// recoverMigrate cleans up leftover staged/migrating files from a previous
+// interrupted migration. Called by Open when detecting a v1 file.
+func recoverMigrate(path string) {
+	os.Remove(path + ".staged")
+	os.Remove(path + ".migrating")
 }

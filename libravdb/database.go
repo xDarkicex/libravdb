@@ -661,6 +661,9 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 
 		collection, err := newShardedCollectionFromStorage(ctx, name, shardStorages, config, db.metrics, db.newWriteController())
 		if err != nil {
+			for j := 0; j < shardCount; j++ {
+				shardStorages[j].Close()
+			}
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
 		collection.db = db

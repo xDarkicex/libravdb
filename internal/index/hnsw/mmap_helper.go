@@ -30,8 +30,11 @@ func (h *Index) createMmapRawVectorStore(mmapPath string) (*MmapRawVectorStore, 
 		}
 
 		vec, err := h.getNodeVectorLocal(node)
-		if err != nil || len(vec) != h.config.Dimension {
-			// Write zeros if unavailable
+		if err != nil {
+			return nil, fmt.Errorf("get vector for ordinal %d: %w", node.Ordinal, err)
+		}
+		if len(vec) != h.config.Dimension {
+			// Write zeros if unavailable (e.g. deleted node)
 			zeros := make([]byte, bytesPerVector)
 			if _, err := file.Write(zeros); err != nil {
 				return nil, err

@@ -105,7 +105,7 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 	linkSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(48 + (config.M+slack)*4),
+		SlotSize:  uint64(SFLMetadataOverhead + (config.M+slack)*4),
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -120,12 +120,13 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 	link0SFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(48 + (config.M*2+slack0)*4),
+		SlotSize:  uint64(SFLMetadataOverhead + (config.M*2+slack0)*4),
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
 	}, 64)
 	if err != nil {
+		linkSFL.Free()
 		return nil, fmt.Errorf("failed to create link0SFL: %w", err)
 	}
 
@@ -328,7 +329,7 @@ func (h *Index) newNodeLinks(level int, baseM int) [][]uint32 {
 		if err != nil {
 			panic(fmt.Sprintf("hnsw: failed to allocate links: %v", err))
 		}
-		ptr := unsafe.Pointer(&slot[48])
+		ptr := unsafe.Pointer(&slot[SFLMetadataOverhead])
 		// Slice up to maxCapacity, but start with len 0
 		links[i] = unsafe.Slice((*uint32)(ptr), maxCapacity)[:0]
 	}
@@ -1175,15 +1176,15 @@ func (h *Index) freeLinkSliceIfSFL(level int, links []uint32) {
 
 	// Only deallocate if it was originally an SFL slice
 	if cap(links) == expectedCap {
-		basePtr := unsafe.Pointer(uintptr(ptr) - 48)
+		basePtr := unsafe.Pointer(uintptr(ptr) - SFLMetadataOverhead)
 		if level == 0 {
 			if h.link0SFL != nil {
-				slot := unsafe.Slice((*byte)(basePtr), int(48+expectedCap*4))
+				slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead+expectedCap*4))
 				_ = h.link0SFL.Deallocate(slot)
 			}
 		} else {
 			if h.linkSFL != nil {
-				slot := unsafe.Slice((*byte)(basePtr), int(48+expectedCap*4))
+				slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead+expectedCap*4))
 				_ = h.linkSFL.Deallocate(slot)
 			}
 		}

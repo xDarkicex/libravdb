@@ -18,6 +18,14 @@ const (
 
 	// Chunk size for streaming operations (64KB)
 	StreamChunkSize = 64 * 1024
+
+	// SFLMetadataOverhead is the byte offset where user data begins in
+	// each ShardedFreeList slot. The first 48 bytes are reserved for the
+	// FreeList header, Hyaline SMR chain, and SFL metadata. Callers
+	// constructing slots (newNodeLinks) and reading them back (readLinks)
+	// must use this constant to compute capacity and data pointers.
+	// Keep in sync with github.com/xDarkicex/memory SFL layout.
+	SFLMetadataOverhead = 48
 )
 
 // IndexFileHeader defines the binary file format header
