@@ -70,6 +70,7 @@ type graphStore struct {
 	pageReg      *PageRegistry
 	index        *EdgeTableIndex
 	reverse      *ReverseIndex
+	manifest     *DBManifest
 	globalStamp  atomic.Uint32
 	metrics      storeMetrics
 	lastFlushedGen uint32
@@ -145,6 +146,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		pageReg:      NewPageRegistry(),
 		index:        NewEdgeTableIndex(1024),
 		reverse:      revIdx,
+		manifest:     NewDBManifest(),
 	}, nil
 }
 
@@ -183,6 +185,7 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 		page.Header.Generation = 0
 		page.Header.Mutex = 0
 		page.Header.HyalineSlot = uint16(shard)
+		page.Header.LayoutTag = LayoutV2
 		
 		pageSlot = g.pageReg.Register(page)
 		index.Insert(nodeID, pageSlot)
@@ -212,6 +215,7 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 				}
 				newPage := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
 				newPage.Header.Overflow = 0
+				newPage.Header.LayoutTag = LayoutV2
 				
 				newSlot := g.pageReg.Register(newPage)
 				currPage.Header.Overflow = newSlot
@@ -633,7 +637,15 @@ func (g *graphStore) Close() error {
 }
 
 func (g *graphStore) rebuildReverseIndex() {
-	// Simple un-optimized rebuild for now since we just clear and rebuild
-	// Actually we should just read all forward edges and put them in reverse index.
-	// We'll iterate the whole index.
+	for i := uint64(0); i < g.index.capacity; i++ {
+		slot := atomic.LoadUint32(&g.index.table[i].PageSlot)
+		if slot != 0 && slot != Tombstone {
+			nodeID := g.index.table[i].NodeID
+			edges, _ := g.Neighbors(nodeID)
+			for _, e := range edges {
+				rEdge := Edge{Target: nodeID, Weight: e.Weight, Stamp: e.Stamp, Kind: e.Kind}
+				_ = g.appendEdgeToTable(e.Target, rEdge, g.reverse.locator, g.reverse.pool)
+			}
+		}
+	}
 }

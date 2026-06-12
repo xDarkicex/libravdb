@@ -22,8 +22,14 @@ type EdgeTableHeader struct {
 	Generation  uint32  // MVCC version counter
 	Mutex       uint64  // Per-page spin lock word
 	HyalineSlot uint16  // Shard index for Hyaline SMR
-	_           [2]byte // Padding to 24 bytes
+	LayoutTag   uint8   // Layout version tag (0 for backwards compat, 1=V1, 2=V2)
+	_           uint8   // Padding to 24 bytes
 }
+
+const (
+	LayoutV1 uint8 = 1
+	LayoutV2 uint8 = 2
+)
 
 // EdgeTableLocator maps node IDs to their EdgeTable pages
 type EdgeTableLocator struct {

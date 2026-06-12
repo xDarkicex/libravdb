@@ -269,9 +269,6 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 		}
 	}
 
-	// Rebuild reverse index from forward index
-	forwardIndex.rebuildReverseIndex()
-
 	// Restore lastFlushedGen
 	atomic.StoreUint32(&forwardIndex.lastFlushedGen, maxStamp)
 
