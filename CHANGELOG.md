@@ -1,37 +1,81 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.0] — 2026-06-12
 
-### Added
-- **IVF-PQ index persistence**: binary serialization format (v2) with CRC32 integrity checks, saving coarse centroids, PQ codebooks, and per-cluster inverted lists (ordinal + compressed codes). `SerializeToBytes` / `DeserializeFromBytes` + `SaveToDisk` / `LoadFromDisk` API.
-- **IVF-PQ two-phase deserialization**: `DeserializeFromBytes` restores centroids and codebooks without retraining; `PopulateEntriesFromStorage` wires storage records into pre-serialized clusters by ordinal, avoiding centroid-distance recomputation entirely. Cluster membership is authoritative from the persisted inverted lists.
-- **IVF-PQ quantizer reconstitution**: when the storage engine bridge creates an index without quantization config during reopen, `DeserializeFromBytes` now reconstitutes the quantizer from the payload's stored codebook metadata rather than rejecting the chunk — preventing silent fallback to full rebuild.
-- **IVF-PQ restart benchmarks** at 1K, 10K, and 50K covering both valid-persisted and corrupt-chunk (forced rebuild) paths.
-- **File compaction with WAL truncation**: `Compact()` public API rewrites the database from snapshot only, discarding all accumulated WAL history. Auto-compaction triggers in `checkpointLocked` when file size exceeds 2× the snapshot-only minimum.
-- **`compactionErrors` counter** on Engine with `CompactionErrors()` accessor for observability into silent compaction failures.
-- **Tiered off-heap max-heap**: power-of-2 `ShardedFreeList` pools (k=1–16, 17–128, 129–1024, 1025–4096) eliminate `runtime.mallocgc` and `runtime.growslice` from the inner distance-scan loop. `heapSlot` RAII wrapper binds each slot to its originating pool for safe deallocation.
-- **k-cap DoS prevention**: all three index types (`flat`, `ivfpq`, `hnsw`) reject `k > 4096` at the `Search` entry point.
-- **IVFPQ k-way merge**: parallel `collectCandidates` results merged via min-heap of size W (workers), reducing merge complexity from O(W·k log k) to O(W·k log W).
+151 files changed, 7,763 insertions, 3,897 deletions across 59 commits.
 
-### Fixed
-- **IVF-PQ persisted reopen performed full rebuild**: `DeserializeFromBytes` rejected valid chunks when the bridge-created index lacked quantization config, causing `loadIndexes` to fall back to `rebuildCollectionIndexFromRecords`. Both benchmark paths were identical (1.0x gap at all scales). Fixed by reconstituting the quantizer from stored payload metadata.
-- **Memory manager data race**: removed dead `lastUsage` field (written under RLock, never read), converted `lastPressureLevel` to `atomic.Int32`.
-- **Collection index swap race**: `Search` now snapshots `c.index` and shard indexes under `c.mu.RLock()` before releasing.
-- **Engine read method races**: all 7 read methods (`Get`, `GetByOrdinal`, `GetIDByOrdinal`, `Exists`, `Count`, `MemoryUsage`, `NextOrdinal`) hold `e.mu.RLock()` across the full data access window.
-- **MESI false sharing**: `groupCommitWindow`, `groupCommitMaxWindow`, and `groupCommitStepWindow` padded to 64-byte cache line boundaries.
-- **Iterate starvation prevention**: `Collection.Iterate` collects IDs under RLock, processes in 10K-record chunks re-acquiring RLock per chunk, preventing `flushBatch` starvation at scale.
-- **`ordinalToID` slot leak**: `applyRecordDelete` now clears the ordinal slot, and startup reconstruction skips deleted records so the slot stays released across restarts.
-- **`shards` range copies mutex**: fixed `for i := range c.shards` to avoid copying `sync.Mutex`.
+### Breaking Changes
 
-### Changed
-- **`hnsw-performance-optimizations.md`**: rewritten to reflect actual tiered off-heap architecture, verified benchmarks, concurrency hardening, k-way merge, and k-cap protection.
-- **IVF-PQ `PopulateEntriesFromStorage` allocation pre-sizing**: `ordinalToEntry` map, per-cluster `Entries` slices, and per-cluster `CompressedVectors` maps are now pre-sized using entry counts from the deserialized inverted lists, eliminating incremental rehash and slice-growth allocations during persisted reopen. Empty clusters are skipped. Net savings: ~1.7% B/op and ~0.2% allocs/op at 50K; dominant allocations (>90%) are structural (vector data clones and entry struct wrapping), inherent to the two-layer architecture and not reducible without refactoring storage→index data ownership.
+- **`libravdb.New` renamed to `libravdb.Open`** — all callers must update. The new name reflects that `Open` may create or open an existing database file.
+- **Context propagation** — `Stats(ctx)`, `GetMemoryUsage(ctx)`, and `TriggerGC(ctx)` now require `context.Context`.
+- **Binary format v2** — all index magic numbers changed (HNSW `0x484E5357` → `"LIBRAHNS"`, Flat → `"LIBRAFLT"`, IVFPQ → `"LIBRAIVF"`), WAL encoding switched from JSON to binary, codec version bumped to 2, Creator field embedded in file header (`"libravdb/2.0.0 xDarkicex"`). v1 `.libravdb` files are not directly readable by v2.
 
-### Benchmark Results (Apple M2)
-- **IVF-PQ persisted reopen** (no retraining, direct cluster placement by ordinal):
-  - 1K vectors (16 clusters, PQ 16×8): 1.81ms, 2.75MB, 12,442 allocs — **24.6x faster** than rebuild (44.5ms)
-  - 10K vectors (64 clusters, PQ 16×8): 16.5ms, 22.6MB, 85,101 allocs — **278x faster** than rebuild (4.58s)
-  - 50K vectors (128 clusters, PQ 16×8): 97.4ms, 110.4MB, 406,214 allocs — **893x faster** than rebuild (86.94s)
-- IVF-PQ persisted reopen allocation profile (50K): dominant sources are vector data clones (~25.6MB) and entry struct wrapping (~4MB) — both structural. Remaining transient allocations: deserMeta entry structs (~2.4MB) and map bucket overhead (~2MB), freed at end of population.
-- Flat search (1M entries, k=10): 192 µs/op, 6352 B/op, 32 allocs/op — allocations are from result extraction only, inner scan loop is zero-alloc.
-- HNSW search (25K vectors, 32-dim): 25 ms/op, 3,866 qps.
+### Migration (v1 → v2)
+
+- **Auto-migration on `Open()`** — v1 files are detected by `formatVersion == 1`, transparently migrated to v2 format, and the original is backed up as `.v1.bak`. No daemon code changes needed beyond the `New`→`Open` rename.
+- **`Migrate(ctx, path)` API** — standalone migration for preflight or batch scripting. Crash-safe three-step atomic rename (migrating → staged → backup → path) with startup recovery for interrupted migrations.
+- **`ErrV1FormatMigrationRequired`** sentinel for programmatic detection.
+
+### New APIs
+
+- **`Vacuum(ctx)`** — reclaim disk space without blocking concurrent operations. Three-phase WAL fast-forward design holds locks for ~1ms (snapshot) + ~5ms (catch-up + rename).
+- **`Backup(ctx, destPath)`** — point-in-time snapshot to a new path under brief lock.
+- **`Drop(ctx)`** — completely destroy the database file and close the engine.
+- **SystemHealthMonitor** — wired into the Database lifecycle with circuit breaker, health checks, and Prometheus metrics.
+
+### Performance
+
+- **Off-heap vector storage** via `github.com/xDarkicex/memory` ShardedFreeList: Flat index vectors, HNSW node links, arena-backed search/insert/deserialization scratch buffers. Eliminates GC pressure on the hot path.
+- **HNSW**: precomputed D×D distance matrices, bulk-read vectors (single `io.ReadFull` vs `binary.Read` per float32), arena-backed `readNodes` deserialization.
+- **IVFPQ**: matmul-style cluster assignment with centroid norm precomputation, bounded max-heap for probe cluster selection (replaces full sort), `PrepareQuery` for concurrent query caching, arena-backed search path.
+- **Flat**: scratchPool arena for search path, cached metadata size on insert to avoid O(N) `MemoryUsage` scans.
+- **Algorithmic fixes**: k-means++ running-min, dot-product argmin in cluster assignment, O(N²) → O(N) delete fallback, bubble sort → `sort.Slice` in multiple hot paths.
+
+### Concurrency
+
+- **Shard mutation locks** — `updateSharded`, `upsertSharded`, and sharded `Delete` now use `Lock()` instead of `RLock()` to prevent concurrent mutation races.
+- **Write admission gate** — bounded per-collection write concurrency with context-aware queueing.
+- **Lock contention** — `sync.RWMutex` with lock mutation IDs for parallel shard inserts, mutex released before CPU-bound search computation in IVFPQ.
+- **Goroutine lifecycle** — `goleak` integration, `errgroup` supervision, buffered error channels, context cancellation through flush and streaming paths.
+
+### Bug Fixes
+
+- Arena-backed string cloning in HNSW persistence (dangling pointer into recycled arena).
+- Off-heap SFL for node link arrays in readNodes.
+- `arena.Reset()` per-node to prevent exhaustion on large files.
+- Vector deallocation on Flat delete, insertLocked, and BatchInsert.
+- Nil guard for IVFPQ `CompressedVectors` with lazy initialization.
+- `MaxVectorSize` cap before `make()` in binary decoder.
+- `clear()` on arena-backed slices after reset in IVFPQ BatchInsert.
+- `WriteByte` returns `error` for `io.ByteWriter` compliance.
+- HNSW size==1 delete SFL link slot leak.
+- Flat search result cloning to prevent caller mutation of internal state.
+- Deep clone metadata maps to prevent nested reference corruption.
+- Bounds and nil guards on `h.nodes[neighbor.ID]` in HNSW connection functions.
+- `NaN` returned from `CosineDistance` for zero vectors.
+- Path traversal rejection in `MemoryMapManager.CreateMapping`.
+- `atomic.Bool` for closed/adaptiveMode flags.
+- ArenaSlice error propagation in IVFPQ merge and batch chunk processing.
+
+### Binary Format Details
+
+| Component | v1 (old) | v2 (new) |
+|---|---|---|
+| File header | 72 bytes, checksum at 72:76 | 96 bytes with 24-byte Creator, checksum at 96:100 |
+| HNSW magic | `0x484E5357` (uint32) | `"LIBRAHNS"` (8 bytes) |
+| Flat encoding | JSON | `"LIBRAFLT"` binary with `FlatFormatVersion=1` |
+| IVFPQ encoding | JSON | `"LIBRAIVF"` binary with `ivfpqFormatVersion=2` |
+| WAL frames | JSON | Binary tagged-value encoding (codec v2) |
+| Snapshot | JSON | Binary tagged-value encoding (codec v2) |
+| `SFLMetadataOverhead` | implicit 48 (magic number) | `SFLMetadataOverhead` constant in `hnsw/format.go` |
+
+### Removed
+
+- `internal/storage/lsm/` — removed in favor of singlefile engine.
+- `internal/storage/segments/` — removed alongside LSM.
+
+### Dependency Changes
+
+- `github.com/xDarkicex/memory` — v1.0.0 → v1.0.2
+- `go.uber.org/goleak` v1.3.0 — promoted from indirect to direct
+- `github.com/xDarkicex/slabby` — removed from direct dependencies
