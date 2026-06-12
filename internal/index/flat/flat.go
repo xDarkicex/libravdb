@@ -334,8 +334,10 @@ func (idx *Index) acquireHeapSlot(k int) (*heapSlot, []heapElement) {
 	return nil, nil
 }
 
-// Search performs brute-force search across all vectors using a max-heap for top-k.
-func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
+// Search finds the k nearest neighbors using exhaustive search
+func (idx *Index) Search(ctx context.Context, query []float32, k int, filter interface {
+	Test(idx uint64) bool
+}) ([]*SearchResult, error) {
 	if len(query) != idx.config.Dimension {
 		return nil, fmt.Errorf("query dimension mismatch: expected %d, got %d",
 			idx.config.Dimension, len(query))
@@ -396,8 +398,14 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	for i := 0; i < len(idx.vectors); i++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		default:
+		}
+
+		if filter != nil && !filter.Test(uint64(i)) {
+			continue
 		}
 
 		entry := idx.vectors[i]

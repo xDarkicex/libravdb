@@ -14,11 +14,18 @@ import (
 	"github.com/xDarkicex/memory"
 )
 
-// Index defines the interface for vector indexes
+// GraphFilter is an interface used to filter search candidates based on a graph bitset.
+type GraphFilter interface {
+	Test(idx uint64) bool
+}
+
+// Index defines the interface for all vector index implementations
 type Index interface {
+	// Insert adds a vector to the index
 	Insert(ctx context.Context, entry *VectorEntry) error
 	BatchInsert(ctx context.Context, entries []*VectorEntry) error // NEW: Optimized batch insertion
-	Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error)
+	// Search finds the k nearest neighbors
+	Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error)
 	Delete(ctx context.Context, id string) error
 	Size() int
 	MemoryUsage() int64
@@ -170,8 +177,8 @@ func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 }
 
 // Search adapts the search results from HNSW to interface types
-func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
-	hnswResults, err := w.index.Search(ctx, query, k)
+func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
+	hnswResults, err := w.index.Search(ctx, query, k, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -364,8 +371,8 @@ func (w *ivfpqWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) 
 }
 
 // Search adapts the search results from IVF-PQ to interface types
-func (w *ivfpqWrapper) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
-	ivfpqResults, err := w.index.Search(ctx, query, k)
+func (w *ivfpqWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
+	ivfpqResults, err := w.index.Search(ctx, query, k, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -533,8 +540,8 @@ func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 }
 
 // Search adapts the search results from Flat to interface types
-func (w *flatWrapper) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
-	flatResults, err := w.index.Search(ctx, query, k)
+func (w *flatWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
+	flatResults, err := w.index.Search(ctx, query, k, filter)
 	if err != nil {
 		return nil, err
 	}

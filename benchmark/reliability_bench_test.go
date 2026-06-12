@@ -174,7 +174,7 @@ func BenchmarkSearchDuringSave(b *testing.B) {
 	var baselineLatency time.Duration
 	for i := 0; i < 10; i++ {
 		start := time.Now()
-		_, err := index.Search(ctx, queryVector, 10)
+		_, err := index.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			b.Fatalf("Baseline search failed: %v", err)
 		}
@@ -201,7 +201,7 @@ func BenchmarkSearchDuringSave(b *testing.B) {
 		// Perform searches during save
 		for j := 0; j < 5; j++ {
 			start := time.Now()
-			_, err := index.Search(ctx, queryVector, 10)
+			_, err := index.Search(ctx, queryVector, 10, nil)
 			if err != nil {
 				b.Errorf("Search during save failed: %v", err)
 				continue

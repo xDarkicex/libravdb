@@ -99,7 +99,7 @@ func TestMemoryMappingIntegration(t *testing.T) {
 		query[i] = float32(i)
 	}
 
-	results, err := index.Search(ctx, query, 10)
+	results, err := index.Search(ctx, query, 10, nil)
 	if err != nil {
 		t.Fatalf("Failed to search: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestMemoryMappingIntegration(t *testing.T) {
 		}
 
 		// Search for the new vector
-		newResults, err := index.Search(ctx, query, 5)
+		newResults, err := index.Search(ctx, query, 5, nil)
 		if err != nil {
 			t.Fatalf("Failed to search for new vector: %v", err)
 		}
@@ -399,7 +399,7 @@ func TestMemoryMappingPerformance(t *testing.T) {
 	t.Logf("Query vector dimension: %d, Config dimension: %d", len(query), config.Dimension)
 
 	// Warm up
-	_, err = index.Search(ctx, query, 10)
+	_, err = index.Search(ctx, query, 10, nil)
 	if err != nil {
 		t.Fatalf("Failed to warm up search: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestMemoryMappingPerformance(t *testing.T) {
 	searchCount := 100
 	searchStart := time.Now()
 	for i := range searchCount {
-		results, err := index.Search(ctx, query, 10)
+		results, err := index.Search(ctx, query, 10, nil)
 		if err != nil {
 			t.Fatalf("Failed to search iteration %d: %v", i, err)
 		}
@@ -429,7 +429,7 @@ func TestMemoryMappingPerformance(t *testing.T) {
 	// Measure search performance without mapping
 	searchStart = time.Now()
 	for i := range searchCount {
-		results, err := index.Search(ctx, query, 10)
+		results, err := index.Search(ctx, query, 10, nil)
 		if err != nil {
 			t.Fatalf("Failed to search without mapping iteration %d: %v", i, err)
 		}

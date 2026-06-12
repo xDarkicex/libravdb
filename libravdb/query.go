@@ -19,6 +19,7 @@ type QueryBuilder struct {
 	threshold    float32
 	thresholdSet bool
 	efSearch     int // Override collection default
+	graphFilter  GraphFilter
 }
 
 // Filter represents a metadata filter condition (deprecated, use filter package)
@@ -319,6 +320,12 @@ func (qb *QueryBuilder) WithEfSearch(efSearch int) *QueryBuilder {
 	return qb
 }
 
+// WithGraphFilter adds a graph bitset filter for pruning candidates during search.
+func (qb *QueryBuilder) WithGraphFilter(filter GraphFilter) *QueryBuilder {
+	qb.graphFilter = filter
+	return qb
+}
+
 // Execute runs the query and returns results
 func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	if qb.vector == nil {
@@ -333,7 +340,7 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	optimizedFilters := qb.optimizeFilters()
 
 	// Get initial search results from vector index
-	result, err := qb.collection.Search(qb.ctx, qb.vector, qb.getSearchLimit())
+	result, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), qb.graphFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +386,7 @@ func (qb *QueryBuilder) List() ([]Record, error) {
 			return nil, fmt.Errorf("limit must be positive, got %d", qb.limit)
 		}
 
-		results, err := qb.collection.Search(qb.ctx, qb.vector, qb.getSearchLimit())
+		results, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), qb.graphFilter)
 		if err != nil {
 			return nil, err
 		}

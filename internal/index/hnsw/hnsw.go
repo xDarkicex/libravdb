@@ -396,8 +396,10 @@ func (h *Index) batchInsertOptimized(ctx context.Context, entries []*VectorEntry
 	return nil
 }
 
-// Search finds the k nearest neighbors to the query vector
-func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
+// Search performs a KNN search using the HNSW algorithm.
+func (h *Index) Search(ctx context.Context, query []float32, k int, filter interface {
+	Test(idx uint64) bool
+}) ([]*SearchResult, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -436,7 +438,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 
 	// Phase 2: Search level 0 with ef
 	ef := max(h.config.EfSearch, k)
-	candidates, err := h.searchLevel(ctx, query, ep, ef, 0, queryState)
+	candidates, err := h.searchLevel(ctx, query, ep, ef, 0, queryState, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +468,17 @@ func (h *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchRe
 			Score:   candidate.Distance,
 			Vector:  resultVector,
 		})
+	}
+
+	// Filter candidates based on the graph filter
+	if filter != nil {
+		var filtered []*SearchResult
+		for _, res := range results {
+			if filter.Test(uint64(res.Ordinal)) {
+				filtered = append(filtered, res)
+			}
+		}
+		results = filtered
 	}
 
 	return results, nil

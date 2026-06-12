@@ -21,6 +21,7 @@ type Txn struct {
 	ID      uint64
 	wal     *wal.WAL
 	records []*wal.Entry
+	store   *graphStore
 }
 
 // AppendRecord accumulates a WAL record in the transaction.
@@ -42,8 +43,19 @@ func (t *Txn) Commit(ctx context.Context) error {
 	return t.wal.AppendBatch(ctx, t.records)
 }
 
+// AddEdge adds a directed edge to the graph within this transaction.
+func (t *Txn) AddEdge(src, tgt uint64, weight float32, kind uint8) error {
+	return t.store.AddEdge(t, src, tgt, weight, kind)
+}
+
+// RemoveEdge removes a directed edge from the graph within this transaction.
+func (t *Txn) RemoveEdge(src, tgt uint64, kind uint8) error {
+	return t.store.RemoveEdge(t, src, tgt, kind)
+}
+
 // Graph provides edge storage and traversal operations
 type Graph interface {
+	BeginTxn() *Txn
 	AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uint8) error
 	RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *Txn, nodeID uint64) error
@@ -74,6 +86,7 @@ type graphStore struct {
 	globalStamp  atomic.Uint32
 	metrics      storeMetrics
 	lastFlushedGen uint32
+	nextTxnID    atomic.Uint64
 }
 
 // NewGraph initializes the Graph store with off-heap allocators.
@@ -394,6 +407,14 @@ retry:
 	
 	pool.HyalineLeave(int(shard))
 	return edges, nil
+}
+
+// BeginTxn starts a new graph transaction.
+func (g *graphStore) BeginTxn() *Txn {
+	return &Txn{
+		ID:    g.nextTxnID.Add(1),
+		store: g,
+	}
 }
 
 func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList) {

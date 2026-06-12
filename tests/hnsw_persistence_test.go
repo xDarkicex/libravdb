@@ -86,7 +86,7 @@ func TestHNSWPersistence(t *testing.T) {
 	if metadataAfter == nil {
 		t.Log("Metadata is nil after loading - checking if index is empty")
 		// Try a simple search to see if data was loaded
-		testResults, searchErr := index2.Search(ctx, vectors[0], 1)
+		testResults, searchErr := index2.Search(ctx, vectors[0], 1, nil)
 		if searchErr != nil {
 			t.Fatalf("Search failed on loaded index: %v", searchErr)
 		}
@@ -107,7 +107,7 @@ func TestHNSWPersistence(t *testing.T) {
 
 	// Test search functionality on loaded index
 	queryVector := []float32{1.5, 2.5, 3.5, 4.5}
-	results, err := index2.Search(ctx, queryVector, 2)
+	results, err := index2.Search(ctx, queryVector, 2, nil)
 	if err != nil {
 		t.Fatalf("Failed to search loaded index: %v", err)
 	}

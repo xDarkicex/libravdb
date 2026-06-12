@@ -93,7 +93,7 @@ func TestIVFPQWithQuantizationIntegration(t *testing.T) {
 
 			// Test search with quantization
 			query := testEntries[0].Vector
-			results, err := idx.Search(ctx, query, 3)
+			results, err := idx.Search(ctx, query, 3, nil)
 			if err != nil {
 				t.Fatalf("failed to search: %v", err)
 			}
@@ -278,7 +278,7 @@ func TestIVFPQSearchAccuracy(t *testing.T) {
 
 	// Test search accuracy
 	for i, queryVec := range knownVectors {
-		results, err := idx.Search(ctx, queryVec, 3)
+		results, err := idx.Search(ctx, queryVec, 3, nil)
 		if err != nil {
 			t.Errorf("failed to search for vector %d: %v", i, err)
 			continue
