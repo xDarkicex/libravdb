@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"errors"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -12,9 +11,6 @@ import (
 	"github.com/xDarkicex/memory"
 )
 
-var (
-	ErrNoTransaction = errors.New("transaction required")
-)
 
 // Txn is a minimal transaction context for graph operations.
 type Txn struct {
@@ -163,10 +159,32 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 	}, nil
 }
 
-func lockPage(m *uint64) {
-	for !atomic.CompareAndSwapUint64(m, 0, 1) {
+func tryLockPage(m *uint64) bool {
+	for i := 0; i < 100; i++ {
+		if atomic.CompareAndSwapUint64(m, 0, 1) {
+			return true
+		}
 		runtime.Gosched()
 	}
+	return false
+}
+
+func retryOp(op func() error) error {
+	backoff := 1 * time.Millisecond
+	maxBackoff := 64 * time.Millisecond
+	for i := 0; i < 10; i++ {
+		err := op()
+		if err == ErrConcurrentModification {
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		return err
+	}
+	return ErrConcurrentModification
 }
 
 func unlockPage(m *uint64) {
@@ -184,7 +202,12 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 	if pageSlot == 0 {
 		slotBytes, err := pool.Allocate()
 		if err != nil {
-			return err
+			// Memory exhaustion handling: attempt GC and retry
+			runtime.GC()
+			slotBytes, err = pool.Allocate()
+			if err != nil {
+				return err
+			}
 		}
 		if pool == g.pagePool {
 			g.metrics.pagesAllocated.Add(1)
@@ -206,7 +229,9 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 		page = g.pageReg.Get(pageSlot)
 	}
 
-	lockPage(&page.Header.Mutex)
+	if !tryLockPage(&page.Header.Mutex) {
+		return ErrConcurrentModification
+	}
 	
 	totalCount := page.Header.Count
 	if totalCount < 8 {
@@ -219,8 +244,13 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 			if currPage.Header.Overflow == 0 {
 				slotBytes, err := pool.Allocate()
 				if err != nil {
-					unlockPage(&page.Header.Mutex)
-					return err
+					// Memory exhaustion handling: attempt GC and retry
+					runtime.GC()
+					slotBytes, err = pool.Allocate()
+					if err != nil {
+						unlockPage(&page.Header.Mutex)
+						return err
+					}
 				}
 				if pool == g.pagePool {
 					g.metrics.pagesAllocated.Add(1)
@@ -254,7 +284,7 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 	return nil
 }
 
-var ErrEdgeNotFound = errors.New("edge not found")
+
 
 func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, kindToRemove uint8, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
 	shard := nodeID % uint64(g.cfg.PageShards)
@@ -268,7 +298,9 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 	
 	page := g.pageReg.Get(pageSlot)
 	
-	lockPage(&page.Header.Mutex)
+	if !tryLockPage(&page.Header.Mutex) {
+		return ErrConcurrentModification
+	}
 	defer unlockPage(&page.Header.Mutex)
 	
 	totalCount := page.Header.Count
@@ -427,7 +459,13 @@ func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool 
 	
 	page := g.pageReg.Get(pageSlot)
 	
-	lockPage(&page.Header.Mutex)
+	if !tryLockPage(&page.Header.Mutex) {
+		// retirePageChain is internal cleanup, if we fail to lock, we just skip it or retry
+		// But let's just spin in a fallback loop for cleanup since it must complete
+		for !tryLockPage(&page.Header.Mutex) {
+			time.Sleep(time.Millisecond)
+		}
+	}
 	defer unlockPage(&page.Header.Mutex)
 	
 	currPage := page
@@ -454,12 +492,18 @@ func (g *graphStore) AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uin
 
 func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32, kind uint8, stamp uint32) error {
 	fEdge := Edge{Target: tgt, Weight: weight, Stamp: stamp, Kind: kind}
-	if err := g.appendEdgeToTable(src, fEdge, g.index, g.pagePool); err != nil {
+	err := retryOp(func() error {
+		return g.appendEdgeToTable(src, fEdge, g.index, g.pagePool)
+	})
+	if err != nil {
 		return err
 	}
 
 	rEdge := Edge{Target: src, Weight: weight, Stamp: stamp, Kind: kind}
-	if err := g.appendEdgeToTable(tgt, rEdge, g.reverse.locator, g.reverse.pool); err != nil {
+	err = retryOp(func() error {
+		return g.appendEdgeToTable(tgt, rEdge, g.reverse.locator, g.reverse.pool)
+	})
+	if err != nil {
 		return err
 	}
 
@@ -484,13 +528,17 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 }
 
 func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
-	err := g.removeEdgeFromTable(src, tgt, kind, g.index, g.pagePool)
+	err := retryOp(func() error {
+		return g.removeEdgeFromTable(src, tgt, kind, g.index, g.pagePool)
+	})
 	if err != nil {
 		return err
 	}
 	
-	err = g.removeEdgeFromTable(tgt, src, kind, g.reverse.locator, g.reverse.pool)
-	if err != nil {
+	err = retryOp(func() error {
+		return g.removeEdgeFromTable(tgt, src, kind, g.reverse.locator, g.reverse.pool)
+	})
+	if err != nil && err != ErrEdgeNotFound {
 		return err
 	}
 
@@ -515,12 +563,16 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 	inboundEdges, _ := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 	for _, edge := range inboundEdges {
-		_ = g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.index, g.pagePool)
+		_ = retryOp(func() error {
+			return g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.index, g.pagePool)
+		})
 	}
 
 	outboundEdges, _ := g.neighborsFromTable(nodeID, g.index, g.pagePool, g.cfg.PageShards)
 	for _, edge := range outboundEdges {
-		_ = g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.reverse.locator, g.reverse.pool)
+		_ = retryOp(func() error {
+			return g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.reverse.locator, g.reverse.pool)
+		})
 	}
 
 	g.retirePageChain(nodeID, g.index, g.pagePool)
@@ -586,7 +638,12 @@ func (g *graphStore) NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error
 }
 
 func (g *graphStore) Stats() GraphStats {
-	return g.metrics.get()
+	stats := g.metrics.get()
+	stats.OffHeapMemory = g.edgePool.Stats().Allocated +
+		g.pagePool.Stats().Allocated +
+		g.bitsetPool.Stats().Allocated +
+		g.frontierPool.Stats().Allocated
+	return stats
 }
 
 func (g *graphStore) GetBitset() *Bitset {

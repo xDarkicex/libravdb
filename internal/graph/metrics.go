@@ -15,6 +15,7 @@ type GraphStats struct {
 	BFSCalls          uint64
 	BFSNodesVisited   uint64
 	WALReplayDuration time.Duration
+	OffHeapMemory     uint64
 }
 
 // storeMetrics represents the internal atomic counters.
@@ -27,6 +28,7 @@ type storeMetrics struct {
 	bfsCalls          atomic.Uint64
 	bfsNodesVisited   atomic.Uint64
 	walReplayDuration atomic.Int64 // nanoseconds
+	offHeapMemory     atomic.Uint64
 }
 
 func (m *storeMetrics) get() GraphStats {
@@ -39,5 +41,6 @@ func (m *storeMetrics) get() GraphStats {
 		BFSCalls:          m.bfsCalls.Load(),
 		BFSNodesVisited:   m.bfsNodesVisited.Load(),
 		WALReplayDuration: time.Duration(m.walReplayDuration.Load()),
+		OffHeapMemory:     m.offHeapMemory.Load(),
 	}
 }

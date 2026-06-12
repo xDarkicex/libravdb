@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"math"
 	"sync/atomic"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/storage/wal"
 )
@@ -179,6 +181,7 @@ func DeserializeWALTxnCommitRecord(data []byte) (*WALTxnCommitRecord, error) {
 
 // ReplayWAL reads WAL records, groups them by transaction, and replays committed transactions.
 func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
+	start := time.Now()
 	entries, err := w.Read()
 	if err != nil {
 		return fmt.Errorf("failed to read WAL: %w", err)
@@ -237,7 +240,7 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 			case wal.OpEdgeAdd:
 				record, err := DeserializeWALEdgeAddRecord(entry.Data)
 				if err != nil {
-					// skip corrupt
+					log.Printf("WAL replay warning: skipping corrupt OpEdgeAdd record (txn %d): %v", txnID, err)
 					continue
 				}
 				err = forwardIndex.AddEdgeWithStamp(nil, record.From, record.To, record.Weight, record.Kind, record.Stamp)
@@ -250,6 +253,7 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 			case wal.OpEdgeRemove:
 				record, err := DeserializeWALEdgeRemoveRecord(entry.Data)
 				if err != nil {
+					log.Printf("WAL replay warning: skipping corrupt OpEdgeRemove record (txn %d): %v", txnID, err)
 					continue
 				}
 				err = forwardIndex.RemoveEdge(nil, record.From, record.To, record.Kind)
@@ -259,6 +263,7 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 			case wal.OpNodeEdgeDrop:
 				record, err := DeserializeWALNodeEdgeDropRecord(entry.Data)
 				if err != nil {
+					log.Printf("WAL replay warning: skipping corrupt OpNodeEdgeDrop record (txn %d): %v", txnID, err)
 					continue
 				}
 				err = forwardIndex.DropNodeEdges(nil, record.NodeID)
@@ -271,6 +276,8 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 
 	// Restore lastFlushedGen
 	atomic.StoreUint32(&forwardIndex.lastFlushedGen, maxStamp)
+
+	forwardIndex.metrics.walReplayDuration.Store(time.Since(start).Nanoseconds())
 
 	return nil
 }
