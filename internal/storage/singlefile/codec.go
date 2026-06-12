@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	codecVersion byte = 1 // Binary payload encoding (snapshot state, WAL frames, collection records)
+	codecVersion byte = 2 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
 type encodedPayload struct {

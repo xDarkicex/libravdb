@@ -18,7 +18,7 @@ const (
 )
 
 const (
-	codecVersion byte = 1 // Tagged-value wire format (vectors, metadata, value types)
+	codecVersion byte = 2 // Tagged-value wire format (vectors, metadata, value types)
 
 	minPooledEncoderCapacity = 256
 	maxPooledEncoderCapacity = 16 << 10
