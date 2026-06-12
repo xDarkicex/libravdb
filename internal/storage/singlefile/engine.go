@@ -28,6 +28,7 @@ const (
 	pageSize             = 4096
 	formatVersion        = uint16(2) // On-disk file layout (header page, metapage, chunk framing)
 	fileMagic            = "LIBRAVDB"
+	fileCreator          = "libravdb/2.0.0 xDarkicex" // 24 bytes — embedded in file header
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
 	metaMagicV2   uint32 = 0x4C56444E // V2 metapage includes index persistence fields
@@ -87,6 +88,7 @@ type fileHeader struct {
 	FeatureFlags      uint32
 	FileID            uint64
 	CreatedUnixNano   uint64
+	Creator           [24]byte // "libravdb/2.0.0 xDarkicex"
 	LastCheckpointLSN uint64
 	ActiveMetaPage    uint64
 	WALStartPage      uint64
@@ -615,6 +617,7 @@ func (e *Engine) writeInitialPages() error {
 		WALTailPage:     3,
 	}
 	copy(header.Magic[:], []byte(fileMagic))
+	copy(header.Creator[:], []byte(fileCreator))
 	if err := writeFixedPage(e.file, 0, encodeHeader(header, make([]byte, pageSize))); err != nil {
 		return err
 	}
@@ -653,13 +656,14 @@ func encodeHeader(header *fileHeader, buf []byte) []byte {
 	binary.LittleEndian.PutUint32(buf[12:16], header.FeatureFlags)
 	binary.LittleEndian.PutUint64(buf[16:24], header.FileID)
 	binary.LittleEndian.PutUint64(buf[24:32], header.CreatedUnixNano)
-	binary.LittleEndian.PutUint64(buf[32:40], header.LastCheckpointLSN)
-	binary.LittleEndian.PutUint64(buf[40:48], header.ActiveMetaPage)
-	binary.LittleEndian.PutUint64(buf[48:56], header.WALStartPage)
-	binary.LittleEndian.PutUint64(buf[56:64], header.WALHeadPage)
-	binary.LittleEndian.PutUint64(buf[64:72], header.WALTailPage)
-	checksum := crc32.Checksum(buf[:72], castagnoli)
-	binary.LittleEndian.PutUint32(buf[72:76], checksum)
+	copy(buf[32:56], header.Creator[:])
+	binary.LittleEndian.PutUint64(buf[56:64], header.LastCheckpointLSN)
+	binary.LittleEndian.PutUint64(buf[64:72], header.ActiveMetaPage)
+	binary.LittleEndian.PutUint64(buf[72:80], header.WALStartPage)
+	binary.LittleEndian.PutUint64(buf[80:88], header.WALHeadPage)
+	binary.LittleEndian.PutUint64(buf[88:96], header.WALTailPage)
+	checksum := crc32.Checksum(buf[:96], castagnoli)
+	binary.LittleEndian.PutUint32(buf[96:100], checksum)
 	return buf
 }
 
@@ -691,23 +695,41 @@ func (e *Engine) readHeader() (*fileHeader, error) {
 	if string(buf[:8]) != fileMagic {
 		return nil, fmt.Errorf("invalid database file magic")
 	}
-	expected := crc32.Checksum(buf[:72], castagnoli)
-	if got := binary.LittleEndian.Uint32(buf[72:76]); got != expected {
-		return nil, fmt.Errorf("invalid header checksum")
-	}
+	version := binary.LittleEndian.Uint16(buf[8:10])
 	header := &fileHeader{}
 	copy(header.Magic[:], buf[:8])
-	header.FormatVersion = binary.LittleEndian.Uint16(buf[8:10])
+	header.FormatVersion = version
 	header.PageSize = binary.LittleEndian.Uint16(buf[10:12])
 	header.FeatureFlags = binary.LittleEndian.Uint32(buf[12:16])
 	header.FileID = binary.LittleEndian.Uint64(buf[16:24])
 	header.CreatedUnixNano = binary.LittleEndian.Uint64(buf[24:32])
-	header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[32:40])
-	header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[40:48])
-	header.WALStartPage = binary.LittleEndian.Uint64(buf[48:56])
-	header.WALHeadPage = binary.LittleEndian.Uint64(buf[56:64])
-	header.WALTailPage = binary.LittleEndian.Uint64(buf[64:72])
-	header.Checksum = binary.LittleEndian.Uint32(buf[72:76])
+
+	if version >= 2 {
+		// V2 header: 96-byte data with Creator field, checksum at 96:100.
+		expected := crc32.Checksum(buf[:96], castagnoli)
+		if got := binary.LittleEndian.Uint32(buf[96:100]); got != expected {
+			return nil, fmt.Errorf("invalid header checksum")
+		}
+		copy(header.Creator[:], buf[32:56])
+		header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[56:64])
+		header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[64:72])
+		header.WALStartPage = binary.LittleEndian.Uint64(buf[72:80])
+		header.WALHeadPage = binary.LittleEndian.Uint64(buf[80:88])
+		header.WALTailPage = binary.LittleEndian.Uint64(buf[88:96])
+		header.Checksum = binary.LittleEndian.Uint32(buf[96:100])
+	} else {
+		// V1 header: 72-byte data, checksum at 72:76.
+		expected := crc32.Checksum(buf[:72], castagnoli)
+		if got := binary.LittleEndian.Uint32(buf[72:76]); got != expected {
+			return nil, fmt.Errorf("invalid header checksum")
+		}
+		header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[32:40])
+		header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[40:48])
+		header.WALStartPage = binary.LittleEndian.Uint64(buf[48:56])
+		header.WALHeadPage = binary.LittleEndian.Uint64(buf[56:64])
+		header.WALTailPage = binary.LittleEndian.Uint64(buf[64:72])
+		header.Checksum = binary.LittleEndian.Uint32(buf[72:76])
+	}
 	return header, nil
 }
 
@@ -1512,6 +1534,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		FeatureFlags:      origHeader.FeatureFlags,
 		FileID:            origHeader.FileID,
 		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
 		LastCheckpointLSN: phase1LSN,
 		ActiveMetaPage:    1,
 		WALStartPage:      pageCount,
@@ -1759,6 +1782,7 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		FeatureFlags:      origHeader.FeatureFlags,
 		FileID:            origHeader.FileID,
 		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
 		LastCheckpointLSN: phase1LSN,
 		ActiveMetaPage:    1,
 		WALStartPage:      pageCount,
@@ -1981,6 +2005,7 @@ func (e *Engine) compactFileLocked() error {
 		FeatureFlags:      origHeader.FeatureFlags,
 		FileID:            origHeader.FileID,
 		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
 		LastCheckpointLSN: e.lastLSN,
 		ActiveMetaPage:    1,
 		WALStartPage:      pageCount, // no WAL in compacted file

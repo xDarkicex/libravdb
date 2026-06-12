@@ -1327,7 +1327,7 @@ func TestReplayWALSkipsCorruptNonWALHeader(t *testing.T) {
 		f.Close()
 		t.Fatalf("read header: %v", err)
 	}
-	activeMeta := binary.LittleEndian.Uint64(headerBuf[40:48])
+	activeMeta := binary.LittleEndian.Uint64(headerBuf[64:72])
 
 	// Read active metapage to find IndexOffset.
 	metaBuf := make([]byte, pageSize)
