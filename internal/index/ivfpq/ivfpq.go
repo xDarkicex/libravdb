@@ -1157,7 +1157,10 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 	// Each worker already produced ascending-distance output. Instead of
 	// re-heaping element-by-element (O(W·k log k)), a min-heap of size W
 	// performs a linear merge in O(W·k log W).
-	candidates := mergeSortedWorkerResults(results, k, arena)
+	candidates, err := mergeSortedWorkerResults(results, k, arena)
+	if err != nil {
+		return nil, err
+	}
 	return candidates, nil
 }
 
@@ -1190,7 +1193,7 @@ func mergeDownHeap(h []mergeElem, i, n int) {
 // mergeSortedWorkerResults merges W pre-sorted (ascending distance) candidate
 // arrays into a single top-k candidate slice via k-way merge.
 // Complexity: O(W·k log W) instead of the previous O(W·k log k) re-heaping.
-func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena) []candidate {
+func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena) ([]candidate, error) {
 	// Count non-empty workers and compute total available results.
 	active := 0
 	total := 0
@@ -1201,7 +1204,7 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 		}
 	}
 	if active == 0 {
-		return nil
+		return nil, nil
 	}
 	if k > total {
 		k = total
@@ -1209,12 +1212,12 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 
 	mergeHeap, err := memory.ArenaSlice[mergeElem](arena, active)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("arena allocate mergeHeap: %w", err)
 	}
 	mergeHeap = mergeHeap[:0]
 	pos, err := memory.ArenaSlice[int](arena, len(results))
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("arena allocate pos: %w", err)
 	}
 	pos = pos[:len(results)]
 
@@ -1235,7 +1238,7 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 
 	candidates, err := memory.ArenaSlice[candidate](arena, k)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("arena allocate candidates: %w", err)
 	}
 	candidates = candidates[:0]
 	for len(candidates) < k && len(mergeHeap) > 0 {
@@ -1260,7 +1263,7 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 		}
 		mergeDownHeap(mergeHeap, 0, len(mergeHeap))
 	}
-	return candidates
+	return candidates, nil
 }
 
 func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any) ([]candidate, error) {

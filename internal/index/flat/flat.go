@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 	"unsafe"
@@ -175,7 +174,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		newEntries[i] = &VectorEntry{
 			ID:       entry.ID,
 			Vector:   offHeapVec,
-			Metadata: entry.Metadata, metadataSize: estimateMetadataSize(entry.Metadata),
+			Metadata: cloneMetadata(entry.Metadata), metadataSize: estimateMetadataSize(entry.Metadata),
 		}
 	}
 
@@ -216,7 +215,7 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	newEntry := &VectorEntry{
 		ID:           entry.ID,
 		Vector:       offHeapVec,
-		Metadata:     entry.Metadata,
+		Metadata:     cloneMetadata(entry.Metadata),
 		metadataSize: mdSize,
 	}
 
@@ -382,20 +381,8 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	count := 0
 
 	for i := 0; i < len(idx.vectors); i++ {
-		// Periodically yield the lock to prevent write starvation
-		if i > 0 && i%1024 == 0 {
-			idx.mu.RUnlock()
-			runtime.Gosched() // Yield to allow waiting writers to acquire the lock
-			idx.mu.RLock()
-			// If elements were deleted, ensure we don't go out of bounds
-			if i >= len(idx.vectors) {
-				break
-			}
-		}
-
 		select {
 		case <-ctx.Done():
-			// The deferred RUnlock will handle the unlock
 			return nil, ctx.Err()
 		default:
 		}
@@ -426,11 +413,13 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		downHeap(heapBuf, 0, count)
 
 		entry := idx.vectors[elem.vecIdx]
+		vec := make([]float32, len(entry.Vector))
+		copy(vec, entry.Vector)
 		results[i] = &SearchResult{
 			ID:       entry.ID,
 			Score:    elem.score,
-			Vector:   entry.Vector,
-			Metadata: entry.Metadata,
+			Vector:   vec,
+			Metadata: cloneMetadata(entry.Metadata),
 			Version:  entry.Version,
 		}
 	}
@@ -796,6 +785,19 @@ func estimateValueSize(v interface{}) int64 {
 	default:
 		return 16 // Default estimate
 	}
+}
+
+// cloneMetadata returns a shallow copy of the metadata map so callers
+// cannot mutate the index's internal state through a stored reference.
+func cloneMetadata(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // deallocateVector returns the off-heap slice back to the ShardedFreeList.

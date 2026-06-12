@@ -585,7 +585,7 @@ func BenchmarkFlatSearch(b *testing.B) {
 	}
 }
 
-func TestFlatInsert_SharesMetadataReference(t *testing.T) {
+func TestFlatInsert_ClonesMetadata(t *testing.T) {
 	idx, _ := NewFlat(&Config{Dimension: 1, Metric: util.L2Distance})
 	entry := &VectorEntry{
 		ID:       "x",
@@ -596,8 +596,8 @@ func TestFlatInsert_SharesMetadataReference(t *testing.T) {
 	idx.Insert(ctx, entry)
 	entry.Metadata["k"] = "mutated"
 	results, _ := idx.Search(ctx, []float32{1}, 1)
-	if results[0].Metadata["k"] != "mutated" {
-		t.Error("expected shared reference, got independent copy")
+	if results[0].Metadata["k"] != "v" {
+		t.Errorf("expected cloned metadata 'v', got %q", results[0].Metadata["k"])
 	}
 }
 

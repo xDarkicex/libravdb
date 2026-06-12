@@ -1181,8 +1181,8 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 	defer unlock()
 
 	shard := c.getShard(id)
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	existingEntry, err := shard.storage.Get(ctx, id)
 	if err != nil {
@@ -1246,8 +1246,8 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 	defer unlock()
 
 	shard := c.getShard(id)
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	exists, err := shard.storage.Exists(ctx, id)
 	if err != nil {
@@ -1363,13 +1363,13 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	}
 
 	// Sharded path: route to the correct shard for this ID
+	c.mu.RUnlock()
 	unlock := c.lockMutationIDs([]string{id})
 	defer unlock()
 
 	shard := c.getShard(id)
-	shard.mu.RLock()
-	defer c.mu.RUnlock()
-	defer shard.mu.RUnlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	var indexErr error
 	if entry, err := shard.storage.Get(ctx, id); err == nil {

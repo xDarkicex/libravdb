@@ -40,6 +40,7 @@ func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node,
 	// Handle special case: deleting the only node
 	if h.size == 1 {
 		h.deleteStoredVector(node)
+		h.freeNodeLinks(node) // release off-heap SFL link slots
 		h.nodes = h.nodes[:0]
 		h.entryPoint = nil
 		h.maxLevel = 0
