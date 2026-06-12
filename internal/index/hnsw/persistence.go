@@ -9,16 +9,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+	"unsafe"
 
+	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 const (
 	// File format constants
-	HNSWMagicNumber = 0x484E5357 // "HNSW" in hex
-	ChunkSize       = 1000       // Process nodes in batches
+	ChunkSize       = 1000 // Process nodes in batches
 )
+
+var HNSWMagicBytes = []byte("LIBRAHNS")
 
 // Core serialization functions
 func (h *Index) saveToDiskImpl(ctx context.Context, path string) error {
@@ -102,11 +106,11 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 		}
 	}
 
-	if err := h.readNodes(reader); err != nil {
+	if err := h.readNodes(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read nodes: %w", err)
 	}
 
-	if err := h.readLinks(reader); err != nil {
+	if err := h.readLinks(ctx, reader); err != nil {
 		return fmt.Errorf("failed to read links: %w", err)
 	}
 
@@ -123,8 +127,8 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 }
 
 func (h *Index) writeHeader(writer io.Writer) error {
-	// Magic number (4 bytes)
-	if err := binary.Write(writer, binary.LittleEndian, uint32(HNSWMagicNumber)); err != nil {
+	// Magic bytes (8 bytes)
+	if _, err := writer.Write(HNSWMagicBytes); err != nil {
 		return err
 	}
 
@@ -226,8 +230,9 @@ func (h *Index) writeNodes(writer io.Writer) error {
 			if err := binary.Write(writer, binary.LittleEndian, uint32(len(vector))); err != nil {
 				return err
 			}
-			for _, val := range vector {
-				if err := binary.Write(writer, binary.LittleEndian, val); err != nil {
+			if len(vector) > 0 {
+				vectorBytes := unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4)
+				if _, err := writer.Write(vectorBytes); err != nil {
 					return err
 				}
 			}
@@ -366,14 +371,14 @@ func validateFileFormat(path string) error {
 	}
 	defer file.Close()
 
-	// Read and validate magic number
-	var magic uint32
-	if err := binary.Read(file, binary.LittleEndian, &magic); err != nil {
-		return fmt.Errorf("failed to read magic number: %w", err)
+	// Read and validate magic bytes
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return fmt.Errorf("failed to read magic bytes: %w", err)
 	}
 
-	if magic != HNSWMagicNumber {
-		return fmt.Errorf("invalid magic number: expected %x, got %x", HNSWMagicNumber, magic)
+	if string(magic) != string(HNSWMagicBytes) {
+		return fmt.Errorf("invalid magic number: expected %q, got %q", HNSWMagicBytes, magic)
 	}
 
 	// Read and validate version
@@ -391,9 +396,9 @@ func validateFileFormat(path string) error {
 
 // Read functions for loading from disk
 func (h *Index) readHeader(reader io.Reader) error {
-	// Read magic number (already validated)
-	var magic uint32
-	if err := binary.Read(reader, binary.LittleEndian, &magic); err != nil {
+	// Read magic bytes (already validated, but we must consume them from the reader)
+	magic := make([]byte, 8)
+	if _, err := io.ReadFull(reader, magic); err != nil {
 		return err
 	}
 
@@ -457,7 +462,7 @@ func (h *Index) readConfig(reader io.Reader) error {
 	return nil
 }
 
-func (h *Index) readNodes(reader io.Reader) error {
+func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 	// Read total node count
 	var nodeCount uint32
 	if err := binary.Read(reader, binary.LittleEndian, &nodeCount); err != nil {
@@ -467,8 +472,24 @@ func (h *Index) readNodes(reader io.Reader) error {
 	// Initialize nodes slice
 	h.nodes = make([]*Node, nodeCount)
 
+	// Use the scratch arena for temporary per-node buffers (id bytes, vector
+	// data) so deserialization doesn't allocate on the Go heap.
+	arena := h.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		h.scratchPool.Put(arena)
+	}()
+
 	// Read nodes
 	for i := uint32(0); i < nodeCount; i++ {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// Read node marker
 		var marker uint8
 		if err := binary.Read(reader, binary.LittleEndian, &marker); err != nil {
@@ -490,11 +511,17 @@ func (h *Index) readNodes(reader io.Reader) error {
 		if err := binary.Read(reader, binary.LittleEndian, &idLen); err != nil {
 			return err
 		}
-		idBytes := make([]byte, idLen)
+		idBytes, err := memory.ArenaSlice[byte](arena, int(idLen))
+		if err != nil {
+			return fmt.Errorf("arena allocate id bytes: %w", err)
+		}
+		idBytes = idBytes[:idLen]
 		if _, err := io.ReadFull(reader, idBytes); err != nil {
 			return err
 		}
-		nodeID := string(idBytes)
+		// Clone to heap: idBytes is arena-backed and will be invalidated
+		// when the arena is Reset+returned to scratchPool below.
+		nodeID := strings.Clone(string(idBytes))
 
 		// Read vector dimension
 		var vectorLen uint32
@@ -502,12 +529,16 @@ func (h *Index) readNodes(reader io.Reader) error {
 			return err
 		}
 
-		// Read vector data
-		vector := make([]float32, vectorLen)
-		for j := uint32(0); j < vectorLen; j++ {
-			if err := binary.Read(reader, binary.LittleEndian, &vector[j]); err != nil {
-				return err
-			}
+		// Read vector data — arena-backed bulk read instead of
+		// binary.Read per element (reflection overhead × dim).
+		vector, err := memory.ArenaSlice[float32](arena, int(vectorLen))
+		if err != nil {
+			return fmt.Errorf("arena allocate vector: %w", err)
+		}
+		vector = vector[:vectorLen]
+		raw := unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), int(vectorLen)*4)
+		if _, err := io.ReadFull(reader, raw); err != nil {
+			return err
 		}
 
 		// Read level
@@ -522,12 +553,15 @@ func (h *Index) readNodes(reader io.Reader) error {
 			Level:   int(level),
 		}
 		if h.rawVectorStore != nil {
-			if _, err := h.rawVectorStore.Put(vector); err != nil {
+			ref, err := h.rawVectorStore.Put(vector)
+			if err != nil {
 				return fmt.Errorf("failed to restore raw vector into store: %w", err)
 			}
+			node.Slot = ref.Slot
 		}
 		if int(ordinal) >= len(h.nodes) {
-			grown := make([]*Node, ordinal+1)
+			newCap := nextNodeCapacity(len(h.nodes), int(ordinal)+1)
+			grown := make([]*Node, int(ordinal)+1, newCap)
 			copy(grown, h.nodes)
 			h.nodes = grown
 		}
@@ -536,12 +570,15 @@ func (h *Index) readNodes(reader io.Reader) error {
 			h.idToIndex[nodeID] = ordinal
 			h.ordinalToID[ordinal] = nodeID
 		}
+		
+		// Reset the arena after each node to prevent exhaustion on large files
+		arena.Reset()
 	}
 
 	return nil
 }
 
-func (h *Index) readLinks(reader io.Reader) error {
+func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 	// Read total node count with links
 	var nodeCount uint32
 	if err := binary.Read(reader, binary.LittleEndian, &nodeCount); err != nil {
@@ -550,6 +587,14 @@ func (h *Index) readLinks(reader io.Reader) error {
 
 	// Read links for each node
 	for i := uint32(0); i < nodeCount; i++ {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// Read node index
 		var nodeIndex uint32
 		if err := binary.Read(reader, binary.LittleEndian, &nodeIndex); err != nil {
@@ -569,32 +614,54 @@ func (h *Index) readLinks(reader io.Reader) error {
 			return err
 		}
 
-		// Initialize links for this node
-		node.Links = make([][]uint32, levelCount)
+		// Initialize links for this node. Allocate from SFL (not Go heap)
+	// so freeNodeLinks can safely deallocate them during Delete.
+	node.Links = make([][]uint32, levelCount)
 
-		// Read each level's connections
-		for j := uint32(0); j < levelCount; j++ {
-			var level uint32
-			if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
+	// Read each level's connections
+	for j := uint32(0); j < levelCount; j++ {
+		var level uint32
+		if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
+			return err
+		}
+
+		var connectionCount uint32
+		if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
+			return err
+		}
+
+		// Use the same SFL allocation as newNodeLinks: level 0 uses
+		// link0SFL (larger slot for 2×M connections), higher levels
+		// use linkSFL.
+		var slot []byte
+		var slotErr error
+		if level == 0 {
+			slot, slotErr = h.link0SFL.Allocate()
+		} else {
+			slot, slotErr = h.linkSFL.Allocate()
+		}
+		if slotErr != nil {
+			return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
+		}
+
+		// Data starts after SFLMetadataOverhead. Capacity matches what
+		// newNodeLinks configures (capacity + slack).
+		maxCap := (len(slot) - SFLMetadataOverhead) / 4
+		if uint32(maxCap) < connectionCount {
+			return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
+				nodeIndex, level, connectionCount, maxCap)
+		}
+		connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[SFLMetadataOverhead])), maxCap)[:connectionCount]
+		for k := uint32(0); k < connectionCount; k++ {
+			if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
 				return err
-			}
-
-			var connectionCount uint32
-			if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
-				return err
-			}
-
-			connections := make([]uint32, connectionCount)
-			for k := uint32(0); k < connectionCount; k++ {
-				if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
-					return err
-				}
-			}
-
-			if int(level) < len(node.Links) {
-				node.Links[level] = connections
 			}
 		}
+
+		if int(level) < len(node.Links) {
+			node.Links[level] = connections
+		}
+	}
 	}
 
 	return nil
@@ -648,6 +715,27 @@ func (h *Index) rebuildIndexState() error {
 			// Set entry point (highest level node, or first high-level node found)
 			if h.entryPoint == nil || node.Level > h.entryPoint.Level {
 				h.entryPoint = node
+			}
+		}
+	}
+
+	// Rebuild Backlinks
+	for _, node := range h.nodes {
+		if node != nil {
+			node.Backlinks = make([][]uint32, len(node.Links))
+		}
+	}
+	for i, node := range h.nodes {
+		if node != nil {
+			for level, links := range node.Links {
+				for _, linkID := range links {
+					if int(linkID) < len(h.nodes) {
+						linkNode := h.nodes[linkID]
+						if linkNode != nil && level < len(linkNode.Backlinks) {
+							linkNode.Backlinks[level] = append(linkNode.Backlinks[level], uint32(i))
+						}
+					}
+				}
 			}
 		}
 	}

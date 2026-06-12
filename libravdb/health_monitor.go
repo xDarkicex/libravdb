@@ -10,14 +10,17 @@ import (
 
 // SystemHealthMonitorImpl implements SystemHealthMonitor
 type SystemHealthMonitorImpl struct {
-	mu           sync.RWMutex
-	healthChecks map[string]HealthCheck
 	lastStatus   HealthStatus
-	running      bool
 	ctx          context.Context
+	healthChecks map[string]HealthCheck
 	cancel       context.CancelFunc
-	interval     time.Duration
+	callbackSem  chan struct{}
+	done         chan struct{}
 	callbacks    []HealthStatusCallback
+	callbackWg   sync.WaitGroup
+	interval     time.Duration
+	mu           sync.RWMutex
+	running      bool
 }
 
 // HealthStatusCallback is called when health status changes
@@ -29,6 +32,8 @@ func NewSystemHealthMonitor(interval time.Duration) *SystemHealthMonitorImpl {
 		healthChecks: make(map[string]HealthCheck),
 		interval:     interval,
 		callbacks:    make([]HealthStatusCallback, 0),
+		callbackSem:  make(chan struct{}, 100),
+		done:         make(chan struct{}),
 		lastStatus: HealthStatus{
 			Overall:    HealthUnknown,
 			Components: make(map[string]HealthLevel),
@@ -75,6 +80,7 @@ func (shm *SystemHealthMonitorImpl) Start(ctx context.Context) error {
 
 	shm.ctx, shm.cancel = context.WithCancel(ctx)
 	shm.running = true
+	shm.done = make(chan struct{})
 
 	go shm.monitorLoop()
 	return nil
@@ -83,14 +89,20 @@ func (shm *SystemHealthMonitorImpl) Start(ctx context.Context) error {
 // Stop stops health monitoring
 func (shm *SystemHealthMonitorImpl) Stop() error {
 	shm.mu.Lock()
-	defer shm.mu.Unlock()
-
 	if !shm.running {
+		shm.mu.Unlock()
 		return fmt.Errorf("health monitor not running")
 	}
 
 	shm.cancel()
 	shm.running = false
+	shm.mu.Unlock()
+
+	// Wait for monitorLoop to exit (no more callbacks will be launched),
+	// then wait for any in-flight callbacks to finish.
+	<-shm.done
+	shm.callbackWg.Wait()
+
 	return nil
 }
 
@@ -120,6 +132,7 @@ func (shm *SystemHealthMonitorImpl) GetHealthStatus() HealthStatus {
 
 // monitorLoop runs the health monitoring loop
 func (shm *SystemHealthMonitorImpl) monitorLoop() {
+	defer close(shm.done)
 	ticker := time.NewTicker(shm.interval)
 	defer ticker.Stop()
 
@@ -153,8 +166,8 @@ func (shm *SystemHealthMonitorImpl) performHealthCheck() {
 		Details:    make(map[string]any),
 	}
 
-	// Execute health checks with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Execute health checks with timeout, respecting the monitor's lifecycle context
+	ctx, cancel := context.WithTimeout(shm.ctx, 30*time.Second)
 	defer cancel()
 
 	overallHealth := HealthHealthy
@@ -184,7 +197,17 @@ func (shm *SystemHealthMonitorImpl) performHealthCheck() {
 	// Notify callbacks if status changed
 	if statusChanged {
 		for _, callback := range callbacks {
-			go callback(newStatus)
+			select {
+			case shm.callbackSem <- struct{}{}:
+				shm.callbackWg.Add(1)
+				go func(cb HealthStatusCallback) {
+					defer shm.callbackWg.Done()
+					defer func() { <-shm.callbackSem }()
+					cb(newStatus)
+				}(callback)
+			default:
+				// If we have too many active callbacks, we skip to avoid unbounded goroutine growth.
+			}
 		}
 	}
 }
@@ -302,21 +325,21 @@ func (haeh *HealthAwareErrorHandler) HandleError(ctx context.Context, err error)
 
 // ComponentHealthTracker tracks health of individual components
 type ComponentHealthTracker struct {
-	mu              sync.RWMutex
 	componentHealth map[string]ComponentHealth
+	mu              sync.RWMutex
 }
 
 // ComponentHealth represents the health of a single component
 type ComponentHealth struct {
-	Name          string         `json:"name"`
-	Level         HealthLevel    `json:"level"`
 	LastCheck     time.Time      `json:"last_check"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	LastRecovery  *time.Time     `json:"last_recovery,omitempty"`
+	Name          string         `json:"name"`
 	LastError     string         `json:"last_error,omitempty"`
+	Level         HealthLevel    `json:"level"`
 	ErrorCount    int            `json:"error_count"`
 	SuccessCount  int            `json:"success_count"`
-	Metadata      map[string]any `json:"metadata,omitempty"`
 	RecoveryCount int            `json:"recovery_count"`
-	LastRecovery  *time.Time     `json:"last_recovery,omitempty"`
 }
 
 // NewComponentHealthTracker creates a new component health tracker

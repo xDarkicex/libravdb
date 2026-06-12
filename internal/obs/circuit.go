@@ -72,23 +72,17 @@ func DefaultCircuitBreakerConfig(name string) CircuitBreakerConfig {
 
 // CircuitBreaker implements the circuit breaker pattern for fault tolerance
 type CircuitBreaker struct {
-	mu     sync.RWMutex
-	config CircuitBreakerConfig
-	state  CircuitState
-
-	// Counters
-	failures   int
-	successes  int
-	requests   int
-	generation int64
-
-	// Timing
 	lastFailureTime time.Time
 	lastSuccessTime time.Time
 	expiry          time.Time
-
-	// Callbacks
-	onStateChange func(name string, from, to CircuitState)
+	onStateChange   func(name string, from, to CircuitState)
+	config          CircuitBreakerConfig
+	state           CircuitState
+	failures        int
+	successes       int
+	requests        int
+	generation      int64
+	mu              sync.RWMutex
 }
 
 // NewCircuitBreaker creates a new circuit breaker
@@ -287,8 +281,8 @@ func (cb *CircuitBreaker) Reset() {
 
 // CircuitBreakerManager manages multiple circuit breakers
 type CircuitBreakerManager struct {
-	mu       sync.RWMutex
 	breakers map[string]*CircuitBreaker
+	mu       sync.RWMutex
 }
 
 // NewCircuitBreakerManager creates a new circuit breaker manager

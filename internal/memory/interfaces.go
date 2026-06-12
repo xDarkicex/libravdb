@@ -46,29 +46,14 @@ type MemoryManager interface {
 
 // MemoryUsage represents current memory usage statistics
 type MemoryUsage struct {
-	// Total memory currently in use
-	Total int64
-
-	// Memory used by indices
-	Indices int64
-
-	// Memory used by caches
-	Caches int64
-
-	// Memory used by quantized data
-	Quantized int64
-
-	// Memory used by memory-mapped data
+	Timestamp    time.Time
+	Total        int64
+	Indices      int64
+	Caches       int64
+	Quantized    int64
 	MemoryMapped int64
-
-	// Available memory before hitting limits
-	Available int64
-
-	// Memory limit (0 means no limit)
-	Limit int64
-
-	// Timestamp of measurement
-	Timestamp time.Time
+	Available    int64
+	Limit        int64
 }
 
 // Cache interface for memory-managed caches
@@ -139,29 +124,14 @@ func (l MemoryPressureLevel) String() string {
 
 // MemoryConfig configures memory management behavior
 type MemoryConfig struct {
-	// MaxMemory is the maximum memory limit in bytes (0 = no limit)
-	MaxMemory int64
-
-	// PressureThresholds define when to trigger pressure callbacks
 	PressureThresholds map[MemoryPressureLevel]float64
-
-	// MonitorInterval is how often to check memory usage
-	MonitorInterval time.Duration
-
-	// EnableGC controls whether automatic GC is enabled
-	EnableGC bool
-
-	// GCThreshold is the memory usage percentage that triggers GC
-	GCThreshold float64
-
-	// EnableMMap controls whether memory mapping is enabled
-	EnableMMap bool
-
-	// MMapThreshold is the index size threshold (in bytes) for automatic mmap activation
-	MMapThreshold int64
-
-	// MMapPath is the directory path for memory-mapped files
-	MMapPath string
+	MMapPath           string
+	MaxMemory          int64
+	MonitorInterval    time.Duration
+	GCThreshold        float64
+	MMapThreshold      int64
+	EnableGC           bool
+	EnableMMap         bool
 }
 
 // DefaultMemoryConfig returns sensible default configuration

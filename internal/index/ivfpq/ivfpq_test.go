@@ -9,12 +9,13 @@ import (
 
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 func TestNewIVFPQ(t *testing.T) {
 	tests := []struct {
-		name        string
 		config      *Config
+		name        string
 		expectError bool
 	}{
 		{
@@ -339,8 +340,8 @@ func TestInsertErrors(t *testing.T) {
 	// }
 
 	tests := []struct {
-		name  string
 		entry *VectorEntry
+		name  string
 		train bool
 	}{
 		{
@@ -981,4 +982,68 @@ func generateTestVectors(count, dimension int, seed int64) [][]float32 {
 	}
 
 	return vectors
+}
+
+// TestSearchArenaBacked verifies that the search path uses the scratch arena
+// and produces correct ascending-distance results.
+func TestSearchArenaBacked(t *testing.T) {
+	dim := 16
+	config := DefaultConfig(dim)
+	config.NClusters = 4
+	config.NProbes = 2
+
+	idx, err := NewIVFPQ(config)
+	if err != nil {
+		t.Fatalf("NewIVFPQ: %v", err)
+	}
+	defer idx.Close()
+
+	trainingVectors := make([][]float32, 200)
+	for i := range trainingVectors {
+		v := make([]float32, dim)
+		v[0] = float32(i)
+		v[1] = float32(i % 10)
+		trainingVectors[i] = v
+	}
+
+	if err := idx.Train(context.Background(), trainingVectors); err != nil {
+		t.Fatalf("Train: %v", err)
+	}
+
+	for i, v := range trainingVectors {
+		entry := &VectorEntry{ID: fmt.Sprintf("vec_%d", i), Vector: v}
+		if err := idx.Insert(context.Background(), entry); err != nil {
+			t.Fatalf("Insert %d: %v", i, err)
+		}
+	}
+
+	query := make([]float32, dim)
+	query[0] = 100.0
+	k := 5
+
+	results, err := idx.Search(context.Background(), query, k)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	if len(results) != k {
+		t.Fatalf("got %d results, want %d", len(results), k)
+	}
+
+	// Verify ascending score order.
+	for i := 1; i < len(results); i++ {
+		if results[i-1].Score > results[i].Score {
+			t.Errorf("results not sorted: [%d].Score=%.4f > [%d].Score=%.4f",
+				i-1, results[i-1].Score, i, results[i].Score)
+		}
+	}
+
+	// Verify the arena pool is populated (BatchInsert or Search may have
+	// already used it).
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	if arena == nil {
+		t.Fatal("scratchPool returned nil arena")
+	}
+	arena.Reset()
+	idx.scratchPool.Put(arena)
 }

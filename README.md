@@ -82,7 +82,7 @@ LibraVDB is a high-performance vector database library for Go applications. It p
 LibraVDB persists databases as a single `.libravdb` file.
 
 - Importing the package does not create files.
-- A database file is created or opened when you call `libravdb.New(...)`.
+- A database file is created or opened when you call `libravdb.Open(...)`.
 - If no path is provided, the default path resolves to `./data.libravdb`.
 - `WithStoragePath(...)` should point to a database file such as `./mydb.libravdb`.
 - The `.libravdb` file is the portable unit you can move or copy after closing the database.
@@ -177,7 +177,7 @@ import (
 
 func main() {
     // Create a single-file database
-    db, err := libravdb.New(
+    db, err := libravdb.Open(
         libravdb.WithStoragePath("./vector_data.libravdb"),
         libravdb.WithMetrics(true),
     )
@@ -462,7 +462,7 @@ LibraVDB provides extensive configuration options for optimal performance:
 ### Database Configuration
 
 ```go
-db, err := libravdb.New(
+db, err := libravdb.Open(
     libravdb.WithStoragePath("/var/lib/libravdb/data.libravdb"), // Production database file
     libravdb.WithMetrics(true),                        // Enable Prometheus metrics
     libravdb.WithTracing(true),                        // Enable distributed tracing
@@ -586,6 +586,28 @@ results, err := collection.Query(ctx).
     Execute()
 ```
 
+### Database Management
+
+```go
+// Safely drop a collection and reclaim its disk space immediately
+err = db.DropCollection(ctx, "temporary_data")
+
+// Compact the database to reclaim space from deleted records and collections
+err = db.Vacuum(ctx)
+
+// Create a safe point-in-time copy of the database file
+err = db.Backup(ctx, "./backup.libravdb")
+```
+
+### Migration from v1
+
+LibraVDB v2 introduces a major storage format upgrade. When you call `libravdb.Open()` on a v1 database file, it will automatically stream the data into a new v2 database file and rename the old file to `.v1.bak`. 
+
+If you prefer to perform migrations manually or via script, use `Migrate`:
+```go
+err := libravdb.Migrate(ctx, "./data.libravdb")
+```
+
 ### Lifecycle And Export
 
 ```go
@@ -607,6 +629,21 @@ if err != nil {
 fmt.Printf("collection has %d records\n", count)
 
 if err := db.DeleteCollection(ctx, "session:old"); err != nil {
+    log.Fatal(err)
+}
+
+// Reclaim disk space without blocking concurrent operations
+if err := db.Vacuum(ctx); err != nil {
+    log.Fatal(err)
+}
+
+// Create a safe, point-in-time snapshot to a new path
+if err := db.Backup(ctx, "./backup.libravdb"); err != nil {
+    log.Fatal(err)
+}
+
+// Completely destroy the database file and close the engine
+if err := db.Drop(ctx); err != nil {
     log.Fatal(err)
 }
 ```

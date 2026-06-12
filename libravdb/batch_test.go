@@ -18,7 +18,7 @@ func createTestDB(t *testing.T) *Database {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	db, err := New(WithStoragePath(filepath.Join(tmpDir, "test.libravdb")))
+	db, err := Open(WithStoragePath(filepath.Join(tmpDir, "test.libravdb")))
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create database: %v", err)
@@ -1151,7 +1151,7 @@ func TestShardedBatchInsertParallelizesAcrossShards(t *testing.T) {
 	}
 
 	// Verify collection has the expected total count (200 entries * 2 batches)
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.VectorCount != entryCount*2 {
 		t.Errorf("Expected collection count %d, got %d", entryCount*2, stats.VectorCount)
 	}

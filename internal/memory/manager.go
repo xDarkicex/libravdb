@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,27 +12,17 @@ import (
 
 // manager implements the MemoryManager interface
 type manager struct {
-	config MemoryConfig
-
-	// Memory tracking
-	mu        sync.RWMutex
-	limit     int64
-	caches    map[string]Cache
-	mappables map[string]MemoryMappable
-
-	// Memory mapping
-	mmapManager *MemoryMapManager
-
-	// Callbacks
+	ctx               context.Context
+	caches            map[string]Cache
+	mappables         map[string]MemoryMappable
+	mmapManager       *MemoryMapManager
+	cancel            context.CancelFunc
+	done              chan struct{}
+	config            MemoryConfig
 	pressureCallbacks []func(usage MemoryUsage)
 	releaseCallbacks  []func(freed int64)
-
-	// Monitoring
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-
-	// Pressure tracking
+	limit             int64
+	mu                sync.RWMutex
 	lastPressureLevel atomic.Int32
 }
 
@@ -64,7 +55,7 @@ func NewManager(config MemoryConfig) MemoryManager {
 		mmapManager:       mmapManager,
 		pressureCallbacks: make([]func(usage MemoryUsage), 0),
 		releaseCallbacks:  make([]func(freed int64), 0),
-		done: make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 }
 
@@ -480,8 +471,8 @@ func (m *manager) enableMemoryMappingForPressure(targetBytes int64) int64 {
 
 	// Get list of mappables that can be memory mapped
 	candidates := make([]struct {
-		name     string
 		mappable MemoryMappable
+		name     string
 		size     int64
 	}, 0)
 
@@ -491,23 +482,20 @@ func (m *manager) enableMemoryMappingForPressure(targetBytes int64) int64 {
 			size := mappable.EstimateSize()
 			if size > 0 {
 				candidates = append(candidates, struct {
-					name     string
 					mappable MemoryMappable
+					name     string
 					size     int64
-				}{name, mappable, size})
+				}{mappable: mappable, name: name, size: size})
 			}
 		}
 	}
 	m.mu.RUnlock()
 
-	// Sort candidates by size (largest first) to maximize memory savings
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[i].size < candidates[j].size {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	// Sort candidates by size (largest first) to maximize memory savings.
+	// O(n log n) instead of the O(n²) bubble sort previously used here.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].size > candidates[j].size
+	})
 
 	// Enable memory mapping for candidates until we've freed enough memory
 	for _, candidate := range candidates {
@@ -538,8 +526,8 @@ func (m *manager) checkAndEnableAutomaticMemoryMapping() {
 
 	m.mu.RLock()
 	candidates := make([]struct {
-		name     string
 		mappable MemoryMappable
+		name     string
 	}, 0)
 
 	for name, mappable := range m.mappables {
@@ -548,9 +536,9 @@ func (m *manager) checkAndEnableAutomaticMemoryMapping() {
 			// Enable memory mapping if size exceeds threshold
 			if size >= m.config.MMapThreshold {
 				candidates = append(candidates, struct {
-					name     string
 					mappable MemoryMappable
-				}{name, mappable})
+					name     string
+				}{mappable: mappable, name: name})
 			}
 		}
 	}

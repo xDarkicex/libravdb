@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -13,11 +14,11 @@ import (
 
 // MemoryMap represents a memory-mapped file
 type MemoryMap struct {
-	mu       sync.RWMutex
 	file     *os.File
+	path     string
 	data     []byte
 	size     int64
-	path     string
+	mu       sync.RWMutex
 	readOnly bool
 }
 
@@ -59,9 +60,9 @@ func NewMemoryMap(path string, size int64, readOnly bool) (*MemoryMap, error) {
 		size = stat.Size()
 	}
 
-	if size == 0 {
+	if size <= 0 {
 		file.Close()
-		return nil, fmt.Errorf("cannot memory map empty file")
+		return nil, fmt.Errorf("cannot memory map empty or invalid sized file")
 	}
 
 	// Memory map the file
@@ -194,9 +195,9 @@ func (m *MemoryMap) Resize(newSize int64) error {
 
 // MemoryMapManager manages multiple memory mappings
 type MemoryMapManager struct {
-	mu       sync.RWMutex
 	mappings map[string]*MemoryMap
 	basePath string
+	mu       sync.RWMutex
 }
 
 // NewMemoryMapManager creates a new memory map manager
@@ -207,8 +208,31 @@ func NewMemoryMapManager(basePath string) *MemoryMapManager {
 	}
 }
 
+// validateMappingName rejects names that would escape basePath via path
+// traversal. Names must be non-empty, single path components, and free of
+// reserved names and ".." sequences.
+func validateMappingName(name string) error {
+	if name == "" {
+		return fmt.Errorf("mapping name must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("mapping name %q is reserved", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("mapping name %q must not contain path separators", name)
+	}
+	if filepath.Clean(name) != name {
+		return fmt.Errorf("mapping name %q must not contain traversal sequences", name)
+	}
+	return nil
+}
+
 // CreateMapping creates a new memory mapping
 func (m *MemoryMapManager) CreateMapping(name string, size int64, readOnly bool) (*MemoryMap, error) {
+	if err := validateMappingName(name); err != nil {
+		return nil, err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

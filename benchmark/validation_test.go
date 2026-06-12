@@ -373,12 +373,12 @@ func testReliabilityMetrics(t *testing.T, ctx context.Context) {
 		// Test multiple corruption scenarios
 		corruptionTests := []struct {
 			name   string
-			offset int64
 			data   []byte
+			offset int64
 		}{
-			{"Header corruption", 0, []byte{0xFF, 0xFF, 0xFF, 0xFF}},
-			{"Middle corruption", 50, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}, // More corruption
-			{"CRC corruption", 48, []byte{0xFF, 0xFF, 0xFF, 0xFF}},                            // Corrupt the CRC32 field at offset 48
+			{name: "Header corruption", offset: 0, data: []byte{0xFF, 0xFF, 0xFF, 0xFF}},
+			{name: "Middle corruption", offset: 50, data: []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}, // More corruption
+			{name: "CRC corruption", offset: 48, data: []byte{0xFF, 0xFF, 0xFF, 0xFF}},                            // Corrupt the CRC32 field at offset 48
 		}
 
 		detectionCount := 0

@@ -9,28 +9,30 @@ import (
 
 // GracefulDegradationManagerImpl implements GracefulDegradationManager
 type GracefulDegradationManagerImpl struct {
-	mu                  sync.RWMutex
-	degradationLevel    int
-	maxDegradationLevel int
 	memoryManager       MemoryManager
 	quantizationManager QuantizationManager
 	indexManager        IndexManager
-	config              DegradationConfig
 	activeDegradations  map[string]DegradationAction
+	callbackSem         chan struct{}
 	degradationHistory  []DegradationEvent
 	callbacks           []DegradationCallback
+	config              DegradationConfig
+	callbackWg          sync.WaitGroup
+	degradationLevel    int
+	maxDegradationLevel int
+	mu                  sync.RWMutex
 }
 
 // DegradationConfig configures graceful degradation behavior
 type DegradationConfig struct {
+	MaxDegradationLevel        int           `json:"max_degradation_level"`
+	RecoveryTimeout            time.Duration `json:"recovery_timeout"`
+	RecoveryCheckInterval      time.Duration `json:"recovery_check_interval"`
 	EnableQuantizationFallback bool          `json:"enable_quantization_fallback"`
 	EnableMemoryMapping        bool          `json:"enable_memory_mapping"`
 	EnableCacheEviction        bool          `json:"enable_cache_eviction"`
 	EnableIndexSimplification  bool          `json:"enable_index_simplification"`
-	MaxDegradationLevel        int           `json:"max_degradation_level"`
-	RecoveryTimeout            time.Duration `json:"recovery_timeout"`
 	AutoRecoveryEnabled        bool          `json:"auto_recovery_enabled"`
-	RecoveryCheckInterval      time.Duration `json:"recovery_check_interval"`
 }
 
 // DefaultDegradationConfig returns sensible defaults
@@ -49,24 +51,24 @@ func DefaultDegradationConfig() DegradationConfig {
 
 // DegradationAction represents an active degradation
 type DegradationAction struct {
-	Type        string                 `json:"type"`
-	Level       int                    `json:"level"`
 	StartTime   time.Time              `json:"start_time"`
-	Description string                 `json:"description"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Type        string                 `json:"type"`
+	Description string                 `json:"description"`
+	Level       int                    `json:"level"`
 	Reversible  bool                   `json:"reversible"`
 }
 
 // DegradationEvent represents a degradation event in history
 type DegradationEvent struct {
 	Timestamp time.Time              `json:"timestamp"`
-	Action    string                 `json:"action"` // "apply" or "revert"
-	Type      string                 `json:"type"`
-	Level     int                    `json:"level"`
-	Reason    string                 `json:"reason"`
-	Success   bool                   `json:"success"`
-	Duration  time.Duration          `json:"duration"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	Action    string                 `json:"action"`
+	Type      string                 `json:"type"`
+	Reason    string                 `json:"reason"`
+	Level     int                    `json:"level"`
+	Duration  time.Duration          `json:"duration"`
+	Success   bool                   `json:"success"`
 }
 
 // DegradationCallback is called when degradation actions are applied or reverted
@@ -84,6 +86,7 @@ type MemoryManager interface {
 
 // MemoryUsage represents memory usage statistics
 type MemoryUsage struct {
+	Timestamp    time.Time `json:"timestamp"`
 	Total        int64     `json:"total"`
 	Indices      int64     `json:"indices"`
 	Caches       int64     `json:"caches"`
@@ -91,7 +94,6 @@ type MemoryUsage struct {
 	MemoryMapped int64     `json:"memory_mapped"`
 	Available    int64     `json:"available"`
 	Limit        int64     `json:"limit"`
-	Timestamp    time.Time `json:"timestamp"`
 }
 
 // QuantizationManager interface for degradation
@@ -118,6 +120,7 @@ func NewGracefulDegradationManager(config DegradationConfig) *GracefulDegradatio
 		activeDegradations:  make(map[string]DegradationAction),
 		degradationHistory:  make([]DegradationEvent, 0),
 		callbacks:           make([]DegradationCallback, 0),
+		callbackSem:         make(chan struct{}, 100),
 	}
 }
 
@@ -170,7 +173,7 @@ func (gdm *GracefulDegradationManagerImpl) SetDegradationLevel(level int) error 
 
 	// Apply or revert degradations as needed
 	if level > oldLevel {
-		return gdm.applyDegradationLevel(level, "manual_set")
+		return gdm.applyDegradationLevel(oldLevel, level, "manual_set")
 	} else if level < oldLevel {
 		return gdm.revertDegradationLevel(oldLevel, level, "manual_set")
 	}
@@ -384,18 +387,74 @@ func (gdm *GracefulDegradationManagerImpl) HandleIndexCorruption(ctx context.Con
 	return nil
 }
 
-// applyDegradationLevel applies degradation up to the specified level
-func (gdm *GracefulDegradationManagerImpl) applyDegradationLevel(level int, reason string) error {
-	// This would contain the logic to apply degradations incrementally
-	// For now, we'll just record the action
-	gdm.recordDegradationAction("level_increase", level, fmt.Sprintf("Increased degradation level to %d: %s", level, reason), true)
+// applyDegradationLevel applies degradation incrementally from oldLevel up to newLevel
+func (gdm *GracefulDegradationManagerImpl) applyDegradationLevel(oldLevel, newLevel int, reason string) error {
+	for lvl := oldLevel + 1; lvl <= newLevel; lvl++ {
+		switch lvl {
+		case 1:
+			if gdm.memoryManager != nil {
+				if err := gdm.memoryManager.TriggerGC(); err == nil {
+					gdm.recordDegradationAction("memory_gc", 1, "Triggered garbage collection", true)
+				}
+			}
+		case 2:
+			if gdm.config.EnableCacheEviction && gdm.memoryManager != nil {
+				if freed, err := gdm.memoryManager.EvictCaches(0); err == nil && freed > 0 {
+					gdm.recordDegradationAction("cache_eviction", 2, fmt.Sprintf("Evicted %d bytes from caches", freed), true)
+				}
+			}
+		case 3:
+			if gdm.config.EnableMemoryMapping && gdm.memoryManager != nil {
+				if err := gdm.memoryManager.EnableMemoryMapping(); err == nil {
+					gdm.recordDegradationAction("memory_mapping", 3, "Enabled memory mapping", true)
+				}
+			}
+		case 4:
+			if gdm.config.EnableQuantizationFallback && gdm.quantizationManager != nil {
+				if err := gdm.quantizationManager.FallbackToUncompressed("all"); err == nil {
+					gdm.recordDegradationAction("quantization_fallback", 4, "Fallback to uncompressed storage", true)
+				}
+			}
+		case 5:
+			if gdm.config.EnableIndexSimplification && gdm.indexManager != nil {
+				if err := gdm.indexManager.SimplifyIndex("all", newLevel); err == nil {
+					gdm.recordDegradationAction("index_simplification", 5, "Simplified index structures", false)
+				}
+			}
+		}
+	}
+	gdm.recordDegradationAction("level_increase", newLevel, fmt.Sprintf("Increased degradation level from %d to %d: %s", oldLevel, newLevel, reason), true)
 	return nil
 }
 
-// revertDegradationLevel reverts degradation from oldLevel to newLevel
+// revertDegradationLevel reverts degradation from oldLevel down to newLevel
 func (gdm *GracefulDegradationManagerImpl) revertDegradationLevel(oldLevel, newLevel int, reason string) error {
-	// This would contain the logic to revert degradations
-	// For now, we'll just record the action
+	for lvl := oldLevel; lvl > newLevel; lvl-- {
+		switch lvl {
+		case 5:
+			if gdm.config.EnableIndexSimplification && gdm.indexManager != nil {
+				if err := gdm.indexManager.RestoreIndex("all"); err == nil {
+					gdm.recordDegradationAction("index_restore", 4, "Restored index structures", true)
+				}
+			}
+		case 4:
+			if gdm.config.EnableQuantizationFallback && gdm.quantizationManager != nil {
+				if err := gdm.quantizationManager.RestoreQuantization("all"); err == nil {
+					gdm.recordDegradationAction("quantization_restore", 3, "Restored quantization", true)
+				}
+			}
+		case 3:
+			if gdm.config.EnableMemoryMapping && gdm.memoryManager != nil {
+				if err := gdm.memoryManager.DisableMemoryMapping(); err == nil {
+					gdm.recordDegradationAction("memory_mapping_disable", 2, "Disabled memory mapping", true)
+				}
+			}
+		case 2:
+			// Cache eviction naturally refills; no explicit revert action required
+		case 1:
+			// Garbage collection is point-in-time; no explicit revert action required
+		}
+	}
 	gdm.recordDegradationAction("level_decrease", newLevel, fmt.Sprintf("Decreased degradation level from %d to %d: %s", oldLevel, newLevel, reason), true)
 	return nil
 }
@@ -417,7 +476,17 @@ func (gdm *GracefulDegradationManagerImpl) recordDegradationAction(actionType st
 // notifyCallbacks notifies all registered callbacks
 func (gdm *GracefulDegradationManagerImpl) notifyCallbacks(event DegradationEvent) {
 	for _, callback := range gdm.callbacks {
-		go callback(event)
+		select {
+		case gdm.callbackSem <- struct{}{}:
+			gdm.callbackWg.Add(1)
+			go func(cb DegradationCallback) {
+				defer gdm.callbackWg.Done()
+				defer func() { <-gdm.callbackSem }()
+				cb(event)
+			}(callback)
+		default:
+			// If overloaded, skip to avoid unbounded goroutine spawn
+		}
 	}
 }
 

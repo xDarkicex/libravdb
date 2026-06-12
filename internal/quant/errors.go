@@ -26,15 +26,15 @@ const (
 
 // QuantizationError represents a quantization-specific error
 type QuantizationError struct {
-	Code        QuantizationErrorCode  `json:"code"`
+	Timestamp   time.Time              `json:"timestamp"`
+	Cause       error                  `json:"cause,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 	Message     string                 `json:"message"`
 	Component   string                 `json:"component"`
 	Operation   string                 `json:"operation"`
+	Code        QuantizationErrorCode  `json:"code"`
 	Retryable   bool                   `json:"retryable"`
 	Recoverable bool                   `json:"recoverable"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-	Cause       error                  `json:"cause,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
 }
 
 func (qe *QuantizationError) Error() string {

@@ -171,17 +171,17 @@ type ErrorContext struct {
 
 // VectorDBError represents a structured error with additional context
 type VectorDBError struct {
-	Code           ErrorCode      `json:"code"`
-	Message        string         `json:"message"`
+	Timestamp      time.Time      `json:"timestamp"`
 	Details        any            `json:"details,omitempty"`
-	Retryable      bool           `json:"retryable"`
+	Cause          error          `json:"cause,omitempty"`
+	Context        *ErrorContext  `json:"context,omitempty"`
+	Message        string         `json:"message"`
+	Code           ErrorCode      `json:"code"`
 	Severity       ErrorSeverity  `json:"severity"`
 	RecoveryAction RecoveryAction `json:"recovery_action"`
-	Context        *ErrorContext  `json:"context,omitempty"`
-	Cause          error          `json:"cause,omitempty"`
-	Timestamp      time.Time      `json:"timestamp"`
 	RetryCount     int            `json:"retry_count"`
 	MaxRetries     int            `json:"max_retries"`
+	Retryable      bool           `json:"retryable"`
 }
 
 func (e *VectorDBError) Error() string {
@@ -308,12 +308,12 @@ func captureStackTrace() string {
 
 // ErrorRecoveryManager handles automatic error recovery
 type ErrorRecoveryManager struct {
-	recoveryStrategies map[ErrorCode]RecoveryStrategy
-	maxRetryAttempts   int
-	retryBackoff       time.Duration
-	circuitBreakers    map[string]CircuitBreaker
 	degradationManager GracefulDegradationManager
 	healthMonitor      SystemHealthMonitor
+	recoveryStrategies map[ErrorCode]RecoveryStrategy
+	circuitBreakers    map[string]CircuitBreaker
+	maxRetryAttempts   int
+	retryBackoff       time.Duration
 	mu                 sync.RWMutex
 }
 
@@ -404,10 +404,10 @@ type SystemHealthMonitor interface {
 
 // HealthStatus represents the overall health of the system
 type HealthStatus struct {
-	Overall    HealthLevel            `json:"overall"`
-	Components map[string]HealthLevel `json:"components"`
 	Timestamp  time.Time              `json:"timestamp"`
+	Components map[string]HealthLevel `json:"components"`
 	Details    map[string]any         `json:"details,omitempty"`
+	Overall    HealthLevel            `json:"overall"`
 }
 
 // HealthLevel represents the health level of a component
@@ -533,14 +533,14 @@ type AutomaticRecoveryOrchestrator struct {
 // RecoveryAttempt represents a recovery attempt
 type RecoveryAttempt struct {
 	Timestamp     time.Time     `json:"timestamp"`
-	ErrorCode     ErrorCode     `json:"error_code"`
 	Component     string        `json:"component"`
 	Operation     string        `json:"operation"`
 	RecoveryType  string        `json:"recovery_type"`
-	Success       bool          `json:"success"`
-	Duration      time.Duration `json:"duration"`
 	ErrorMessage  string        `json:"error_message,omitempty"`
 	RecoverySteps []string      `json:"recovery_steps,omitempty"`
+	ErrorCode     ErrorCode     `json:"error_code"`
+	Duration      time.Duration `json:"duration"`
+	Success       bool          `json:"success"`
 }
 
 // NewAutomaticRecoveryOrchestrator creates a new recovery orchestrator
@@ -687,12 +687,12 @@ func (aro *AutomaticRecoveryOrchestrator) GetRecoveryStats() RecoveryStats {
 
 // RecoveryStats represents statistics about recovery attempts
 type RecoveryStats struct {
+	ByErrorCode        map[ErrorCode]int `json:"by_error_code"`
+	ByComponent        map[string]int    `json:"by_component"`
+	ByRecoveryType     map[string]int    `json:"by_recovery_type"`
 	TotalAttempts      int               `json:"total_attempts"`
 	SuccessfulAttempts int               `json:"successful_attempts"`
 	SuccessRate        float64           `json:"success_rate"`
 	TotalDuration      time.Duration     `json:"total_duration"`
 	AverageDuration    time.Duration     `json:"average_duration"`
-	ByErrorCode        map[ErrorCode]int `json:"by_error_code"`
-	ByComponent        map[string]int    `json:"by_component"`
-	ByRecoveryType     map[string]int    `json:"by_recovery_type"`
 }

@@ -24,7 +24,7 @@ func TestCoreFunctionality(t *testing.T) {
 	}()
 
 	// Create database
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath("./test_data"),
 		libravdb.WithMetrics(true),
 	)

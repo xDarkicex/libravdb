@@ -8,8 +8,8 @@ import (
 
 // EqualityFilter implements exact equality matching for metadata fields
 type EqualityFilter struct {
-	Field string
 	Value interface{}
+	Field string
 }
 
 // NewEqualityFilter creates a new equality filter
@@ -27,7 +27,15 @@ func (f *EqualityFilter) Apply(ctx context.Context, entries []*VectorEntry) ([]*
 	}
 
 	var result []*VectorEntry
-	for _, entry := range entries {
+	for i, entry := range entries {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+		}
+
 		if entry.Metadata == nil {
 			continue
 		}

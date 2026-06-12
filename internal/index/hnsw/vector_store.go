@@ -11,9 +11,9 @@ const (
 )
 
 type VectorRef struct {
-	Kind  VectorEncoding
 	Slot  uint32
 	Bytes uint32
+	Kind  VectorEncoding
 	Valid bool
 }
 
@@ -43,8 +43,8 @@ type RawVectorStore interface {
 }
 
 type InMemoryRawVectorStore struct {
-	dim     int
 	vectors [][]float32
+	dim     int
 	bytes   int64
 	active  int
 }

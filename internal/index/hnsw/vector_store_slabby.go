@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/xDarkicex/slabby"
+	"github.com/xDarkicex/memory"
 )
 
 const (
@@ -12,20 +12,20 @@ const (
 	RawVectorStoreSlabby = "slabby"
 
 	defaultSlabbySegmentCapacity = 4096
+	userDataOffset               = 48
 )
 
 type slabbySlot struct {
-	segment int
-	slot    slabby.Slot
-	active  bool
+	slot   []byte
+	active bool
 }
 
 type SlabbyRawVectorStore struct {
+	sfl             *memory.ShardedFreeList
+	slots           []slabbySlot
 	dim             int
 	bytesPerVector  int
 	segmentCapacity int
-	allocators      []*slabby.SlotArena
-	slots           []slabbySlot
 	activeCount     int
 }
 
@@ -37,61 +37,43 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		segmentCapacity = defaultSlabbySegmentCapacity
 	}
 
+	bytesPerVector := dim * 4
+	slotSize := uint64(bytesPerVector + userDataOffset)
+	slotSize = (slotSize + 7) &^ 7
+
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		SlotSize:  slotSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 16,
+	}, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create memory pool for slabby store: %w", err)
+	}
+
 	store := &SlabbyRawVectorStore{
 		dim:             dim,
-		bytesPerVector:  dim * 4,
+		bytesPerVector:  bytesPerVector,
 		segmentCapacity: segmentCapacity,
-		allocators:      make([]*slabby.SlotArena, 0, 1),
+		sfl:             sfl,
 		slots:           make([]slabbySlot, 0),
 	}
-	if err := store.grow(); err != nil {
-		return nil, err
-	}
 	return store, nil
-}
-
-func (s *SlabbyRawVectorStore) grow() error {
-	alloc, err := slabby.NewSlotArena(s.bytesPerVector, s.segmentCapacity, slabby.WithPCPUCache(true))
-	if err != nil {
-		return fmt.Errorf("failed to create slabby slot arena: %w", err)
-	}
-	s.allocators = append(s.allocators, alloc)
-	return nil
 }
 
 func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
 	if len(vec) != s.dim {
 		return VectorRef{}, fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dim, len(vec))
 	}
-	if len(s.allocators) == 0 {
-		if err := s.grow(); err != nil {
-			return VectorRef{}, err
-		}
-	}
 
-	var (
-		slot slabby.Slot
-		data []byte
-		err  error
-		seg  = len(s.allocators) - 1
-	)
-	slot, data, err = s.allocators[seg].AllocateSlot()
+	slot, err := s.sfl.Allocate()
 	if err != nil {
-		if err := s.grow(); err != nil {
-			return VectorRef{}, err
-		}
-		seg = len(s.allocators) - 1
-		slot, data, err = s.allocators[seg].AllocateSlot()
-		if err != nil {
-			return VectorRef{}, fmt.Errorf("failed to allocate slabby vector slot: %w", err)
-		}
+		return VectorRef{}, fmt.Errorf("failed to allocate vector slot: %w", err)
 	}
 
-	writeVectorBytes(data, vec)
+	writeVectorBytes(slot[userDataOffset:], vec)
 	s.slots = append(s.slots, slabbySlot{
-		segment: seg,
-		slot:    slot,
-		active:  true,
+		slot:   slot,
+		active: true,
 	})
 	s.activeCount++
 	slotIndex := len(s.slots) - 1
@@ -115,8 +97,7 @@ func (s *SlabbyRawVectorStore) Get(ref VectorRef) ([]float32, error) {
 	if !slot.active {
 		return nil, fmt.Errorf("raw vector slot %d is inactive", ref.Slot)
 	}
-	data := s.allocators[slot.segment].BytesForAllocatedSlot(slot.slot)
-	return bytesAsFloat32View(data, s.dim), nil
+	return bytesAsFloat32View(slot.slot[userDataOffset:], s.dim), nil
 }
 
 func (s *SlabbyRawVectorStore) Delete(ref VectorRef) error {
@@ -130,37 +111,37 @@ func (s *SlabbyRawVectorStore) Delete(ref VectorRef) error {
 	if !slot.active {
 		return nil
 	}
-	if err := s.allocators[slot.segment].FreeSlot(slot.slot); err != nil {
-		return fmt.Errorf("failed to free slabby vector slot: %w", err)
+	if err := s.sfl.Retire(slot.slot); err != nil {
+		return fmt.Errorf("failed to retire vector slot: %w", err)
 	}
 	slot.active = false
+	slot.slot = nil
 	s.activeCount--
 	return nil
 }
 
 func (s *SlabbyRawVectorStore) Reset() error {
-	for i, alloc := range s.allocators {
-		if alloc != nil {
-			if err := alloc.Close(); err != nil {
-				return fmt.Errorf("failed to close slabby segment %d: %w", i, err)
-			}
-		}
+	if s.sfl != nil {
+		s.sfl.Reset()
 	}
-	s.allocators = nil
 	s.slots = nil
 	s.activeCount = 0
 	return nil
 }
 
 func (s *SlabbyRawVectorStore) Close() error {
-	return s.Reset()
+	if s.sfl != nil {
+		return s.sfl.Free()
+	}
+	return nil
 }
 
 func (s *SlabbyRawVectorStore) MemoryUsage() int64 {
-	if s == nil {
+	if s == nil || s.sfl == nil {
 		return 0
 	}
-	return int64(len(s.allocators) * s.segmentCapacity * s.bytesPerVector)
+	stats := s.sfl.Stats()
+	return int64(stats.Reserved)
 }
 
 func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
@@ -170,28 +151,12 @@ func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
 		Dimension:      s.dim,
 		BytesPerVector: s.bytesPerVector,
 	}
-	var totalSlots int
-	var usedSlots int
-	for _, alloc := range s.allocators {
-		if alloc == nil {
-			continue
-		}
-		stats := alloc.Stats()
-		if stats == nil {
-			continue
-		}
-		profile.ReservedBytes += stats.ReservedBytes
-		profile.ReservedDataBytes += stats.ReservedDataBytes
-		profile.ReservedMetaBytes += stats.ReservedMetaBytes
-		profile.ReservedGuardBytes += stats.ReservedGuardBytes
-		profile.LiveBytes += stats.LiveBytes
-		profile.FreeBytes += stats.FreeBytes
-		totalSlots += stats.TotalSlabs
-		usedSlots += stats.UsedSlabs
-	}
-	profile.MemoryUsage = profile.ReservedBytes
-	if totalSlots > 0 {
-		profile.CapacityUtilization = float64(usedSlots) / float64(totalSlots)
+	if s.sfl != nil {
+		stats := s.sfl.Stats()
+		profile.ReservedBytes = int64(stats.Reserved)
+		profile.LiveBytes = int64(stats.Allocated)
+		profile.FreeBytes = int64(stats.Reserved - stats.Allocated)
+		profile.MemoryUsage = profile.ReservedBytes
 	}
 	return profile
 }

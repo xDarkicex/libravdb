@@ -11,8 +11,8 @@ func TestProductQuantizer_Configure(t *testing.T) {
 	pq := NewProductQuantizer()
 
 	tests := []struct {
-		name    string
 		config  *QuantizationConfig
+		name    string
 		wantErr bool
 	}{
 		{
@@ -348,7 +348,7 @@ func TestProductQuantizer_DistanceToQuery(t *testing.T) {
 	}
 
 	// Compute distance to query
-	dist1, err := pq.DistanceToQuery(compressed, query)
+	dist1, err := pq.DistanceToQuery(compressed, query, nil)
 	if err != nil {
 		t.Fatalf("DistanceToQuery() error = %v", err)
 	}
@@ -359,7 +359,7 @@ func TestProductQuantizer_DistanceToQuery(t *testing.T) {
 	}
 
 	// Compute distance to same query again (should use cached tables)
-	dist2, err := pq.DistanceToQuery(compressed, query)
+	dist2, err := pq.DistanceToQuery(compressed, query, nil)
 	if err != nil {
 		t.Fatalf("DistanceToQuery() second call error = %v", err)
 	}
@@ -370,7 +370,7 @@ func TestProductQuantizer_DistanceToQuery(t *testing.T) {
 	}
 
 	// Distance to self should be 0
-	selfDist, err := pq.DistanceToQuery(compressed, vector)
+	selfDist, err := pq.DistanceToQuery(compressed, vector, nil)
 	if err != nil {
 		t.Fatalf("Self distance error = %v", err)
 	}
@@ -441,7 +441,7 @@ func TestProductQuantizer_UntrainedOperations(t *testing.T) {
 		t.Error("Expected error for Distance on untrained quantizer")
 	}
 
-	_, err = pq.DistanceToQuery(compressed, vector)
+	_, err = pq.DistanceToQuery(compressed, vector, nil)
 	if err == nil {
 		t.Error("Expected error for DistanceToQuery on untrained quantizer")
 	}

@@ -22,7 +22,7 @@ func main() {
 	defer os.RemoveAll(tempDir)
 
 	// Create database and collection
-	db, err := libravdb.New(libravdb.WithStoragePath(tempDir))
+	db, err := libravdb.Open(libravdb.WithStoragePath(tempDir))
 	if err != nil {
 		log.Fatalf("Failed to create database: %v", err)
 	}

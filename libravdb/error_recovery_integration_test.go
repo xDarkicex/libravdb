@@ -13,11 +13,11 @@ import (
 
 // Mock implementations for integration tests
 type mockQuantizationManager struct {
+	quantizationStatus map[string]bool
 	fallbackCalled     bool
 	restoreCalled      bool
 	precisionReduced   bool
 	shouldFail         bool
-	quantizationStatus map[string]bool
 }
 
 func (m *mockQuantizationManager) FallbackToUncompressed(component string) error {
@@ -53,11 +53,11 @@ func (m *mockQuantizationManager) GetQuantizationStatus(component string) (bool,
 }
 
 type mockIndexManager struct {
+	complexity map[string]int
 	simplified bool
 	restored   bool
 	rebuilt    bool
 	shouldFail bool
-	complexity map[string]int
 }
 
 func (m *mockIndexManager) SimplifyIndex(component string, level int) error {

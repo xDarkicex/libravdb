@@ -8,7 +8,7 @@ import (
 )
 
 func TestStreamingSimple_BasicFunctionality(t *testing.T) {
-	db, err := New(WithStoragePath(":memory:"))
+	db, err := Open(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestStreamingSimple_BasicFunctionality(t *testing.T) {
 }
 
 func TestStreamingSimple_BackpressureBasic(t *testing.T) {
-	db, err := New(WithStoragePath(":memory:"))
+	db, err := Open(WithStoragePath(":memory:"))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

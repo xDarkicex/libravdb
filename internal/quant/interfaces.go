@@ -47,8 +47,8 @@ type QuantizationConfig struct {
 
 // Validate checks if the quantization configuration is valid
 func (qc *QuantizationConfig) Validate() error {
-	if qc.Bits < 1 || qc.Bits > 32 {
-		return fmt.Errorf("bits must be between 1 and 32, got %d", qc.Bits)
+	if qc.Bits < 1 || qc.Bits > 16 {
+		return fmt.Errorf("bits must be between 1 and 16, got %d", qc.Bits)
 	}
 
 	if qc.TrainRatio <= 0.0 || qc.TrainRatio > 1.0 {
@@ -111,8 +111,13 @@ type Quantizer interface {
 	// Distance computes distance between two compressed vectors
 	Distance(compressed1, compressed2 []byte) (float32, error)
 
-	// DistanceToQuery computes distance from compressed vector to query vector
-	DistanceToQuery(compressed []byte, query []float32) (float32, error)
+	// DistanceToQuery computes distance from compressed vector to query vector.
+	// state is an optional precomputed state returned by PrepareQuery.
+	DistanceToQuery(compressed []byte, query []float32, state any) (float32, error)
+
+	// PrepareQuery precomputes distance tables or other state for a query.
+	// Returns a state object that should be passed to DistanceToQuery.
+	PrepareQuery(query []float32) any
 
 	// CompressionRatio returns the compression ratio achieved
 	CompressionRatio() float32
@@ -125,6 +130,9 @@ type Quantizer interface {
 
 	// Config returns the current configuration
 	Config() *QuantizationConfig
+
+	// Close cleans up resources
+	Close() error
 }
 
 // QuantizerFactory creates quantizer instances

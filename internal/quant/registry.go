@@ -7,8 +7,8 @@ import (
 
 // Registry manages quantizer factories
 type Registry struct {
-	mu        sync.RWMutex
 	factories map[QuantizationType]QuantizerFactory
+	mu        sync.RWMutex
 }
 
 // NewRegistry creates a new quantizer registry

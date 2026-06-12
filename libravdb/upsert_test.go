@@ -10,7 +10,7 @@ import (
 
 func TestUpsertInsertOnNewID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestUpsertInsertOnNewID(t *testing.T) {
 
 func TestUpsertReplaceOnExistingID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestUpsertReplaceOnExistingID(t *testing.T) {
 
 func TestUpsertMetadataReplaceNotMerge(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestUpsertMetadataReplaceNotMerge(t *testing.T) {
 
 func TestUpsertConcurrentSameID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestUpsertConcurrentSameID(t *testing.T) {
 
 func TestTransactionUpsertRollsBackCleanly(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestTransactionUpsertRollsBackCleanly(t *testing.T) {
 
 func TestBatchUpsertTrueOnExistingRecord(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestBatchUpsertTrueOnExistingRecord(t *testing.T) {
 
 func TestTransactionUpsertVisibleInListByMetadata(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestTransactionUpsertVisibleInListByMetadata(t *testing.T) {
 
 func TestTransactionUpsertReplaceVisibleInListByMetadata(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestTransactionUpsertReplaceVisibleInListByMetadata(t *testing.T) {
 
 func TestUpsertOrdinalPreservedOnReplace(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}

@@ -16,10 +16,10 @@ type restartBenchConfig struct {
 	count     int
 	indexType IndexType
 	// IVF-PQ specific
-	nClusters int
-	nProbes   int
+	nClusters  int
+	nProbes    int
 	nSubspaces int // PQ codebooks
-	bits      int // PQ bits
+	bits       int // PQ bits
 }
 
 // BenchmarkRestartPersisted measures New() time when a valid persisted index chunk
@@ -118,7 +118,7 @@ func benchmarkRestartPersisted(b *testing.B, cfg restartBenchConfig) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		db, err := New(WithStoragePath(path))
+		db, err := Open(WithStoragePath(path))
 		if err != nil {
 			b.Fatalf("reopen: %v", err)
 		}
@@ -150,7 +150,7 @@ func benchmarkRestartRebuild(b *testing.B, cfg restartBenchConfig) {
 		copyFile(b, path, copyPath)
 
 		b.StartTimer()
-		db, err := New(WithStoragePath(copyPath))
+		db, err := Open(WithStoragePath(copyPath))
 		if err != nil {
 			b.Fatalf("reopen: %v", err)
 		}
@@ -171,7 +171,7 @@ func benchmarkRestartRebuild(b *testing.B, cfg restartBenchConfig) {
 func createAndCompact(tb testing.TB, ctx context.Context, path string, cfg restartBenchConfig) *Database {
 	tb.Helper()
 
-	db, err := New(WithStoragePath(path))
+	db, err := Open(WithStoragePath(path))
 	if err != nil {
 		tb.Fatalf("new db: %v", err)
 	}
@@ -254,7 +254,13 @@ func corruptIndexChunk(tb testing.TB, path string) {
 	if _, err := f.ReadAt(headerBuf, 0); err != nil {
 		tb.Fatalf("read header: %v", err)
 	}
-	activeMetaPage := binary.LittleEndian.Uint64(headerBuf[40:48])
+	formatVersion := binary.LittleEndian.Uint16(headerBuf[8:10])
+	var activeMetaPage uint64
+	if formatVersion >= 2 {
+		activeMetaPage = binary.LittleEndian.Uint64(headerBuf[64:72])
+	} else {
+		activeMetaPage = binary.LittleEndian.Uint64(headerBuf[40:48])
+	}
 
 	// Read the active metapage.
 	metaBuf := make([]byte, pageSize)

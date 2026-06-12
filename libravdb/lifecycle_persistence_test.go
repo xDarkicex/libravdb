@@ -11,7 +11,7 @@ func TestListCollectionsPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestListCollectionsPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestCollectionIterationAndMetadataPersistAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestCollectionIterationAndMetadataPersistAcrossReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestDeleteCollectionPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDeleteCollectionPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestDeleteCollectionsPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestDeleteCollectionsPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestDeleteCollectionsPersistsAcrossReopen(t *testing.T) {
 
 func TestDeleteBatchRemovesRecordsFromIterationAndSearch(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestDeleteBatchRemovesRecordsFromIterationAndSearch(t *testing.T) {
 
 func TestDeleteIsIdempotentAndRepairsStaleIndexEntry(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestDeleteIsIdempotentAndRepairsStaleIndexEntry(t *testing.T) {
 
 func TestShardedDeleteIsIdempotentAndRepairsStaleIndexEntry(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestListByMetadataWorksBeforeAndAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestListByMetadataWorksBeforeAndAfterReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestCollectionCountReflectsPersistedState(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestCollectionCountReflectsPersistedState(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -441,7 +441,7 @@ func TestQueryBuilderListSupportsMetadataOnlyListing(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -485,7 +485,7 @@ func TestQueryBuilderListSupportsMetadataOnlyListing(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -503,7 +503,7 @@ func TestQueryBuilderListHonorsThresholdWithVectorQuery(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestQueryBuilderListHonorsThresholdWithVectorQuery(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestShardedCollectionReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -611,7 +611,7 @@ func TestShardedCollectionReopen(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestShardedCollectionListHidesShardNames(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -674,7 +674,7 @@ func TestShardedCollectionListHidesShardNames(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -697,7 +697,7 @@ func TestShardedCollectionDeleteRemovesAllShards(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -722,7 +722,7 @@ func TestShardedCollectionDeleteRemovesAllShards(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -738,7 +738,7 @@ func TestShardedCollectionCloseCleansUpResources(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestShardedCollectionCloseCleansUpResources(t *testing.T) {
 	}
 
 	// Reopen - collection should still exist since we didn't delete it
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
@@ -795,7 +795,7 @@ func TestShardedCollectionCloseCleansUpResources(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 
-	reopened2, err := New(WithStoragePath(dbPath))
+	reopened2, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database after delete: %v", err)
 	}
@@ -813,7 +813,7 @@ func TestIVFPQCompactReopenRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	dbPath := testDBPath(t)
 
-	db, err := New(WithStoragePath(dbPath))
+	db, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
@@ -866,7 +866,7 @@ func TestIVFPQCompactReopenRoundTrip(t *testing.T) {
 	}
 
 	// Reopen — exercises DeserializeFromBytes + PopulateEntriesFromStorage.
-	reopened, err := New(WithStoragePath(dbPath))
+	reopened, err := Open(WithStoragePath(dbPath))
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}

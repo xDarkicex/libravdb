@@ -15,7 +15,7 @@ func TestConfigPersistence(t *testing.T) {
 	dbPath := filepath.Join(testDir, "test_config_persistence.libravdb")
 
 	// Create database with custom configuration
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {
@@ -64,7 +64,7 @@ func TestConfigPersistence(t *testing.T) {
 	}
 
 	// Reopen database
-	db2, err := libravdb.New(
+	db2, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 	)
 	if err != nil {

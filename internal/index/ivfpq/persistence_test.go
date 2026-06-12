@@ -62,7 +62,7 @@ func TestSerializeDeserializeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := idx2.DeserializeFromBytes(data); err != nil {
+	if err := idx2.DeserializeFromBytes(context.Background(), data); err != nil {
 		t.Fatal(err)
 	}
 	if !idx2.IsTrained() {
@@ -113,7 +113,7 @@ func TestDeserializeRejectsCorruptData(t *testing.T) {
 	defer idx.Close()
 
 	// Bogus data.
-	err = idx.DeserializeFromBytes([]byte{0x00, 0x01, 0x02, 0x03})
+	err = idx.DeserializeFromBytes(context.Background(), []byte{0x00, 0x01, 0x02, 0x03})
 	if err == nil {
 		t.Fatal("expected error for corrupt data")
 	}
@@ -148,7 +148,7 @@ func TestDeserializeRejectsConfigMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer idx2.Close()
-	err = idx2.DeserializeFromBytes(data)
+	err = idx2.DeserializeFromBytes(context.Background(), data)
 	if err == nil {
 		t.Fatal("expected config mismatch error")
 	}

@@ -208,10 +208,70 @@ func (f *ContainmentFilter) exactMatch(fieldSlice, targetValues []interface{}) b
 	return true
 }
 
-// toSlice converts various array types to []interface{}
+// toSlice converts various array types to []interface{}.
+// Common slice types take a fast path; reflection is the fallback.
 func (f *ContainmentFilter) toSlice(v interface{}) []interface{} {
 	if v == nil {
 		return nil
+	}
+
+	switch val := v.(type) {
+	case []interface{}:
+		return val
+	case []string:
+		result := make([]interface{}, len(val))
+		for i, s := range val {
+			result[i] = s
+		}
+		return result
+	case []float64:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = n
+		}
+		return result
+	case []float32:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = float64(n)
+		}
+		return result
+	case []int:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = int64(n)
+		}
+		return result
+	case []int64:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = n
+		}
+		return result
+	case []int32:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = int64(n)
+		}
+		return result
+	case []uint64:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = n
+		}
+		return result
+	case []uint32:
+		result := make([]interface{}, len(val))
+		for i, n := range val {
+			result[i] = uint64(n)
+		}
+		return result
+	case []bool:
+		result := make([]interface{}, len(val))
+		for i, b := range val {
+			result[i] = b
+		}
+		return result
 	}
 
 	rv := reflect.ValueOf(v)
@@ -226,7 +286,8 @@ func (f *ContainmentFilter) toSlice(v interface{}) []interface{} {
 	return result
 }
 
-// valuesEqual compares two values for equality, handling type conversions
+// valuesEqual compares two values for equality.
+// Same-type comparisons avoid reflect.DeepEqual; mixed types fall back to it.
 func (f *ContainmentFilter) valuesEqual(a, b interface{}) bool {
 	if a == nil && b == nil {
 		return true
@@ -235,13 +296,51 @@ func (f *ContainmentFilter) valuesEqual(a, b interface{}) bool {
 		return false
 	}
 
-	// Direct equality check first
-	if reflect.DeepEqual(a, b) {
-		return true
+	// Fast path: same underlying type.
+	switch a := a.(type) {
+	case string:
+		if b, ok := b.(string); ok {
+			return a == b
+		}
+	case int64:
+		if b, ok := b.(int64); ok {
+			return a == b
+		}
+	case float64:
+		if b, ok := b.(float64); ok {
+			return a == b
+		}
+	case bool:
+		if b, ok := b.(bool); ok {
+			return a == b
+		}
+	case uint64:
+		if b, ok := b.(uint64); ok {
+			return a == b
+		}
+	case int:
+		if b, ok := b.(int); ok {
+			return a == b
+		}
+	case int32:
+		if b, ok := b.(int32); ok {
+			return a == b
+		}
+	case uint32:
+		if b, ok := b.(uint32); ok {
+			return a == b
+		}
+	case float32:
+		if b, ok := b.(float32); ok {
+			return a == b
+		}
 	}
 
-	// Handle numeric type conversions
-	return f.numericEqual(a, b) || f.stringEqual(a, b)
+	// Mixed-type: try numeric and string conversion before DeepEqual.
+	if f.numericEqual(a, b) || f.stringEqual(a, b) {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // numericEqual handles numeric type conversions for equality

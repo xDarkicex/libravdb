@@ -22,9 +22,9 @@ type Filter interface {
 
 // VectorEntry represents a vector with metadata (matches libravdb.VectorEntry)
 type VectorEntry struct {
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 	ID       string                 `json:"id"`
 	Vector   []float32              `json:"vector"`
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // FilterType represents the type of filter

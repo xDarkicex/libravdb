@@ -17,7 +17,7 @@ import (
 
 // Threshold candidates to benchmark.
 var thresholdCandidates = []struct {
-	name string
+	name  string
 	hnsw  int
 	ivfpq int
 }{
@@ -31,11 +31,11 @@ var thresholdCandidates = []struct {
 var sizeSamples = []int{500, 1000, 2000, 5000, 10000}
 
 const (
-	benchDim       = 32
-	benchSearchK   = 8
-	benchRuns      = 5
-	benchWarmup    = 1
-	benchSeed int64 = 42
+	benchDim           = 32
+	benchSearchK       = 8
+	benchRuns          = 5
+	benchWarmup        = 1
+	benchSeed    int64 = 42
 )
 
 // genVector creates a pseudo-random normalized vector.
@@ -60,7 +60,7 @@ func measureThreshold(tb testing.TB, size int, threshold int) ([]float64, string
 	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/bench.libravdb"
 
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)
@@ -166,8 +166,8 @@ func TestAutoIndexThresholdBenchmark(t *testing.T) {
 
 	type probeResult struct {
 		indexType string
-		mean      float64
 		raw       []float64
+		mean      float64
 	}
 	results := make(map[string]map[int]probeResult)
 

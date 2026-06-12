@@ -3,11 +3,16 @@ package storage
 import (
 	"context"
 
+	"errors"
+
 	"github.com/xDarkicex/libravdb/internal/index"
 )
 
+var ErrV1FormatMigrationRequired = errors.New("v1 format migration required")
+
 // CollectionConfig is the engine-level persisted collection configuration.
 type CollectionConfig struct {
+	RawVectorStore string
 	Dimension      int
 	Metric         int
 	IndexType      int
@@ -18,7 +23,6 @@ type CollectionConfig struct {
 	NProbes        int
 	ML             float64
 	Version        int
-	RawVectorStore string
 	RawStoreCap    int
 }
 
@@ -29,6 +33,9 @@ type Engine interface {
 	ListCollections() ([]string, error)
 	DeleteCollection(name string) error
 	Close() error
+	Vacuum(ctx context.Context) error
+	Backup(ctx context.Context, destPath string) error
+	Drop(ctx context.Context) error
 }
 
 // WriteStats captures coarse write-path instrumentation for benchmarking.
@@ -44,12 +51,12 @@ type WriteStats struct {
 type EngineStatus int32
 
 const (
-	StatusStarting          EngineStatus = iota // New() called, not yet opened
-	StatusRecoveringSnapshot                    // loading snapshot from disk
-	StatusRecoveringIndexes                     // loading or rebuilding indexes
-	StatusReplayingWAL                          // replaying WAL from last checkpoint LSN
-	StatusReady                                 // fully operational, queries accepted
-	StatusFailed                                // fatal recovery error, engine unusable
+	StatusStarting           EngineStatus = iota // New() called, not yet opened
+	StatusRecoveringSnapshot                     // loading snapshot from disk
+	StatusRecoveringIndexes                      // loading or rebuilding indexes
+	StatusReplayingWAL                           // replaying WAL from last checkpoint LSN
+	StatusReady                                  // fully operational, queries accepted
+	StatusFailed                                 // fatal recovery error, engine unusable
 )
 
 // WriteStatsProvider is an optional interface for engines that expose write-path counters.
@@ -67,13 +74,13 @@ const (
 
 // TxOperation represents one row-level mutation in a transactional batch.
 type TxOperation struct {
-	Type               TxOperationType
+	Metadata           map[string]interface{}
 	Collection         string
 	ID                 string
-	Ordinal            uint32
 	Vector             []float32
-	Metadata           map[string]interface{}
 	ExpectedVersion    uint64
+	Ordinal            uint32
+	Type               TxOperationType
 	HasExpectedVersion bool
 }
 

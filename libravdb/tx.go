@@ -70,19 +70,19 @@ const (
 )
 
 type txMutation struct {
-	kind               txMutationKind
+	metadata           map[string]interface{}
 	collection         string
 	id                 string
 	vector             []float32
-	metadata           map[string]interface{}
-	hasExpectedVersion bool
 	expectedVersion    uint64
+	kind               txMutationKind
+	hasExpectedVersion bool
 }
 
 type transaction struct {
 	db        *Database
-	mu        sync.Mutex
 	ops       []txMutation
+	mu        sync.Mutex
 	closed    bool
 	committed bool
 }
@@ -778,6 +778,7 @@ func (s *txCommitState) buildIndexes(ctx context.Context, names []string, logger
 		})
 		idx, err := buildIndexForEntries(ctx, state.collection.config, provider, entries)
 		if err != nil {
+			closeIndexes(indexes)
 			return nil, err
 		}
 		indexes[name] = idx

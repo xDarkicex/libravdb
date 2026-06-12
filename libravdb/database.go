@@ -15,6 +15,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/obs"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
+	"github.com/xDarkicex/memory"
 )
 
 // Logger is the logging interface accepted by the database.
@@ -25,30 +26,32 @@ type Logger interface {
 
 // Database represents the main vector database instance
 type Database struct {
-	mu          sync.RWMutex
-	collections map[string]*Collection
-	storage     storage.Engine
-	bridge      *indexPersistenceBridge // cached indexes from recovery, used for lazy-loading
-	metrics     *obs.Metrics
-	health      *obs.HealthChecker
-	config      *Config
-	logger      Logger
-	closed      bool
+	storage       storage.Engine
+	logger        Logger
+	collections   map[string]*Collection
+	bridge        *indexPersistenceBridge
+	metrics       *obs.Metrics
+	health        *obs.HealthChecker
+	healthMonitor *SystemHealthMonitorImpl
+	config        *Config
+	scratchPool   *sync.Pool
+	mu            sync.RWMutex
+	closed        bool
 }
 
 // Config holds database-wide configuration
 type Config struct {
+	Logger              Logger
 	StoragePath         string
-	MetricsEnabled      bool
-	TracingEnabled      bool
 	MaxCollections      int
 	MaxConcurrentWrites int
 	MaxWriteQueueDepth  int
-	Logger              Logger
+	MetricsEnabled      bool
+	TracingEnabled      bool
 }
 
-// New creates a new Database instance with the given options
-func New(opts ...Option) (*Database, error) {
+// Open opens a Database at the configured path, creating it if necessary.
+func Open(opts ...Option) (*Database, error) {
 	config := &Config{
 		StoragePath:         "./data",
 		MetricsEnabled:      true,
@@ -71,8 +74,22 @@ func New(opts ...Option) (*Database, error) {
 	storageEngine, err := singlefile.New(config.StoragePath,
 		singlefile.WithIndexSnapshotProvider(bridge),
 	)
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+		if errors.Is(err, storage.ErrV1FormatMigrationRequired) {
+			if err := Migrate(context.Background(), config.StoragePath); err != nil {
+				return nil, fmt.Errorf("auto-migration failed: %w", err)
+			}
+			// Retry opening the newly migrated database
+			storageEngine, err = singlefile.New(config.StoragePath,
+				singlefile.WithIndexSnapshotProvider(bridge),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open database after migration: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to initialize storage engine: %w", err)
+		}
 	}
 
 	// Initialize observability
@@ -88,6 +105,15 @@ func New(opts ...Option) (*Database, error) {
 		metrics:     metrics,
 		config:      config,
 		logger:      config.Logger,
+		scratchPool: &sync.Pool{
+			New: func() interface{} {
+				arena, err := memory.NewArena(1024 * 1024)
+				if err != nil {
+					panic(fmt.Sprintf("failed to allocate scratch arena: %v", err))
+				}
+				return arena
+			},
+		},
 	}
 
 	// Wire the bridge back to the database so SerializeIndex can access
@@ -99,9 +125,26 @@ func New(opts ...Option) (*Database, error) {
 	// Initialize health checker
 	db.health = obs.NewHealthChecker(db)
 
+	// Start the background health monitor. Registers a storage engine
+	// liveness check and begins periodic monitoring with callbacks.
+	db.healthMonitor = NewSystemHealthMonitor(30 * time.Second)
+	db.healthMonitor.RegisterHealthCheck("storage", func(ctx context.Context) (HealthLevel, error) {
+		_, err := storageEngine.ListCollections()
+		if err != nil {
+			return HealthCritical, fmt.Errorf("storage list: %w", err)
+		}
+		return HealthHealthy, nil
+	})
+	if err := db.healthMonitor.Start(context.Background()); err != nil {
+		storageEngine.Close()
+		return nil, fmt.Errorf("failed to start health monitor: %w", err)
+	}
+
 	// Load existing collections from storage, preferring cached indexes
 	// that were deserialized or rebuilt during recovery.
 	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
+		db.healthMonitor.Stop()
+		storageEngine.Close()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 
@@ -132,7 +175,7 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, ErrTooManyCollections
 	}
 
-	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
+	collection, err := newCollection(ctx, name, db.storage, db.metrics, db.newWriteController(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
@@ -172,7 +215,7 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 		// Fall through to create.
 	}
 
-	col, err := db.createCollectionLocked(name, opts...)
+	col, err := db.createCollectionLocked(ctx, name, opts...)
 	if err == nil {
 		return col, nil
 	}
@@ -189,8 +232,8 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 }
 
 // createCollectionLocked creates a collection. Caller must hold db.mu.
-func (db *Database) createCollectionLocked(name string, opts ...CollectionOption) (*Collection, error) {
-	collection, err := newCollection(name, db.storage, db.metrics, db.newWriteController(), opts...)
+func (db *Database) createCollectionLocked(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error) {
+	collection, err := newCollection(ctx, name, db.storage, db.metrics, db.newWriteController(), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
@@ -251,7 +294,7 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 	}); ok {
 		var err error
-		collection, err = db.loadCollectionFromStorage(name, fileEngine, db.bridge)
+		collection, err = db.loadCollectionFromStorage(context.Background(), name, fileEngine, db.bridge)
 		if err != nil {
 			return nil, err
 		}
@@ -367,8 +410,28 @@ func (db *Database) Health(ctx context.Context) (*obs.HealthStatus, error) {
 	return db.health.Check(ctx)
 }
 
+// HealthMonitor returns the background system health monitor. Callers can
+// register additional health checks and status-change callbacks.
+func (db *Database) HealthMonitor() SystemHealthMonitor {
+	return db.healthMonitor
+}
+
+// Ping checks if the database is responsive and the storage engine is accessible.
+func (db *Database) Ping(ctx context.Context) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+
+	// A basic check to see if storage responds
+	_, err := db.storage.ListCollections()
+	return err
+}
+
 // Stats returns database statistics
-func (db *Database) Stats() *DatabaseStats {
+func (db *Database) Stats(ctx context.Context) *DatabaseStats {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -379,7 +442,7 @@ func (db *Database) Stats() *DatabaseStats {
 
 	var totalMemory int64
 	for name, collection := range db.collections {
-		collectionStats := collection.Stats()
+		collectionStats := collection.Stats(ctx)
 		stats.Collections[name] = collectionStats
 		totalMemory += collectionStats.MemoryUsage
 	}
@@ -453,7 +516,7 @@ func (db *Database) SetGlobalMemoryLimit(bytes int64) error {
 }
 
 // GetGlobalMemoryUsage returns total memory usage across all collections
-func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
+func (db *Database) GetGlobalMemoryUsage(ctx context.Context) (*GlobalMemoryUsage, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -467,7 +530,7 @@ func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
 	}
 
 	for name, collection := range db.collections {
-		memUsage, err := collection.GetMemoryUsage()
+		memUsage, err := collection.GetMemoryUsage(ctx)
 		if err != nil {
 			continue // Skip collections with errors
 		}
@@ -480,7 +543,7 @@ func (db *Database) GetGlobalMemoryUsage() (*GlobalMemoryUsage, error) {
 			MemoryMapped:  memUsage.MemoryMapped,
 			Limit:         memUsage.Limit,
 			Available:     memUsage.Available,
-			PressureLevel: "normal", // TODO: Calculate pressure level
+			PressureLevel: calculatePressureLevel(memUsage.Total, memUsage.Limit),
 			Timestamp:     memUsage.Timestamp,
 		}
 
@@ -548,8 +611,11 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 			continue
 		}
 
-		collection, err := db.loadCollectionFromStorage(name, fileEngine, bridge)
+		collection, err := db.loadCollectionFromStorage(ctx, name, fileEngine, bridge)
 		if err != nil {
+			for _, c := range loadedCollections {
+				c.Close()
+			}
 			return err
 		}
 
@@ -563,11 +629,10 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 	}
 	db.mu.Unlock()
 
-	_ = ctx
 	return nil
 }
 
-func (db *Database) loadCollectionFromStorage(name string, engine interface {
+func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, engine interface {
 	GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
 }, bridge *indexPersistenceBridge) (*Collection, error) {
 	// Check if this is a shard collection name - if so, skip it
@@ -587,12 +652,18 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 		for i := 1; i < shardCount; i++ {
 			shardStorages[i], _, err = engine.GetCollectionWithConfig(shardNames[i])
 			if err != nil {
+				for j := 0; j < i; j++ {
+					shardStorages[j].Close()
+				}
 				return nil, fmt.Errorf("collection %s is missing shard %d: %w", name, i, err)
 			}
 		}
 
-		collection, err := newShardedCollectionFromStorage(name, shardStorages, config, db.metrics, db.newWriteController())
+		collection, err := newShardedCollectionFromStorage(ctx, name, shardStorages, config, db.metrics, db.newWriteController())
 		if err != nil {
+			for j := 0; j < shardCount; j++ {
+				shardStorages[j].Close()
+			}
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
 		collection.db = db
@@ -612,7 +683,7 @@ func (db *Database) loadCollectionFromStorage(name string, engine interface {
 		cachedIndex = bridge.takeCachedIndex(name)
 	}
 
-	collection, err := newCollectionFromStorage(name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
+	collection, err := newCollectionFromStorage(ctx, name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
@@ -647,6 +718,14 @@ func (db *Database) Close() error {
 
 	var errors []error
 
+	// Stop the background health monitor before tearing down collections
+	// so health checks don't access closing state.
+	if db.healthMonitor != nil {
+		if err := db.healthMonitor.Stop(); err != nil {
+			errors = append(errors, fmt.Errorf("health monitor stop: %w", err))
+		}
+	}
+
 	// Close all collections
 	for _, collection := range db.collections {
 		if err := collection.Close(); err != nil {
@@ -666,4 +745,70 @@ func (db *Database) Close() error {
 	}
 
 	return nil
+}
+
+// Vacuum reclaims disk space by rewriting the underlying storage file, dropping
+// deleted records and obsolete WAL frames. This is a non-blocking operation
+// that only briefly pauses the database during the final swap.
+func (db *Database) Vacuum(ctx context.Context) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	if v, ok := db.storage.(interface{ Vacuum(context.Context) error }); ok {
+		return v.Vacuum(ctx)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Vacuum")
+}
+
+// Backup creates a point-in-time copy of the database to the specified destination
+// path. It uses a non-blocking fast-forward design to ensure the copy is consistent
+// without interrupting active database operations.
+func (db *Database) Backup(ctx context.Context, destPath string) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	if v, ok := db.storage.(interface{ Backup(context.Context, string) error }); ok {
+		return v.Backup(ctx, destPath)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Backup")
+}
+
+// Drop completely closes the database and destroys its underlying files from disk.
+// Once a database is dropped, it cannot be recovered without a backup.
+func (db *Database) Drop(ctx context.Context) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	
+	// Close all collections safely
+	for _, collection := range db.collections {
+		collection.Close()
+	}
+	db.collections = make(map[string]*Collection)
+	
+	// Stop health monitor
+	if db.healthMonitor != nil {
+		db.healthMonitor.Stop()
+	}
+	
+	db.closed = true
+	
+	if v, ok := db.storage.(interface{ Drop(context.Context) error }); ok {
+		return v.Drop(ctx)
+	}
+	
+	return fmt.Errorf("underlying storage engine does not support Drop")
 }

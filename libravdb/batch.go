@@ -2,12 +2,15 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
+	"github.com/xDarkicex/memory"
 )
 
 // BatchOperation represents a batch operation that can be executed
@@ -19,24 +22,24 @@ type BatchOperation interface {
 
 // BatchResult contains the results of a batch operation
 type BatchResult struct {
+	RollbackError    error              `json:"rollback_error,omitempty"`
+	Errors           map[int]error      `json:"errors"`
+	Items            []*BatchItemResult `json:"items"`
 	Successful       int                `json:"successful"`
 	Failed           int                `json:"failed"`
-	Errors           map[int]error      `json:"errors"` // Index -> Error mapping
 	Duration         time.Duration      `json:"duration"`
-	Items            []*BatchItemResult `json:"items"`
 	RollbackRequired bool               `json:"rollback_required"`
-	RollbackError    error              `json:"rollback_error,omitempty"`
 }
 
 // BatchItemResult represents the result of a single item in a batch
 type BatchItemResult struct {
-	Index          int       `json:"index"`
-	ID             string    `json:"id"`
-	Success        bool      `json:"success"`
-	Error          error     `json:"error,omitempty"`
-	BatchErrorCode string    `json:"batch_error_code,omitempty"`
 	Timestamp      time.Time `json:"timestamp"`
+	Error          error     `json:"error,omitempty"`
+	ID             string    `json:"id"`
+	BatchErrorCode string    `json:"batch_error_code,omitempty"`
+	Index          int       `json:"index"`
 	Retries        int       `json:"retries"`
+	Success        bool      `json:"success"`
 }
 
 // Batch operation error codes
@@ -52,20 +55,21 @@ const (
 
 // BatchOptions configures batch operation behavior
 type BatchOptions struct {
-	ChunkSize        int                                    `json:"chunk_size"`
-	MaxConcurrency   int                                    `json:"max_concurrency"`
-	FailFast         bool                                   `json:"fail_fast"`
 	ProgressCallback func(completed, total int)             `json:"-"`
-	Timeout          time.Duration                          `json:"timeout"`
-	EnableRollback   bool                                   `json:"enable_rollback"`
-	MaxRetries       int                                    `json:"max_retries"`
-	RetryDelay       time.Duration                          `json:"retry_delay"`
 	DetailedProgress func(progress *BatchProgress)          `json:"-"`
 	ErrorCallback    func(item *BatchItemResult, err error) `json:"-"`
+	ChunkSize        int                                    `json:"chunk_size"`
+	MaxConcurrency   int                                    `json:"max_concurrency"`
+	Timeout          time.Duration                          `json:"timeout"`
+	MaxRetries       int                                    `json:"max_retries"`
+	RetryDelay       time.Duration                          `json:"retry_delay"`
+	FailFast         bool                                   `json:"fail_fast"`
+	EnableRollback   bool                                   `json:"enable_rollback"`
 }
 
 // BatchProgress provides detailed progress information
 type BatchProgress struct {
+	LastError    error         `json:"last_error,omitempty"`
 	Completed    int           `json:"completed"`
 	Total        int           `json:"total"`
 	Successful   int           `json:"successful"`
@@ -75,7 +79,6 @@ type BatchProgress struct {
 	ElapsedTime  time.Duration `json:"elapsed_time"`
 	EstimatedETA time.Duration `json:"estimated_eta"`
 	ItemsPerSec  float64       `json:"items_per_sec"`
-	LastError    error         `json:"last_error,omitempty"`
 }
 
 // DefaultBatchOptions returns sensible defaults for batch operations
@@ -93,32 +96,32 @@ func DefaultBatchOptions() *BatchOptions {
 
 // VectorUpdate represents an update operation for a vector
 type VectorUpdate struct {
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 	ID       string                 `json:"id"`
-	Vector   []float32              `json:"vector,omitempty"`   // Optional: update vector
-	Metadata map[string]interface{} `json:"metadata,omitempty"` // Optional: update metadata
-	Upsert   bool                   `json:"upsert"`             // Create if not exists
+	Vector   []float32              `json:"vector,omitempty"`
+	Upsert   bool                   `json:"upsert"`
 }
 
 // BatchInsert represents a batch insert operation
 type BatchInsert struct {
 	collection      *Collection
-	entries         []*VectorEntry
 	options         *BatchOptions
+	progressTracker *progressTracker
+	entries         []*VectorEntry
 	insertedIDs     []string
 	rollbackMutex   sync.Mutex
-	progressTracker *progressTracker
 }
 
 // progressTracker tracks detailed progress for batch operations
 type progressTracker struct {
 	startTime    time.Time
+	lastError    error
 	completed    int
 	total        int
 	successful   int
 	failed       int
 	currentChunk int
 	totalChunks  int
-	lastError    error
 	mutex        sync.RWMutex
 }
 
@@ -182,23 +185,28 @@ func (pt *progressTracker) getProgress() *BatchProgress {
 // BatchUpdate represents a batch update operation
 type BatchUpdate struct {
 	collection      *Collection
-	updates         []*VectorUpdate
 	options         *BatchOptions
-	modifiedIDs     []string
-	originalEntries []*VectorEntry // Store original entries for rollback
-	rollbackMutex   sync.Mutex
 	progressTracker *progressTracker
+	updates         []*VectorUpdate
+	modifiedIDs     []string
+	originalEntries []*VectorEntry
+	rollbackMutex   sync.Mutex
 }
 
 // BatchDelete represents a batch delete operation
 type BatchDelete struct {
 	collection      *Collection
-	ids             []string
 	options         *BatchOptions
-	deletedEntries  []*VectorEntry // Store for rollback
-	rollbackMutex   sync.Mutex
 	progressTracker *progressTracker
+	ids             []string
+	deletedEntries  []*VectorEntry
+	rollbackMutex   sync.Mutex
 }
+
+// errFound is a package-level sentinel used to break out of storage.Iterate
+// once a matching entry is located. Callers must check with errors.Is and
+// treat it as a non-error control-flow signal.
+var errFound = errors.New("entry found")
 
 // NewBatchInsert creates a new batch insert operation
 func (c *Collection) NewBatchInsert(entries []*VectorEntry, opts ...*BatchOptions) *BatchInsert {
@@ -389,10 +397,16 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	arena, err := memory.NewArena(1024 * 1024)
+	if err != nil {
+		return nil, fmt.Errorf("arena create: %w", err)
+	}
+	defer arena.Free()
+
 	type chunkOutcome struct {
-		chunkIdx int
-		result   *chunkResult
 		err      error
+		result   *chunkResult
+		chunkIdx int
 	}
 
 	outcomes := make(chan chunkOutcome, totalChunks)
@@ -426,8 +440,16 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 		close(waitDone)
 	}()
 
-	chunkResults := make([]*chunkResult, totalChunks)
-	chunkErrors := make([]error, totalChunks)
+	chunkResults, err := memory.ArenaSlice[*chunkResult](arena, totalChunks)
+	if err != nil {
+		return nil, fmt.Errorf("arena chunkResults: %w", err)
+	}
+	chunkResults = chunkResults[:totalChunks]
+	chunkErrors, err := memory.ArenaSlice[error](arena, totalChunks)
+	if err != nil {
+		return nil, fmt.Errorf("arena chunkErrors: %w", err)
+	}
+	chunkErrors = chunkErrors[:totalChunks]
 
 	completedChunks := 0
 	for completedChunks < totalChunks {
@@ -509,9 +531,9 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 
 // chunkResult represents the result of processing a single chunk
 type chunkResult struct {
-	items     []*BatchItemResult
-	errors    map[int]error
 	lastError error
+	errors    map[int]error
+	items     []*BatchItemResult
 }
 
 // processChunk processes a single chunk of entries
@@ -531,17 +553,38 @@ func (b *BatchInsert) tryProcessChunkFast(ctx context.Context, chunk []*VectorEn
 		}, true, nil
 	}
 
-	indexEntries := make([]*index.VectorEntry, 0, len(chunk))
+	arena := b.collection.db.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		b.collection.db.scratchPool.Put(arena)
+	}()
+
+	structsSlice, err := memory.ArenaSlice[index.VectorEntry](arena, len(chunk))
+	if err != nil {
+		return nil, false, nil // fall back to heap path
+	}
+	structsSlice = structsSlice[:len(chunk)]
+	pointersSlice, err := memory.ArenaSlice[*index.VectorEntry](arena, len(chunk))
+	if err != nil {
+		return nil, false, nil // fall back to heap path
+	}
+	pointersSlice = pointersSlice[:len(chunk)]
+
+	validCount := 0
 	for _, entry := range chunk {
 		if err := b.validateEntry(entry); err != nil {
 			return nil, false, nil
 		}
-		indexEntries = append(indexEntries, &index.VectorEntry{
+		structsSlice[validCount] = index.VectorEntry{
 			ID:       entry.ID,
 			Vector:   entry.Vector,
 			Metadata: entry.Metadata,
-		})
+		}
+		pointersSlice[validCount] = &structsSlice[validCount]
+		validCount++
 	}
+
+	indexEntries := pointersSlice[:validCount]
 
 	if err := b.collection.insertBatch(ctx, indexEntries); err != nil {
 		return nil, false, nil
@@ -719,13 +762,13 @@ func (b *BatchInsert) categorizeError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "dimension"):
+	case strings.Contains(errStr, "dimension"):
 		return BatchErrorValidation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "duplicate"):
+	case strings.Contains(errStr, "duplicate"):
 		return BatchErrorDuplicate
-	case contains(errStr, "memory"):
+	case strings.Contains(errStr, "memory"):
 		return BatchErrorMemory
 	default:
 		return BatchErrorInternal
@@ -739,9 +782,9 @@ func (b *BatchInsert) isNonRetryableError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "dimension") ||
-		contains(errStr, "empty") ||
-		contains(errStr, "duplicate")
+	return strings.Contains(errStr, "dimension") ||
+		strings.Contains(errStr, "empty") ||
+		strings.Contains(errStr, "duplicate")
 }
 
 // validateEntry validates a vector entry before insertion
@@ -760,22 +803,6 @@ func (b *BatchInsert) validateEntry(entry *VectorEntry) error {
 	}
 
 	return nil
-}
-
-// contains is a simple string contains helper
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || (len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			findSubstring(s, substr))))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // Size returns the number of items in the batch update
@@ -970,7 +997,11 @@ func (b *BatchUpdate) processUpdateWithRetries(ctx context.Context, update *Vect
 		var originalEntry *VectorEntry
 		if !update.Upsert && b.options.EnableRollback {
 			// Retrieve original entry before updating
-			_ = b.collection.storage.Iterate(ctx, func(entry *index.VectorEntry) error {
+			storageImpl := b.collection.storage
+			if storageImpl == nil {
+				storageImpl = b.collection.getShard(update.ID).storage
+			}
+			_ = storageImpl.Iterate(ctx, func(entry *index.VectorEntry) error {
 				if entry.ID == update.ID {
 					originalEntry = &VectorEntry{
 						ID:       entry.ID,
@@ -981,7 +1012,7 @@ func (b *BatchUpdate) processUpdateWithRetries(ctx context.Context, update *Vect
 					for k, v := range entry.Metadata {
 						originalEntry.Metadata[k] = v
 					}
-					return fmt.Errorf("found") // Use error to break iteration
+					return errFound // Sentinel to break iteration; callers filter with errors.Is
 				}
 				return nil
 			})
@@ -1083,11 +1114,11 @@ func (b *BatchUpdate) categorizeUpdateError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "dimension"):
+	case strings.Contains(errStr, "dimension"):
 		return BatchErrorValidation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "not found"):
+	case strings.Contains(errStr, "not found"):
 		return BatchErrorNotFound
 	default:
 		return BatchErrorInternal
@@ -1101,8 +1132,8 @@ func (b *BatchUpdate) isNonRetryableUpdateError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "dimension") ||
-		contains(errStr, "empty")
+	return strings.Contains(errStr, "dimension") ||
+		strings.Contains(errStr, "empty")
 }
 
 // validateUpdate validates an update operation
@@ -1262,7 +1293,7 @@ func (b *BatchDelete) processDeleteChunk(ctx context.Context, chunk []string, st
 			if b.options.ErrorCallback != nil {
 				b.options.ErrorCallback(itemResult, err)
 			}
-			}
+		}
 
 		result.items = append(result.items, itemResult)
 
@@ -1303,7 +1334,7 @@ func (b *BatchDelete) processDeleteWithRetries(ctx context.Context, id string, i
 					for k, v := range entry.Metadata {
 						originalEntry.Metadata[k] = v
 					}
-					return fmt.Errorf("found") // Use error to break iteration
+					return errFound // Sentinel to break iteration; callers filter with errors.Is
 				}
 				return nil
 			})
@@ -1398,11 +1429,11 @@ func (b *BatchDelete) categorizeDeleteError(err error) string {
 		return BatchErrorTimeout
 	case err == context.Canceled:
 		return BatchErrorCancellation
-	case contains(errStr, "empty"):
+	case strings.Contains(errStr, "empty"):
 		return BatchErrorValidation
-	case contains(errStr, "not found"):
+	case strings.Contains(errStr, "not found"):
 		return BatchErrorNotFound
-	case contains(errStr, "not yet implemented"):
+	case strings.Contains(errStr, "not yet implemented"):
 		return BatchErrorInternal
 	default:
 		return BatchErrorInternal
@@ -1416,6 +1447,6 @@ func (b *BatchDelete) isNonRetryableDeleteError(err error) bool {
 	}
 
 	errStr := err.Error()
-	return contains(errStr, "empty") ||
-		contains(errStr, "not yet implemented")
+	return strings.Contains(errStr, "empty") ||
+		strings.Contains(errStr, "not yet implemented")
 }

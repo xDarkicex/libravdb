@@ -43,8 +43,8 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 		}
 	}
 
-	if len(store.allocators) < 3 {
-		t.Fatalf("expected slabby store to grow across segments, got %d allocator(s)", len(store.allocators))
+	if store.sfl.Stats().SlabCount < 1 {
+		t.Fatalf("expected slabby store to have allocated slabs, got %d", store.sfl.Stats().SlabCount)
 	}
 
 	if err := store.Delete(refs[1]); err != nil {
@@ -57,8 +57,8 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 	if err := store.Reset(); err != nil {
 		t.Fatalf("reset failed: %v", err)
 	}
-	if len(store.allocators) != 0 || len(store.slots) != 0 {
-		t.Fatalf("expected reset to clear slabby store, got %d allocators and %d slots", len(store.allocators), len(store.slots))
+	if store.sfl != nil && store.sfl.Stats().Allocated != 0 || len(store.slots) != 0 {
+		t.Fatalf("expected reset to clear slabby store")
 	}
 }
 

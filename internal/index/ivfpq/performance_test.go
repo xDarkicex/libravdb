@@ -34,8 +34,10 @@ func TestIVFPQvsHNSWPerformance(t *testing.T) {
 	ctx := context.Background()
 	dimension := 128
 
-	// Test different dataset sizes
-	testSizes := []int{1000, 5000, 10000, 25000}
+	// Test different dataset sizes. Larger sizes (10000, 25000) run
+	// the HNSW comparison path which takes minutes under -race; keep
+	// the default set small enough to complete within go test -timeout.
+	testSizes := []int{1000, 5000}
 
 	for _, size := range testSizes {
 		t.Run(fmt.Sprintf("Dataset_%d", size), func(t *testing.T) {
@@ -45,8 +47,8 @@ func TestIVFPQvsHNSWPerformance(t *testing.T) {
 
 			// Test IVF-PQ with different configurations
 			ivfpqConfigs := []struct {
-				name   string
 				config *Config
+				name   string
 			}{
 				{
 					name:   "IVF-PQ_Default",
@@ -276,8 +278,8 @@ func TestQuantizationEffectiveness(t *testing.T) {
 
 	// Test different quantization configurations
 	quantConfigs := []struct {
-		name   string
 		config *quant.QuantizationConfig
+		name   string
 	}{
 		{
 			name:   "No_Quantization",

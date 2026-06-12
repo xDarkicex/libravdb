@@ -10,12 +10,12 @@ import (
 
 // MockMemoryMappable implements the MemoryMappable interface for testing
 type MockMemoryMappable struct {
-	canMap        bool
-	estimatedSize int64
-	isMapped      atomic.Bool
-	mappedSize    atomic.Int64
 	enableError   error
 	disableError  error
+	estimatedSize int64
+	mappedSize    atomic.Int64
+	isMapped      atomic.Bool
+	canMap        bool
 }
 
 func (m *MockMemoryMappable) CanMemoryMap() bool {

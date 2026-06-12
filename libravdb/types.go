@@ -7,18 +7,18 @@ import (
 
 // VectorEntry represents a vector with metadata for storage/indexing
 type VectorEntry struct {
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 	ID       string                 `json:"id"`
 	Vector   []float32              `json:"vector"`
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // Record represents a persisted vector record returned by iteration/list APIs.
 type Record struct {
-	ID       string                 `json:"id"`
-	Ordinal  uint32                 `json:"ordinal"`
-	Vector   []float32              `json:"vector"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	ID       string                 `json:"id"`
+	Vector   []float32              `json:"vector"`
 	Version  uint64                 `json:"version"`
+	Ordinal  uint32                 `json:"ordinal"`
 }
 
 // SearchResult represents a single search result.
@@ -26,11 +26,11 @@ type Record struct {
 // For cosine collections, Score uses cosine similarity semantics.
 // Other metrics expose a normalized monotone relevance score.
 type SearchResult struct {
-	ID       string                 `json:"id"`
-	Score    float32                `json:"score"`
-	Vector   []float32              `json:"vector,omitempty"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	ID       string                 `json:"id"`
+	Vector   []float32              `json:"vector,omitempty"`
 	Version  uint64                 `json:"version"`
+	Score    float32                `json:"score"`
 }
 
 // SearchResults represents the complete search response.
@@ -43,36 +43,28 @@ type SearchResults struct {
 
 // DatabaseStats represents database-wide statistics
 type DatabaseStats struct {
-	CollectionCount int                         `json:"collection_count"`
 	Collections     map[string]*CollectionStats `json:"collections"`
+	CollectionCount int                         `json:"collection_count"`
 	MemoryUsage     int64                       `json:"memory_usage"`
 	Uptime          time.Duration               `json:"uptime"`
 }
 
 // CollectionStats represents collection-specific statistics
 type CollectionStats struct {
-	Name        string `json:"name"`
-	VectorCount int    `json:"vector_count"`
-	Dimension   int    `json:"dimension"`
-	IndexType   string `json:"index_type"`
-	MemoryUsage int64  `json:"memory_usage"`
-
-	// Enhanced memory statistics
-	MemoryStats         *CollectionMemoryStats `json:"memory_stats,omitempty"`
-	RawVectorStoreStats *RawVectorStoreStats   `json:"raw_vector_store_stats,omitempty"`
-
-	// Optimization information
-	OptimizationStatus *OptimizationStatus `json:"optimization_status,omitempty"`
-
-	// Ordinal statistics
-	LiveRecordCount    int     `json:"live_record_count"`
-	NextOrdinal        uint32  `json:"next_ordinal"`
-	OrdinalUtilization float64 `json:"ordinal_utilization"`
-
-	// Configuration information
-	HasQuantization      bool `json:"has_quantization"`
-	HasMemoryLimit       bool `json:"has_memory_limit"`
-	MemoryMappingEnabled bool `json:"memory_mapping_enabled"`
+	MemoryStats          *CollectionMemoryStats `json:"memory_stats,omitempty"`
+	OptimizationStatus   *OptimizationStatus    `json:"optimization_status,omitempty"`
+	RawVectorStoreStats  *RawVectorStoreStats   `json:"raw_vector_store_stats,omitempty"`
+	IndexType            string                 `json:"index_type"`
+	Name                 string                 `json:"name"`
+	MemoryUsage          int64                  `json:"memory_usage"`
+	Dimension            int                    `json:"dimension"`
+	VectorCount          int                    `json:"vector_count"`
+	LiveRecordCount      int                    `json:"live_record_count"`
+	OrdinalUtilization   float64                `json:"ordinal_utilization"`
+	NextOrdinal          uint32                 `json:"next_ordinal"`
+	HasQuantization      bool                   `json:"has_quantization"`
+	HasMemoryLimit       bool                   `json:"has_memory_limit"`
+	MemoryMappingEnabled bool                   `json:"memory_mapping_enabled"`
 }
 
 type RawVectorStoreStats struct {
@@ -225,72 +217,50 @@ type OptimizationOptions struct {
 
 // OptimizationStatus represents the current optimization state of a collection
 type OptimizationStatus struct {
-	// InProgress indicates if optimization is currently running
-	InProgress bool `json:"in_progress"`
-
-	// LastOptimization is the timestamp of the last completed optimization
-	LastOptimization time.Time `json:"last_optimization"`
-
-	// CanOptimize indicates if optimization can be started
-	CanOptimize bool `json:"can_optimize"`
-
-	// RecommendedOptimizations suggests which optimizations would be beneficial
-	RecommendedOptimizations []string `json:"recommended_optimizations,omitempty"`
+	LastOptimization         time.Time `json:"last_optimization"`
+	RecommendedOptimizations []string  `json:"recommended_optimizations,omitempty"`
+	InProgress               bool      `json:"in_progress"`
+	CanOptimize              bool      `json:"can_optimize"`
 }
 
 // CollectionMemoryStats represents memory usage statistics for a collection
 type CollectionMemoryStats struct {
-	// Total memory usage in bytes
-	Total int64 `json:"total"`
+	Timestamp     time.Time `json:"timestamp"`
+	PressureLevel string    `json:"pressure_level"`
+	Total         int64     `json:"total"`
+	Storage       int64     `json:"storage"`
+	Index         int64     `json:"index"`
+	Cache         int64     `json:"cache"`
+	Quantized     int64     `json:"quantized"`
+	MemoryMapped  int64     `json:"memory_mapped"`
+	Limit         int64     `json:"limit"`
+	Available     int64     `json:"available"`
+}
 
-	// Canonical storage memory usage in bytes
-	Storage int64 `json:"storage"`
-
-	// Index memory usage in bytes
-	Index int64 `json:"index"`
-
-	// Cache memory usage in bytes
-	Cache int64 `json:"cache"`
-
-	// Quantized data memory usage in bytes
-	Quantized int64 `json:"quantized"`
-
-	// Memory-mapped data size in bytes
-	MemoryMapped int64 `json:"memory_mapped"`
-
-	// Memory limit in bytes (0 = no limit)
-	Limit int64 `json:"limit"`
-
-	// Available memory before hitting limit
-	Available int64 `json:"available"`
-
-	// Memory pressure level
-	PressureLevel string `json:"pressure_level"`
-
-	// Timestamp of measurement
-	Timestamp time.Time `json:"timestamp"`
+func calculatePressureLevel(total, limit int64) string {
+	if limit <= 0 {
+		return "normal"
+	}
+	ratio := float64(total) / float64(limit)
+	if ratio >= 0.90 {
+		return "critical"
+	}
+	if ratio >= 0.75 {
+		return "high"
+	}
+	if ratio >= 0.50 {
+		return "warning"
+	}
+	return "normal"
 }
 
 // GlobalMemoryUsage represents memory usage across all collections in the database
 type GlobalMemoryUsage struct {
-	// Total memory usage across all collections
-	TotalMemory int64 `json:"total_memory"`
-
-	// Total index memory usage
-	TotalIndex int64 `json:"total_index"`
-
-	// Total cache memory usage
-	TotalCache int64 `json:"total_cache"`
-
-	// Total quantized data memory usage
-	TotalQuantized int64 `json:"total_quantized"`
-
-	// Total memory-mapped data size
-	TotalMemoryMapped int64 `json:"total_memory_mapped"`
-
-	// Per-collection memory statistics
-	Collections map[string]*CollectionMemoryStats `json:"collections"`
-
-	// Timestamp of measurement
-	Timestamp time.Time `json:"timestamp"`
+	Timestamp         time.Time                         `json:"timestamp"`
+	Collections       map[string]*CollectionMemoryStats `json:"collections"`
+	TotalMemory       int64                             `json:"total_memory"`
+	TotalIndex        int64                             `json:"total_index"`
+	TotalCache        int64                             `json:"total_cache"`
+	TotalQuantized    int64                             `json:"total_quantized"`
+	TotalMemoryMapped int64                             `json:"total_memory_mapped"`
 }

@@ -32,6 +32,7 @@ func TestHNSWPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create HNSW index: %v", err)
 	}
+	defer index.Close()
 
 	// Insert some test vectors
 	vectors := [][]float32{
@@ -75,6 +76,7 @@ func TestHNSWPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create second HNSW index: %v", err)
 	}
+	defer index2.Close()
 	if err := index2.LoadFromDisk(ctx, testFile); err != nil {
 		t.Fatalf("Failed to load index from disk: %v", err)
 	}

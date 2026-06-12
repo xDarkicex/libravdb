@@ -12,7 +12,7 @@ import (
 
 func TestShardedUpsertInsertOnNewID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestShardedUpsertInsertOnNewID(t *testing.T) {
 
 func TestShardedUpsertReplaceOnExistingID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestShardedUpsertReplaceOnExistingID(t *testing.T) {
 
 func TestShardedUpsertMetadataReplaceNotMerge(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestShardedUpsertMetadataReplaceNotMerge(t *testing.T) {
 
 func TestShardedUpsertOrdinalPreservedOnReplace(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestShardedUpsertOrdinalPreservedOnReplace(t *testing.T) {
 
 func TestShardedUpsertConcurrentSameID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestShardedUpsertConcurrentSameID(t *testing.T) {
 
 func TestShardedUpsertConcurrentDifferentShards(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)), WithMaxWriteQueueDepth(80))
+	db, err := Open(WithStoragePath(testDBPath(t)), WithMaxWriteQueueDepth(80))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestShardedUpsertConcurrentDifferentShards(t *testing.T) {
 
 func TestShardedUpsertMultipleReplacesSameID(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(WithStoragePath(testDBPath(t)))
+	db, err := Open(WithStoragePath(testDBPath(t)))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}

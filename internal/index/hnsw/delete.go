@@ -3,8 +3,11 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"math"
+	"slices"
 
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 // deleteNode removes a vector from the HNSW index (internal implementation)
@@ -16,7 +19,7 @@ func (h *Index) deleteNode(ctx context.Context, id string) error {
 	}
 	nodeID, node := h.findNodeByID(id)
 	if nodeID == ^uint32(0) {
-		return fmt.Errorf("node with ID '%s' not found", id)
+		return fmt.Errorf("node with ID '%s': %w", id, util.ErrNotFound)
 	}
 	return h.deleteNodeLocked(ctx, nodeID, node, id)
 }
@@ -28,7 +31,7 @@ func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
 		return fmt.Errorf("cannot delete from empty index")
 	}
 	if ordinal >= uint32(len(h.nodes)) || h.nodes[ordinal] == nil {
-		return fmt.Errorf("node with ordinal %d not found", ordinal)
+		return fmt.Errorf("node with ordinal %d: %w", ordinal, util.ErrNotFound)
 	}
 	return h.deleteNodeLocked(ctx, ordinal, h.nodes[ordinal], h.ordinalToID[ordinal])
 }
@@ -37,6 +40,7 @@ func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node,
 	// Handle special case: deleting the only node
 	if h.size == 1 {
 		h.deleteStoredVector(node)
+		h.freeNodeLinks(node) // release off-heap SFL link slots
 		h.nodes = h.nodes[:0]
 		h.entryPoint = nil
 		h.maxLevel = 0
@@ -101,16 +105,21 @@ func (h *Index) removeAllConnections(ctx context.Context, targetID uint32, targe
 
 func (h *Index) removeIncomingConnections(targetID uint32, level int) []uint32 {
 	affected := make([]uint32, 0)
-	for nodeID, node := range h.nodes {
-		if node == nil || uint32(nodeID) == targetID || level >= len(node.Links) {
+	targetNode := h.nodes[targetID]
+	if targetNode == nil || level >= len(targetNode.Backlinks) {
+		return affected
+	}
+
+	for _, incomingID := range targetNode.Backlinks[level] {
+		if incomingID >= uint32(len(h.nodes)) {
+			continue
+		}
+		node := h.nodes[incomingID]
+		if node == nil || level >= len(node.Links) {
 			continue
 		}
 
 		links := node.Links[level]
-		if len(links) == 0 {
-			continue
-		}
-
 		newLinks := links[:0]
 		removed := false
 		for _, linkID := range links {
@@ -122,9 +131,10 @@ func (h *Index) removeIncomingConnections(targetID uint32, level int) []uint32 {
 		}
 		if removed {
 			node.Links[level] = newLinks
-			affected = append(affected, uint32(nodeID))
+			affected = append(affected, incomingID)
 		}
 	}
+	// We do not need to clear targetNode.Backlinks[level] because targetNode is being deleted anyway.
 	return affected
 }
 
@@ -137,12 +147,28 @@ func (h *Index) removeConnection(fromID, toID uint32, level int) {
 
 	// Find and remove the connection efficiently
 	links := fromNode.Links[level]
+	removed := false
 	for i, linkID := range links {
 		if linkID == toID {
 			// Remove by swapping with last element and truncating
 			links[i] = links[len(links)-1]
 			fromNode.Links[level] = links[:len(links)-1]
+			removed = true
 			break
+		}
+	}
+
+	if removed {
+		toNode := h.nodes[toID]
+		if toNode != nil && level < len(toNode.Backlinks) {
+			backlinks := toNode.Backlinks[level]
+			for i, blID := range backlinks {
+				if blID == fromID {
+					backlinks[i] = backlinks[len(backlinks)-1]
+					toNode.Backlinks[level] = backlinks[:len(backlinks)-1]
+					break
+				}
+			}
 		}
 	}
 }
@@ -152,6 +178,12 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	if len(neighbors) < 2 {
 		return nil // Nothing to reconnect
 	}
+
+	arena := h.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		h.scratchPool.Put(arena)
+	}()
 
 	// Check for cancellation before expensive reconnection
 	select {
@@ -166,7 +198,10 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	}
 
 	// Precompute all distances between valid neighbors
-	validNeighbors := make([]uint32, 0, len(neighbors))
+	validNeighbors, err := memory.ArenaSlice[uint32](arena, len(neighbors))
+	if err != nil {
+		return fmt.Errorf("arena allocate validNeighbors: %w", err)
+	}
 	for _, neighborID := range neighbors {
 		if neighborID < uint32(len(h.nodes)) && h.nodes[neighborID] != nil {
 			validNeighbors = append(validNeighbors, neighborID)
@@ -176,42 +211,32 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	if len(validNeighbors) < 2 {
 		return nil
 	}
+	D := len(validNeighbors)
 
-	// Precompute distance matrix
-	distanceCache := make(map[[2]uint32]float32)
-	for i, id1 := range validNeighbors {
-		// Check for cancellation during distance computation
-		if i%10 == 0 { // Check every 10 iterations to avoid too much overhead
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-		}
-
-		for j, id2 := range validNeighbors {
-			if i >= j {
-				continue // Only compute upper triangle
-			}
-
-			node1 := h.nodes[id1]
-			node2 := h.nodes[id2]
-			if node1 == nil || node2 == nil {
-				continue
-			}
-
-			dist, err := h.computeDistance(nil, nil, node1, node2)
+	// Precompute a D×D distance matrix so each node's distance to every
+	// other node is computed once, not once per ordered pair.
+	distMat, err := memory.ArenaSlice[float32](arena, D*D)
+	if err != nil {
+		return fmt.Errorf("arena allocate distance matrix: %w", err)
+	}
+	distMat = distMat[:D*D]
+	for i := 0; i < D; i++ {
+		ni := validNeighbors[i]
+		nodeI := h.nodes[ni]
+		for j := i + 1; j < D; j++ {
+			nj := validNeighbors[j]
+			nodeJ := h.nodes[nj]
+			d, err := h.computeDistance(nil, nil, nodeI, nodeJ)
 			if err != nil {
-				continue
+				d = float32(math.Inf(1))
 			}
-			distanceCache[[2]uint32{id1, id2}] = dist
-			distanceCache[[2]uint32{id2, id1}] = dist
+			distMat[i*D+j] = d
+			distMat[j*D+i] = d
 		}
 	}
 
 	// For each neighbor, try to connect it to other neighbors
-	for _, neighborID := range validNeighbors {
-		// Check for cancellation between neighbors
+	for ni, neighborID := range validNeighbors {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -223,29 +248,38 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 			continue
 		}
 
-		// Current number of connections for this neighbor
 		currentConnections := len(neighborNode.Links[level])
-		if currentConnections >= maxM {
-			continue // Already at capacity
+
+		minConnections := maxM / 2
+		if minConnections < 1 {
+			minConnections = 1
 		}
 
-		// Find potential new connections from remaining neighbors
-		candidates := make([]*util.Candidate, 0)
-		for _, otherID := range validNeighbors {
-			if neighborID == otherID || h.nodes[otherID] == nil {
+		if currentConnections >= minConnections {
+			continue
+		}
+
+		// Find potential new connections from remaining neighbors.
+		// Distances come from the precomputed matrix — no per-pair recompute.
+		candidatesSlice, _ := memory.ArenaSlice[*util.Candidate](arena, len(validNeighbors))
+		candidates := candidatesSlice[:0]
+		for nj, otherID := range validNeighbors {
+			if ni == nj || h.nodes[otherID] == nil {
 				continue
 			}
 
-			// Check if already connected
 			if h.hasConnection(neighborID, otherID, level) {
 				continue
 			}
 
-			// Use precomputed distance
-			dist := distanceCache[[2]uint32{neighborID, otherID}]
+			d := distMat[ni*D+nj]
+			if d == float32(math.Inf(1)) {
+				continue
+			}
+
 			candidates = append(candidates, &util.Candidate{
 				ID:       otherID,
-				Distance: dist,
+				Distance: d,
 			})
 		}
 
@@ -253,7 +287,7 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 			continue
 		}
 
-		// Select best candidates to connect
+		// Select best candidates to connect (aim to restore to maxM)
 		availableSlots := maxM - currentConnections
 		numToSelect := min(len(candidates), availableSlots)
 
@@ -294,30 +328,39 @@ func (h *Index) selectBestCandidatesByDistance(candidates []*util.Candidate, num
 		return candidates
 	}
 
-	// Sort candidates by distance (bubble sort for small arrays, or use heap for larger ones)
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := 0; j < len(candidates)-i-1; j++ {
-			if candidates[j].Distance > candidates[j+1].Distance {
-				candidates[j], candidates[j+1] = candidates[j+1], candidates[j]
-			}
+	// Sort candidates by distance using standard library slices.SortFunc
+	slices.SortFunc(candidates, func(a, b *util.Candidate) int {
+		if a.Distance < b.Distance {
+			return -1
 		}
-	}
+		if a.Distance > b.Distance {
+			return 1
+		}
+		return 0
+	})
 
 	return candidates[:numToSelect]
 }
 
 // createBidirectionalConnection creates a bidirectional connection between two nodes
 func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int) {
-	// Add nodeID2 to nodeID1's connections
 	node1 := h.nodes[nodeID1]
+	node2 := h.nodes[nodeID2]
+
 	if node1 != nil && level < len(node1.Links) {
-		appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2)
+		if h.appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2) {
+			if node2 != nil && level < len(node2.Backlinks) {
+				node2.Backlinks[level] = append(node2.Backlinks[level], nodeID1)
+			}
+		}
 	}
 
-	// Add nodeID1 to nodeID2's connections
-	node2 := h.nodes[nodeID2]
 	if node2 != nil && level < len(node2.Links) {
-		appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1)
+		if h.appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1) {
+			if node1 != nil && level < len(node1.Backlinks) {
+				node1.Backlinks[level] = append(node1.Backlinks[level], nodeID2)
+			}
+		}
 	}
 }
 
@@ -340,16 +383,17 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 
 	// Fallback: scan all nodes for highest level
 	var fallbackEntryPoint *Node
+	var fallbackOrdinal uint32
 	newMaxLevel := -1
 
 	for i, node := range h.nodes {
 		if node == nil || uint32(i) == deletedID {
 			continue
 		}
-
 		if node.Level > newMaxLevel {
 			newMaxLevel = node.Level
 			fallbackEntryPoint = node
+			fallbackOrdinal = uint32(i)
 		}
 	}
 
@@ -360,8 +404,9 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 	h.entryPoint = fallbackEntryPoint
 	h.maxLevel = newMaxLevel
 
-	// Rebuild entry point candidates list
-	h.rebuildEntryPointCandidates()
+	// Add the fallback to the candidate list. The list is maintained
+	// incrementally during Insert/Delete; a full O(N) rebuild is unnecessary.
+	h.entryPointCandidates = append(h.entryPointCandidates, fallbackOrdinal)
 
 	return nil
 }
@@ -398,19 +443,6 @@ func (h *Index) removeFromEntryPointCandidates(nodeID uint32) {
 	}
 }
 
-// rebuildEntryPointCandidates rebuilds the entry point candidates list
-func (h *Index) rebuildEntryPointCandidates() {
-	h.entryPointCandidates = h.entryPointCandidates[:0] // Clear existing
-
-	// Add nodes with level >= threshold (e.g., level 2+) as candidates
-	levelThreshold := 2
-	for i, node := range h.nodes {
-		if node != nil && node.Level >= levelThreshold {
-			h.entryPointCandidates = append(h.entryPointCandidates, uint32(i))
-		}
-	}
-}
-
 // removeNodeFromIndex removes a node from all index data structures
 func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
 	delete(h.idToIndex, id)
@@ -419,6 +451,7 @@ func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
 	h.removeFromEntryPointCandidates(nodeID)
 
 	if nodeID < uint32(len(h.nodes)) {
+		h.freeNodeLinks(h.nodes[nodeID])
 		h.nodes[nodeID].Links = nil
 		h.nodes[nodeID].CompressedVector = nil
 		h.nodes[nodeID] = nil
@@ -431,7 +464,7 @@ func (h *Index) deleteStoredVector(node *Node) {
 	}
 	_ = h.rawVectorStore.Delete(VectorRef{
 		Kind:  VectorEncodingRaw,
-		Slot:  node.Ordinal,
+		Slot:  node.Slot,
 		Bytes: uint32(h.config.Dimension * 4),
 		Valid: true,
 	})

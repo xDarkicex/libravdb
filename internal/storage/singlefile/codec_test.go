@@ -1,6 +1,10 @@
 package singlefile
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/xDarkicex/libravdb/internal/util"
+)
 
 func TestMetadataCodecAcceptsAllIntegerWidths(t *testing.T) {
 	metadata := map[string]interface{}{
@@ -17,16 +21,16 @@ func TestMetadataCodecAcceptsAllIntegerWidths(t *testing.T) {
 		"slice": []interface{}{int32(7), uint16(9)},
 	}
 
-	enc := acquireBinaryEncoder(0)
-	if err := enc.writeMetadata(metadata); err != nil {
-		t.Fatalf("writeMetadata() error = %v", err)
+	enc := util.AcquireBinaryEncoder(0)
+	if err := enc.WriteMetadata(metadata); err != nil {
+		t.Fatalf("WriteMetadata() error = %v", err)
 	}
-	encoded := enc.detachBytes()
-	releaseBinaryEncoder(enc)
+	encoded := enc.DetachBytes()
+	util.ReleaseBinaryEncoder(enc)
 
-	got, err := (&binaryDecoder{data: encoded}).readMetadata()
+	got, err := (&util.BinaryDecoder{Data: encoded}).ReadMetadata()
 	if err != nil {
-		t.Fatalf("readMetadata() error = %v", err)
+		t.Fatalf("ReadMetadata() error = %v", err)
 	}
 
 	if got["int8"] != int64(-8) {

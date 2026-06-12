@@ -83,7 +83,7 @@ func TestOpenClawMemoryProfile(t *testing.T) {
 			searchDuration := time.Since(searchStart)
 			searchQPS := float64(len(queries)) / searchDuration.Seconds()
 
-			memUsage, memErr := collection.GetMemoryUsage()
+			memUsage, memErr := collection.GetMemoryUsage(context.Background())
 			if memErr != nil {
 				t.Fatalf("failed to get memory usage: %v", memErr)
 			}
@@ -328,7 +328,7 @@ func createOpenClawCollection(tb testing.TB, workload openClawWorkload) (*librav
 func newOpenClawDBAndCollection(tb testing.TB, workload openClawWorkload) (*libravdb.Database, *libravdb.Collection) {
 	tb.Helper()
 
-	db, err := libravdb.New(libravdb.WithStoragePath(filepath.Join(tb.TempDir(), "openclaw.libravdb")), libravdb.WithMetrics(false))
+	db, err := libravdb.Open(libravdb.WithStoragePath(filepath.Join(tb.TempDir(), "openclaw.libravdb")), libravdb.WithMetrics(false))
 	if err != nil {
 		tb.Fatalf("failed to create database: %v", err)
 	}

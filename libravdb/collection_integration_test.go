@@ -18,7 +18,7 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 	ctx := context.Background()
 
 	// Create database with enhanced configuration
-	db, err := New(
+	db, err := Open(
 		WithStoragePath(filepath.Join(tmpDir, "enhanced.libravdb")),
 		WithMetrics(true),
 	)
@@ -71,7 +71,7 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 	}
 
 	// Verify configuration was applied correctly
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats.Dimension != 128 {
 		t.Errorf("Expected dimension 128, got %d", stats.Dimension)
 	}
@@ -79,9 +79,9 @@ func TestEnhancedCollectionConfiguration(t *testing.T) {
 	// Test inserting vectors with metadata that matches the schema
 
 	testVectors := []struct {
+		metadata map[string]interface{}
 		id       string
 		vector   []float32
-		metadata map[string]interface{}
 	}{
 		{
 			id:     "vec1",
@@ -156,7 +156,7 @@ func TestBackwardCompatibleConfiguration(t *testing.T) {
 	// Test that old-style configuration still works
 	tmpDir := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(tmpDir, "compat.libravdb")))
+	db, err := Open(WithStoragePath(filepath.Join(tmpDir, "compat.libravdb")))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestBackwardCompatibleConfiguration(t *testing.T) {
 func TestConfigurationValidationIntegration(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(tmpDir, "validation.libravdb")))
+	db, err := Open(WithStoragePath(filepath.Join(tmpDir, "validation.libravdb")))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestShardedCollectionStatsAggregation(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(dbPath, "stats_test")))
+	db, err := Open(WithStoragePath(filepath.Join(dbPath, "stats_test")))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestShardedCollectionStatsAggregation(t *testing.T) {
 	}
 
 	// Stats should not panic and should return aggregated values
-	stats := collection.Stats()
+	stats := collection.Stats(context.Background())
 	if stats == nil {
 		t.Fatal("Stats() returned nil")
 	}
@@ -291,7 +291,7 @@ func TestShardedCollectionGetMemoryUsage(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(dbPath, "mem_test")))
+	db, err := Open(WithStoragePath(filepath.Join(dbPath, "mem_test")))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestShardedCollectionGetMemoryUsage(t *testing.T) {
 	}
 
 	// GetMemoryUsage should not panic and should return aggregate usage
-	usage, err := collection.GetMemoryUsage()
+	usage, err := collection.GetMemoryUsage(context.Background())
 	if err != nil {
 		t.Fatalf("GetMemoryUsage failed: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestShardedCollectionTriggerGC(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(dbPath, "gc_test")))
+	db, err := Open(WithStoragePath(filepath.Join(dbPath, "gc_test")))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestShardedSearchUsesPerShardK(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(dbPath, "search_test")))
+	db, err := Open(WithStoragePath(filepath.Join(dbPath, "search_test")))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestShardedSearchUsesBoundedTopKMerge(t *testing.T) {
 	ctx := context.Background()
 	dbPath := t.TempDir()
 
-	db, err := New(WithStoragePath(filepath.Join(dbPath, "merge_test")))
+	db, err := Open(WithStoragePath(filepath.Join(dbPath, "merge_test")))
 	if err != nil {
 		t.Fatalf("new database: %v", err)
 	}

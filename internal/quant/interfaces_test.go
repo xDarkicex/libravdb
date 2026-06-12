@@ -6,12 +6,12 @@ import (
 
 func TestQuantizationType_String(t *testing.T) {
 	tests := []struct {
-		qType    QuantizationType
 		expected string
+		qType    QuantizationType
 	}{
-		{ProductQuantization, "product"},
-		{ScalarQuantization, "scalar"},
-		{QuantizationType(999), "unknown"},
+		{expected: "product", qType: ProductQuantization},
+		{expected: "scalar", qType: ScalarQuantization},
+		{expected: "unknown", qType: QuantizationType(999)},
 	}
 
 	for _, tt := range tests {
@@ -25,8 +25,8 @@ func TestQuantizationType_String(t *testing.T) {
 
 func TestQuantizationConfig_Validate(t *testing.T) {
 	tests := []struct {
-		name    string
 		config  *QuantizationConfig
+		name    string
 		wantErr bool
 	}{
 		{
@@ -129,9 +129,9 @@ func TestQuantizationConfig_Validate(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	tests := []struct {
+		want  *QuantizationConfig
 		name  string
 		qType QuantizationType
-		want  *QuantizationConfig
 	}{
 		{
 			name:  "product quantization default",

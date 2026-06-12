@@ -4,11 +4,14 @@ import (
 	"context"
 	"time"
 
+	"unsafe"
+
 	"github.com/xDarkicex/libravdb/internal/index/flat"
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
 	"github.com/xDarkicex/libravdb/internal/index/ivfpq"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 // Index defines the interface for vector indexes
@@ -25,39 +28,39 @@ type Index interface {
 	SaveToDisk(ctx context.Context, path string) error
 	LoadFromDisk(ctx context.Context, path string) error
 	SerializeToBytes() ([]byte, error)
-	DeserializeFromBytes(data []byte) error
+	DeserializeFromBytes(ctx context.Context, data []byte) error
 	GetPersistenceMetadata() *PersistenceMetadata
 }
 
 // VectorEntry represents a vector entry (avoid circular imports)
 type VectorEntry struct {
-	ID       string
-	Ordinal  uint32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
 }
 
 // SearchResult represents a search result (avoid circular imports)
 type SearchResult struct {
-	Ordinal  uint32
-	ID       string
-	Score    float32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Ordinal  uint32
+	Score    float32
 }
 
 // NEW: PersistenceMetadata holds metadata about persisted index
 type PersistenceMetadata struct {
-	Version       uint32    `json:"version"`        // Binary format version
-	NodeCount     int       `json:"node_count"`     // Total number of nodes
-	Dimension     int       `json:"dimension"`      // Vector dimension
-	MaxLevel      int       `json:"max_level"`      // Maximum graph level
-	IndexType     string    `json:"index_type"`     // Index algorithm (HNSW, etc.)
-	CreatedAt     time.Time `json:"created_at"`     // When index was persisted
-	ChecksumCRC32 uint32    `json:"checksum_crc32"` // File integrity checksum
-	FileSize      int64     `json:"file_size"`      // Total file size in bytes
+	CreatedAt     time.Time `json:"created_at"`
+	IndexType     string    `json:"index_type"`
+	NodeCount     int       `json:"node_count"`
+	Dimension     int       `json:"dimension"`
+	MaxLevel      int       `json:"max_level"`
+	FileSize      int64     `json:"file_size"`
+	Version       uint32    `json:"version"`
+	ChecksumCRC32 uint32    `json:"checksum_crc32"`
 }
 
 // IndexType represents different index algorithms
@@ -85,26 +88,25 @@ func (it IndexType) String() string {
 
 // HNSWConfig holds configuration for HNSW index
 type HNSWConfig struct {
+	Provider       hnsw.VectorProvider
+	Quantization   *quant.QuantizationConfig
+	RawVectorStore string
 	Dimension      int
 	M              int
 	EfConstruction int
 	EfSearch       int
 	ML             float64
 	Metric         util.DistanceMetric
-	Provider       hnsw.VectorProvider
-	RawVectorStore string
 	RawStoreCap    int
-	// Quantization configuration (optional)
-	Quantization *quant.QuantizationConfig
 }
 
 // IVFPQConfig holds configuration for IVF-PQ index
 type IVFPQConfig struct {
+	Quantization  *quant.QuantizationConfig
 	Dimension     int
 	NClusters     int
 	NProbes       int
 	Metric        util.DistanceMetric
-	Quantization  *quant.QuantizationConfig
 	MaxIterations int
 	Tolerance     float64
 	RandomSeed    int64
@@ -112,14 +114,15 @@ type IVFPQConfig struct {
 
 // FlatConfig holds configuration for Flat index
 type FlatConfig struct {
+	Quantization *quant.QuantizationConfig
 	Dimension    int
 	Metric       util.DistanceMetric
-	Quantization *quant.QuantizationConfig
 }
 
 // hnswWrapper wraps the HNSW index to adapt between interface types
 type hnswWrapper struct {
 	index *hnsw.Index
+	sfl   *memory.ShardedFreeList
 }
 
 func (w *hnswWrapper) RawVectorStoreProfile() map[string]any {
@@ -141,16 +144,29 @@ func (w *hnswWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 // BatchInsert adapts the interface VectorEntry slice to HNSW VectorEntry slice
 func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
 	hnswEntries := make([]*hnsw.VectorEntry, len(entries))
+	slots := make([][]byte, len(entries))
 	for i, entry := range entries {
-		hnswEntries[i] = &hnsw.VectorEntry{
-			ID:       entry.ID,
-			Ordinal:  entry.Ordinal,
-			Vector:   entry.Vector,
-			Metadata: entry.Metadata,
-			Version:  entry.Version,
+		slot, err := w.sfl.Allocate()
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = w.sfl.Deallocate(slots[j])
+			}
+			return err
 		}
+		slots[i] = slot
+		hnswEntry := (*hnsw.VectorEntry)(unsafe.Pointer(&slot[48]))
+		hnswEntry.ID = entry.ID
+		hnswEntry.Ordinal = entry.Ordinal
+		hnswEntry.Vector = entry.Vector
+		hnswEntry.Metadata = entry.Metadata
+		hnswEntry.Version = entry.Version
+		hnswEntries[i] = hnswEntry
 	}
-	return w.index.BatchInsert(ctx, hnswEntries)
+	err := w.index.BatchInsert(ctx, hnswEntries)
+	for _, slot := range slots {
+		_ = w.sfl.Deallocate(slot)
+	}
+	return err
 }
 
 // Search adapts the search results from HNSW to interface types
@@ -191,6 +207,9 @@ func (w *hnswWrapper) MemoryUsage() int64 {
 
 // Close delegates to the wrapped index
 func (w *hnswWrapper) Close() error {
+	if w.sfl != nil {
+		_ = w.sfl.Free()
+	}
 	return w.index.Close()
 }
 
@@ -210,8 +229,8 @@ func (w *hnswWrapper) SerializeToBytes() ([]byte, error) {
 }
 
 // DeserializeFromBytes delegates to the wrapped HNSW index
-func (w *hnswWrapper) DeserializeFromBytes(data []byte) error {
-	return w.index.DeserializeFromBytes(data)
+func (w *hnswWrapper) DeserializeFromBytes(ctx context.Context, data []byte) error {
+	return w.index.DeserializeFromBytes(ctx, data)
 }
 
 // NEW: GetPersistenceMetadata delegates to the wrapped index
@@ -256,12 +275,28 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		return nil, err
 	}
 
-	return &hnswWrapper{index: hnswIndex}, nil
+	slotSize := 48 + uint64(unsafe.Sizeof(hnsw.VectorEntry{}))
+	slotSize = (slotSize + 7) &^ 7
+	if slotSize < 32 {
+		slotSize = 32
+	}
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		SlotSize:  slotSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 4,
+	}, 64)
+	if err != nil {
+		hnswIndex.Close()
+		return nil, err
+	}
+
+	return &hnswWrapper{index: hnswIndex, sfl: sfl}, nil
 }
 
 // ivfpqWrapper wraps the IVF-PQ index to adapt between interface types
 type ivfpqWrapper struct {
 	index *ivfpq.Index
+	sfl   *memory.ShardedFreeList
 }
 
 func (w *ivfpqWrapper) Train(ctx context.Context, vectors [][]float32) error {
@@ -300,14 +335,32 @@ func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 	return w.index.Insert(ctx, ivfpqEntry)
 }
 
-// BatchInsert provides batch insertion for IVF-PQ (fallback to individual inserts for now)
+// BatchInsert delegates batch insertion to the underlying IVF-PQ index
 func (w *ivfpqWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	for _, entry := range entries {
-		if err := w.Insert(ctx, entry); err != nil {
+	ivfpqEntries := make([]*ivfpq.VectorEntry, len(entries))
+	slots := make([][]byte, len(entries))
+	for i, entry := range entries {
+		slot, err := w.sfl.Allocate()
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = w.sfl.Deallocate(slots[j])
+			}
 			return err
 		}
+		slots[i] = slot
+		ivfpqEntry := (*ivfpq.VectorEntry)(unsafe.Pointer(&slot[48]))
+		ivfpqEntry.ID = entry.ID
+		ivfpqEntry.Ordinal = entry.Ordinal
+		ivfpqEntry.Vector = entry.Vector
+		ivfpqEntry.Metadata = entry.Metadata
+		ivfpqEntry.Version = entry.Version
+		ivfpqEntries[i] = ivfpqEntry
 	}
-	return nil
+	err := w.index.BatchInsert(ctx, ivfpqEntries)
+	for _, slot := range slots {
+		_ = w.sfl.Deallocate(slot)
+	}
+	return err
 }
 
 // Search adapts the search results from IVF-PQ to interface types
@@ -347,6 +400,9 @@ func (w *ivfpqWrapper) MemoryUsage() int64 {
 
 // Close delegates to the wrapped index
 func (w *ivfpqWrapper) Close() error {
+	if w.sfl != nil {
+		_ = w.sfl.Free()
+	}
 	return w.index.Close()
 }
 
@@ -366,8 +422,8 @@ func (w *ivfpqWrapper) SerializeToBytes() ([]byte, error) {
 }
 
 // DeserializeFromBytes delegates to the wrapped IVFPQ index
-func (w *ivfpqWrapper) DeserializeFromBytes(data []byte) error {
-	return w.index.DeserializeFromBytes(data)
+func (w *ivfpqWrapper) DeserializeFromBytes(ctx context.Context, data []byte) error {
+	return w.index.DeserializeFromBytes(ctx, data)
 }
 
 // GetPersistenceMetadata delegates to the wrapped index
@@ -377,8 +433,12 @@ func (w *ivfpqWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 		return nil
 	}
 
-	// For now, return a basic metadata structure
-	// TODO: Implement proper persistence metadata for IVF-PQ
+	// FileSize is the total bytes of compressed vectors (the on-disk payload
+	// for an IVF-PQ index). ChecksumCRC32 stays 0 here because the in-memory
+	// representation has no canonical serialized form without calling
+	// SerializeToBytes (which would allocate the full buffer). Callers that
+	// need a real CRC should persist via SaveToDisk and read the on-disk
+	// header instead.
 	return &PersistenceMetadata{
 		Version:       1,
 		NodeCount:     w.index.Size(),
@@ -386,8 +446,8 @@ func (w *ivfpqWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 		MaxLevel:      0, // Not applicable for IVF-PQ
 		IndexType:     "IVF-PQ",
 		CreatedAt:     time.Now(),
-		ChecksumCRC32: 0, // TODO: Implement checksum
-		FileSize:      0, // TODO: Implement file size calculation
+		ChecksumCRC32: 0, // 0 for in-memory; populated by on-disk format header
+		FileSize:      ivfpqMeta.CompressedSize,
 	}
 }
 
@@ -410,12 +470,28 @@ func NewIVFPQ(config *IVFPQConfig) (Index, error) {
 		return nil, err
 	}
 
-	return &ivfpqWrapper{index: ivfpqIndex}, nil
+	slotSize := 48 + uint64(unsafe.Sizeof(ivfpq.VectorEntry{}))
+	slotSize = (slotSize + 7) &^ 7
+	if slotSize < 32 {
+		slotSize = 32
+	}
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		SlotSize:  slotSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 4,
+	}, 64)
+	if err != nil {
+		ivfpqIndex.Close()
+		return nil, err
+	}
+
+	return &ivfpqWrapper{index: ivfpqIndex, sfl: sfl}, nil
 }
 
 // flatWrapper wraps the Flat index to adapt between interface types
 type flatWrapper struct {
 	index *flat.Index
+	sfl   *memory.ShardedFreeList
 }
 
 // Insert adapts the interface VectorEntry to Flat VectorEntry
@@ -432,15 +508,28 @@ func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 // BatchInsert provides batch insertion for Flat (fallback to individual inserts for now)
 func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
 	flatEntries := make([]*flat.VectorEntry, len(entries))
+	slots := make([][]byte, len(entries))
 	for i, entry := range entries {
-		flatEntries[i] = &flat.VectorEntry{
-			ID:       entry.ID,
-			Vector:   entry.Vector,
-			Metadata: entry.Metadata,
-			Version:  entry.Version,
+		slot, err := w.sfl.Allocate()
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = w.sfl.Deallocate(slots[j])
+			}
+			return err
 		}
+		slots[i] = slot
+		flatEntry := (*flat.VectorEntry)(unsafe.Pointer(&slot[48]))
+		flatEntry.ID = entry.ID
+		flatEntry.Vector = entry.Vector
+		flatEntry.Metadata = entry.Metadata
+		flatEntry.Version = entry.Version
+		flatEntries[i] = flatEntry
 	}
-	return w.index.BatchInsert(ctx, flatEntries)
+	err := w.index.BatchInsert(ctx, flatEntries)
+	for _, slot := range slots {
+		_ = w.sfl.Deallocate(slot)
+	}
+	return err
 }
 
 // Search adapts the search results from Flat to interface types
@@ -480,6 +569,9 @@ func (w *flatWrapper) MemoryUsage() int64 {
 
 // Close delegates to the wrapped index
 func (w *flatWrapper) Close() error {
+	if w.sfl != nil {
+		_ = w.sfl.Free()
+	}
 	return w.index.Close()
 }
 
@@ -499,8 +591,8 @@ func (w *flatWrapper) SerializeToBytes() ([]byte, error) {
 }
 
 // DeserializeFromBytes delegates to the wrapped Flat index
-func (w *flatWrapper) DeserializeFromBytes(data []byte) error {
-	return w.index.DeserializeFromBytes(data)
+func (w *flatWrapper) DeserializeFromBytes(ctx context.Context, data []byte) error {
+	return w.index.DeserializeFromBytes(ctx, data)
 }
 
 // GetPersistenceMetadata delegates to the wrapped index
@@ -537,5 +629,20 @@ func NewFlat(config *FlatConfig) (Index, error) {
 		return nil, err
 	}
 
-	return &flatWrapper{index: flatIndex}, nil
+	slotSize := 48 + uint64(unsafe.Sizeof(flat.VectorEntry{}))
+	slotSize = (slotSize + 7) &^ 7
+	if slotSize < 32 {
+		slotSize = 32
+	}
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		SlotSize:  slotSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 4,
+	}, 64)
+	if err != nil {
+		flatIndex.Close()
+		return nil, err
+	}
+
+	return &flatWrapper{index: flatIndex, sfl: sfl}, nil
 }

@@ -1,15 +1,20 @@
 package hnsw
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 type searchScratch struct {
+	arena        *memory.Arena
 	visitedMarks []uint32
-	visitMark    uint32
 	maxHeapBuf   []util.Candidate
 	minHeapBuf   []util.Candidate
 	pruneBuf     []util.Candidate
+	visitMark    uint32
 }
 
 type candidateMinHeap struct {
@@ -101,11 +106,11 @@ func (h *candidateMaxHeap) PopCandidate() util.Candidate {
 	}
 	return item
 }
-func (h *candidateMaxHeap) Top() *util.Candidate {
+func (h *candidateMaxHeap) Top() util.Candidate {
 	if len(h.items) == 0 {
-		return nil
+		return util.Candidate{}
 	}
-	return &h.items[0]
+	return h.items[0]
 }
 func (h *candidateMaxHeap) siftUp(idx int) {
 	for idx > 0 {
@@ -141,23 +146,34 @@ func (h *candidateMaxHeap) siftDown(idx int) {
 }
 
 func (h *Index) acquireSearchScratch() *searchScratch {
-	scratch := h.searchScratchPool.Get().(*searchScratch)
-	nodeCount := len(h.nodes)
-	if cap(scratch.visitedMarks) < nodeCount {
-		newCap := cap(scratch.visitedMarks)
-		if newCap == 0 {
-			newCap = 1024
-		}
-		for newCap < nodeCount {
-			newCap *= 2
-		}
+	return h.acquireSearchScratchWithNodeCount(len(h.nodes))
+}
 
-		grown := make([]uint32, nodeCount, newCap)
-		copy(grown, scratch.visitedMarks)
-		scratch.visitedMarks = grown
+func (h *Index) acquireSearchScratchWithNodeCount(nodeCount int) *searchScratch {
+	scratch := h.searchScratchPool.Get().(*searchScratch)
+
+	// Ensure the Arena is sized for visitedMarks + heap bufs (~320 KB headroom).
+	needed := uint64(nodeCount*4 + 320*1024)
+	if scratch.arena == nil || scratch.arena.Remaining() < needed {
+		if scratch.arena != nil {
+			scratch.arena.Free()
+		}
+		a, err := memory.NewArena(needed)
+		if err != nil {
+			// mmap failure is fatal — the scratch is unusable.
+			panic("hnsw: failed to allocate search scratch arena: " + err.Error())
+		}
+		scratch.arena = a
 	} else {
-		scratch.visitedMarks = scratch.visitedMarks[:nodeCount]
+		scratch.arena.Reset()
 	}
+
+	marks, err := memory.ArenaSlice[uint32](scratch.arena, nodeCount)
+	if err != nil {
+		panic("hnsw: failed to allocate visited marks from arena: " + err.Error())
+	}
+	scratch.visitedMarks = marks
+
 	scratch.visitMark++
 	if scratch.visitMark == 0 {
 		for i := range scratch.visitedMarks {
@@ -169,24 +185,30 @@ func (h *Index) acquireSearchScratch() *searchScratch {
 }
 
 func (h *Index) releaseSearchScratch(scratch *searchScratch) {
+	// Arena.Reset() rewinds the bump pointer, keeping the mmap'd region
+	// so the next acquireSearchScratch can reuse it without a new mmap.
+	scratch.arena.Reset()
 	h.searchScratchPool.Put(scratch)
 }
 
 // greedySearchLevel performs the ef=1 greedy descent used by HNSW on upper layers.
-func (h *Index) greedySearchLevel(query []float32, entryPoint *Node, level int) *util.Candidate {
-	candidate, ok := h.greedySearchLevelValue(query, entryPoint, level)
+func (h *Index) greedySearchLevel(ctx context.Context, query []float32, entryPoint *Node, level int, queryState any) (*util.Candidate, error) {
+	candidate, ok, err := h.greedySearchLevelValue(ctx, query, entryPoint, level, queryState)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	return &util.Candidate{
 		ID:       candidate.ID,
 		Distance: candidate.Distance,
-	}
+	}, nil
 }
 
-func (h *Index) greedySearchLevelValue(query []float32, entryPoint *Node, level int) (util.Candidate, bool) {
+func (h *Index) greedySearchLevelValue(ctx context.Context, query []float32, entryPoint *Node, level int, queryState any) (util.Candidate, bool, error) {
 	if entryPoint == nil {
-		return util.Candidate{}, false
+		return util.Candidate{}, false, nil
 	}
 
 	scratch := h.acquireSearchScratch()
@@ -198,16 +220,22 @@ func (h *Index) greedySearchLevelValue(query []float32, entryPoint *Node, level 
 	current := entryPoint
 	currentID := h.findNodeID(current)
 	if currentID == ^uint32(0) || int(currentID) >= len(h.nodes) {
-		return util.Candidate{}, false
+		return util.Candidate{}, false, nil
 	}
 
-	currentDistance := h.computeDistanceOptimized(query, current)
-	if currentDistance < 0 {
-		return util.Candidate{}, false
+	currentDistance, err := h.computeDistanceOptimized(query, current, queryState)
+	if err != nil {
+		return util.Candidate{}, false, err
 	}
 	visited[currentID] = visitMark
 
 	for {
+		select {
+		case <-ctx.Done():
+			return util.Candidate{}, false, ctx.Err()
+		default:
+		}
+
 		improved := false
 		if level >= len(current.Links) {
 			break
@@ -224,9 +252,9 @@ func (h *Index) greedySearchLevelValue(query []float32, entryPoint *Node, level 
 				continue
 			}
 
-			neighborDistance := h.computeDistanceOptimized(query, neighborNode)
-			if neighborDistance < 0 {
-				continue
+			neighborDistance, err := h.computeDistanceOptimized(query, neighborNode, queryState)
+			if err != nil {
+				return util.Candidate{}, false, err
 			}
 
 			if neighborDistance < currentDistance {
@@ -245,38 +273,26 @@ func (h *Index) greedySearchLevelValue(query []float32, entryPoint *Node, level 
 	return util.Candidate{
 		ID:       currentID,
 		Distance: currentDistance,
-	}, true
+	}, true, nil
 }
 
-// searchLevel performs optimized search at a specific level
-func (h *Index) searchLevel(query []float32, entryPoint *Node, ef int, level int) []*util.Candidate {
-	return h.searchLevelWithOptions(query, entryPoint, ef, level, true)
+func (h *Index) searchLevel(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, queryState any) ([]*util.Candidate, error) {
+	return h.searchLevelWithOptions(ctx, query, entryPoint, ef, level, true, queryState)
 }
 
-func (h *Index) searchLevelForConstruction(query []float32, entryPoint *Node, ef int, level int) []util.Candidate {
+func (h *Index) searchLevelForConstruction(query []float32, entryPoint *Node, ef int, level int, queryState any) ([]util.Candidate, error) {
 	scratch := h.acquireSearchScratch()
 	defer h.releaseSearchScratch(scratch)
 
-	return h.searchLevelValuesWithScratch(query, entryPoint, ef, level, false, scratch)
+	return h.searchLevelValuesWithScratch(context.Background(), query, entryPoint, ef, level, false, scratch, queryState)
 }
 
-func (h *Index) searchAndSelectForConstruction(
-	query []float32,
-	entryPoint *Node,
-	ef int,
-	level int,
-	maxM int,
-) []util.Candidate {
+// searchAndSelectForConstruction finds neighbors at a specific level and selects the best ones for construction
+func (h *Index) searchAndSelectForConstruction(query []float32, entryPoint *Node, ef int, level int, maxM int, queryState any) ([]util.Candidate, error) {
 	scratch := h.acquireSearchScratch()
 	defer h.releaseSearchScratch(scratch)
 
-	selected := h.searchAndSelectForConstructionWithScratch(query, entryPoint, ef, level, maxM, scratch)
-	if len(selected) == 0 {
-		return nil
-	}
-	result := make([]util.Candidate, len(selected))
-	copy(result, selected)
-	return result
+	return h.searchAndSelectForConstructionWithScratch(query, entryPoint, ef, level, maxM, scratch, queryState)
 }
 
 func (h *Index) searchAndSelectForConstructionWithScratch(
@@ -286,29 +302,36 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 	level int,
 	maxM int,
 	scratch *searchScratch,
-) []util.Candidate {
-	workingSet := h.searchLevelScratchValues(query, entryPoint, ef, level, scratch)
+	queryState any,
+) ([]util.Candidate, error) {
+	workingSet, err := h.searchLevelScratchValues(context.Background(), query, entryPoint, ef, level, scratch, queryState)
+	if err != nil {
+		return nil, err
+	}
 	if len(workingSet) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	selected := h.neighborSelector.SelectNeighborsOptimizedValues(query, workingSet, level, h)
 	if len(selected) == 0 {
-		return nil
+		return nil, nil
 	}
 	if len(selected) > maxM {
 		selected = selected[:maxM]
 	}
-	return selected
+	return selected, nil
 }
 
-func (h *Index) searchLevelWithOptions(query []float32, entryPoint *Node, ef int, level int, sortResults bool) []*util.Candidate {
+func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, queryState any) ([]*util.Candidate, error) {
 	scratch := h.acquireSearchScratch()
 	defer h.releaseSearchScratch(scratch)
 
-	values := h.searchLevelValuesWithScratch(query, entryPoint, ef, level, sortResults, scratch)
+	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState)
+	if err != nil {
+		return nil, err
+	}
 	if len(values) == 0 {
-		return []*util.Candidate{}
+		return []*util.Candidate{}, nil
 	}
 
 	result := make([]*util.Candidate, len(values))
@@ -319,23 +342,29 @@ func (h *Index) searchLevelWithOptions(query []float32, entryPoint *Node, ef int
 			Distance: candidateCopy.Distance,
 		}
 	}
-	return result
+	return result, nil
 }
 
-func (h *Index) searchLevelValuesWithScratch(query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch) []util.Candidate {
+func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch, queryState any) ([]util.Candidate, error) {
 	if !sortResults {
-		values := h.searchLevelScratchValues(query, entryPoint, ef, level, scratch)
+		values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState)
+		if err != nil {
+			return nil, err
+		}
 		if len(values) == 0 {
-			return nil
+			return nil, nil
 		}
 		result := make([]util.Candidate, len(values))
 		copy(result, values)
-		return result
+		return result, nil
 	}
 
-	values := h.searchLevelScratchValues(query, entryPoint, ef, level, scratch)
+	values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState)
+	if err != nil {
+		return nil, err
+	}
 	if len(values) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	resultLen := len(values)
@@ -345,41 +374,44 @@ func (h *Index) searchLevelValuesWithScratch(query []float32, entryPoint *Node, 
 		result[i] = heap.PopCandidate()
 	}
 
-	return result
+	return result, nil
 }
 
-func (h *Index) searchLevelScratchValues(query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch) []util.Candidate {
+func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch, queryState any) ([]util.Candidate, error) {
 	if ef <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	visited := scratch.visitedMarks[:len(h.nodes)]
 	visitMark := scratch.visitMark
+	// ArenaSlice always re-allocates from the arena because the previous
+	// search's arena was Reset() in releaseSearchScratch — old slice
+	// pointers are stale after the arena is rewound.
 	maxCap := ef * 2
-	if cap(scratch.maxHeapBuf) < maxCap {
-		scratch.maxHeapBuf = make([]util.Candidate, 0, maxCap)
-	} else {
-		scratch.maxHeapBuf = scratch.maxHeapBuf[:0]
+	maxHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, maxCap)
+	if err != nil {
+		panic("hnsw: arena maxHeapBuf: " + err.Error())
 	}
+	scratch.maxHeapBuf = maxHeap
 	minCap := max(maxCap, ef*8)
-	if cap(scratch.minHeapBuf) < minCap {
-		scratch.minHeapBuf = make([]util.Candidate, 0, minCap)
-	} else {
-		scratch.minHeapBuf = scratch.minHeapBuf[:0]
+	minHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, minCap)
+	if err != nil {
+		panic("hnsw: arena minHeapBuf: " + err.Error())
 	}
+	scratch.minHeapBuf = minHeap
 	candidates := &candidateMaxHeap{items: scratch.maxHeapBuf}
 	w := &candidateMinHeap{items: scratch.minHeapBuf}
 
 	// Initialize with entry point
 	entryID := h.findNodeID(entryPoint)
 	if entryID == ^uint32(0) || entryID >= uint32(len(visited)) {
-		return nil
+		return nil, nil
 	}
 
 	// Compute distance handling quantization
-	distance := h.computeDistanceOptimized(query, entryPoint)
-	if distance < 0 {
-		return nil // Error in distance computation
+	distance, err := h.computeDistanceOptimized(query, entryPoint, queryState)
+	if err != nil {
+		return nil, err // Error in distance computation
 	}
 
 	candidate := util.Candidate{ID: entryID, Distance: distance}
@@ -389,6 +421,12 @@ func (h *Index) searchLevelScratchValues(query []float32, entryPoint *Node, ef i
 	visited[entryID] = visitMark
 
 	for w.Len() > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		current := w.PopCandidate()
 
 		// Early termination condition - optimized for large datasets
@@ -413,9 +451,9 @@ func (h *Index) searchLevelScratchValues(query []float32, entryPoint *Node, ef i
 					if neighborNode == nil {
 						continue
 					}
-					neighborDistance := h.computeDistanceOptimized(query, neighborNode)
-					if neighborDistance < 0 {
-						continue // Skip if distance computation failed
+					neighborDistance, err := h.computeDistanceOptimized(query, neighborNode, queryState)
+					if err != nil {
+						return nil, err // Signal error
 					}
 
 					neighborCandidate := util.Candidate{
@@ -437,35 +475,38 @@ func (h *Index) searchLevelScratchValues(query []float32, entryPoint *Node, ef i
 			}
 		}
 	}
-	return candidates.items
+	return candidates.items, nil
 }
 
 // computeDistanceOptimized provides optimized distance computation with error handling
-func (h *Index) computeDistanceOptimized(query []float32, node *Node) float32 {
+func (h *Index) computeDistanceOptimized(query []float32, node *Node, queryState any) (float32, error) {
 	if node == nil {
-		return -1
+		return -1, fmt.Errorf("node is nil")
 	}
 	if node.CompressedVector != nil && h.quantizer != nil {
-		distance, err := h.quantizer.DistanceToQuery(node.CompressedVector, query)
+		distance, err := h.quantizer.DistanceToQuery(node.CompressedVector, query, queryState)
 		if err != nil {
 			// Fall back to decompressed vector
 			vec, decompErr := h.quantizer.Decompress(node.CompressedVector)
 			if decompErr != nil {
-				return -1 // Signal error
+				return -1, fmt.Errorf("decompression failed: %w", decompErr)
 			}
-			return h.distance(query, vec)
+			return h.distance(query, vec), nil
 		}
-		return distance
+		return distance, nil
 	}
 	if h.provider != nil {
 		distance, err := h.provider.Distance(query, node.Ordinal)
 		if err == nil {
-			return distance
+			return distance, nil
 		}
 	}
 	vec, err := h.getNodeVector(node)
 	if err == nil && vec != nil {
-		return h.distance(query, vec)
+		return h.distance(query, vec), nil
 	}
-	return -1 // Signal error - no vector available
+	if err != nil {
+		return -1, err
+	}
+	return -1, fmt.Errorf("no vector available")
 }

@@ -129,8 +129,8 @@ func TestContainmentFilter_SingleValueAsArray(t *testing.T) {
 
 func TestContainmentFilter_Validate(t *testing.T) {
 	tests := []struct {
-		name      string
 		filter    *ContainmentFilter
+		name      string
 		wantError bool
 	}{
 		{
@@ -201,8 +201,8 @@ func TestContainmentFilter_EstimateSelectivity(t *testing.T) {
 func TestContainmentFilter_String(t *testing.T) {
 	tests := []struct {
 		name     string
-		mode     ContainmentMode
 		expected string
+		mode     ContainmentMode
 	}{
 		{
 			name:     "contains any",

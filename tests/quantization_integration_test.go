@@ -24,7 +24,7 @@ func TestQuantizationIntegration(t *testing.T) {
 
 	t.Run("Product Quantization End-to-End", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "pq_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -76,7 +76,7 @@ func TestQuantizationIntegration(t *testing.T) {
 		}
 
 		// Verify collection stats
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != 50 {
 			t.Errorf("Expected 50 vectors, got %d", stats.VectorCount)
 		}
@@ -90,7 +90,7 @@ func TestQuantizationIntegration(t *testing.T) {
 
 	t.Run("Scalar Quantization End-to-End", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "sq_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -145,7 +145,7 @@ func TestQuantizationIntegration(t *testing.T) {
 
 	t.Run("Quantization vs Unquantized Comparison", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "comparison_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -200,8 +200,8 @@ func TestQuantizationIntegration(t *testing.T) {
 		}
 
 		// Compare memory usage
-		unquantizedStats := unquantizedCollection.Stats()
-		quantizedStats := quantizedCollection.Stats()
+		unquantizedStats := unquantizedCollection.Stats(context.Background())
+		quantizedStats := quantizedCollection.Stats(context.Background())
 
 		t.Logf("Unquantized memory: %d bytes", unquantizedStats.MemoryUsage)
 		t.Logf("Quantized memory: %d bytes", quantizedStats.MemoryUsage)
@@ -236,7 +236,7 @@ func TestQuantizationIntegration(t *testing.T) {
 
 	t.Run("Custom Quantization Configuration", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "custom_test")),
 			libravdb.WithMetrics(false),
 		)

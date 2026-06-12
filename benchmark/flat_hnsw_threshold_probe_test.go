@@ -24,13 +24,13 @@ import (
 // Using smaller dimension (32) to make HNSW construction feasible in probe time.
 // This still demonstrates asymptotic behavior: Flat is O(N*d), HNSW is O(log N * d).
 const (
-	probeDimension     = 32
-	belowThresholdN    = 9999
-	aboveThresholdN    = 10001
-	searchK            = 8
-	warmupRuns         = 1
-	measuredRuns       = 5
-	fixedSeed    int64 = 12345 // deterministic vectors
+	probeDimension        = 32
+	belowThresholdN       = 9999
+	aboveThresholdN       = 10001
+	searchK               = 8
+	warmupRuns            = 1
+	measuredRuns          = 5
+	fixedSeed       int64 = 12345 // deterministic vectors
 )
 
 // generateDeterministicVector creates a pseudo-random normalized vector.
@@ -59,7 +59,7 @@ func prepareThresholdProbe(t *testing.T) (*libravdb.Collection, *libravdb.Collec
 	// Create temporary database for probe
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/probe.libravdb"
-	db, err := libravdb.New(
+	db, err := libravdb.Open(
 		libravdb.WithStoragePath(dbPath),
 		libravdb.WithMetrics(false),
 	)
@@ -249,8 +249,8 @@ func TestFlatHNSWThresholdProbe(t *testing.T) {
 	defer cleanup()
 
 	// Observe index types after collection stabilization
-	belowStats := belowCol.Stats()
-	aboveStats := aboveCol.Stats()
+	belowStats := belowCol.Stats(context.Background())
+	aboveStats := aboveCol.Stats(context.Background())
 	t.Logf("Below-threshold index type: %s", belowStats.IndexType)
 	t.Logf("Above-threshold index type: %s", aboveStats.IndexType)
 	t.Logf("Below-threshold vector count: %d", belowStats.VectorCount)

@@ -8,12 +8,10 @@ import (
 
 // Monitor provides utilities for memory monitoring and statistics
 type Monitor struct {
-	mu    sync.RWMutex
-	stats []MemorySnapshot
-
-	// Configuration
+	stats        []MemorySnapshot
 	maxSnapshots int
 	interval     time.Duration
+	mu           sync.RWMutex
 }
 
 // MemorySnapshot represents a point-in-time memory measurement

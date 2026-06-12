@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -19,32 +20,33 @@ import (
 
 // Config holds configuration for IVF-PQ index
 type Config struct {
-	Dimension     int                       // Vector dimension
-	NClusters     int                       // Number of clusters (inverted lists)
-	NProbes       int                       // Number of clusters to probe during search
-	Metric        util.DistanceMetric       // Distance metric
-	Quantization  *quant.QuantizationConfig // Product quantization config
-	MaxIterations int                       // Max k-means iterations
-	Tolerance     float64                   // K-means convergence tolerance
-	RandomSeed    int64                     // Random seed for reproducibility
+	Quantization  *quant.QuantizationConfig
+	Dimension     int
+	NClusters     int
+	NProbes       int
+	Metric        util.DistanceMetric
+	MaxIterations int
+	Tolerance     float64
+	RandomSeed    int64
 }
 
 // VectorEntry represents a vector entry
 type VectorEntry struct {
-	ID       string
-	Ordinal  uint32
-	Vector   []float32
-	Metadata map[string]interface{}
-	Version  uint64
+	Metadata   map[string]interface{}
+	ID         string
+	Vector     []float32
+	Compressed []byte
+	Version    uint64
+	Ordinal    uint32
 }
 
 // SearchResult represents a search result
 type SearchResult struct {
-	ID       string
-	Score    float32
-	Vector   []float32
 	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
 	Version  uint64
+	Score    float32
 }
 
 // DefaultConfig returns a default IVF-PQ configuration
@@ -145,45 +147,42 @@ func AutoTuneConfig(dimension int, estimatedVectors int, targetMemoryMB int) *Co
 
 // Cluster represents a single inverted list cluster
 type Cluster struct {
-	ID                int               // Cluster ID
-	Centroid          []float32         // Cluster centroid
-	Entries           []*VectorEntry    // Vectors assigned to this cluster
-	CompressedVectors map[string][]byte // Compressed vectors for quantized storage
-	mutex             sync.RWMutex      // Protects concurrent access
+	CompressedVectors map[string][]byte
+	Centroid          []float32
+	Entries           []*VectorEntry
+	ID                int
+	mutex             sync.RWMutex
+	centroidNorm2     float32
+	centroidNorm      float32
 }
 
 // Index implements IVF-PQ (Inverted File with Product Quantization) index
 type Index struct {
-	config       *Config
-	clusters     []*Cluster
-	quantizer    quant.Quantizer
-	distanceFunc util.DistanceFunc
-	trained      bool
-	size         int
-	mutex        sync.RWMutex
-	rand         *rand.Rand
-
-	// Adaptive search parameters
-	searchStats  *SearchStats
-	adaptiveMode bool
-
-	// deserMeta holds deserialized entry metadata pending population.
-	// Set by DeserializeFromBytes, consumed by PopulateEntriesFromStorage.
-	deserMeta *deserializedMeta
-
-	// populatedFromStorage tracks whether PopulateEntriesFromStorage has been
-	// called. Used to avoid double-population on subsequent reopen attempts.
+	quantizer            quant.Quantizer
+	rand                 *rand.Rand
+	deserMeta            *deserializedMeta
+	distanceFunc         util.DistanceFunc
+	searchStats          *SearchStats
+	config               *Config
+	scratchPool          *sync.Pool
+	idToCluster          sync.Map
+	clusters             []*Cluster
+	size                 int
+	mutex                sync.RWMutex
+	adaptiveMode         atomic.Bool
+	trained              bool
 	populatedFromStorage bool
+	queryTiers           [4]ivfPoolTier
 }
 
 // SearchStats tracks search performance for adaptive optimization
 type SearchStats struct {
-	mutex          sync.RWMutex
+	lastAdjustment time.Time
 	totalSearches  int64
 	totalLatencyMs int64
 	accuracySum    float64
 	currentProbes  int
-	lastAdjustment time.Time
+	mutex          sync.RWMutex
 }
 
 type candidate struct {
@@ -232,41 +231,35 @@ func ivfDownHeap(h []ivfHeapElement, i, n int) {
 }
 
 // ivfUserDataOffset is the byte offset within a ShardedFreeList slot where user
-// data begins. The first 64 bytes are reserved for FreeList/ShardedFreeList metadata.
-const ivfUserDataOffset = 64
+// data begins. The memory package's SFL metadata occupies offsets 0–43 (Hyaline
+// chain at 0/8/16/24/32, structIdx+shardIdx at 40); 8-byte aligned to 48.
+const ivfUserDataOffset = 48
 
 // ivfHeapSlot binds an off-heap slot to its originating pool so that free()
 // routes to the correct tier by construction.
 type ivfHeapSlot struct {
-	slot []byte
 	pool *memory.ShardedFreeList
+	slot []byte
 }
 
 func (hs *ivfHeapSlot) free() { hs.pool.Deallocate(hs.slot) }
 
 // Power-of-2 tier table. Each tier's slot is sized for its maxK.
 type ivfPoolTier struct {
-	maxK int
 	pool *memory.ShardedFreeList
+	maxK int
 	once sync.Once
 }
 
-var ivfQueryTiers = [...]ivfPoolTier{
-	{maxK: 16},
-	{maxK: 128},
-	{maxK: 1024},
-	{maxK: 4096},
-}
-
-// acquireHeapSlot returns an ivfHeapSlot paired with a []ivfHeapElement buffer
+// acquireIVFHeapSlot returns an ivfHeapSlot paired with a []ivfHeapElement buffer
 // backed by the appropriate off-heap tier. Returns nil, nil if k exceeds the
 // largest tier — caller must fall back to Go heap allocation.
-func acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
-	for i := range ivfQueryTiers {
-		if k > ivfQueryTiers[i].maxK {
+func (idx *Index) acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
+	for i := range idx.queryTiers {
+		if k > idx.queryTiers[i].maxK {
 			continue
 		}
-		tier := &ivfQueryTiers[i]
+		tier := &idx.queryTiers[i]
 		tier.once.Do(func() {
 			slotSize := uint64(ivfUserDataOffset + tier.maxK*16)
 			pool, err := memory.NewShardedFreeList(memory.FreeListConfig{
@@ -291,6 +284,8 @@ func acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
 	}
 	return nil, nil
 }
+
+
 
 // NewIVFPQ creates a new IVF-PQ index
 func NewIVFPQ(config *Config) (*Index, error) {
@@ -337,6 +332,13 @@ func NewIVFPQ(config *Config) (*Index, error) {
 		}
 	}
 
+	scratchPool := &sync.Pool{
+		New: func() any {
+			a, _ := memory.NewArena(1024 * 1024)
+			return a
+		},
+	}
+
 	return &Index{
 		config:       config,
 		clusters:     clusters,
@@ -345,11 +347,17 @@ func NewIVFPQ(config *Config) (*Index, error) {
 		trained:      false,
 		size:         0,
 		rand:         rand.New(rand.NewSource(config.RandomSeed)),
+		scratchPool:  scratchPool,
 		searchStats: &SearchStats{
 			currentProbes:  config.NProbes,
 			lastAdjustment: time.Now(),
 		},
-		adaptiveMode: false,
+		queryTiers: [4]ivfPoolTier{
+			{maxK: 16},
+			{maxK: 128},
+			{maxK: 1024},
+			{maxK: 4096},
+		},
 	}, nil
 }
 
@@ -383,7 +391,9 @@ func (idx *Index) Train(ctx context.Context, vectors [][]float32) error {
 		}
 	}
 
+	idx.mutex.Lock()
 	idx.trained = true
+	idx.mutex.Unlock()
 	return nil
 }
 
@@ -426,23 +436,35 @@ func (idx *Index) trainCoarseQuantizer(ctx context.Context, vectors [][]float32)
 }
 
 func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float32, assignments []int) (float64, error) {
+	// Precompute norms for fast assignment scores
+	centroidNorm2 := make([]float32, len(idx.clusters))
+	centroidNorm := make([]float32, len(idx.clusters))
+	for j, cluster := range idx.clusters {
+		var sum float32
+		for _, v := range cluster.Centroid {
+			sum += v * v
+		}
+		centroidNorm2[j] = sum
+		centroidNorm[j] = float32(math.Sqrt(float64(sum)))
+	}
+
 	workers := parallelismFor(len(vectors))
 	if workers == 1 {
 		totalInertia := float64(0)
 		for i, vec := range vectors {
 			bestCluster := 0
-			bestDistance := float32(math.Inf(1))
+			bestScore := float32(math.Inf(-1))
 
 			for j, cluster := range idx.clusters {
-				distance := idx.distanceFunc(vec, cluster.Centroid)
-				if distance < bestDistance {
-					bestDistance = distance
+				score := idx.computeAssignmentScore(vec, cluster.Centroid, centroidNorm2[j], centroidNorm[j])
+				if score > bestScore {
+					bestScore = score
 					bestCluster = j
 				}
 			}
 
 			assignments[i] = bestCluster
-			totalInertia += float64(bestDistance)
+			totalInertia += float64(idx.distanceFunc(vec, idx.clusters[bestCluster].Centroid))
 		}
 		return totalInertia, nil
 	}
@@ -474,17 +496,17 @@ func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float
 
 				vec := vectors[i]
 				bestCluster := 0
-				bestDistance := float32(math.Inf(1))
+				bestScore := float32(math.Inf(-1))
 				for j, cluster := range idx.clusters {
-					distance := idx.distanceFunc(vec, cluster.Centroid)
-					if distance < bestDistance {
-						bestDistance = distance
+					score := idx.computeAssignmentScore(vec, cluster.Centroid, centroidNorm2[j], centroidNorm[j])
+					if score > bestScore {
+						bestScore = score
 						bestCluster = j
 					}
 				}
 
 				assignments[i] = bestCluster
-				localInertia += float64(bestDistance)
+				localInertia += float64(idx.distanceFunc(vec, idx.clusters[bestCluster].Centroid))
 			}
 
 			inertias[worker] = localInertia
@@ -508,45 +530,53 @@ func (idx *Index) assignVectorsToClusters(ctx context.Context, vectors [][]float
 }
 
 // initializeCentroids initializes cluster centroids using k-means++
+// with running-min tracking: O(N·k·dim) instead of O(N·k²·dim).
 func (idx *Index) initializeCentroids(vectors [][]float32) error {
-	if len(vectors) < idx.config.NClusters {
+	nClusters := idx.config.NClusters
+	if len(vectors) < nClusters {
 		return fmt.Errorf("not enough vectors for initialization")
 	}
 
-	// Choose first centroid randomly
+	// Choose first centroid randomly.
 	firstIdx := idx.rand.Intn(len(vectors))
 	copy(idx.clusters[0].Centroid, vectors[firstIdx])
 
-	// Choose remaining centroids using k-means++ (proportional to squared distance)
-	for k := 1; k < idx.config.NClusters; k++ {
-		distances := make([]float64, len(vectors))
-		totalDistance := float64(0)
+	// minDist[i] tracks the squared distance from vector i to its nearest
+	// already-chosen centroid. Updated incrementally as each new centroid
+	// is selected — we only compute distance to the new centroid, not all k.
+	minDist := make([]float64, len(vectors))
+	totalDist := float64(0)
+	for i, vec := range vectors {
+		d := float64(idx.distanceFunc(vec, idx.clusters[0].Centroid))
+		minDist[i] = d * d
+		totalDist += minDist[i]
+	}
 
-		// Compute distance to nearest existing centroid for each vector
-		for i, vec := range vectors {
-			minDistance := float32(math.Inf(1))
-
-			for j := 0; j < k; j++ {
-				distance := idx.distanceFunc(vec, idx.clusters[j].Centroid)
-				if distance < minDistance {
-					minDistance = distance
-				}
-			}
-
-			distances[i] = float64(minDistance * minDistance) // Squared distance
-			totalDistance += distances[i]
-		}
-
-		// Choose next centroid with probability proportional to squared distance
-		target := idx.rand.Float64() * totalDistance
+	// Choose remaining centroids using k-means++ (proportional to squared distance).
+	for k := 1; k < nClusters; k++ {
+		// Select next centroid via roulette-wheel selection.
+		target := idx.rand.Float64() * totalDist
 		cumulative := float64(0)
-
-		for i, distance := range distances {
-			cumulative += distance
+		chosenIdx := 0
+		for i, d := range minDist {
+			cumulative += d
 			if cumulative >= target {
-				copy(idx.clusters[k].Centroid, vectors[i])
+				chosenIdx = i
 				break
 			}
+		}
+		copy(idx.clusters[k].Centroid, vectors[chosenIdx])
+
+		// Update running-min distances: only compare against the new centroid.
+		totalDist = 0
+		newCentroid := idx.clusters[k].Centroid
+		for i, vec := range vectors {
+			d := float64(idx.distanceFunc(vec, newCentroid))
+			d2 := d * d
+			if d2 < minDist[i] {
+				minDist[i] = d2
+			}
+			totalDist += minDist[i]
 		}
 	}
 
@@ -586,25 +616,54 @@ func (idx *Index) updateCentroids(vectors [][]float32, assignments []int) error 
 			randomIdx := idx.rand.Intn(len(vectors))
 			copy(cluster.Centroid, vectors[randomIdx])
 		}
+		// Precompute norms for fast assignment scores
+		var norm2 float32
+		for _, v := range cluster.Centroid {
+			norm2 += v * v
+		}
+		cluster.centroidNorm2 = norm2
+		cluster.centroidNorm = float32(math.Sqrt(float64(norm2)))
 	}
 
 	return nil
 }
 
+// computeAssignmentScore computes a metric-specific score to maximize for cluster assignment.
+// This avoids expensive sqrt or ||x|| computations where possible.
+func (idx *Index) computeAssignmentScore(vec, centroid []float32, norm2, norm float32) float32 {
+	switch util.DistanceMetric(idx.config.Metric) {
+	case util.L2Distance:
+		// argmin(||x-c||²) ≡ argmax(dot(x,c) - ||c||²/2)
+		return dotProduct(vec, centroid) - norm2*0.5
+	case util.InnerProduct:
+		// IP is maximized when dot product is maximized
+		return dotProduct(vec, centroid)
+	case util.CosineDistance:
+		// Cosine similarity = dot(x,c) / (||x|| * ||c||)
+		// Since ||x|| is constant, we maximize dot(x,c) / ||c||
+		if norm == 0 {
+			return float32(math.Inf(-1))
+		}
+		return dotProduct(vec, centroid) / norm
+	default:
+		// Fallback for unknown metrics: use actual distance function (negated so smaller distance = higher score)
+		return -idx.distanceFunc(vec, centroid)
+	}
+}
+
 // assignToCluster finds the best cluster for a vector
 func (idx *Index) assignToCluster(vector []float32) (int, error) {
 	if !idx.trained {
-		return 0, fmt.Errorf("index must be trained before assignment")
+		return 0, fmt.Errorf("assignToCluster: %w", util.ErrNotTrained)
 	}
 
 	bestCluster := 0
-	bestDistance := float32(math.Inf(1))
+	bestScore := float32(math.Inf(-1))
 
 	for i, cluster := range idx.clusters {
-		distance := idx.distanceFunc(vector, cluster.Centroid)
-
-		if distance < bestDistance {
-			bestDistance = distance
+		score := idx.computeAssignmentScore(vector, cluster.Centroid, cluster.centroidNorm2, cluster.centroidNorm)
+		if score > bestScore {
+			bestScore = score
 			bestCluster = i
 		}
 	}
@@ -615,12 +674,7 @@ func (idx *Index) assignToCluster(vector []float32) (int, error) {
 // findProbeClusters finds the top-k closest clusters for search probing
 func (idx *Index) findProbeClusters(query []float32) ([]int, error) {
 	if !idx.trained {
-		return nil, fmt.Errorf("index must be trained before search")
-	}
-
-	type clusterDistance struct {
-		id       int
-		distance float32
+		return nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
 	distances := make([]clusterDistance, len(idx.clusters))
@@ -677,9 +731,9 @@ func (idx *Index) GetClusterInfo() []ClusterInfo {
 
 // ClusterInfo provides information about a cluster
 type ClusterInfo struct {
-	ID       int       // Cluster ID
-	Size     int       // Number of vectors in cluster
-	Centroid []float32 // Cluster centroid
+	Centroid []float32
+	ID       int
+	Size     int
 }
 
 // min returns the minimum of two integers
@@ -698,10 +752,46 @@ func max(a, b int) int {
 	return b
 }
 
+func dotProduct(a, b []float32) float32 {
+	var sum float32
+	for i := range a {
+		sum += a[i] * b[i]
+	}
+	return sum
+}
+
+type clusterDistance struct {
+	id       int
+	distance float32
+}
+
+func siftDownClusterDist(h []clusterDistance, i, n int) {
+	for {
+		largest := i
+		left := 2*i + 1
+		right := 2*i + 2
+		if left < n && h[left].distance > h[largest].distance {
+			largest = left
+		}
+		if right < n && h[right].distance > h[largest].distance {
+			largest = right
+		}
+		if largest == i {
+			return
+		}
+		h[i], h[largest] = h[largest], h[i]
+		i = largest
+	}
+}
+
 // Insert adds a vector entry to the index with enhanced quantization support
 func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	if entry == nil {
 		return fmt.Errorf("entry cannot be nil")
+	}
+
+	if len(entry.Vector) == 0 {
+		return fmt.Errorf("vector cannot be empty")
 	}
 
 	if len(entry.Vector) != idx.config.Dimension {
@@ -709,33 +799,44 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 			len(entry.Vector), idx.config.Dimension)
 	}
 
+	idx.mutex.RLock()
 	if !idx.trained {
-		return fmt.Errorf("index must be trained before insertion")
+		idx.mutex.RUnlock()
+		return fmt.Errorf("Insert: %w", util.ErrNotTrained)
 	}
 
 	// Find the best cluster for this vector
 	clusterID, err := idx.assignToCluster(entry.Vector)
 	if err != nil {
+		idx.mutex.RUnlock()
 		return fmt.Errorf("failed to assign vector to cluster: %w", err)
 	}
 
 	// Compress vector if quantization is enabled
-	var compressed []byte
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		compressed, err = idx.quantizer.Compress(entry.Vector)
+		entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
 		if err != nil {
+			idx.mutex.RUnlock()
 			return fmt.Errorf("failed to compress vector: %w", err)
 		}
 	}
 
 	// Add to cluster
 	cluster := idx.clusters[clusterID]
+	idx.mutex.RUnlock()
 	cluster.mutex.Lock()
+
+	// Guard against nil (post-Deserialize or post-Close).
+	if cluster.CompressedVectors == nil {
+		cluster.CompressedVectors = make(map[string][]byte)
+	}
+
+	idx.idToCluster.Store(entry.ID, clusterID)
 	cluster.Entries = append(cluster.Entries, entry)
 
-	// Store compressed version if available
-	if compressed != nil {
-		cluster.CompressedVectors[entry.ID] = compressed
+	// Store compressed version in the cluster map for persistence.
+	if entry.Compressed != nil {
+		cluster.CompressedVectors[entry.ID] = entry.Compressed
 	}
 
 	cluster.mutex.Unlock()
@@ -743,6 +844,184 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	// Update size
 	idx.mutex.Lock()
 	idx.size++
+	idx.mutex.Unlock()
+
+	return nil
+}
+
+// BatchInsert adds multiple vector entries to the index in parallel
+func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Maximum entries to process in one arena to prevent memory exhaustion
+	const maxChunkSize = 1000
+
+	for i := 0; i < len(entries); i += maxChunkSize {
+		end := min(i+maxChunkSize, len(entries))
+		chunk := entries[i:end]
+
+		if err := idx.batchInsertChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) error {
+	idx.mutex.RLock()
+	if !idx.trained {
+		idx.mutex.RUnlock()
+		return fmt.Errorf("Insert: %w", util.ErrNotTrained)
+	}
+
+	workers := parallelismFor(len(entries))
+
+	type processedEntry struct {
+		err        error
+		entry      *VectorEntry
+		compressed []byte
+		clusterID  int
+	}
+
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		idx.scratchPool.Put(arena)
+	}()
+
+	processedSlice, err := memory.ArenaSlice[processedEntry](arena, len(entries))
+	if err != nil {
+		idx.mutex.RUnlock()
+		return err
+	}
+	processed := processedSlice[:len(entries)]
+	var wg sync.WaitGroup
+	chunkSize := (len(entries) + workers - 1) / workers
+
+	for worker := 0; worker < workers; worker++ {
+		start := worker * chunkSize
+		if start >= len(entries) {
+			break
+		}
+		end := min(start+chunkSize, len(entries))
+
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				select {
+				case <-ctx.Done():
+					processed[i].err = ctx.Err()
+					return
+				default:
+				}
+
+				entry := entries[i]
+				if entry == nil {
+					processed[i].err = fmt.Errorf("entry cannot be nil")
+					continue
+				}
+
+				if len(entry.Vector) != idx.config.Dimension {
+					processed[i].err = fmt.Errorf("vector dimension %d does not match index dimension %d",
+						len(entry.Vector), idx.config.Dimension)
+					continue
+				}
+
+				clusterID, err := idx.assignToCluster(entry.Vector)
+				if err != nil {
+					processed[i].err = fmt.Errorf("failed to assign vector to cluster: %w", err)
+					continue
+				}
+
+				if idx.quantizer != nil && idx.quantizer.IsTrained() {
+					entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
+					if err != nil {
+						processed[i].err = fmt.Errorf("failed to compress vector: %w", err)
+						continue
+					}
+				}
+
+				processed[i] = processedEntry{
+					entry:      entry,
+					clusterID:  clusterID,
+					compressed: entry.Compressed,
+				}
+			}
+		}(start, end)
+	}
+
+	wg.Wait()
+	idx.mutex.RUnlock()
+
+	for _, p := range processed {
+		if p.err != nil {
+			return p.err
+		}
+	}
+
+	// Allocate counts array from Arena
+	countsSlice, err := memory.ArenaSlice[int](arena, len(idx.clusters))
+	if err != nil {
+		return fmt.Errorf("arena allocate counts: %w", err)
+	}
+	counts := countsSlice[:len(idx.clusters)]
+	clear(counts) // Zero out memory from previous arena uses
+
+	for _, p := range processed {
+		if p.err == nil {
+			counts[p.clusterID]++
+		}
+	}
+
+	// Allocate updates arrays from Arena
+	clusterUpdatesSlice, err := memory.ArenaSlice[[]processedEntry](arena, len(idx.clusters))
+	if err != nil {
+		return fmt.Errorf("arena allocate cluster updates: %w", err)
+	}
+	clusterUpdates := clusterUpdatesSlice[:len(idx.clusters)]
+	clear(clusterUpdates) // Zero out memory from previous arena uses
+
+	for i, c := range counts {
+		if c > 0 {
+			slice, err := memory.ArenaSlice[processedEntry](arena, c)
+			if err != nil {
+				return fmt.Errorf("arena allocate cluster %d updates: %w", i, err)
+			}
+			clusterUpdates[i] = slice[:0]
+		}
+	}
+
+	for _, p := range processed {
+		if p.err == nil {
+			clusterUpdates[p.clusterID] = append(clusterUpdates[p.clusterID], p)
+		}
+	}
+
+	for clusterID, updates := range clusterUpdates {
+		if len(updates) == 0 {
+			continue
+		}
+
+		cluster := idx.clusters[clusterID]
+		cluster.mutex.Lock()
+
+		for _, p := range updates {
+			idx.idToCluster.Store(p.entry.ID, clusterID)
+			cluster.Entries = append(cluster.Entries, p.entry)
+			if p.compressed != nil {
+				cluster.CompressedVectors[p.entry.ID] = p.compressed
+			}
+		}
+
+		cluster.mutex.Unlock()
+	}
+
+	idx.mutex.Lock()
+	idx.size += len(entries)
 	idx.mutex.Unlock()
 
 	return nil
@@ -758,26 +1037,48 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	}
 
 	if k <= 0 {
-		return nil, fmt.Errorf("k must be positive, got %d", k)
+		return nil, fmt.Errorf("k must be positive, got %d: %w", k, util.ErrInvalidK)
 	}
 	if k > 4096 {
 		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
 	}
 
+	idx.mutex.RLock()
 	if !idx.trained {
-		return nil, fmt.Errorf("index must be trained before search")
+		idx.mutex.RUnlock()
+		return nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
-	// Adjust probe count if adaptive mode is enabled
+	// Adjust probe count if adaptive mode is enabled (touches searchStats).
 	idx.adjustProbeCount()
 
+	// Capture a local reference to clusters under the lock so that a
+	// concurrent Close (which takes Lock and nils idx.clusters) cannot
+	// cause a nil-pointer dereference after we release RLock.
+	clusters := idx.clusters
+	idx.mutex.RUnlock()
+
+	// Acquire a scratch arena for search-scoped allocations (same pool
+	// used by BatchInsert). Reset + return on exit.
+	arena := idx.scratchPool.Get().(*memory.Arena)
+	defer func() {
+		arena.Reset()
+		idx.scratchPool.Put(arena)
+	}()
+
 	// Find clusters to probe with enhanced strategy
-	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query)
+	probeClusters, clusterDistances, err := idx.findProbeClustersWithDistances(query, arena, clusters)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
 	}
 
-	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k)
+	// Warm quantizer distance tables so parallel workers only read from the cache.
+	var queryState any
+	if idx.quantizer != nil {
+		queryState = idx.quantizer.PrepareQuery(query)
+	}
+
+	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState)
 	if err != nil {
 		return nil, err
 	}
@@ -800,8 +1101,6 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	// Estimate accuracy based on result quality (simplified metric)
 	accuracy := 1.0
 	if len(results) > 0 {
-		// Simple accuracy estimation: if we found results, assume good accuracy
-		// In practice, this could be more sophisticated
 		accuracy = math.Min(1.0, float64(len(results))/float64(k))
 	}
 
@@ -810,14 +1109,18 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
+func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any) ([]candidate, error) {
 	workers := parallelismFor(len(probeClusters))
 	if workers == 1 {
-		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k)
+		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState)
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
-	results := make([][]candidate, workers)
+	results, err := memory.ArenaSlice[[]candidate](arena, workers)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate results: %w", err)
+	}
+	results = results[:workers]
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -832,7 +1135,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		go func(worker, start, end int) {
 			defer wg.Done()
 
-			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k)
+			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena, clusters, queryState)
 			if err != nil {
 				errCh <- err
 				return
@@ -854,7 +1157,10 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 	// Each worker already produced ascending-distance output. Instead of
 	// re-heaping element-by-element (O(W·k log k)), a min-heap of size W
 	// performs a linear merge in O(W·k log W).
-	candidates := mergeSortedWorkerResults(results, k)
+	candidates, err := mergeSortedWorkerResults(results, k, arena)
+	if err != nil {
+		return nil, err
+	}
 	return candidates, nil
 }
 
@@ -887,7 +1193,7 @@ func mergeDownHeap(h []mergeElem, i, n int) {
 // mergeSortedWorkerResults merges W pre-sorted (ascending distance) candidate
 // arrays into a single top-k candidate slice via k-way merge.
 // Complexity: O(W·k log W) instead of the previous O(W·k log k) re-heaping.
-func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
+func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena) ([]candidate, error) {
 	// Count non-empty workers and compute total available results.
 	active := 0
 	total := 0
@@ -898,16 +1204,22 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 		}
 	}
 	if active == 0 {
-		return nil
+		return nil, nil
 	}
 	if k > total {
 		k = total
 	}
 
-	// Allocate a small merge heap on the Go heap — size is bounded by W (workers),
-	// typically ≤ GOMAXPROCS, not by k. This is a trivial allocation.
-	mergeHeap := make([]mergeElem, 0, active)
-	pos := make([]int, len(results))
+	mergeHeap, err := memory.ArenaSlice[mergeElem](arena, active)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate mergeHeap: %w", err)
+	}
+	mergeHeap = mergeHeap[:0]
+	pos, err := memory.ArenaSlice[int](arena, len(results))
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate pos: %w", err)
+	}
+	pos = pos[:len(results)]
 
 	for w, batch := range results {
 		if len(batch) == 0 {
@@ -924,7 +1236,11 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 		mergeDownHeap(mergeHeap, i, len(mergeHeap))
 	}
 
-	candidates := make([]candidate, 0, k)
+	candidates, err := memory.ArenaSlice[candidate](arena, k)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate candidates: %w", err)
+	}
+	candidates = candidates[:0]
 	for len(candidates) < k && len(mergeHeap) > 0 {
 		root := mergeHeap[0]
 		w := root.worker
@@ -947,15 +1263,20 @@ func mergeSortedWorkerResults(results [][]candidate, k int) []candidate {
 		}
 		mergeDownHeap(mergeHeap, 0, len(mergeHeap))
 	}
-	return candidates
+	return candidates, nil
 }
 
-func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int) ([]candidate, error) {
-	hs, heapBuf := acquireIVFHeapSlot(k)
+func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any) ([]candidate, error) {
+	hs, heapBuf := idx.acquireIVFHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
 	} else {
-		heapBuf = make([]ivfHeapElement, k)
+		var err error
+		heapBuf, err = memory.ArenaSlice[ivfHeapElement](arena, k)
+		if err != nil {
+			return nil, fmt.Errorf("arena allocate heap buf: %w", err)
+		}
+		heapBuf = heapBuf[:k]
 	}
 
 	count := 0
@@ -967,12 +1288,12 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 		default:
 		}
 
-		cluster := idx.clusters[clusterID]
+		cluster := clusters[clusterID]
 		cluster.mutex.RLock()
 		clusterDist := clusterDistances[i]
 
 		for _, entry := range cluster.Entries {
-			distance, err := idx.distanceToEntry(query, cluster, entry)
+			distance, err := idx.distanceToEntry(query, cluster, entry, queryState)
 			if err != nil {
 				cluster.mutex.RUnlock()
 				return nil, err
@@ -993,7 +1314,11 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 	}
 
 	// Extract results in ascending distance order (smallest first).
-	candidates := make([]candidate, count)
+	candidates, err := memory.ArenaSlice[candidate](arena, count)
+	if err != nil {
+		return nil, fmt.Errorf("arena allocate candidates: %w", err)
+	}
+	candidates = candidates[:count]
 	for i := count - 1; i >= 0; i-- {
 		elem := heapBuf[0]
 		count--
@@ -1010,18 +1335,19 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 	return candidates, nil
 }
 
-func (idx *Index) distanceToEntry(query []float32, cluster *Cluster, entry *VectorEntry) (float32, error) {
+func (idx *Index) distanceToEntry(query []float32, _ *Cluster, entry *VectorEntry, queryState any) (float32, error) {
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		compressed, exists := cluster.CompressedVectors[entry.ID]
-		if !exists {
+		compressed := entry.Compressed
+		if compressed == nil {
 			var err error
 			compressed, err = idx.quantizer.Compress(entry.Vector)
 			if err != nil {
 				return 0, fmt.Errorf("failed to compress vector: %w", err)
 			}
+			entry.Compressed = compressed
 		}
 
-		distance, err := idx.quantizer.DistanceToQuery(compressed, query)
+		distance, err := idx.quantizer.DistanceToQuery(compressed, query, queryState)
 		if err != nil {
 			return 0, fmt.Errorf("failed to compute quantized distance: %w", err)
 		}
@@ -1032,38 +1358,37 @@ func (idx *Index) distanceToEntry(query []float32, cluster *Cluster, entry *Vect
 }
 
 // findProbeClustersWithDistances finds probe clusters and returns their distances to query
-func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []float32, error) {
+func (idx *Index) findProbeClustersWithDistances(query []float32, arena *memory.Arena, clusters []*Cluster) ([]int, []float32, error) {
 	if !idx.trained {
-		return nil, nil, fmt.Errorf("index must be trained before search")
+		return nil, nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
-	type clusterDistance struct {
-		id       int
-		distance float32
+	distances, err := memory.ArenaSlice[clusterDistance](arena, len(clusters))
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate distances: %w", err)
 	}
-
-	distances := make([]clusterDistance, len(idx.clusters))
-	workers := parallelismFor(len(idx.clusters))
+	distances = distances[:len(clusters)]
+	workers := parallelismFor(len(clusters))
 	if workers == 1 {
-		for i, cluster := range idx.clusters {
+		for i, cluster := range clusters {
 			distance := idx.distanceFunc(query, cluster.Centroid)
 			distances[i] = clusterDistance{id: i, distance: distance}
 		}
 	} else {
-		chunkSize := (len(idx.clusters) + workers - 1) / workers
+		chunkSize := (len(clusters) + workers - 1) / workers
 		var wg sync.WaitGroup
 		for worker := 0; worker < workers; worker++ {
 			start := worker * chunkSize
-			if start >= len(idx.clusters) {
+			if start >= len(clusters) {
 				break
 			}
-			end := min(start+chunkSize, len(idx.clusters))
+			end := min(start+chunkSize, len(clusters))
 
 			wg.Add(1)
 			go func(start, end int) {
 				defer wg.Done()
 				for i := start; i < end; i++ {
-					cluster := idx.clusters[i]
+					cluster := clusters[i]
 					distance := idx.distanceFunc(query, cluster.Centroid)
 					distances[i] = clusterDistance{id: i, distance: distance}
 				}
@@ -1072,14 +1397,9 @@ func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []floa
 		wg.Wait()
 	}
 
-	// Sort by distance and take top NProbes
-	sort.Slice(distances, func(i, j int) bool {
-		return distances[i].distance < distances[j].distance
-	})
-
 	// Use adaptive probe count if enabled, otherwise use configured value
 	var probeCount int
-	if idx.adaptiveMode {
+	if idx.adaptiveMode.Load() {
 		idx.searchStats.mutex.RLock()
 		probeCount = min(idx.searchStats.currentProbes, len(distances))
 		idx.searchStats.mutex.RUnlock()
@@ -1087,12 +1407,40 @@ func (idx *Index) findProbeClustersWithDistances(query []float32) ([]int, []floa
 		probeCount = min(idx.config.NProbes, len(distances))
 	}
 
-	probes := make([]int, probeCount)
-	probeDists := make([]float32, probeCount)
+	// Select top probeCount using a bounded max-heap instead of full sort.
+	// O(NClusters log NProbes) instead of O(NClusters log NClusters).
+	// The distances array is reused as heap storage.
+	heap := distances[:probeCount]
+	// Heapify: build max-heap from first probeCount elements.
+	for i := probeCount/2 - 1; i >= 0; i-- {
+		siftDownClusterDist(heap, i, probeCount)
+	}
+	// Process remaining elements.
+	for i := probeCount; i < len(distances); i++ {
+		if distances[i].distance < heap[0].distance {
+			heap[0] = distances[i]
+			siftDownClusterDist(heap, 0, probeCount)
+		}
+	}
 
-	for i := 0; i < probeCount; i++ {
-		probes[i] = distances[i].id
-		probeDists[i] = distances[i].distance
+	probes, err := memory.ArenaSlice[int](arena, probeCount)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate probes: %w", err)
+	}
+	probes = probes[:probeCount]
+	probeDists, err := memory.ArenaSlice[float32](arena, probeCount)
+	if err != nil {
+		return nil, nil, fmt.Errorf("arena allocate probeDists: %w", err)
+	}
+	probeDists = probeDists[:probeCount]
+
+	// Extract in ascending order by repeatedly popping the max.
+	for i := probeCount - 1; i >= 0; i-- {
+		probes[i] = heap[0].id
+		probeDists[i] = heap[0].distance
+		heap[0] = heap[probeCount-1]
+		probeCount--
+		siftDownClusterDist(heap, 0, probeCount)
 	}
 
 	return probes, probeDists, nil
@@ -1115,16 +1463,12 @@ func parallelismFor(items int) int {
 
 // EnableAdaptiveSearch enables adaptive probe count adjustment based on performance
 func (idx *Index) EnableAdaptiveSearch() {
-	idx.mutex.Lock()
-	defer idx.mutex.Unlock()
-	idx.adaptiveMode = true
+	idx.adaptiveMode.Store(true)
 }
 
 // DisableAdaptiveSearch disables adaptive probe count adjustment
 func (idx *Index) DisableAdaptiveSearch() {
-	idx.mutex.Lock()
-	defer idx.mutex.Unlock()
-	idx.adaptiveMode = false
+	idx.adaptiveMode.Store(false)
 }
 
 // GetSearchStats returns current search statistics
@@ -1142,7 +1486,7 @@ func (idx *Index) GetSearchStats() SearchStats {
 
 // adjustProbeCount adaptively adjusts the number of probes based on search performance
 func (idx *Index) adjustProbeCount() {
-	if !idx.adaptiveMode {
+	if !idx.adaptiveMode.Load() {
 		return
 	}
 
@@ -1190,7 +1534,7 @@ func (idx *Index) adjustProbeCount() {
 
 // recordSearchStats records statistics for a search operation
 func (idx *Index) recordSearchStats(latencyMs int64, accuracy float64) {
-	if !idx.adaptiveMode {
+	if !idx.adaptiveMode.Load() {
 		return
 	}
 
@@ -1209,32 +1553,36 @@ func (idx *Index) Delete(ctx context.Context, id string) error {
 	}
 
 	idx.mutex.Lock()
-	defer idx.mutex.Unlock()
 
-	// Search all clusters for the entry
-	for _, cluster := range idx.clusters {
-		cluster.mutex.Lock()
+	clusterIDVal, ok := idx.idToCluster.Load(id)
+	if !ok {
+		idx.mutex.Unlock()
+		return fmt.Errorf("entry with id %s: %w", id, util.ErrNotFound)
+	}
+	clusterID := clusterIDVal.(int)
+	idx.idToCluster.Delete(id)
 
-		for i, entry := range cluster.Entries {
-			if entry.ID == id {
-				// Remove entry by swapping with last element
-				cluster.Entries[i] = cluster.Entries[len(cluster.Entries)-1]
-				cluster.Entries = cluster.Entries[:len(cluster.Entries)-1]
+	// Capture cluster reference under the lock to prevent races with Close.
+	cluster := idx.clusters[clusterID]
+	idx.mutex.Unlock()
+	cluster.mutex.Lock()
 
-				// Remove compressed vector if it exists
-				delete(cluster.CompressedVectors, id)
+	for i, entry := range cluster.Entries {
+		if entry.ID == id {
+			cluster.Entries[i] = cluster.Entries[len(cluster.Entries)-1]
+			cluster.Entries = cluster.Entries[:len(cluster.Entries)-1]
+			delete(cluster.CompressedVectors, id)
+			cluster.mutex.Unlock()
 
-				cluster.mutex.Unlock()
-
-				idx.size--
-				return nil
-			}
+			idx.mutex.Lock()
+			idx.size--
+			idx.mutex.Unlock()
+			return nil
 		}
-
-		cluster.mutex.Unlock()
 	}
 
-	return fmt.Errorf("entry with id %s not found", id)
+	cluster.mutex.Unlock()
+	return fmt.Errorf("entry with id %s in cluster %d: %w", id, clusterID, util.ErrNotFound)
 }
 
 // Size returns the number of vectors in the index
@@ -1296,11 +1644,22 @@ func (idx *Index) Close() error {
 		cluster.mutex.Unlock()
 	}
 
+	for i := range idx.queryTiers {
+		if idx.queryTiers[i].pool != nil {
+			idx.queryTiers[i].pool.Free()
+			idx.queryTiers[i].pool = nil
+		}
+	}
+
 	idx.clusters = nil
-	idx.quantizer = nil
+	if idx.quantizer != nil {
+		idx.quantizer.Close()
+		idx.quantizer = nil
+	}
 	idx.trained = false
 	idx.size = 0
 	idx.deserMeta = nil
+	idx.idToCluster = sync.Map{}
 
 	return nil
 }

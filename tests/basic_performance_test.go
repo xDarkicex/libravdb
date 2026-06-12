@@ -24,7 +24,7 @@ func TestBasicPerformance(t *testing.T) {
 
 	t.Run("Small Collection Performance", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "small_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -99,7 +99,7 @@ func TestBasicPerformance(t *testing.T) {
 		}
 
 		// Verify collection stats
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != vectorCount {
 			t.Errorf("Expected %d vectors, got %d", vectorCount, stats.VectorCount)
 		}
@@ -110,7 +110,7 @@ func TestBasicPerformance(t *testing.T) {
 
 	t.Run("Flat Index Performance", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "flat_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -182,7 +182,7 @@ func TestBasicPerformance(t *testing.T) {
 
 	t.Run("Batch Operations Performance", func(t *testing.T) {
 		// Create database
-		db, err := libravdb.New(
+		db, err := libravdb.Open(
 			libravdb.WithStoragePath(filepath.Join(tempDir, "batch_test")),
 			libravdb.WithMetrics(false),
 		)
@@ -235,7 +235,7 @@ func TestBasicPerformance(t *testing.T) {
 			float64(batchSize)/batchDuration.Seconds())
 
 		// Verify all vectors were inserted
-		stats := collection.Stats()
+		stats := collection.Stats(context.Background())
 		if stats.VectorCount != batchSize {
 			t.Errorf("Expected %d vectors, got %d", batchSize, stats.VectorCount)
 		}

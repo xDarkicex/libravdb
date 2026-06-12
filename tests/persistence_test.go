@@ -23,7 +23,7 @@ func TestDataPersistence(t *testing.T) {
 	ctx := context.Background()
 
 	// Insert data, close DB, reopen, verify data exists
-	db1, err := libravdb.New(libravdb.WithStoragePath("./persist_test"))
+	db1, err := libravdb.Open(libravdb.WithStoragePath("./persist_test"))
 	if err != nil {
 		t.Fatalf("Failed to create initial database: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestDataPersistence(t *testing.T) {
 	db1.Close()
 
 	// Reopen database - should recover data
-	db2, err := libravdb.New(libravdb.WithStoragePath("./persist_test"))
+	db2, err := libravdb.Open(libravdb.WithStoragePath("./persist_test"))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}

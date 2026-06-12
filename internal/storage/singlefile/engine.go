@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -15,15 +16,19 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 const (
 	pageSize             = 4096
-	formatVersion        = uint16(1)
+	formatVersion        = uint16(2) // On-disk file layout (header page, metapage, chunk framing)
 	fileMagic            = "LIBRAVDB"
+	fileCreator          = "libravdb/2.0.0 xDarkicex" // 24 bytes — embedded in file header
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
 	metaMagicV2   uint32 = 0x4C56444E // V2 metapage includes index persistence fields
@@ -83,6 +88,7 @@ type fileHeader struct {
 	FeatureFlags      uint32
 	FileID            uint64
 	CreatedUnixNano   uint64
+	Creator           [24]byte // "libravdb/2.0.0 xDarkicex"
 	LastCheckpointLSN uint64
 	ActiveMetaPage    uint64
 	WALStartPage      uint64
@@ -128,36 +134,39 @@ type walFrameHeader struct {
 }
 
 type walRecord struct {
-	Header         walFrameHeader
+	PayloadEncoder *util.BinaryEncoder
 	Payload        []byte
-	payloadEncoder *binaryEncoder
+	Header         walFrameHeader
 }
 
 type persistedState struct {
-	NextCollectionID uint64                          `json:"next_collection_id"`
 	Collections      map[string]*persistedCollection `json:"collections"`
+	NextCollectionID uint64                          `json:"next_collection_id"`
 }
 
 type persistedCollection struct {
-	ID          uint64                   `json:"id"`
-	Config      storage.CollectionConfig `json:"config"`
-	CreatedLSN  uint64                   `json:"created_lsn"`
-	UpdatedLSN  uint64                   `json:"updated_lsn"`
-	Deleted     bool                     `json:"deleted"`
-	LiveCount   uint64                   `json:"live_count"`
-	NextOrdinal uint32                   `json:"next_ordinal"`
-	Records     map[string]*recordValue  `json:"records"`
-	ordinalToID []string
+	Records             map[string]*recordValue `json:"records"`
+	vectorSFL           *memory.ShardedFreeList
+	Config              storage.CollectionConfig `json:"config"`
+	ordinalToID         []string
+	vectorSlots         [][]byte
+	ID                  uint64 `json:"id"`
+	CreatedLSN          uint64 `json:"created_lsn"`
+	UpdatedLSN          uint64 `json:"updated_lsn"`
+	LiveCount           uint64 `json:"live_count"`
+	NextOrdinal         uint32 `json:"next_ordinal"`
+	reservedNextOrdinal atomic.Uint32
+	Deleted             bool `json:"deleted"`
 }
 
 type recordValue struct {
+	Metadata   map[string]interface{} `json:"metadata"`
+	Vector     []float32              `json:"vector"`
 	Version    uint64                 `json:"version"`
 	CreatedLSN uint64                 `json:"created_lsn"`
 	UpdatedLSN uint64                 `json:"updated_lsn"`
-	Deleted    bool                   `json:"deleted"`
 	Ordinal    uint32                 `json:"ordinal"`
-	Vector     []float32              `json:"vector"`
-	Metadata   map[string]interface{} `json:"metadata"`
+	Deleted    bool                   `json:"deleted"`
 }
 
 type collectionCreatePayload struct {
@@ -170,11 +179,11 @@ type collectionDeletePayload struct {
 }
 
 type recordPutPayload struct {
+	Metadata   map[string]interface{} `json:"metadata"`
 	Collection string                 `json:"collection"`
 	ID         string                 `json:"id"`
-	Ordinal    uint32                 `json:"ordinal"`
 	Vector     []float32              `json:"vector"`
-	Metadata   map[string]interface{} `json:"metadata"`
+	Ordinal    uint32                 `json:"ordinal"`
 }
 
 type recordDeletePayload struct {
@@ -210,58 +219,62 @@ type IndexSnapshotProvider interface {
 
 // indexBlockEntry is a single collection's serialized index within the index chunk.
 type indexBlockEntry struct {
-	name           string
-	indexType      uint8
-	indexVersion   uint16
-	payload        []byte
+	name            string
+	payload         []byte
 	payloadChecksum uint32
+	indexVersion    uint16
+	indexType       uint8
 }
 
 // Engine is the single-file storage engine.
 type Engine struct {
-	mu              sync.RWMutex
-	path            string
-	file            *os.File
-	state           *persistedState
-	collections     map[string]*Collection
-	fileID          uint64
-	metaEpoch       uint64
-	activeMetaPage  uint64
-	lastLSN         uint64
-	lastTxID        uint64
-	dirty           bool
-	dirtyBytes      uint64
-	dirtyOps        int
-	walTransactions uint64
-	walBytes        uint64
-	batchFlushes    uint64
-	batchedEntries  uint64
-	checkpoints      uint64
-	replayedTxs      uint64
-	discardedTxs     uint64
-	compactionErrors uint64
-	closed           bool
-	status           atomic.Int32 // EngineStatus: Starting → Recovering* → Ready | Failed
-	recoveryErr      atomic.Value // error, set when status transitions to Failed
-	indexProvider    IndexSnapshotProvider
-
-	// WAL batch buffer: accumulates entries across multiple putRecords calls
-	// and flushes them together to reduce fsync overhead.
-	batchBuffer struct {
-		mu                 sync.Mutex
-		entries            []batchEntry  // accumulated entries awaiting flush
-		flusher            chan struct{} // signal to wake up flusher
-		closed             bool
-		flushNow           []chan error // completion channels for foreground flushes
+	recoveryErr   atomic.Value
+	ctx           context.Context
+	indexProvider IndexSnapshotProvider
+	cancel        context.CancelFunc
+	file          *os.File
+	state         *persistedState
+	collections   map[string]*Collection
+	path          string
+	batchBuffer   struct {
+		mu       sync.Mutex
+		entries  []batchEntry
+		flusher  chan struct{}
+		flushNow []chan// accumulated entries awaiting flush
+		// signal to wake up flusher
+		error
 		flushSignalPending int32
 		pendingWaiters     int32
 	}
+	dirtyOps         int
+	compactionErrors uint64
+	lastTxID         uint64
+	fileID           uint64
+	dirtyBytes       uint64
+	metaEpoch        uint64
+	walTransactions  uint64
+	walBytes         uint64
+	batchFlushes     uint64
+	batchedEntries   uint64
+	checkpoints      uint64
+	replayedTxs      uint64
+	discardedTxs     uint64
+	lastLSN          uint64
+	activeMetaPage   uint64
+	mu               sync.RWMutex
+	status           atomic.Int32
+	closed           atomic.Bool
+	dirty            bool // completion channels for foreground flushes
 }
 
 // batchEntry holds a buffered record pending WAL flush.
 type batchEntry struct {
 	collection string
 	entries    []*index.VectorEntry
+	// encoded holds pre-encoded recordPut payloads, 1:1 with entries.
+	// When set, flushBatch passes these to putRecordsInlocked to avoid
+	// re-encoding under e.mu.Lock().
+	encoded []encodedPayload
 }
 
 // startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
@@ -305,9 +318,28 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		return nil, err
 	}
 
-	file, err := os.OpenFile(resolved, os.O_RDWR|os.O_CREATE, 0644)
+	file, err := os.OpenFile(resolved, os.O_RDWR|os.O_CREATE|oNoFollow, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open database file: %w", err)
+	}
+
+	// Check format version early before applying options or starting goroutines
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("stat database file: %w", err)
+	}
+
+	if stat.Size() > 0 {
+		buf := make([]byte, 10)
+		if _, err := file.ReadAt(buf, 0); err == nil {
+			magic := string(buf[:8])
+			version := binary.LittleEndian.Uint16(buf[8:10])
+			if magic == fileMagic && version == 1 {
+				file.Close()
+				return nil, storage.ErrV1FormatMigrationRequired
+			}
+		}
 	}
 
 	engine := &Engine{
@@ -316,6 +348,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		state:       &persistedState{NextCollectionID: 1, Collections: make(map[string]*persistedCollection)},
 		collections: make(map[string]*Collection),
 	}
+	engine.ctx, engine.cancel = context.WithCancel(context.Background())
 
 	// Apply options before recovery so provider is available to loadIndexes.
 	for _, opt := range opts {
@@ -329,7 +362,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	engine.batchBuffer.flusher = make(chan struct{})
 	engine.batchBuffer.entries = nil
 
-	stat, err := file.Stat()
+	stat, err = file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, fmt.Errorf("stat database file: %w", err)
@@ -343,6 +376,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		// Start background flusher only after successful initialization
 		startBatchFlusher(engine)
 		engine.status.Store(int32(storage.StatusReady))
+		engine.initReservedOrdinals()
 		return engine, nil
 	}
 
@@ -353,6 +387,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 
 	// Start background flusher only after successful open
 	startBatchFlusher(engine)
+	engine.initReservedOrdinals()
 	return engine, nil
 }
 
@@ -360,6 +395,7 @@ func resolveDatabasePath(path string) (string, error) {
 	if path == "" {
 		path = "./data.libravdb"
 	}
+	path = filepath.Clean(path)
 
 	if strings.HasPrefix(path, ":memory:") {
 		name := strings.TrimPrefix(path, ":memory:")
@@ -581,52 +617,57 @@ func (e *Engine) writeInitialPages() error {
 		WALTailPage:     3,
 	}
 	copy(header.Magic[:], []byte(fileMagic))
-	if err := writeFixedPage(e.file, 0, encodeHeader(header)); err != nil {
+	copy(header.Creator[:], []byte(fileCreator))
+	if err := writeFixedPage(e.file, 0, encodeHeader(header, make([]byte, pageSize))); err != nil {
 		return err
 	}
 
 	metaA := &metaPage{Magic: metaMagic, RootFreelist: 0}
 	metaB := &metaPage{Magic: metaMagic, RootFreelist: math.MaxUint64}
-	if err := writeFixedPage(e.file, 1, encodeMeta(metaA)); err != nil {
+	if err := writeFixedPage(e.file, 1, encodeMeta(metaA, make([]byte, pageSize))); err != nil {
 		return err
 	}
-	if err := writeFixedPage(e.file, 2, encodeMeta(metaB)); err != nil {
+	if err := writeFixedPage(e.file, 2, encodeMeta(metaB, make([]byte, pageSize))); err != nil {
 		return err
 	}
 
 	return e.file.Sync()
 }
 
+var pagePool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, pageSize)
+		return &buf
+	},
+}
+
 func writeFixedPage(file *os.File, page uint64, data []byte) error {
 	if len(data) > pageSize {
 		return fmt.Errorf("page payload too large: %d", len(data))
 	}
-	buf := make([]byte, pageSize)
-	copy(buf, data)
-	_, err := file.WriteAt(buf, int64(page)*pageSize)
+	_, err := file.WriteAt(data, int64(page)*pageSize)
 	return err
 }
 
-func encodeHeader(header *fileHeader) []byte {
-	buf := make([]byte, pageSize)
+func encodeHeader(header *fileHeader, buf []byte) []byte {
 	copy(buf[:8], header.Magic[:])
 	binary.LittleEndian.PutUint16(buf[8:10], header.FormatVersion)
 	binary.LittleEndian.PutUint16(buf[10:12], header.PageSize)
 	binary.LittleEndian.PutUint32(buf[12:16], header.FeatureFlags)
 	binary.LittleEndian.PutUint64(buf[16:24], header.FileID)
 	binary.LittleEndian.PutUint64(buf[24:32], header.CreatedUnixNano)
-	binary.LittleEndian.PutUint64(buf[32:40], header.LastCheckpointLSN)
-	binary.LittleEndian.PutUint64(buf[40:48], header.ActiveMetaPage)
-	binary.LittleEndian.PutUint64(buf[48:56], header.WALStartPage)
-	binary.LittleEndian.PutUint64(buf[56:64], header.WALHeadPage)
-	binary.LittleEndian.PutUint64(buf[64:72], header.WALTailPage)
-	checksum := crc32.Checksum(buf[:72], castagnoli)
-	binary.LittleEndian.PutUint32(buf[72:76], checksum)
+	copy(buf[32:56], header.Creator[:])
+	binary.LittleEndian.PutUint64(buf[56:64], header.LastCheckpointLSN)
+	binary.LittleEndian.PutUint64(buf[64:72], header.ActiveMetaPage)
+	binary.LittleEndian.PutUint64(buf[72:80], header.WALStartPage)
+	binary.LittleEndian.PutUint64(buf[80:88], header.WALHeadPage)
+	binary.LittleEndian.PutUint64(buf[88:96], header.WALTailPage)
+	checksum := crc32.Checksum(buf[:96], castagnoli)
+	binary.LittleEndian.PutUint32(buf[96:100], checksum)
 	return buf
 }
 
-func encodeMeta(meta *metaPage) []byte {
-	buf := make([]byte, pageSize)
+func encodeMeta(meta *metaPage, buf []byte) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], metaMagicV2)
 	binary.LittleEndian.PutUint64(buf[4:12], meta.MetaEpoch)
 	binary.LittleEndian.PutUint64(buf[12:20], meta.RootCatalog)
@@ -645,35 +686,57 @@ func encodeMeta(meta *metaPage) []byte {
 }
 
 func (e *Engine) readHeader() (*fileHeader, error) {
-	buf := make([]byte, pageSize)
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
 	if _, err := e.file.ReadAt(buf, 0); err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 	if string(buf[:8]) != fileMagic {
 		return nil, fmt.Errorf("invalid database file magic")
 	}
-	expected := crc32.Checksum(buf[:72], castagnoli)
-	if got := binary.LittleEndian.Uint32(buf[72:76]); got != expected {
-		return nil, fmt.Errorf("invalid header checksum")
-	}
+	version := binary.LittleEndian.Uint16(buf[8:10])
 	header := &fileHeader{}
 	copy(header.Magic[:], buf[:8])
-	header.FormatVersion = binary.LittleEndian.Uint16(buf[8:10])
+	header.FormatVersion = version
 	header.PageSize = binary.LittleEndian.Uint16(buf[10:12])
 	header.FeatureFlags = binary.LittleEndian.Uint32(buf[12:16])
 	header.FileID = binary.LittleEndian.Uint64(buf[16:24])
 	header.CreatedUnixNano = binary.LittleEndian.Uint64(buf[24:32])
-	header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[32:40])
-	header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[40:48])
-	header.WALStartPage = binary.LittleEndian.Uint64(buf[48:56])
-	header.WALHeadPage = binary.LittleEndian.Uint64(buf[56:64])
-	header.WALTailPage = binary.LittleEndian.Uint64(buf[64:72])
-	header.Checksum = binary.LittleEndian.Uint32(buf[72:76])
+
+	if version >= 2 {
+		// V2 header: 96-byte data with Creator field, checksum at 96:100.
+		expected := crc32.Checksum(buf[:96], castagnoli)
+		if got := binary.LittleEndian.Uint32(buf[96:100]); got != expected {
+			return nil, fmt.Errorf("invalid header checksum")
+		}
+		copy(header.Creator[:], buf[32:56])
+		header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[56:64])
+		header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[64:72])
+		header.WALStartPage = binary.LittleEndian.Uint64(buf[72:80])
+		header.WALHeadPage = binary.LittleEndian.Uint64(buf[80:88])
+		header.WALTailPage = binary.LittleEndian.Uint64(buf[88:96])
+		header.Checksum = binary.LittleEndian.Uint32(buf[96:100])
+	} else {
+		// V1 header: 72-byte data, checksum at 72:76.
+		expected := crc32.Checksum(buf[:72], castagnoli)
+		if got := binary.LittleEndian.Uint32(buf[72:76]); got != expected {
+			return nil, fmt.Errorf("invalid header checksum")
+		}
+		header.LastCheckpointLSN = binary.LittleEndian.Uint64(buf[32:40])
+		header.ActiveMetaPage = binary.LittleEndian.Uint64(buf[40:48])
+		header.WALStartPage = binary.LittleEndian.Uint64(buf[48:56])
+		header.WALHeadPage = binary.LittleEndian.Uint64(buf[56:64])
+		header.WALTailPage = binary.LittleEndian.Uint64(buf[64:72])
+		header.Checksum = binary.LittleEndian.Uint32(buf[72:76])
+	}
 	return header, nil
 }
 
 func (e *Engine) readMetaPage(page uint64) (*metaPage, error) {
-	buf := make([]byte, pageSize)
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
 	if _, err := e.file.ReadAt(buf, int64(page)*pageSize); err != nil {
 		return nil, err
 	}
@@ -737,6 +800,9 @@ func (e *Engine) readChunkAt(offset uint64) ([]byte, error) {
 	if header.Magic != chunkMagic {
 		return nil, fmt.Errorf("invalid chunk magic at offset %d", offset)
 	}
+	if header.PayloadLen > maxChunkSize {
+		return nil, fmt.Errorf("chunk size %d exceeds limit %d at offset %d", header.PayloadLen, maxChunkSize, offset)
+	}
 	payload := make([]byte, header.PayloadLen)
 	if _, err := e.file.ReadAt(payload, int64(offset)+16); err != nil {
 		return nil, err
@@ -787,6 +853,9 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 			continue
 		}
 
+		if chunk.PayloadLen > maxChunkSize {
+			return fmt.Errorf("chunk size %d exceeds limit %d during replay", chunk.PayloadLen, maxChunkSize)
+		}
 		payload := make([]byte, chunk.PayloadLen)
 		if _, err := e.file.ReadAt(payload, offset+16); err != nil {
 			return err
@@ -812,18 +881,24 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 				return err
 			}
 			e.replayedTxs++
+			if record.Header.LSN > e.lastLSN {
+				e.lastLSN = record.Header.LSN
+			}
+			if record.Header.TxID > e.lastTxID {
+				e.lastTxID = record.Header.TxID
+			}
 			delete(pending, record.Header.TxID)
 		case recordTypeTxAbort:
 			e.discardedTxs++
+			if record.Header.LSN > e.lastLSN {
+				e.lastLSN = record.Header.LSN
+			}
+			if record.Header.TxID > e.lastTxID {
+				e.lastTxID = record.Header.TxID
+			}
 			delete(pending, record.Header.TxID)
 		default:
 			pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
-		}
-		if record.Header.LSN > e.lastLSN {
-			e.lastLSN = record.Header.LSN
-		}
-		if record.Header.TxID > e.lastTxID {
-			e.lastTxID = record.Header.TxID
 		}
 		offset += int64(16 + chunk.PayloadLen)
 	}
@@ -907,6 +982,13 @@ func (e *Engine) applyDeleteCollection(name string, lsn uint64) {
 	if collection := e.state.Collections[name]; collection != nil {
 		collection.Deleted = true
 		collection.UpdatedLSN = lsn
+		// Free all off-heap vector slots. Individual deallocation is
+		// unnecessary: Free() releases all mmap'd slabs at once.
+		if collection.vectorSFL != nil {
+			collection.vectorSFL.Free()
+			collection.vectorSFL = nil
+			collection.vectorSlots = nil
+		}
 	}
 }
 
@@ -916,6 +998,75 @@ func (e *Engine) applyRecordPut(payload recordPutPayload, lsn uint64) error {
 
 func (e *Engine) applyRecordPutOwned(payload recordPutPayload, lsn uint64, adopt bool) error {
 	return e.applyRecordPutFields(payload.Collection, payload.ID, payload.Ordinal, payload.Vector, payload.Metadata, lsn, adopt)
+}
+
+// sflMetadataOverhead is the minimum reserved bytes at the start of each
+// ShardedFreeList slot. The memory package's SFL metadata occupies offsets
+// 0–43 (Hyaline chain at 0/8/16/24/32, structIdx+shardIdx at 40); rounded
+// up to the nearest 8-byte boundary: 48.
+const sflMetadataOverhead = 48
+
+// initVectorSFL lazily initializes the ShardedFreeList for off-heap vector storage.
+func (c *persistedCollection) initVectorSFL() error {
+	if c.vectorSFL != nil {
+		return nil
+	}
+	// Slot must hold the vector data plus the SFL internal metadata prefix.
+	slotSize := uint64(sflMetadataOverhead + c.Config.Dimension*4)
+	slotSize = (slotSize + 7) &^ 7 // 8-byte alignment
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		SlotSize:  slotSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 16,
+	}, 64)
+	if err != nil {
+		return fmt.Errorf("init vector SFL: %w", err)
+	}
+	c.vectorSFL = sfl
+	c.vectorSlots = make([][]byte, nextOrdinalCapacity(0, 16))
+	return nil
+}
+
+// storeVectorOffHeap allocates an SFL slot, copies vector data into it, and
+// returns a []float32 view of the off-heap slot. frees any previous slot at ordinal.
+func (c *persistedCollection) storeVectorOffHeap(ordinal uint32, vector []float32) ([]float32, error) {
+	if len(vector) != c.Config.Dimension {
+		return nil, fmt.Errorf("vector dimension %d != collection dimension %d", len(vector), c.Config.Dimension)
+	}
+	if err := c.initVectorSFL(); err != nil {
+		return nil, err
+	}
+	// Grow vectorSlots if needed.
+	if int(ordinal) >= len(c.vectorSlots) {
+		grown := make([][]byte, nextOrdinalCapacity(len(c.vectorSlots), int(ordinal)+1))
+		copy(grown, c.vectorSlots)
+		c.vectorSlots = grown
+	}
+	// Free previous slot if replacing.
+	if existing := c.vectorSlots[ordinal]; existing != nil {
+		c.vectorSFL.Deallocate(existing)
+		c.vectorSlots[ordinal] = nil
+	}
+	slot, err := c.vectorSFL.Allocate()
+	if err != nil {
+		return nil, fmt.Errorf("allocate vector slot: %w", err)
+	}
+	// Copy vector bytes after the SFL metadata prefix.
+	data := slot[sflMetadataOverhead:]
+	copy(data, unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4))
+	c.vectorSlots[ordinal] = slot
+	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), c.Config.Dimension), nil
+}
+
+// freeVectorSlot returns a vector's off-heap slot to the SFL.
+func (c *persistedCollection) freeVectorSlot(ordinal uint32) {
+	if c.vectorSFL == nil || int(ordinal) >= len(c.vectorSlots) {
+		return
+	}
+	if slot := c.vectorSlots[ordinal]; slot != nil {
+		c.vectorSFL.Deallocate(slot)
+		c.vectorSlots[ordinal] = nil
+	}
 }
 
 func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32, vector []float32, metadata map[string]interface{}, lsn uint64, adopt bool) error {
@@ -942,11 +1093,15 @@ func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32,
 		collection.NextOrdinal = next
 	}
 	ensureOrdinalSlot(collection, current.Ordinal, id)
+	// Store vector off-heap via ShardedFreeList.
+	owned, err := collection.storeVectorOffHeap(current.Ordinal, vector)
+	if err != nil {
+		return fmt.Errorf("store vector off-heap: %w", err)
+	}
+	current.Vector = owned
 	if adopt {
-		current.Vector = vector
 		current.Metadata = metadata
 	} else {
-		current.Vector = append([]float32(nil), vector...)
 		current.Metadata = cloneMetadata(metadata)
 	}
 	current.UpdatedLSN = lsn
@@ -1015,6 +1170,7 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	}
 	current.Deleted = true
 	current.UpdatedLSN = lsn
+	collection.freeVectorSlot(current.Ordinal)
 	if collection.LiveCount > 0 {
 		collection.LiveCount--
 	}
@@ -1029,8 +1185,8 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 func encodeIndexBlock(entries []indexBlockEntry) []byte {
 	size := 4 // collectionCount uint32
 	for _, e := range entries {
-		size += 2 + len(e.name) // nameLen uint16 + name bytes
-		size += 1 + 2            // indexType uint8 + indexVersion uint16
+		size += 2 + len(e.name)        // nameLen uint16 + name bytes
+		size += 1 + 2                  // indexType uint8 + indexVersion uint16
 		size += 4 + len(e.payload) + 4 // payloadLen uint32 + payload bytes + payloadChecksum uint32
 	}
 	buf := make([]byte, 0, size)
@@ -1058,24 +1214,27 @@ func decodeIndexBlock(data []byte) ([]indexBlockEntry, error) {
 	entries := make([]indexBlockEntry, 0, count)
 	for i := uint32(0); i < count; i++ {
 		if pos+2 > len(data) {
-			break
+			return nil, fmt.Errorf("truncated index block: expected entry %d name length at offset %d", i, pos)
 		}
 		nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
 		pos += 2
 		if pos+nameLen > len(data) {
-			break
+			return nil, fmt.Errorf("truncated index block: entry %d name extends past end at offset %d", i, pos)
 		}
 		name := string(data[pos : pos+nameLen])
 		pos += nameLen
 		if pos+7 > len(data) {
-			break
+			return nil, fmt.Errorf("truncated index block: entry %d (%s) header cut at offset %d", i, name, pos)
 		}
 		indexType := data[pos]
 		indexVersion := binary.LittleEndian.Uint16(data[pos+1:])
 		payloadLen := int(binary.LittleEndian.Uint32(data[pos+3:]))
 		pos += 7
 		if pos+payloadLen+4 > len(data) {
-			break
+			return nil, fmt.Errorf("truncated index entry for collection %s", name)
+		}
+		if payloadLen > maxIndexEntrySize {
+			return nil, fmt.Errorf("index entry size %d exceeds limit %d", payloadLen, maxIndexEntrySize)
 		}
 		payload := make([]byte, payloadLen)
 		copy(payload, data[pos:pos+payloadLen])
@@ -1178,8 +1337,15 @@ func (e *Engine) checkpointLocked() error {
 		IndexLength:     indexLength,
 		IndexChecksum:   indexChecksum,
 	}
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
+
+	for i := range buf {
+		buf[i] = 0
+	}
 	// STEP 4: fsync (durable: snapshot + index + metapage)
-	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta)); err != nil {
+	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta, buf)); err != nil {
 		return err
 	}
 	if err := e.file.Sync(); err != nil {
@@ -1194,7 +1360,11 @@ func (e *Engine) checkpointLocked() error {
 	header.LastCheckpointLSN = e.lastLSN
 	header.ActiveMetaPage = nextMetaPage
 	header.WALHeadPage = pageCount
-	if err := writeFixedPage(e.file, 0, encodeHeader(header)); err != nil {
+
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(e.file, 0, encodeHeader(header, buf)); err != nil {
 		return err
 	}
 	if err := e.file.Sync(); err != nil {
@@ -1210,8 +1380,537 @@ func (e *Engine) checkpointLocked() error {
 	// Auto-compact when WAL bloat exceeds 2× the minimum file size.
 	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot)) + 16 + int64(len(indexBlock))
 	if stat.Size() > compactSize*2 {
-		_ = e.compactFile()
+		if err := e.compactFile(); err != nil {
+			log.Printf("singlefile: auto-compact failed: %v", err)
+		}
 	}
+	return nil
+}
+
+func captureState(e *Engine) *persistedState {
+	cloned := &persistedState{
+		NextCollectionID: e.state.NextCollectionID,
+		Collections:      make(map[string]*persistedCollection, len(e.state.Collections)),
+	}
+	for name, coll := range e.state.Collections {
+		c := &persistedCollection{
+			ID:          coll.ID,
+			Config:      coll.Config,
+			CreatedLSN:  coll.CreatedLSN,
+			UpdatedLSN:  coll.UpdatedLSN,
+			LiveCount:   coll.LiveCount,
+			NextOrdinal: coll.NextOrdinal,
+			Deleted:     coll.Deleted,
+			Records:     make(map[string]*recordValue, len(coll.Records)),
+		}
+		for id, rec := range coll.Records {
+			r := &recordValue{
+				Vector:     append([]float32(nil), rec.Vector...),
+				Version:    rec.Version,
+				CreatedLSN: rec.CreatedLSN,
+				UpdatedLSN: rec.UpdatedLSN,
+				Ordinal:    rec.Ordinal,
+				Deleted:    rec.Deleted,
+			}
+			if rec.Metadata != nil {
+				r.Metadata = make(map[string]interface{}, len(rec.Metadata))
+				for k, v := range rec.Metadata {
+					r.Metadata[k] = v
+				}
+			}
+			c.Records[id] = r
+		}
+		cloned.Collections[name] = c
+	}
+	return cloned
+}
+
+// Vacuum reclaims disk space by writing a compacted database to a temporary file
+// and atomically replacing the active file. It minimizes lock contention by
+// performing heavy serialization unlocked, then copying only the appended WAL
+// deltas during a brief final lock.
+func (e *Engine) Vacuum(ctx context.Context) error {
+	// Phase 1: flush + snapshot (brief lock)
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("engine closed")
+	}
+	if err := e.checkpointLocked(); err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum pre-checkpoint: %w", err)
+	}
+	
+	// Snapshot vectors for indexes safely
+	if e.indexProvider != nil {
+		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("vacuum snapshot vectors: %w", err)
+		}
+	}
+
+	stat, err := e.file.Stat()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum stat: %w", err)
+	}
+	phase1Size := stat.Size()
+	snapshotState := captureState(e)
+	origHeader, err := e.readHeader()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("vacuum read header: %w", err)
+	}
+	phase1LSN := e.lastLSN
+	e.mu.Unlock()
+
+	// Phase 2: Serialization and writing temp file (Unlocked)
+	snapshotBytes, err := encodeStateBinary(snapshotState)
+	if err != nil {
+		return fmt.Errorf("vacuum encode state: %w", err)
+	}
+	if len(snapshotBytes) > maxChunkSize {
+		return fmt.Errorf("vacuum snapshot size %d exceeds limit %d", len(snapshotBytes), maxChunkSize)
+	}
+
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(snapshotState.Collections))
+		for name := range snapshotState.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("vacuum serialize index %s: %w", name, err)
+			}
+			if indexBytes == nil {
+				continue
+			}
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+
+	tmpPath := e.path + ".vacuum"
+	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("vacuum create temp file: %w", err)
+	}
+	
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	const snapshotOffset = uint64(3 * pageSize)
+	indexOffset := snapshotOffset + 16 + uint64(len(snapshotBytes))
+	indexLength := uint64(len(indexBlock))
+	totalSize := int64(indexOffset)
+	if len(indexBlock) > 0 {
+		totalSize += 16 + int64(indexLength)
+	}
+	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
+
+	fh := &fileHeader{
+		FormatVersion:     origHeader.FormatVersion,
+		PageSize:          origHeader.PageSize,
+		FeatureFlags:      origHeader.FeatureFlags,
+		FileID:            origHeader.FileID,
+		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
+		LastCheckpointLSN: phase1LSN,
+		ActiveMetaPage:    1,
+		WALStartPage:      pageCount,
+		WALHeadPage:       pageCount,
+		WALTailPage:       pageCount,
+	}
+	copy(fh.Magic[:], origHeader.Magic[:])
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write header: %w", err)
+	}
+
+	meta := &metaPage{
+		Magic:           metaMagicV2,
+		MetaEpoch:       1,
+		RootCatalog:     3,
+		RootFreelist:    0,
+		LastAppliedLSN:  phase1LSN,
+		PageCount:       pageCount,
+		CollectionCount: uint64(len(snapshotState.Collections)),
+		SnapshotOffset:  snapshotOffset,
+		SnapshotLength:  uint64(len(snapshotBytes)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
+	}
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write meta A: %w", err)
+	}
+	
+	meta.RootFreelist = math.MaxUint64
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("vacuum write meta B: %w", err)
+	}
+	pagePool.Put(bufPtr)
+
+	var chunkHdr [16]byte
+	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
+	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
+	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
+	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
+	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
+	if _, err := tmpFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+		return fmt.Errorf("vacuum write chunk header: %w", err)
+	}
+	if _, err := tmpFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+		return fmt.Errorf("vacuum write snapshot payload: %w", err)
+	}
+
+	if len(indexBlock) > 0 {
+		var idxHdr [16]byte
+		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
+		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
+		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
+		if _, err := tmpFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+			return fmt.Errorf("vacuum write index chunk header: %w", err)
+		}
+		if _, err := tmpFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+			return fmt.Errorf("vacuum write index payload: %w", err)
+		}
+	}
+
+	// Phase 3: Catch-up & Swap (Brief Lock)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return fmt.Errorf("engine closed during vacuum")
+	}
+
+	// Flush any in-flight writes
+	if err := e.checkpointLocked(); err != nil {
+		return fmt.Errorf("vacuum final checkpoint: %w", err)
+	}
+
+	stat, err = e.file.Stat()
+	if err != nil {
+		return fmt.Errorf("vacuum final stat: %w", err)
+	}
+	currentSize := stat.Size()
+
+	if currentSize > phase1Size {
+		// Copy WAL bytes that landed during Phase 2
+		// Seek temp file to end (should be at totalSize)
+		if _, err := tmpFile.Seek(0, io.SeekEnd); err != nil {
+			return fmt.Errorf("vacuum seek temp file: %w", err)
+		}
+		
+		// Create section reader for the delta
+		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
+		if _, err := io.Copy(tmpFile, deltaReader); err != nil {
+			return fmt.Errorf("vacuum copy WAL deltas: %w", err)
+		}
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("vacuum final sync: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("vacuum close temp: %w", err)
+	}
+
+	if err := e.file.Close(); err != nil {
+		// reopen guard
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("vacuum close original: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
+		return fmt.Errorf("vacuum close original: %w", err)
+	}
+
+	e.file = nil // Safety before rename
+	if err := os.Rename(tmpPath, e.path); err != nil {
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("vacuum rename: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
+		return fmt.Errorf("vacuum rename: %w", err)
+	}
+	
+	f, err := os.OpenFile(e.path, os.O_RDWR, 0644)
+	if err != nil {
+		e.status.Store(int32(storage.StatusFailed))
+		return fmt.Errorf("vacuum open new file: %w", err)
+	}
+	e.file = f
+	e.dirty = false
+	cleanup = false // Successfully swapped, defer won't remove it
+	return nil
+}
+
+// Backup creates a point-in-time copy of the active database to destPath.
+// It uses the same non-blocking fast-forward logic as Vacuum.
+func (e *Engine) Backup(ctx context.Context, destPath string) error {
+	// Phase 1: flush + snapshot (brief lock)
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("engine closed")
+	}
+	if err := e.checkpointLocked(); err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup pre-checkpoint: %w", err)
+	}
+	
+	if e.indexProvider != nil {
+		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("backup snapshot vectors: %w", err)
+		}
+	}
+
+	stat, err := e.file.Stat()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup stat: %w", err)
+	}
+	phase1Size := stat.Size()
+	snapshotState := captureState(e)
+	origHeader, err := e.readHeader()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("backup read header: %w", err)
+	}
+	phase1LSN := e.lastLSN
+	e.mu.Unlock()
+
+	// Phase 2: Serialization and writing backup file (Unlocked)
+	snapshotBytes, err := encodeStateBinary(snapshotState)
+	if err != nil {
+		return fmt.Errorf("backup encode state: %w", err)
+	}
+	if len(snapshotBytes) > maxChunkSize {
+		return fmt.Errorf("backup snapshot size %d exceeds limit %d", len(snapshotBytes), maxChunkSize)
+	}
+
+	var indexBlock []byte
+	var indexChecksum uint32
+	if e.indexProvider != nil {
+		names := make([]string, 0, len(snapshotState.Collections))
+		for name := range snapshotState.Collections {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		entries := make([]indexBlockEntry, 0, len(names))
+		for _, name := range names {
+			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			if err != nil {
+				return fmt.Errorf("backup serialize index %s: %w", name, err)
+			}
+			if indexBytes == nil { continue }
+			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+			entries = append(entries, indexBlockEntry{
+				name:            name,
+				indexType:       indexType,
+				indexVersion:    indexVersion,
+				payload:         indexBytes,
+				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+			})
+		}
+		if len(entries) > 0 {
+			indexBlock = encodeIndexBlock(entries)
+			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
+		}
+	}
+
+	destFile, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("backup create file: %w", err)
+	}
+	
+	cleanup := true
+	defer func() {
+		if cleanup {
+			destFile.Close()
+			os.Remove(destPath)
+		}
+	}()
+
+	const snapshotOffset = uint64(3 * pageSize)
+	indexOffset := snapshotOffset + 16 + uint64(len(snapshotBytes))
+	indexLength := uint64(len(indexBlock))
+	totalSize := int64(indexOffset)
+	if len(indexBlock) > 0 {
+		totalSize += 16 + int64(indexLength)
+	}
+	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
+
+	fh := &fileHeader{
+		FormatVersion:     origHeader.FormatVersion,
+		PageSize:          origHeader.PageSize,
+		FeatureFlags:      origHeader.FeatureFlags,
+		FileID:            origHeader.FileID,
+		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
+		LastCheckpointLSN: phase1LSN,
+		ActiveMetaPage:    1,
+		WALStartPage:      pageCount,
+		WALHeadPage:       pageCount,
+		WALTailPage:       pageCount,
+	}
+	copy(fh.Magic[:], origHeader.Magic[:])
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 0, encodeHeader(fh, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write header: %w", err)
+	}
+
+	meta := &metaPage{
+		Magic:           metaMagicV2,
+		MetaEpoch:       1,
+		RootCatalog:     3,
+		RootFreelist:    0,
+		LastAppliedLSN:  phase1LSN,
+		PageCount:       pageCount,
+		CollectionCount: uint64(len(snapshotState.Collections)),
+		SnapshotOffset:  snapshotOffset,
+		SnapshotLength:  uint64(len(snapshotBytes)),
+		IndexOffset:     indexOffset,
+		IndexLength:     indexLength,
+		IndexChecksum:   indexChecksum,
+	}
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 1, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write meta A: %w", err)
+	}
+	
+	meta.RootFreelist = math.MaxUint64
+	for i := range buf { buf[i] = 0 }
+	if err := writeFixedPage(destFile, 2, encodeMeta(meta, buf)); err != nil {
+		pagePool.Put(bufPtr)
+		return fmt.Errorf("backup write meta B: %w", err)
+	}
+	pagePool.Put(bufPtr)
+
+	var chunkHdr [16]byte
+	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
+	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
+	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
+	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
+	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
+	if _, err := destFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+		return fmt.Errorf("backup write chunk header: %w", err)
+	}
+	if _, err := destFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+		return fmt.Errorf("backup write snapshot payload: %w", err)
+	}
+
+	if len(indexBlock) > 0 {
+		var idxHdr [16]byte
+		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
+		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
+		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
+		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
+		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
+		if _, err := destFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+			return fmt.Errorf("backup write index chunk header: %w", err)
+		}
+		if _, err := destFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+			return fmt.Errorf("backup write index payload: %w", err)
+		}
+	}
+
+	// Phase 3: Catch-up (Brief Lock)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return fmt.Errorf("engine closed during backup")
+	}
+
+	if err := e.checkpointLocked(); err != nil {
+		return fmt.Errorf("backup final checkpoint: %w", err)
+	}
+
+	stat, err = e.file.Stat()
+	if err != nil {
+		return fmt.Errorf("backup final stat: %w", err)
+	}
+	currentSize := stat.Size()
+
+	if currentSize > phase1Size {
+		if _, err := destFile.Seek(0, io.SeekEnd); err != nil {
+			return fmt.Errorf("backup seek temp file: %w", err)
+		}
+		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
+		if _, err := io.Copy(destFile, deltaReader); err != nil {
+			return fmt.Errorf("backup copy WAL deltas: %w", err)
+		}
+	}
+
+	if err := destFile.Sync(); err != nil {
+		return fmt.Errorf("backup final sync: %w", err)
+	}
+	if err := destFile.Close(); err != nil {
+		return fmt.Errorf("backup close dest: %w", err)
+	}
+
+	cleanup = false
+	return nil
+}
+
+// Drop destroys the storage engine by closing its file descriptor and removing it
+// from the filesystem.
+func (e *Engine) Drop(ctx context.Context) error {
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("database already closed")
+	}
+	e.mu.Unlock()
+	
+	if err := e.Close(); err != nil {
+		return fmt.Errorf("drop close: %w", err)
+	}
+	
+	if err := os.Remove(e.path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("drop remove: %w", err)
+	}
+	
 	return nil
 }
 
@@ -1232,6 +1931,9 @@ func (e *Engine) compactFileLocked() error {
 	snapshot, err := encodeStateBinary(e.state)
 	if err != nil {
 		return fmt.Errorf("compact: encode state: %w", err)
+	}
+	if len(snapshot) > maxChunkSize {
+		return fmt.Errorf("compact: snapshot size %d exceeds limit %d", len(snapshot), maxChunkSize)
 	}
 
 	// Preserve FileID and CreatedUnixNano from the live header.
@@ -1303,6 +2005,7 @@ func (e *Engine) compactFileLocked() error {
 		FeatureFlags:      origHeader.FeatureFlags,
 		FileID:            origHeader.FileID,
 		CreatedUnixNano:   origHeader.CreatedUnixNano,
+		Creator:           origHeader.Creator,
 		LastCheckpointLSN: e.lastLSN,
 		ActiveMetaPage:    1,
 		WALStartPage:      pageCount, // no WAL in compacted file
@@ -1310,7 +2013,15 @@ func (e *Engine) compactFileLocked() error {
 		WALTailPage:       pageCount,
 	}
 	copy(fh.Magic[:], origHeader.Magic[:])
-	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh)); err != nil {
+
+	bufPtr := pagePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer pagePool.Put(bufPtr)
+	for i := range buf {
+		buf[i] = 0
+	}
+
+	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
 		return fmt.Errorf("compact: write header: %w", err)
 	}
 
@@ -1329,11 +2040,21 @@ func (e *Engine) compactFileLocked() error {
 		IndexLength:     indexLength,
 		IndexChecksum:   indexChecksum,
 	}
-	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta)); err != nil {
+	if len(indexBlock) > maxChunkSize {
+		return fmt.Errorf("compact: index block size %d exceeds limit %d", len(indexBlock), maxChunkSize)
+	}
+
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
 		return fmt.Errorf("compact: write meta A: %w", err)
 	}
 	meta.RootFreelist = math.MaxUint64 // meta B marker
-	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta)); err != nil {
+	for i := range buf {
+		buf[i] = 0
+	}
+	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
 		return fmt.Errorf("compact: write meta B: %w", err)
 	}
 
@@ -1379,13 +2100,23 @@ func (e *Engine) compactFileLocked() error {
 	// ── Atomic rename ─────────────────────────────────────────────────────
 	// Close original before rename; if anything fails, reopen original.
 	if err := e.file.Close(); err != nil {
-		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("compact: close original: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
 		return fmt.Errorf("compact: close original: %w", err)
 	}
 	e.file = nil
 
 	if err := os.Rename(tmpPath, e.path); err != nil {
-		e.file, _ = os.OpenFile(e.path, os.O_RDWR, 0644)
+		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
+			e.status.Store(int32(storage.StatusFailed))
+			return fmt.Errorf("compact: rename: %w; reopen: %w", err, ferr)
+		} else {
+			e.file = f
+		}
 		return fmt.Errorf("compact: rename: %w", err)
 	}
 
@@ -1422,7 +2153,7 @@ func (e *Engine) Compact() error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("compact: database is closed")
 	}
 	return e.compactFile()
@@ -1430,9 +2161,14 @@ func (e *Engine) Compact() error {
 
 // CompactionErrors returns the count of compaction errors since engine startup.
 func (e *Engine) CompactionErrors() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.compactionErrors
 }
 
+// appendChunkLocked writes a chunk header + payload at the current file end.
+// Caller must hold e.mu. Does NOT fsync — callers that require durability
+// (e.g. checkpointLocked) must call e.file.Sync() after appending all chunks.
 func (e *Engine) appendChunkLocked(kind uint16, payload []byte) (uint64, error) {
 	return e.appendChunkHeaderPayloadLocked(kind, nil, payload)
 }
@@ -1470,9 +2206,9 @@ func (e *Engine) appendChunkHeaderPayloadLocked(kind uint16, headerPart, payload
 func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	defer func() {
 		for i := range records {
-			if records[i].payloadEncoder != nil {
-				releaseDetachedPayload(records[i].Payload, records[i].payloadEncoder)
-				records[i].payloadEncoder = nil
+			if records[i].PayloadEncoder != nil {
+				releaseDetachedPayload(records[i].Payload, records[i].PayloadEncoder)
+				records[i].PayloadEncoder = nil
 			}
 		}
 	}()
@@ -1555,25 +2291,25 @@ func newFrame(recordType uint16, lsn, txID, prevLSN uint64, payload encodedPaylo
 			Checksum:   crc32.Checksum(payload.bytes, castagnoli),
 		},
 		Payload:        payload.bytes,
-		payloadEncoder: payload.encoder,
+		PayloadEncoder: payload.encoder,
 	}
 }
 
-func releaseDetachedPayload(payload []byte, enc *binaryEncoder) {
+func releaseDetachedPayload(payload []byte, enc *util.BinaryEncoder) {
 	if enc == nil {
 		return
 	}
 	if payload != nil {
-		enc.buf = payload[:0]
+		enc.Buf = payload[:0]
 	}
-	releaseBinaryEncoder(enc)
+	util.ReleaseBinaryEncoder(enc)
 }
 
 func (e *Engine) createCollection(name string, config storage.CollectionConfig) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	if collection := e.state.Collections[name]; collection != nil && !collection.Deleted {
@@ -1614,6 +2350,8 @@ func (e *Engine) batchFlusher() {
 
 	for {
 		select {
+		case <-e.ctx.Done():
+			return
 		case <-ticker.C:
 			_ = e.flushBatch()
 		case <-e.batchBuffer.flusher:
@@ -1633,14 +2371,6 @@ func (e *Engine) batchFlusher() {
 			}
 		}
 		timer.Reset(batchFlushInterval)
-
-		// Check if the engine is closed
-		e.batchBuffer.mu.Lock()
-		closed := e.batchBuffer.closed
-		e.batchBuffer.mu.Unlock()
-		if closed {
-			return
-		}
 	}
 }
 
@@ -1712,7 +2442,7 @@ func (e *Engine) flushBatch() error {
 		}
 	}
 
-	if e.closed {
+	if e.closed.Load() {
 		// Signal any waiting flushes with error
 		signalErr(fmt.Errorf("database is closed"))
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
@@ -1725,11 +2455,13 @@ func (e *Engine) flushBatch() error {
 	for _, batch := range entries {
 		if len(merged) > 0 && merged[len(merged)-1].collection == batch.collection {
 			merged[len(merged)-1].entries = append(merged[len(merged)-1].entries, batch.entries...)
+			merged[len(merged)-1].encoded = append(merged[len(merged)-1].encoded, batch.encoded...)
 			continue
 		}
 		merged = append(merged, batchEntry{
 			collection: batch.collection,
 			entries:    batch.entries,
+			encoded:    batch.encoded,
 		})
 	}
 
@@ -1738,9 +2470,9 @@ func (e *Engine) flushBatch() error {
 		batchedEntries += len(batch.entries)
 	}
 
-	// Write all entries to WAL - inline the put logic to avoid lock issues
+	// Write all entries to WAL - use pre-encoded payloads to minimise time under e.mu.
 	for i, batch := range merged {
-		if err := e.putRecordsInlocked(batch.collection, batch.entries); err != nil {
+		if err := e.putRecordsInlocked(batch.collection, batch.entries, batch.encoded); err != nil {
 			// On error, re-queue only the failed suffix (merged[i:] onwards).
 			// Do NOT re-queue merged[:i] because they were already committed.
 			failedSuffix := merged[i:]
@@ -1771,7 +2503,7 @@ func (e *Engine) flushBatch() error {
 
 // putRecordsInlocked writes records to WAL and applies them to memory.
 // Caller must hold e.mu. This is the internal batch-friendly variant.
-func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) error {
+func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, encoded []encodedPayload) error {
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
@@ -1792,32 +2524,36 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) e
 	frames := make([]walRecord, len(entries)+2)
 	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	prevLSN := frames[0].Header.LSN
-	ownedVectors := make([][]float32, len(entries))
-	totalVectorLen := 0
-	for _, entry := range entries {
-		totalVectorLen += len(entry.Vector)
-	}
-	vectorBacking := make([]float32, totalVectorLen)
-	vectorOffset := 0
 	for i, entry := range entries {
-		vectorLen := len(entry.Vector)
-		ownedVector := vectorBacking[vectorOffset : vectorOffset+vectorLen : vectorOffset+vectorLen]
-		copy(ownedVector, entry.Vector)
-		vectorOffset += vectorLen
-		ownedVectors[i] = ownedVector
-		payloadStruct := recordPutPayload{
-			Collection: name,
-			ID:         entry.ID,
-			Ordinal:    entry.Ordinal,
-			Vector:     ownedVector,
-			Metadata:   entry.Metadata,
-		}
-		payload, err := encodeRecordPutPayloadBinary(payloadStruct)
-		if err != nil {
-			return err
-		}
 		lsn := e.nextLSNLocked()
-		frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+		if i < len(encoded) && encoded[i].encoder != nil {
+			frames[i+1] = walRecord{
+				Header: walFrameHeader{
+					Magic:      chunkMagic,
+					Version:    formatVersion,
+					RecordType: recordTypeRecordPut,
+					LSN:        lsn,
+					TxID:       txID,
+					PrevLSN:    prevLSN,
+					PayloadLen: uint32(len(encoded[i].bytes)),
+					Checksum:   crc32.Checksum(encoded[i].bytes, castagnoli),
+				},
+				Payload:        encoded[i].bytes,
+				PayloadEncoder: encoded[i].encoder,
+			}
+		} else {
+			payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+				Collection: name,
+				ID:         entry.ID,
+				Ordinal:    entry.Ordinal,
+				Vector:     entry.Vector,
+				Metadata:   entry.Metadata,
+			})
+			if err != nil {
+				return err
+			}
+			frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+		}
 		prevLSN = lsn
 	}
 	commitLSN := e.nextLSNLocked()
@@ -1827,24 +2563,60 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry) e
 		return err
 	}
 	for i, entry := range entries {
-		if err := e.applyRecordPutFields(name, entry.ID, entry.Ordinal, ownedVectors[i], entry.Metadata, frames[i+1].Header.LSN, true); err != nil {
+		if err := e.applyRecordPutFields(name, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, frames[i+1].Header.LSN, true); err != nil {
 			return err
 		}
 	}
-	e.markDirtyLocked(written, len(ownedVectors))
+	e.markDirtyLocked(written, len(entries))
 	if err := e.maybeCheckpointLocked(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, error) {
-	if e.closed {
+func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (bool, error) {
+	if e.closed.Load() {
 		return false, fmt.Errorf("database is closed")
+	}
+
+	// Pre-encode recordPut payloads before acquiring any locks.
+	encoded := make([]encodedPayload, len(entries))
+	for i, entry := range entries {
+		if i%100 == 0 {
+			select {
+			case <-ctx.Done():
+				for j := 0; j < i; j++ {
+					releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+				}
+				return false, ctx.Err()
+			default:
+			}
+		}
+		payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
+			Collection: name,
+			ID:         entry.ID,
+			Ordinal:    entry.Ordinal,
+			Vector:     entry.Vector,
+			Metadata:   entry.Metadata,
+		})
+		if err != nil {
+			for j := 0; j < i; j++ {
+				releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+			}
+			return false, err
+		}
+		encoded[i] = payload
 	}
 
 	// Add entries to batch buffer
 	e.batchBuffer.mu.Lock()
+	if e.closed.Load() {
+		e.batchBuffer.mu.Unlock()
+		for j := 0; j < len(entries); j++ {
+			releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+		}
+		return false, fmt.Errorf("database is closed")
+	}
 	bufferedEntries := 0
 	for _, batch := range e.batchBuffer.entries {
 		bufferedEntries += len(batch.entries)
@@ -1853,6 +2625,7 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
 		collection: name,
 		entries:    entries,
+		encoded:    encoded,
 	})
 	e.batchBuffer.mu.Unlock()
 
@@ -1870,28 +2643,30 @@ func (e *Engine) putRecords(name string, entries []*index.VectorEntry) (bool, er
 
 // flushNow forces an immediate flush of the batch buffer and waits for completion.
 // This is used by single-record Insert to ensure immediate durability.
-// Returns the error from the flush operation, or nil on success.
-func (e *Engine) flushNow() error {
-	done := make(chan error)
+// Respects context cancellation — returns ctx.Err() if the context is cancelled
+// before the flush completes.
+func (e *Engine) flushNow(ctx context.Context) error {
+	done := make(chan error, 1)
 	e.batchBuffer.mu.Lock()
-	// Only add to pending flushes if there's actually something to flush
-	// or if we want to ensure any in-progress flush completes
 	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
 	e.batchBuffer.mu.Unlock()
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 
-	// Signal the flusher once for the current commit window.
 	e.requestBatchFlush()
 
-	// Wait for flush to complete and return the error
-	return <-done
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (e *Engine) deleteRecord(name, id string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	collection := e.state.Collections[name]
@@ -1935,7 +2710,7 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 
@@ -1993,7 +2768,7 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 
@@ -2082,7 +2857,7 @@ func (e *Engine) GetCollection(name string) (storage.Collection, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 	persisted := e.state.Collections[name]
@@ -2117,7 +2892,7 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *stor
 func (e *Engine) ListCollections() ([]string, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.closed {
+	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 	names := make([]string, 0, len(e.state.Collections))
@@ -2135,7 +2910,7 @@ func (e *Engine) DeleteCollection(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed {
+	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 	collection := e.state.Collections[name]
@@ -2170,33 +2945,32 @@ func (e *Engine) DeleteCollection(name string) error {
 
 // Close checkpoints and closes the database file.
 func (e *Engine) Close() error {
-	// Signal the batch flusher to stop and flush remaining entries.
-	e.batchBuffer.mu.Lock()
-	if !e.batchBuffer.closed {
-		e.batchBuffer.closed = true
-	}
-	e.batchBuffer.mu.Unlock()
-
-	// Wake the flusher so it checks the closed flag promptly.
-	select {
-	case e.batchBuffer.flusher <- struct{}{}:
-	default:
-	}
+	// Cancel the engine context to stop the batch flusher.
+	e.cancel()
 
 	// Flush any remaining buffered entries before close.
 	_ = e.flushBatch()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed.Load() {
 		return nil
+	}
+	// Free all off-heap vector storage. Individual slot deallocation is
+	// unnecessary: Free() releases all mmap'd slabs at once.
+	for _, collection := range e.state.Collections {
+		if collection.vectorSFL != nil {
+			collection.vectorSFL.Free()
+			collection.vectorSFL = nil
+			collection.vectorSlots = nil
+		}
 	}
 	if e.dirty {
 		if err := e.file.Sync(); err != nil {
 			return err
 		}
 	}
-	e.closed = true
+	e.closed.Store(true)
 	return e.file.Close()
 }
 
@@ -2270,7 +3044,7 @@ func cloneEntry(record *recordValue) *index.VectorEntry {
 func (c *Collection) persisted() (*persistedCollection, error) {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2284,7 +3058,7 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 	_ = ctx
 	c.engine.mu.Lock()
 	defer c.engine.mu.Unlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2312,14 +3086,14 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
 		return err
 	}
-	flushed, err := c.engine.putRecords(c.name, []*index.VectorEntry{entry})
+	flushed, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
 	if err != nil {
 		return err
 	}
 	if flushed {
 		return nil
 	}
-	return c.engine.flushNow()
+	return c.engine.flushNow(ctx)
 }
 
 // InsertBatch persists multiple vector entries.
@@ -2330,14 +3104,14 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 	if err := c.assignOrdinals(entries); err != nil {
 		return err
 	}
-	flushed, err := c.engine.putRecords(c.name, entries)
+	flushed, err := c.engine.putRecords(ctx, c.name, entries)
 	if err != nil {
 		return err
 	}
 	if flushed {
 		return nil
 	}
-	return c.engine.flushNow()
+	return c.engine.flushNow(ctx)
 }
 
 // Get returns a persisted entry by ID.
@@ -2345,7 +3119,7 @@ func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, er
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2365,7 +3139,7 @@ func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return false, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2379,7 +3153,7 @@ func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {
 func (c *Collection) GetByOrdinal(ordinal uint32) ([]float32, error) {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return nil, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2420,7 +3194,7 @@ func (c *Collection) GetIDByOrdinal(ctx context.Context, ordinal uint32) (string
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return "", fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2445,7 +3219,7 @@ func (c *Collection) MemoryUsage(ctx context.Context) (int64, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2461,7 +3235,7 @@ func (c *Collection) MemoryUsage(ctx context.Context) (int64, error) {
 		usage += int64(len(record.Vector) * 4)
 		for key, value := range record.Metadata {
 			usage += int64(len(key))
-			usage += estimateMetadataValueSize(value)
+			usage += util.EstimateMetadataValueSize(value)
 		}
 	}
 	return usage, nil
@@ -2476,7 +3250,7 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 // Iterate walks all live records.
 func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error {
 	c.engine.mu.RLock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		c.engine.mu.RUnlock()
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
@@ -2514,6 +3288,13 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 
 		chunk := make([]*index.VectorEntry, 0, end-start)
 		c.engine.mu.RLock()
+		// Refetch persisted — a concurrent DeleteCollection may have replaced
+		// the pointer since the initial RLock acquisition above.
+		persisted := c.engine.state.Collections[c.name]
+		if persisted == nil || persisted.Deleted {
+			c.engine.mu.RUnlock()
+			return fmt.Errorf("collection %s was deleted during iteration", c.name)
+		}
 		for _, id := range ids[start:end] {
 			record := persisted.Records[id]
 			if record == nil || record.Deleted {
@@ -2539,7 +3320,7 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2549,12 +3330,23 @@ func (c *Collection) Count(ctx context.Context) (int, error) {
 	return int(persisted.LiveCount), nil
 }
 
+// initReservedOrdinals seeds each collection's atomic ordinal pre-reservation
+// counter from the committed NextOrdinal. Called after recovery so the first
+// insert doesn't collide with ordinals already assigned to committed records.
+func (e *Engine) initReservedOrdinals() {
+	for _, coll := range e.state.Collections {
+		if coll != nil && !coll.Deleted {
+			coll.reservedNextOrdinal.Store(coll.NextOrdinal)
+		}
+	}
+}
+
 // NextOrdinal returns the next ordinal that would be assigned to a new record.
 func (c *Collection) NextOrdinal(ctx context.Context) (uint32, error) {
 	_ = ctx
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	if c.closed.Load() || c.engine.closed {
+	if c.closed.Load() || c.engine.closed.Load() {
 		return 0, fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2571,9 +3363,9 @@ func (c *Collection) Close() error {
 }
 
 func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
-	c.engine.mu.Lock()
-	defer c.engine.mu.Unlock()
-	if c.closed.Load() || c.engine.closed {
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed.Load() {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
 	persisted := c.engine.state.Collections[c.name]
@@ -2588,8 +3380,8 @@ func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 			entry.Ordinal = current.Ordinal
 			continue
 		}
-		entry.Ordinal = persisted.NextOrdinal
-		persisted.NextOrdinal++
+		n := persisted.reservedNextOrdinal.Add(1)
+		entry.Ordinal = n - 1
 	}
 	return nil
 }

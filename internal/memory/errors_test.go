@@ -348,13 +348,13 @@ func TestMemoryHealthMonitor(t *testing.T) {
 
 type mockMemoryManager struct {
 	usage                   MemoryUsage
-	handleLimitCalled       bool
 	handleLimitError        error
-	handleLimitSuccess      bool
-	gcCalled                bool
 	getUsageCallCount       int
 	usageDropOnGetAfterCall int
 	usageDropOnGetAmount    int64
+	handleLimitCalled       bool
+	handleLimitSuccess      bool
+	gcCalled                bool
 }
 
 func (mmm *mockMemoryManager) SetLimit(bytes int64) error {

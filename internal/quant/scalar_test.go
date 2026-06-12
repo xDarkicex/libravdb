@@ -9,8 +9,8 @@ import (
 
 func TestScalarQuantizer_Configure(t *testing.T) {
 	tests := []struct {
-		name        string
 		config      *QuantizationConfig
+		name        string
 		expectError bool
 	}{
 		{
@@ -350,7 +350,7 @@ func TestScalarQuantizer_DistanceToQuery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			distance, err := sq.DistanceToQuery(compressed, tt.query)
+			distance, err := sq.DistanceToQuery(compressed, tt.query, nil)
 			if err != nil {
 				t.Fatalf("failed to compute distance to query: %v", err)
 			}
