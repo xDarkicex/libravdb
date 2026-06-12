@@ -3,8 +3,12 @@ package storage
 import (
 	"context"
 
+	"errors"
+
 	"github.com/xDarkicex/libravdb/internal/index"
 )
+
+var ErrV1FormatMigrationRequired = errors.New("v1 format migration required")
 
 // CollectionConfig is the engine-level persisted collection configuration.
 type CollectionConfig struct {

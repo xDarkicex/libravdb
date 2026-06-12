@@ -56,7 +56,7 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version != codecVersion {
+	if version != codecVersion && version != 1 {
 		return nil, fmt.Errorf("unsupported snapshot codec version %d", version)
 	}
 	nextCollectionID, err := dec.ReadUint64()

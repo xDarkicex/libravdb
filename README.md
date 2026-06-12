@@ -586,6 +586,28 @@ results, err := collection.Query(ctx).
     Execute()
 ```
 
+### Database Management
+
+```go
+// Safely drop a collection and reclaim its disk space immediately
+err = db.DropCollection(ctx, "temporary_data")
+
+// Compact the database to reclaim space from deleted records and collections
+err = db.Vacuum(ctx)
+
+// Create a safe point-in-time copy of the database file
+err = db.Backup(ctx, "./backup.libravdb")
+```
+
+### Migration from v1
+
+LibraVDB v2 introduces a major storage format upgrade. When you call `libravdb.Open()` on a v1 database file, it will automatically stream the data into a new v2 database file and rename the old file to `.v1.bak`. 
+
+If you prefer to perform migrations manually or via script, use `Migrate`:
+```go
+err := libravdb.Migrate(ctx, "./data.libravdb")
+```
+
 ### Lifecycle And Export
 
 ```go

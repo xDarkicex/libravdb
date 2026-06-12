@@ -327,7 +327,7 @@ func (dec *BinaryDecoder) ExpectVersion() error {
 	if err != nil {
 		return err
 	}
-	if version != codecVersion {
+	if version != codecVersion && version != 1 {
 		return fmt.Errorf("unsupported codec version %d", version)
 	}
 	return nil

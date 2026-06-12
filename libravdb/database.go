@@ -74,8 +74,22 @@ func Open(opts ...Option) (*Database, error) {
 	storageEngine, err := singlefile.New(config.StoragePath,
 		singlefile.WithIndexSnapshotProvider(bridge),
 	)
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+		if errors.Is(err, storage.ErrV1FormatMigrationRequired) {
+			if err := Migrate(context.Background(), config.StoragePath); err != nil {
+				return nil, fmt.Errorf("auto-migration failed: %w", err)
+			}
+			// Retry opening the newly migrated database
+			storageEngine, err = singlefile.New(config.StoragePath,
+				singlefile.WithIndexSnapshotProvider(bridge),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open database after migration: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to initialize storage engine: %w", err)
+		}
 	}
 
 	// Initialize observability

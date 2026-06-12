@@ -26,7 +26,7 @@ import (
 
 const (
 	pageSize             = 4096
-	formatVersion        = uint16(1) // On-disk file layout (header page, metapage, chunk framing)
+	formatVersion        = uint16(2) // On-disk file layout (header page, metapage, chunk framing)
 	fileMagic            = "LIBRAVDB"
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
@@ -321,6 +321,25 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		return nil, fmt.Errorf("open database file: %w", err)
 	}
 
+	// Check format version early before applying options or starting goroutines
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("stat database file: %w", err)
+	}
+
+	if stat.Size() > 0 {
+		buf := make([]byte, 10)
+		if _, err := file.ReadAt(buf, 0); err == nil {
+			magic := string(buf[:8])
+			version := binary.LittleEndian.Uint16(buf[8:10])
+			if magic == fileMagic && version == 1 {
+				file.Close()
+				return nil, storage.ErrV1FormatMigrationRequired
+			}
+		}
+	}
+
 	engine := &Engine{
 		path:        resolved,
 		file:        file,
@@ -341,7 +360,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	engine.batchBuffer.flusher = make(chan struct{})
 	engine.batchBuffer.entries = nil
 
-	stat, err := file.Stat()
+	stat, err = file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, fmt.Errorf("stat database file: %w", err)
