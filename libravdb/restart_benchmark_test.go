@@ -254,7 +254,13 @@ func corruptIndexChunk(tb testing.TB, path string) {
 	if _, err := f.ReadAt(headerBuf, 0); err != nil {
 		tb.Fatalf("read header: %v", err)
 	}
-	activeMetaPage := binary.LittleEndian.Uint64(headerBuf[40:48])
+	formatVersion := binary.LittleEndian.Uint16(headerBuf[8:10])
+	var activeMetaPage uint64
+	if formatVersion >= 2 {
+		activeMetaPage = binary.LittleEndian.Uint64(headerBuf[64:72])
+	} else {
+		activeMetaPage = binary.LittleEndian.Uint64(headerBuf[40:48])
+	}
 
 	// Read the active metapage.
 	metaBuf := make([]byte, pageSize)
