@@ -22,8 +22,12 @@ func Migrate(ctx context.Context, path string) error {
 	backupPath := path + ".v1.bak"
 
 	// Clean up any stale leftovers from a previous interrupted migration.
-	os.Remove(migratingPath)
-	os.Remove(stagedPath)
+	if err := os.Remove(migratingPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cleanup stale migrating file: %w", err)
+	}
+	if err := os.Remove(stagedPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cleanup stale staged file: %w", err)
+	}
 
 	v2DB, err := Open(WithStoragePath(migratingPath))
 	if err != nil {
@@ -125,9 +129,30 @@ func Migrate(ctx context.Context, path string) error {
 	return nil
 }
 
-// recoverMigrate cleans up leftover staged/migrating files from a previous
-// interrupted migration. Called by Open when detecting a v1 file.
+// recoverMigrate cleans up leftover files from a previous interrupted
+// migration. If the swap was interrupted after backup but before activation
+// (staged + backup both exist), it finishes the activation by renaming
+// staged → path. Otherwise it just removes stale temp files.
 func recoverMigrate(path string) {
-	os.Remove(path + ".staged")
-	os.Remove(path + ".migrating")
+	stagedPath := path + ".staged"
+	backupPath := path + ".v1.bak"
+	migratingPath := path + ".migrating"
+
+	stagedExists := fileExists(stagedPath)
+	backupExists := fileExists(backupPath)
+
+	if stagedExists && backupExists {
+		// Interrupted after backup was created but before staged→path
+		// activation completed. Finish the migration.
+		os.Rename(stagedPath, path)
+		os.Remove(migratingPath)
+		return
+	}
+	os.Remove(stagedPath)
+	os.Remove(migratingPath)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

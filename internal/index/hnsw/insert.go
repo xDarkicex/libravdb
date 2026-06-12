@@ -46,7 +46,7 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 		if currentNode == nil {
 			currentNode = h.entryPoint
 		}
-		greedy, ok, err := h.greedySearchLevelValue(context.Background(), searchVector, currentNode, level, queryState)
+		greedy, ok, err := h.greedySearchLevelValue(ctx, searchVector, currentNode, level, queryState)
 		if err != nil {
 			return err
 		}
