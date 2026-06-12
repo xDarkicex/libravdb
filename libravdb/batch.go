@@ -559,9 +559,15 @@ func (b *BatchInsert) tryProcessChunkFast(ctx context.Context, chunk []*VectorEn
 		b.collection.db.scratchPool.Put(arena)
 	}()
 
-	structsSlice, _ := memory.ArenaSlice[index.VectorEntry](arena, len(chunk))
+	structsSlice, err := memory.ArenaSlice[index.VectorEntry](arena, len(chunk))
+	if err != nil {
+		return nil, false, nil // fall back to heap path
+	}
 	structsSlice = structsSlice[:len(chunk)]
-	pointersSlice, _ := memory.ArenaSlice[*index.VectorEntry](arena, len(chunk))
+	pointersSlice, err := memory.ArenaSlice[*index.VectorEntry](arena, len(chunk))
+	if err != nil {
+		return nil, false, nil // fall back to heap path
+	}
 	pointersSlice = pointersSlice[:len(chunk)]
 
 	validCount := 0
