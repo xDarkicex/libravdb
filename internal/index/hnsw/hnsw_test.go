@@ -64,7 +64,7 @@ func TestHNSWDeterministicFixedSeedSearchResults(t *testing.T) {
 			}
 		}
 
-		results, err := index.Search(context.Background(), vectors[0], 10)
+		results, err := index.Search(context.Background(), vectors[0], 10, nil)
 		if err != nil {
 			t.Fatalf("failed to search deterministic index: %v", err)
 		}

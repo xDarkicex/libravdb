@@ -276,15 +276,15 @@ func (h *Index) greedySearchLevelValue(ctx context.Context, query []float32, ent
 	}, true, nil
 }
 
-func (h *Index) searchLevel(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, queryState any) ([]*util.Candidate, error) {
-	return h.searchLevelWithOptions(ctx, query, entryPoint, ef, level, true, queryState)
+func (h *Index) searchLevel(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, queryState any, filter interface{ Test(idx uint64) bool }) ([]*util.Candidate, error) {
+	return h.searchLevelWithOptions(ctx, query, entryPoint, ef, level, true, queryState, filter)
 }
 
 func (h *Index) searchLevelForConstruction(query []float32, entryPoint *Node, ef int, level int, queryState any) ([]util.Candidate, error) {
 	scratch := h.acquireSearchScratch()
 	defer h.releaseSearchScratch(scratch)
 
-	return h.searchLevelValuesWithScratch(context.Background(), query, entryPoint, ef, level, false, scratch, queryState)
+	return h.searchLevelValuesWithScratch(context.Background(), query, entryPoint, ef, level, false, scratch, queryState, nil)
 }
 
 // searchAndSelectForConstruction finds neighbors at a specific level and selects the best ones for construction
@@ -304,7 +304,7 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 	scratch *searchScratch,
 	queryState any,
 ) ([]util.Candidate, error) {
-	workingSet, err := h.searchLevelScratchValues(context.Background(), query, entryPoint, ef, level, scratch, queryState)
+	workingSet, err := h.searchLevelScratchValues(context.Background(), query, entryPoint, ef, level, scratch, queryState, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -322,11 +322,11 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 	return selected, nil
 }
 
-func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, queryState any) ([]*util.Candidate, error) {
+func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, queryState any, filter interface{ Test(idx uint64) bool }) ([]*util.Candidate, error) {
 	scratch := h.acquireSearchScratch()
 	defer h.releaseSearchScratch(scratch)
 
-	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState)
+	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -345,9 +345,9 @@ func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, ent
 	return result, nil
 }
 
-func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch, queryState any) ([]util.Candidate, error) {
+func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }) ([]util.Candidate, error) {
 	if !sortResults {
-		values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState)
+		values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +359,7 @@ func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float3
 		return result, nil
 	}
 
-	values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState)
+	values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float3
 	return result, nil
 }
 
-func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch, queryState any) ([]util.Candidate, error) {
+func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }) ([]util.Candidate, error) {
 	if ef <= 0 {
 		return nil, nil
 	}

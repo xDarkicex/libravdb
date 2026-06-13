@@ -92,7 +92,7 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		}
 	}
 
-	results, err := index.Search(context.Background(), vectors[0], 5)
+	results, err := index.Search(context.Background(), vectors[0], 5, nil)
 	if err != nil {
 		t.Fatalf("pre-save search failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		t.Fatalf("failed to access loaded slabby-backed node vector: %v", err)
 	}
 
-	loadedResults, err := loaded.Search(context.Background(), vectors[0], 5)
+	loadedResults, err := loaded.Search(context.Background(), vectors[0], 5, nil)
 	if err != nil {
 		t.Fatalf("post-load search failed: %v", err)
 	}

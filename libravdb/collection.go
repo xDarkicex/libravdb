@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/filter"
+	"github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/obs"
@@ -37,6 +38,9 @@ type Collection struct {
 	mu                     sync.RWMutex
 	closed                 bool
 	optimizationInProgress bool
+	graph                  Graph
+	insertHooks            []InsertHook
+	deleteHooks            []DeleteHook
 }
 
 // CollectionConfig holds collection-specific configuration
@@ -58,6 +62,7 @@ type CollectionConfig struct {
 	RawStoreCap        int            `json:"raw_store_cap,omitempty"`
 	Metric             DistanceMetric `json:"metric"`
 	SaveInterval       time.Duration  `json:"save_interval"`
+	Graph              Graph          `json:"-"`
 	NProbes            int            `json:"n_probes,omitempty"`
 	NClusters          int            `json:"n_clusters,omitempty"`
 	IndexType          IndexType      `json:"index_type"`
@@ -387,6 +392,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		writes:        writes,
 		metrics:       metrics,
 		memoryManager: memManager,
+		graph:         config.Graph,
 	}
 
 	// Initialize storage and index based on sharding mode
@@ -528,6 +534,7 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 		writes:        writes,
 		metrics:       metrics,
 		memoryManager: memManager,
+		graph:         config.Graph,
 	}
 
 	// Rebuild index from storage data (skipped if cached index was used).
@@ -616,6 +623,7 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 		config:  config,
 		writes:  writes,
 		metrics: metrics,
+		graph:   config.Graph,
 	}
 
 	// Initialize shards from loaded storages
@@ -732,9 +740,41 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
 		}
 
+		if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
+			return err
+		}
+
+		type transactionStarter interface {
+			BeginTxn() *graph.Txn
+		}
+
+		if len(c.insertHooks) > 0 {
+			var txn *graph.Txn
+			if c.graph != nil {
+				if starter, ok := c.graph.(transactionStarter); ok {
+					txn = starter.BeginTxn()
+				}
+			}
+			if txn == nil {
+				txn = &graph.Txn{}
+			}
+
+			for _, hook := range c.insertHooks {
+				if err := hook(txn, uint64(storageEntry.Ordinal), vector); err != nil {
+					return fmt.Errorf("insert hook failed: %w", err)
+				}
+			}
+			if c.graph != nil && txn.ID != 0 {
+				if err := txn.Commit(ctx); err != nil {
+					return fmt.Errorf("failed to commit graph transaction: %w", err)
+				}
+			}
+		}
+
 		if err := c.storage.Insert(ctx, storageEntry); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
+
 		if err := c.index.Insert(ctx, storageEntry); err != nil {
 			if delErr := c.storage.Delete(ctx, id); delErr != nil {
 				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
@@ -759,6 +799,36 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		return fmt.Errorf("failed to check existing vector: %w", err)
 	} else if exists {
 		return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
+	}
+
+	if err := shard.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
+		return err
+	}
+
+	if len(c.insertHooks) > 0 {
+		type transactionStarter interface {
+			BeginTxn() *graph.Txn
+		}
+		var txn *graph.Txn
+		if c.graph != nil {
+			if starter, ok := c.graph.(transactionStarter); ok {
+				txn = starter.BeginTxn()
+			}
+		}
+		if txn == nil {
+			txn = &graph.Txn{}
+		}
+
+		for _, hook := range c.insertHooks {
+			if err := hook(txn, uint64(storageEntry.Ordinal), vector); err != nil {
+				return fmt.Errorf("insert hook failed: %w", err)
+			}
+		}
+		if c.graph != nil && txn.ID != 0 {
+			if err := txn.Commit(ctx); err != nil {
+				return fmt.Errorf("failed to commit graph transaction: %w", err)
+			}
+		}
 	}
 
 	if err := shard.storage.Insert(ctx, storageEntry); err != nil {
@@ -1339,18 +1409,54 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		unlock := c.lockMutationIDs([]string{id})
 		defer unlock()
 		defer c.mu.RUnlock()
+
+		entry, err := c.storage.Get(ctx, id)
+		var hasEntry bool
+		if err == nil {
+			hasEntry = true
+		} else if !isNotFoundError(err) {
+			return fmt.Errorf("failed to get vector for deletion: %w", err)
+		}
+
 		var indexErr error
-		if entry, err := c.storage.Get(ctx, id); err == nil {
+		if hasEntry {
+			type transactionStarter interface {
+				BeginTxn() *graph.Txn
+			}
+
+			if len(c.deleteHooks) > 0 {
+				var txn *graph.Txn
+				if c.graph != nil {
+					if starter, ok := c.graph.(transactionStarter); ok {
+						txn = starter.BeginTxn()
+					}
+				}
+				if txn == nil {
+					txn = &graph.Txn{}
+				}
+
+				for _, hook := range c.deleteHooks {
+					if err := hook(txn, uint64(entry.Ordinal)); err != nil {
+						return fmt.Errorf("delete hook failed: %w", err)
+					}
+				}
+				if c.graph != nil && txn.ID != 0 {
+					if err := txn.Commit(ctx); err != nil {
+						return fmt.Errorf("failed to commit graph transaction: %w", err)
+					}
+				}
+			}
+
+			if err := c.storage.Delete(ctx, id); err != nil {
+				if !isNotFoundError(err) {
+					return fmt.Errorf("failed to write deletion to storage: %w", err)
+				}
+			}
 			indexErr = deleteIndexEntry(ctx, c.index, id, entry.Ordinal)
 		} else {
 			indexErr = c.index.Delete(ctx, id)
 		}
 
-		if err := c.storage.Delete(ctx, id); err != nil {
-			if !isNotFoundError(err) {
-				return fmt.Errorf("failed to write deletion to storage: %w", err)
-			}
-		}
 		if indexErr != nil {
 			if !isNotFoundError(indexErr) {
 				if rebuildErr := c.rebuildIndex(ctx); rebuildErr != nil {
@@ -1371,25 +1477,58 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	unlock := c.lockMutationIDs([]string{id})
 	defer unlock()
 
-	shard := c.getShard(id)
+	shardIdx := shardForID(id)
+	shard := &c.shards[shardIdx]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	entry, err := shard.storage.Get(ctx, id)
+	var hasEntry bool
+	if err == nil {
+		hasEntry = true
+	} else if !isNotFoundError(err) {
+		return fmt.Errorf("failed to get vector for deletion from shard %d: %w", shardIdx, err)
+	}
+
 	var indexErr error
-	if entry, err := shard.storage.Get(ctx, id); err == nil {
+	if hasEntry {
+		if len(c.deleteHooks) > 0 {
+			type transactionStarter interface {
+				BeginTxn() *graph.Txn
+			}
+			var txn *graph.Txn
+			if c.graph != nil {
+				if starter, ok := c.graph.(transactionStarter); ok {
+					txn = starter.BeginTxn()
+				}
+			}
+			if txn == nil {
+				txn = &graph.Txn{}
+			}
+
+			for _, hook := range c.deleteHooks {
+				if err := hook(txn, uint64(entry.Ordinal)); err != nil {
+					return fmt.Errorf("delete hook failed: %w", err)
+				}
+			}
+			if c.graph != nil && txn.ID != 0 {
+				if err := txn.Commit(ctx); err != nil {
+					return fmt.Errorf("failed to commit graph transaction: %w", err)
+				}
+			}
+		}
+
+		if err := shard.storage.Delete(ctx, id); err != nil {
+			if !isNotFoundError(err) {
+				return fmt.Errorf("failed to write deletion to storage shard %d: %w", shardIdx, err)
+			}
+		}
 		indexErr = deleteIndexEntry(ctx, shard.index, id, entry.Ordinal)
 	} else {
 		indexErr = shard.index.Delete(ctx, id)
 	}
-
-	if err := shard.storage.Delete(ctx, id); err != nil {
-		if !isNotFoundError(err) {
-			return fmt.Errorf("failed to write deletion to storage: %w", err)
-		}
-	}
 	if indexErr != nil {
 		if !isNotFoundError(indexErr) {
-			shardIdx := shardForID(id)
 			if rebuildErr := c.rebuildShardIndex(ctx, shardIdx); rebuildErr != nil {
 				return fmt.Errorf("failed to delete vector from shard index: %w; rebuild after delete also failed: %v", indexErr, rebuildErr)
 			}
@@ -1612,20 +1751,30 @@ func (c *Collection) effectiveWriteConcurrency(requested int) int {
 	return requested
 }
 
-// Search performs a vector similarity search
+// Search finds the k most similar vectors to the query vector.
 func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*SearchResults, error) {
+	return c.SearchWithGraphFilter(ctx, vector, k, nil)
+}
+
+// SearchWithGraphFilter finds the k most similar vectors, applying an optional graph bitset filter.
+func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32, k int, filter GraphFilter) (*SearchResults, error) {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if c.closed {
-		return nil, ErrCollectionClosed
+		return nil, fmt.Errorf("collection is closed")
 	}
 	// Use local variables to avoid multiple pointer dereferences during inner loops
 	idx := c.index
 	shardIndexes := make([]index.Index, len(c.shards))
 	for i := range c.shards {
 		shardIndexes[i] = c.shards[i].index
+	}
+
+	var indexFilter index.GraphFilter
+	if filter != nil {
+		indexFilter = filter
 	}
 
 	// Validate input
@@ -1659,7 +1808,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 				defer wg.Done()
 				// Each shard only needs its local top-k; the parent merges all shard results.
 				shardK := k
-				results, err := shardIndexes[shardIdx].Search(ctx, vector, shardK)
+				results, err := shardIndexes[shardIdx].Search(ctx, vector, shardK, indexFilter)
 				resultsCh <- shardResult{results: results, err: err}
 			}(i)
 		}
@@ -1669,7 +1818,7 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results, err := idx.Search(ctx, vector, k)
+			results, err := idx.Search(ctx, vector, k, indexFilter)
 			resultsCh <- shardResult{results: results, err: err}
 		}()
 	}
@@ -2571,6 +2720,36 @@ func cloneMetadata(metadata map[string]interface{}) map[string]interface{} {
 		cloned[k] = v
 	}
 	return cloned
+}
+
+// RegisterInsertHook adds a hook to be called before a vector is inserted.
+// Maximum of 4 hooks can be registered.
+func (c *Collection) RegisterInsertHook(hook InsertHook) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if hook == nil {
+		return fmt.Errorf("cannot register nil hook")
+	}
+	if len(c.insertHooks) >= 4 {
+		return fmt.Errorf("maximum of 4 insert hooks allowed")
+	}
+	c.insertHooks = append(c.insertHooks, hook)
+	return nil
+}
+
+// RegisterDeleteHook adds a hook to be called before a vector is deleted.
+// Maximum of 4 hooks can be registered.
+func (c *Collection) RegisterDeleteHook(hook DeleteHook) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if hook == nil {
+		return fmt.Errorf("cannot register nil hook")
+	}
+	if len(c.deleteHooks) >= 4 {
+		return fmt.Errorf("maximum of 4 delete hooks allowed")
+	}
+	c.deleteHooks = append(c.deleteHooks, hook)
+	return nil
 }
 
 // validate checks if the collection configuration is valid

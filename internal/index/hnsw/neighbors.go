@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 // NeighborSelector implements optimized neighbor selection algorithms

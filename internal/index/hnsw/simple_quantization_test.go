@@ -196,7 +196,7 @@ func TestSimpleQuantizationIntegration(t *testing.T) {
 
 		// Test search
 		query := vectors[0]
-		results, err := index.Search(ctx, query, 3)
+		results, err := index.Search(ctx, query, 3, nil)
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}

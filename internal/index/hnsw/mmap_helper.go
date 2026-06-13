@@ -72,7 +72,7 @@ func (h *Index) createMmapCompressedVectorStore(mmapPath string) (*internalmemor
 		numCodebooks = h.config.Quantization.Codebooks
 	}
 	bytesPerVector := numCodebooks // For typical PQ where 1 codebook = 1 byte
-	
+
 	for _, node := range h.nodes {
 		if node == nil || node.CompressedVector == nil {
 			zeros := make([]byte, bytesPerVector)

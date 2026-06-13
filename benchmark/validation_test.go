@@ -78,7 +78,7 @@ func testFunctionalityMetrics(t *testing.T, ctx context.Context) {
 			queryVector[i] = rand.Float32()
 		}
 
-		results, err := loadIndex.Search(ctx, queryVector, 10)
+		results, err := loadIndex.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			t.Fatalf("Search failed on loaded 1M vector index: %v", err)
 		}
@@ -327,7 +327,7 @@ func testPerformanceMetrics(t *testing.T, ctx context.Context) {
 
 		for i := 0; i < measurements; i++ {
 			start := time.Now()
-			_, err := index.Search(ctx, queryVector, 10)
+			_, err := index.Search(ctx, queryVector, 10, nil)
 			if err != nil {
 				t.Fatalf("Baseline search failed: %v", err)
 			}
@@ -337,7 +337,7 @@ func testPerformanceMetrics(t *testing.T, ctx context.Context) {
 
 		// Measure search latency during save (simplified test)
 		start := time.Now()
-		_, err := index.Search(ctx, queryVector, 10)
+		_, err := index.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			t.Fatalf("Search during save failed: %v", err)
 		}

@@ -23,23 +23,6 @@ type WAL struct {
 	closed bool
 }
 
-// Entry represents a single WAL entry
-type Entry struct {
-	Metadata  map[string]interface{}
-	ID        string
-	Vector    []float32
-	Timestamp uint64
-	Operation Operation
-}
-
-// Operation defines the type of operation
-type Operation uint8
-
-const (
-	OpInsert Operation = iota
-	OpUpdate
-	OpDelete
-)
 
 // New creates a new WAL instance
 func New(path string) (*WAL, error) {
@@ -112,13 +95,20 @@ func (w *WAL) appendEntriesLocked(ctx context.Context, entries []*Entry) error {
 		}
 
 		// Serialize the entire entry natively
-		enc := util.AcquireBinaryEncoder(8 + 1 + 4 + len(entry.ID) + 4 + len(entry.Vector)*4 + util.EstimateMetadataSize(entry.Metadata))
+		enc := util.AcquireBinaryEncoder(8 + 1 + 4 + len(entry.ID) + 4 + len(entry.Vector)*4 + util.EstimateMetadataSize(entry.Metadata) + 4 + len(entry.Data))
 		enc.WriteUint64(entry.Timestamp)
 		enc.WriteByte(byte(entry.Operation))
 		enc.WriteString(entry.ID)
 		enc.WriteVector(entry.Vector)
 
 		err := enc.WriteMetadata(entry.Metadata)
+		if err != nil {
+			util.ReleaseBinaryEncoder(enc)
+			return fmt.Errorf("failed to encode metadata: %w", err)
+		}
+
+		enc.WriteBytes(entry.Data)
+		err = nil
 		if err != nil {
 			util.ReleaseBinaryEncoder(enc)
 			return fmt.Errorf("failed to encode metadata: %w", err)
@@ -293,6 +283,13 @@ func (w *WAL) deserializeEntry(data []byte) (*Entry, error) {
 	entry.Metadata, err = dec.ReadMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("read metadata: %w", err)
+	}
+
+	if dec.Off < len(dec.Data) {
+		entry.Data, err = dec.ReadBytes()
+		if err != nil {
+			return nil, fmt.Errorf("read data: %w", err)
+		}
 	}
 
 	return entry, nil

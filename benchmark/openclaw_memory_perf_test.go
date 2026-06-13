@@ -185,7 +185,7 @@ func TestHNSW2500ProviderSearchRegression(t *testing.T) {
 	measureStandalone := func() time.Duration {
 		start := time.Now()
 		for _, query := range queries {
-			results, err := standalone.Search(ctx, query, openClawTopK)
+			results, err := standalone.Search(ctx, query, openClawTopK, nil)
 			if err != nil {
 				t.Fatalf("standalone search failed: %v", err)
 			}

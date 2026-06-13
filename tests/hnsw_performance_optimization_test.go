@@ -87,14 +87,14 @@ func TestHNSWPerformanceOptimizations(t *testing.T) {
 			queryVector := vectors[0] // Use first vector as query
 
 			// Warm up
-			_, err := index.Search(ctx, queryVector, 10)
+			_, err := index.Search(ctx, queryVector, 10, nil)
 			if err != nil {
 				t.Fatalf("Warmup search failed: %v", err)
 			}
 
 			// Measure search performance
 			searchStart := time.Now()
-			results, err := index.Search(ctx, queryVector, 10)
+			results, err := index.Search(ctx, queryVector, 10, nil)
 			searchDuration := time.Since(searchStart)
 
 			if err != nil {
@@ -199,7 +199,7 @@ func TestHNSWPerformanceOptimizations(t *testing.T) {
 
 		// Test search after batch insertion
 		queryVector := vectors[vectorCount/2]
-		results, err := index.Search(ctx, queryVector, 5)
+		results, err := index.Search(ctx, queryVector, 5, nil)
 		if err != nil {
 			t.Fatalf("Search after batch insertion failed: %v", err)
 		}
@@ -259,7 +259,7 @@ func TestHNSWPerformanceOptimizations(t *testing.T) {
 
 		// Test search quality
 		queryVector := vectors[0]
-		results, err := index.Search(ctx, queryVector, 10)
+		results, err := index.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			t.Fatalf("Search on clustered data failed: %v", err)
 		}
@@ -410,7 +410,7 @@ func BenchmarkHNSWOptimizations(b *testing.B) {
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := index.Search(ctx, queryVector, 10)
+			_, err := index.Search(ctx, queryVector, 10, nil)
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}

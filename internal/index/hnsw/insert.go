@@ -33,12 +33,12 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
 	var singleEntry [1]util.Candidate
-	
+
 	var queryState any
 	if h.quantizer != nil {
 		queryState = h.quantizer.PrepareQuery(searchVector)
 	}
-	
+
 	entryPoints := h.appendFallbackEntryPoint(nil, searchVector, h.entryPoint, &singleEntry)
 
 	for level := h.maxLevel; level > node.Level; level-- {

@@ -132,7 +132,7 @@ func TestHNSW_MemoryMapping(t *testing.T) {
 
 	// Test that search still works after disabling mapping
 	query := []float32{1.5, 2.5, 3.5, 4.5}
-	results, err := index.Search(ctx, query, 3)
+	results, err := index.Search(ctx, query, 3, nil)
 	if err != nil {
 		t.Fatalf("Failed to search after disabling memory mapping: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestHNSW_AutomaticMemoryMappingIntegration(t *testing.T) {
 		query[i] = float32(i)
 	}
 
-	results, err := index.Search(ctx, query, 5)
+	results, err := index.Search(ctx, query, 5, nil)
 	if err != nil {
 		t.Fatalf("Failed to search after automatic memory mapping: %v", err)
 	}

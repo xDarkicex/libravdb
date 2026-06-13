@@ -53,7 +53,7 @@ func BenchmarkFormatCompatibility(b *testing.B) {
 			queryVector[j] = rand.Float32()
 		}
 
-		results, err := loadIndex.Search(ctx, queryVector, 5)
+		results, err := loadIndex.Search(ctx, queryVector, 5, nil)
 		if err != nil {
 			b.Errorf("Search after load failed: %v", err)
 			continue
@@ -141,14 +141,14 @@ func BenchmarkZeroDataLoss(b *testing.B) {
 			queryVector[j] = rand.Float32()
 		}
 
-		originalResults, err := index.Search(ctx, queryVector, 10)
+		originalResults, err := index.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			b.Errorf("Original search failed: %v", err)
 			dataLossCount++
 			continue
 		}
 
-		loadedResults, err := loadIndex.Search(ctx, queryVector, 10)
+		loadedResults, err := loadIndex.Search(ctx, queryVector, 10, nil)
 		if err != nil {
 			b.Errorf("Loaded search failed: %v", err)
 			dataLossCount++

@@ -13,13 +13,13 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 const (
 	// File format constants
-	ChunkSize       = 1000 // Process nodes in batches
+	ChunkSize = 1000 // Process nodes in batches
 )
 
 var HNSWMagicBytes = []byte("LIBRAHNS")
@@ -570,7 +570,7 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 			h.idToIndex[nodeID] = ordinal
 			h.ordinalToID[ordinal] = nodeID
 		}
-		
+
 		// Reset the arena after each node to prevent exhaustion on large files
 		arena.Reset()
 	}
@@ -615,53 +615,53 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 		}
 
 		// Initialize links for this node. Allocate from SFL (not Go heap)
-	// so freeNodeLinks can safely deallocate them during Delete.
-	node.Links = make([][]uint32, levelCount)
+		// so freeNodeLinks can safely deallocate them during Delete.
+		node.Links = make([][]uint32, levelCount)
 
-	// Read each level's connections
-	for j := uint32(0); j < levelCount; j++ {
-		var level uint32
-		if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
-			return err
-		}
-
-		var connectionCount uint32
-		if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
-			return err
-		}
-
-		// Use the same SFL allocation as newNodeLinks: level 0 uses
-		// link0SFL (larger slot for 2×M connections), higher levels
-		// use linkSFL.
-		var slot []byte
-		var slotErr error
-		if level == 0 {
-			slot, slotErr = h.link0SFL.Allocate()
-		} else {
-			slot, slotErr = h.linkSFL.Allocate()
-		}
-		if slotErr != nil {
-			return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
-		}
-
-		// Data starts after SFLMetadataOverhead. Capacity matches what
-		// newNodeLinks configures (capacity + slack).
-		maxCap := (len(slot) - SFLMetadataOverhead) / 4
-		if uint32(maxCap) < connectionCount {
-			return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
-				nodeIndex, level, connectionCount, maxCap)
-		}
-		connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[SFLMetadataOverhead])), maxCap)[:connectionCount]
-		for k := uint32(0); k < connectionCount; k++ {
-			if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
+		// Read each level's connections
+		for j := uint32(0); j < levelCount; j++ {
+			var level uint32
+			if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
 				return err
 			}
-		}
 
-		if int(level) < len(node.Links) {
-			node.Links[level] = connections
+			var connectionCount uint32
+			if err := binary.Read(reader, binary.LittleEndian, &connectionCount); err != nil {
+				return err
+			}
+
+			// Use the same SFL allocation as newNodeLinks: level 0 uses
+			// link0SFL (larger slot for 2×M connections), higher levels
+			// use linkSFL.
+			var slot []byte
+			var slotErr error
+			if level == 0 {
+				slot, slotErr = h.link0SFL.Allocate()
+			} else {
+				slot, slotErr = h.linkSFL.Allocate()
+			}
+			if slotErr != nil {
+				return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
+			}
+
+			// Data starts after SFLMetadataOverhead. Capacity matches what
+			// newNodeLinks configures (capacity + slack).
+			maxCap := (len(slot) - SFLMetadataOverhead) / 4
+			if uint32(maxCap) < connectionCount {
+				return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
+					nodeIndex, level, connectionCount, maxCap)
+			}
+			connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[SFLMetadataOverhead])), maxCap)[:connectionCount]
+			for k := uint32(0); k < connectionCount; k++ {
+				if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
+					return err
+				}
+			}
+
+			if int(level) < len(node.Links) {
+				node.Links[level] = connections
+			}
 		}
-	}
 	}
 
 	return nil

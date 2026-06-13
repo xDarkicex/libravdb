@@ -67,7 +67,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 
 		// Test search functionality
 		query := vectors[0]
-		results, err := index.Search(ctx, query, 5)
+		results, err := index.Search(ctx, query, 5, nil)
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}
@@ -130,7 +130,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 
 		// Test search
 		query := vectors[10]
-		results, err := index.Search(ctx, query, 3)
+		results, err := index.Search(ctx, query, 3, nil)
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}
@@ -281,7 +281,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 
 		// Test search works with mixed nodes
 		query := preTrainingVectors[0]
-		results, err := index.Search(ctx, query, 5)
+		results, err := index.Search(ctx, query, 5, nil)
 		if err != nil {
 			t.Fatalf("Search failed with mixed nodes: %v", err)
 		}
@@ -381,12 +381,12 @@ func TestQuantizationPerformance(t *testing.T) {
 		// Test search accuracy
 		query := vectors[0]
 
-		unquantizedResults, err := unquantizedIndex.Search(ctx, query, 10)
+		unquantizedResults, err := unquantizedIndex.Search(ctx, query, 10, nil)
 		if err != nil {
 			t.Fatalf("Unquantized search failed: %v", err)
 		}
 
-		quantizedResults, err := quantizedIndex.Search(ctx, query, 10)
+		quantizedResults, err := quantizedIndex.Search(ctx, query, 10, nil)
 		if err != nil {
 			t.Fatalf("Quantized search failed: %v", err)
 		}

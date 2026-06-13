@@ -285,8 +285,6 @@ func (idx *Index) acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
 	return nil, nil
 }
 
-
-
 // NewIVFPQ creates a new IVF-PQ index
 func NewIVFPQ(config *Config) (*Index, error) {
 	if config == nil {
@@ -1027,8 +1025,10 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 	return nil
 }
 
-// Search performs k-NN search using IVF-PQ with enhanced multi-probe strategy
-func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*SearchResult, error) {
+// Search finds the k nearest neighbors to the query vector
+func (idx *Index) Search(ctx context.Context, query []float32, k int, filter interface {
+	Test(idx uint64) bool
+}) ([]*SearchResult, error) {
 	startTime := time.Now()
 
 	if len(query) != idx.config.Dimension {
@@ -1078,7 +1078,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 		queryState = idx.quantizer.PrepareQuery(query)
 	}
 
-	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState)
+	candidates, err := idx.collectCandidates(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1109,10 +1109,12 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int) ([]*Search
 	return results, nil
 }
 
-func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any) ([]candidate, error) {
+func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any, filter interface {
+	Test(idx uint64) bool
+}) ([]candidate, error) {
 	workers := parallelismFor(len(probeClusters))
 	if workers == 1 {
-		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState)
+		return idx.collectCandidatesSequential(ctx, query, probeClusters, clusterDistances, k, arena, clusters, queryState, filter)
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
@@ -1135,7 +1137,7 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 		go func(worker, start, end int) {
 			defer wg.Done()
 
-			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena, clusters, queryState)
+			localCandidates, err := idx.collectCandidatesSequential(ctx, query, probeClusters[start:end], clusterDistances[start:end], k, arena, clusters, queryState, filter)
 			if err != nil {
 				errCh <- err
 				return
@@ -1266,7 +1268,9 @@ func mergeSortedWorkerResults(results [][]candidate, k int, arena *memory.Arena)
 	return candidates, nil
 }
 
-func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any) ([]candidate, error) {
+func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float32, probeClusters []int, clusterDistances []float32, k int, arena *memory.Arena, clusters []*Cluster, queryState any, filter interface {
+	Test(idx uint64) bool
+}) ([]candidate, error) {
 	hs, heapBuf := idx.acquireIVFHeapSlot(k)
 	if hs != nil {
 		defer hs.free()
@@ -1293,6 +1297,10 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 		clusterDist := clusterDistances[i]
 
 		for _, entry := range cluster.Entries {
+			if filter != nil && !filter.Test(uint64(entry.Ordinal)) {
+				continue
+			}
+
 			distance, err := idx.distanceToEntry(query, cluster, entry, queryState)
 			if err != nil {
 				cluster.mutex.RUnlock()

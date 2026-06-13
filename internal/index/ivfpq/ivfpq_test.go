@@ -304,7 +304,7 @@ func TestInsertAndSearch(t *testing.T) {
 
 	// Test search
 	query := []float32{1, 0, 0, 0}
-	results, err := idx.Search(ctx, query, 2)
+	results, err := idx.Search(ctx, query, 2, nil)
 	if err != nil {
 		t.Fatalf("failed to search: %v", err)
 	}
@@ -519,7 +519,7 @@ func TestSearchErrors(t *testing.T) {
 				}
 			}
 
-			_, err = freshIdx.Search(ctx, tt.query, tt.k)
+			_, err = freshIdx.Search(ctx, tt.query, tt.k, nil)
 			if err == nil {
 				t.Errorf("expected error but got none")
 			}
@@ -1021,7 +1021,7 @@ func TestSearchArenaBacked(t *testing.T) {
 	query[0] = 100.0
 	k := 5
 
-	results, err := idx.Search(context.Background(), query, k)
+	results, err := idx.Search(context.Background(), query, k, nil)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

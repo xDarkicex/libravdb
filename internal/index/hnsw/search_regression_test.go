@@ -83,7 +83,7 @@ func TestSearchScratchResultsCorrect(t *testing.T) {
 	query[0] = 50.0
 	k := 10
 
-	results, err := idx.Search(ctx, query, k)
+	results, err := idx.Search(ctx, query, k, nil)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

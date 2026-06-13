@@ -404,6 +404,11 @@ func TestBatchDelete_Basic(t *testing.T) {
 
 	// Missing IDs are idempotent deletes.
 	if result.Failed != 0 {
+		for _, item := range result.Items {
+			if !item.Success {
+				t.Logf("Failed delete for %s: %v", item.ID, item.Error)
+			}
+		}
 		t.Errorf("Expected 0 failed deletes, got %d", result.Failed)
 	}
 	if result.Successful != 3 {

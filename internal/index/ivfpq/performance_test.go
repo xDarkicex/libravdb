@@ -188,7 +188,7 @@ func benchmarkIVFPQ(t *testing.T, ctx context.Context, config *Config, vectors [
 	k := 10
 
 	for _, query := range queries {
-		results, err := idx.Search(ctx, query, k)
+		results, err := idx.Search(ctx, query, k, nil)
 		if err != nil {
 			t.Fatalf("Failed to search: %v", err)
 		}
@@ -240,7 +240,7 @@ func benchmarkHNSW(t *testing.T, ctx context.Context, config *hnsw.Config, vecto
 	k := 10
 
 	for _, query := range queries {
-		results, err := idx.Search(ctx, query, k)
+		results, err := idx.Search(ctx, query, k, nil)
 		if err != nil {
 			t.Fatalf("Failed to search: %v", err)
 		}
@@ -420,7 +420,7 @@ func TestAdaptiveSearchOptimization(t *testing.T) {
 	t.Log("Testing without adaptive search...")
 	startTime := time.Now()
 	for _, query := range queries[:100] {
-		_, err := idx.Search(ctx, query, 5)
+		_, err := idx.Search(ctx, query, 5, nil)
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}
@@ -433,7 +433,7 @@ func TestAdaptiveSearchOptimization(t *testing.T) {
 
 	startTime = time.Now()
 	for _, query := range queries[100:] {
-		_, err := idx.Search(ctx, query, 5)
+		_, err := idx.Search(ctx, query, 5, nil)
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}

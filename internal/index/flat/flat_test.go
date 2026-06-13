@@ -152,7 +152,7 @@ func TestFlatBatchInsert(t *testing.T) {
 		t.Fatalf("expected size %d, got %d", len(entries), idx.Size())
 	}
 
-	results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 2)
+	results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 2, nil)
 	if err != nil {
 		t.Fatalf("search after batch insert failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestFlatSearch(t *testing.T) {
 
 	// Test search
 	query := []float32{1.0, 0.0, 0.0}
-	results, err := idx.Search(ctx, query, 2)
+	results, err := idx.Search(ctx, query, 2, nil)
 	if err != nil {
 		t.Errorf("search failed: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestFlatSearch(t *testing.T) {
 	}
 
 	// Test search with k=0
-	results, err = idx.Search(ctx, query, 0)
+	results, err = idx.Search(ctx, query, 0, nil)
 	if err != nil {
 		t.Errorf("search with k=0 failed: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestFlatSearch(t *testing.T) {
 
 	// Test search with dimension mismatch
 	badQuery := []float32{1.0, 0.0}
-	_, err = idx.Search(ctx, badQuery, 1)
+	_, err = idx.Search(ctx, badQuery, 1, nil)
 	if err == nil {
 		t.Error("expected error for dimension mismatch in search")
 	}
@@ -254,7 +254,7 @@ func TestFlatSearchAccuracy(t *testing.T) {
 
 	// Search from origin - should get exact distances
 	query := []float32{0.0, 0.0}
-	results, err := idx.Search(ctx, query, 5)
+	results, err := idx.Search(ctx, query, 5, nil)
 	if err != nil {
 		t.Errorf("search failed: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestFlatDelete(t *testing.T) {
 	}
 
 	// Verify v2 is gone
-	results, err := idx.Search(ctx, []float32{0.0, 1.0, 0.0}, 3)
+	results, err := idx.Search(ctx, []float32{0.0, 1.0, 0.0}, 3, nil)
 	if err != nil {
 		t.Errorf("search failed: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestFlatPersistence(t *testing.T) {
 	}
 
 	// Test search on loaded index
-	results, err := idx2.Search(ctx, []float32{1.0, 0.0, 0.0}, 1)
+	results, err := idx2.Search(ctx, []float32{1.0, 0.0, 0.0}, 1, nil)
 	if err != nil {
 		t.Errorf("search on loaded index failed: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestFlatDistanceMetrics(t *testing.T) {
 			}
 
 			// Test search works with this metric
-			results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 2)
+			results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 2, nil)
 			if err != nil {
 				t.Errorf("search failed with metric %v: %v", metric, err)
 			}
@@ -507,7 +507,7 @@ func TestFlatEmptyIndex(t *testing.T) {
 	ctx := context.Background()
 
 	// Search on empty index
-	results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 5)
+	results, err := idx.Search(ctx, []float32{1.0, 0.0, 0.0}, 5, nil)
 	if err != nil {
 		t.Errorf("search on empty index failed: %v", err)
 	}
@@ -581,7 +581,7 @@ func BenchmarkFlatSearch(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		idx.Search(ctx, query, 10)
+		idx.Search(ctx, query, 10, nil)
 	}
 }
 
@@ -595,7 +595,7 @@ func TestFlatInsert_ClonesMetadata(t *testing.T) {
 	ctx := context.Background()
 	idx.Insert(ctx, entry)
 	entry.Metadata["k"] = "mutated"
-	results, _ := idx.Search(ctx, []float32{1}, 1)
+	results, _ := idx.Search(ctx, []float32{1}, 1, nil)
 	if results[0].Metadata["k"] != "v" {
 		t.Errorf("expected cloned metadata 'v', got %q", results[0].Metadata["k"])
 	}
@@ -630,7 +630,7 @@ func TestSearchArenaBacked(t *testing.T) {
 	query[0] = 50.0
 	k := 5
 
-	results, err := idx.Search(ctx, query, k)
+	results, err := idx.Search(ctx, query, k, nil)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

@@ -81,7 +81,7 @@ func TestEnhancedIVFPQIntegration(t *testing.T) {
 	k := 10
 
 	for i, query := range queries {
-		results, err := idx.Search(ctx, query, k)
+		results, err := idx.Search(ctx, query, k, nil)
 		if err != nil {
 			t.Fatalf("Failed to search query %d: %v", i, err)
 		}
@@ -165,7 +165,7 @@ func TestEnhancedIVFPQIntegration(t *testing.T) {
 
 	// Verify deleted vectors are not found in search
 	deletedQuery := vectors[0] // This vector was deleted
-	results, err := idx.Search(ctx, deletedQuery, k)
+	results, err := idx.Search(ctx, deletedQuery, k, nil)
 	if err != nil {
 		t.Fatalf("Failed to search for deleted vector: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestAutoTuningEffectiveness(t *testing.T) {
 	defaultStart := time.Now()
 	defaultResults := 0
 	for _, query := range queries {
-		results, err := defaultIdx.Search(ctx, query, k)
+		results, err := defaultIdx.Search(ctx, query, k, nil)
 		if err != nil {
 			t.Fatalf("Default search failed: %v", err)
 		}
@@ -257,7 +257,7 @@ func TestAutoTuningEffectiveness(t *testing.T) {
 	autoStart := time.Now()
 	autoResults := 0
 	for _, query := range queries {
-		results, err := autoIdx.Search(ctx, query, k)
+		results, err := autoIdx.Search(ctx, query, k, nil)
 		if err != nil {
 			t.Fatalf("Auto-tuned search failed: %v", err)
 		}
@@ -375,7 +375,7 @@ func TestQuantizationIntegration(t *testing.T) {
 
 	// Test search accuracy with quantization
 	query := vectors[0]
-	results, err := idx.Search(ctx, query, 5)
+	results, err := idx.Search(ctx, query, 5, nil)
 	if err != nil {
 		t.Fatalf("Failed to search: %v", err)
 	}
