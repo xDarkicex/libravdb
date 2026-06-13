@@ -286,8 +286,9 @@ func (g *graphStore) LoadFromSegment(path string, w *wal.WAL) error {
 			offset += edgesBytesSize
 
 			for j := 0; j < int(edgeCount); j++ {
-				if edges[j].Stamp > maxStamp {
-					maxStamp = edges[j].Stamp
+				stamp := edges[j].GetStamp()
+				if stamp > maxStamp {
+					maxStamp = stamp
 				}
 				err := g.appendEdgeToTable(nodeID, edges[j], g.index, g.pagePool)
 				if err != nil {

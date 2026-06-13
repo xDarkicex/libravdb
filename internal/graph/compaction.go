@@ -82,11 +82,10 @@ func CompactSegment(inPath, outPath string) error {
 
 	var manifest *DBManifest
 	if header.ManifestLength > 0 {
-		end := int(header.ManifestOffset + header.ManifestLength)
-		if end > len(data) {
+		if manifestEnd > int64(len(data)) {
 			return fmt.Errorf("manifest bounds out of range")
 		}
-		manifest, err = DeserializeManifest(data[header.ManifestOffset:end])
+		manifest, err = DeserializeManifest(data[header.ManifestOffset:manifestEnd])
 		if err != nil {
 			return err
 		}
@@ -128,7 +127,7 @@ func CompactSegment(inPath, outPath string) error {
 	}
 	crc.Write(manifestBytes)
 
-	offset := int(header.ManifestOffset + header.ManifestLength)
+	offset := int(manifestEnd)
 	if header.ManifestLength == 0 {
 		offset = SegmentHeaderSize
 	}
