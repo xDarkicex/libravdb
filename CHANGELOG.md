@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.1.1] — 2026-06-13
+
+11 files changed, 251 insertions, 74 deletions across 3 commits.
+
+### Graph API
+
+- **Complete `Graph` interface** — `BeginTxn`, `AddEdge`, `RemoveEdge`, `DropNodeEdges`, `Neighbors`, `Degree`, `InboundNeighbors`, `InboundDegree`, `NeighborsAny`, `ForEachEdge`, `BFS`, `GetBitset`/`PutBitset`, `GetFrontierBuf`/`PutFrontierBuf`, `Stats`, `Close` all exposed publicly.
+- **Public type aliases** — `Edge`, `KindSet`, `Bitset`, `FrontierBuf`, `VisitAction`, `GraphStats`, `Txn` re-exported from `internal/graph` so consumers don't import internal packages.
+- **`GraphConfig`** — direct struct (not pointer alias) for configuring memory budget at construction.
+
+### Documentation
+
+- **v2.1.0 changelog** — comprehensive entry covering all 8 phases of the graph layer.
+- **README refresh** — repositioned as hybrid vector-graph database with updated architecture diagram, graph layer feature section, API usage example, and project structure.
+
+### Housekeeping
+
+- **gofmt pass** — whitespace and import ordering cleanup across `internal/storage`, `internal/util`, `internal/storage/wal`.
+
 ## [2.1.0] — 2026-06-13
 
 71 files changed, 5,135 insertions, 231 deletions across 8 commits.
