@@ -40,9 +40,30 @@ func CompactSegment(inPath, outPath string) error {
 		return err
 	}
 
-	expectedCRC := crc32.ChecksumIEEE(data[SegmentHeaderSize:])
-	if expectedCRC != header.CRC32 {
-		return fmt.Errorf("segment CRC mismatch: expected %d, got %d", expectedCRC, header.CRC32)
+	// Check Magic Footer
+	hasFooter := false
+	if info.Size() >= int64(header.ManifestOffset+header.ManifestLength+4) {
+		footer := data[len(data)-4:]
+		if footer[0] == 'S' && footer[1] == 'G' && footer[2] == 'M' && footer[3] == 'T' {
+			hasFooter = true
+		}
+	}
+
+	hashWriter := crc32.NewIEEE()
+	if header.ManifestLength > 0 {
+		hashWriter.Write(data[header.ManifestOffset : header.ManifestOffset+header.ManifestLength])
+	}
+	dataEnd := len(data)
+	if hasFooter {
+		dataEnd -= 4
+	}
+	hashWriter.Write(data[header.ManifestOffset+header.ManifestLength : dataEnd])
+	if hasFooter {
+		hashWriter.Write([]byte{'S', 'G', 'M', 'T'})
+	}
+	
+	if hashWriter.Sum32() != header.CRC32 {
+		return fmt.Errorf("segment CRC mismatch: expected %d, got %d", hashWriter.Sum32(), header.CRC32)
 	}
 
 	var manifest *DBManifest
@@ -126,6 +147,12 @@ func CompactSegment(inPath, outPath string) error {
 			offset += edgesBytesSize
 		}
 	}
+	// Write magic footer "SGMT"
+	footer := [4]byte{'S', 'G', 'M', 'T'}
+	if _, err = fOut.Write(footer[:]); err != nil {
+		return err
+	}
+	crc.Write(footer[:])
 
 	outHeader.CRC32 = crc.Sum32()
 

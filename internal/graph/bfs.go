@@ -12,6 +12,9 @@ type VisitAction func(nodeID uint64, depth int) bool
 // BFS performs a lock-free breadth-first search starting from 'start'.
 // It uses caller-provided off-heap bitset and frontier buffers to ensure zero heap allocations on the hot path.
 func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error {
+	if maxDepth <= 0 {
+		maxDepth = 1 << 20 // Enforce a 1M limit
+	}
 	bitset.Clear()
 	frontier.Clear()
 	
@@ -28,8 +31,8 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 		}
 		g.metrics.bfsNodesVisited.Add(1)
 		
-		if depth >= maxDepth {
-			continue // Don't expand beyond max depth
+		if depth > maxDepth {
+			break
 		}
 		
 		// Get neighbors (lock-free read inline to avoid allocations)

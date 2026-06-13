@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"math/rand"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -57,7 +58,10 @@ type Graph interface {
 	DropNodeEdges(txn *Txn, nodeID uint64) error
 	Neighbors(nodeID uint64) ([]Edge, error)
 	Degree(nodeID uint64) (int, error)
+	InboundNeighbors(nodeID uint64) ([]Edge, error)
+	InboundDegree(nodeID uint64) (int, error)
 	NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error)
+	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
 	
 	BFS(start uint64, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error
 	GetBitset() *Bitset
@@ -172,10 +176,14 @@ func tryLockPage(m *uint64) bool {
 func retryOp(op func() error) error {
 	backoff := 1 * time.Millisecond
 	maxBackoff := 64 * time.Millisecond
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		err := op()
+		if err == nil {
+			return nil
+		}
 		if err == ErrConcurrentModification {
-			time.Sleep(backoff)
+			jitter := time.Duration(rand.Intn(1<<min(i, 10))) * time.Microsecond
+			time.Sleep(backoff + jitter)
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
@@ -185,6 +193,13 @@ func retryOp(op func() error) error {
 		return err
 	}
 	return ErrConcurrentModification
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func unlockPage(m *uint64) {
@@ -597,15 +612,41 @@ func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
 	return g.neighborsFromTable(nodeID, g.index, g.pagePool, g.cfg.PageShards)
 }
 
+func (g *graphStore) InboundNeighbors(nodeID uint64) ([]Edge, error) {
+	return g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+}
+
 func (g *graphStore) Degree(nodeID uint64) (int, error) {
-	shard := nodeID % uint64(g.cfg.PageShards)
+	return g.degreeFromTable(nodeID, g.index, g.pagePool, g.cfg.PageShards)
+}
+
+func (g *graphStore) InboundDegree(nodeID uint64) (int, error) {
+	return g.degreeFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+}
+
+func (g *graphStore) ForEachEdge(fn func(src, tgt uint64, edge Edge) bool) {
+	g.index.Iterate(func(nodeID uint64) {
+		edges, err := g.Neighbors(nodeID)
+		if err != nil {
+			return
+		}
+		for _, e := range edges {
+			if !fn(nodeID, e.Target, e) {
+				return
+			}
+		}
+	})
+}
+
+func (g *graphStore) degreeFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, shards int) (int, error) {
+	shard := nodeID % uint64(shards)
 	
 retry:
-	g.pagePool.HyalineEnter(int(shard))
+	pool.HyalineEnter(int(shard))
 	
-	pageSlot := g.index.Lookup(nodeID)
+	pageSlot := index.Lookup(nodeID)
 	if pageSlot == 0 {
-		g.pagePool.HyalineLeave(int(shard))
+		pool.HyalineLeave(int(shard))
 		return 0, nil
 	}
 	
@@ -614,11 +655,11 @@ retry:
 	count := int(page.Header.Count)
 	
 	if atomic.LoadUint32(&page.Header.Generation) != gen {
-		g.pagePool.HyalineLeave(int(shard))
+		pool.HyalineLeave(int(shard))
 		goto retry
 	}
 	
-	g.pagePool.HyalineLeave(int(shard))
+	pool.HyalineLeave(int(shard))
 	return count, nil
 }
 

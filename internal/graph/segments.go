@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,11 +92,11 @@ func (g *graphStore) FlushToSegment(path string) error {
 		return err
 	}
 	
-	crc := crc32.NewIEEE()
+	hashWriter := crc32.NewIEEE()
 	if _, err = f.Write(manifestBytes); err != nil {
 		return err
 	}
-	crc.Write(manifestBytes)
+	hashWriter.Write(manifestBytes)
 	var totalEdges uint64
 	
 	for _, nodeID := range nodeIDs {
@@ -113,19 +114,26 @@ func (g *graphStore) FlushToSegment(path string) error {
 		if _, err = f.Write(buf); err != nil {
 			return err
 		}
-		crc.Write(buf)
+		hashWriter.Write(buf)
 		
 		if len(edges) > 0 {
 			edgesBytes := unsafe.Slice((*byte)(unsafe.Pointer(&edges[0])), len(edges)*int(unsafe.Sizeof(Edge{})))
 			if _, err = f.Write(edgesBytes); err != nil {
 				return err
 			}
-			crc.Write(edgesBytes)
+			hashWriter.Write(edgesBytes)
 		}
 	}
 	
+	// Write magic footer "SGMT"
+	footer := [4]byte{'S', 'G', 'M', 'T'}
+	if _, err = f.Write(footer[:]); err != nil {
+		return err
+	}
+	hashWriter.Write(footer[:])
+	
 	header.EdgeCount = totalEdges
-	header.CRC32 = crc.Sum32()
+	header.CRC32 = hashWriter.Sum32()
 	
 	if _, err = f.Seek(0, 0); err != nil {
 		return err
@@ -188,9 +196,37 @@ func (g *graphStore) LoadFromSegment(path string, w *wal.WAL) error {
 		return fmt.Errorf("unsupported segment version: %d", header.Version)
 	}
 	
-	expectedCRC := crc32.ChecksumIEEE(data[SegmentHeaderSize:])
-	if expectedCRC != header.CRC32 {
-		return fmt.Errorf("segment CRC mismatch: expected %d, got %d", expectedCRC, header.CRC32)
+	// Check Magic Footer
+	hasFooter := false
+	if info.Size() >= int64(header.ManifestOffset+header.ManifestLength+4) {
+		footer := data[len(data)-4:]
+		if footer[0] == 'S' && footer[1] == 'G' && footer[2] == 'M' && footer[3] == 'T' {
+			hasFooter = true
+		}
+	}
+	
+	if !hasFooter {
+		log.Printf("WARNING: segment %s is missing SGMT footer (V1 backward compatibility)", path)
+	}
+
+	// Validate CRC
+	hashWriter := crc32.NewIEEE()
+	if header.ManifestLength > 0 {
+		hashWriter.Write(data[header.ManifestOffset : header.ManifestOffset+header.ManifestLength])
+	}
+	
+	dataEnd := len(data)
+	if hasFooter {
+		dataEnd -= 4
+	}
+	
+	hashWriter.Write(data[header.ManifestOffset+header.ManifestLength : dataEnd])
+	if hasFooter {
+		hashWriter.Write([]byte{'S', 'G', 'M', 'T'})
+	}
+	
+	if hashWriter.Sum32() != header.CRC32 {
+		return fmt.Errorf("segment CRC mismatch: expected %d, got %d", hashWriter.Sum32(), header.CRC32)
 	}
 	
 	if header.ManifestLength > 0 {

@@ -1,5 +1,9 @@
 package graph
 
+import (
+	"sync/atomic"
+)
+
 // EdgeTablePage stores edges for a single node with inline-first-8 layout.
 //
 // ShardedFreeList slot layout: each slot has 64 bytes of allocator metadata
@@ -64,6 +68,16 @@ func NewEdgeTableIndex(capacity uint64) *EdgeTableIndex {
 		table:      make([]EdgeTableLocator, capacity),
 		capacity:   capacity,
 		loadFactor: 0.75,
+	}
+}
+
+// Iterate visits every non-empty node in the table.
+func (idx *EdgeTableIndex) Iterate(fn func(nodeID uint64)) {
+	for i := uint64(0); i < idx.capacity; i++ {
+		nodeID := atomic.LoadUint64(&idx.table[i].NodeID)
+		if nodeID != 0 {
+			fn(nodeID)
+		}
 	}
 }
 

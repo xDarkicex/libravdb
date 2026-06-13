@@ -1370,32 +1370,42 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		defer c.mu.RUnlock()
 
 		entry, err := c.storage.Get(ctx, id)
-		if err != nil {
+		var hasEntry bool
+		if err == nil {
+			hasEntry = true
+		} else if !isNotFoundError(err) {
 			return fmt.Errorf("failed to get vector for deletion: %w", err)
 		}
 
-		indexErr := deleteIndexEntry(ctx, c.index, id, entry.Ordinal)
-
-		if err := c.storage.Delete(ctx, id); err != nil {
-			if !isNotFoundError(err) {
-				return fmt.Errorf("failed to write deletion to storage: %w", err)
-			}
+		var indexErr error
+		if hasEntry {
+			indexErr = deleteIndexEntry(ctx, c.index, id, entry.Ordinal)
+		} else {
+			indexErr = c.index.Delete(ctx, id)
 		}
 
-		type transactionStarter interface {
-			BeginTxn() *graph.Txn
-		}
-
-		if len(c.deleteHooks) > 0 && c.graph != nil {
-			if starter, ok := c.graph.(transactionStarter); ok {
-				txn := starter.BeginTxn()
-				for _, hook := range c.deleteHooks {
-					if err := hook(txn, uint64(entry.Ordinal)); err != nil {
-						return fmt.Errorf("delete hook failed: %w", err)
-					}
+		if hasEntry {
+			if err := c.storage.Delete(ctx, id); err != nil {
+				if !isNotFoundError(err) {
+					return fmt.Errorf("failed to write deletion to storage: %w", err)
 				}
-				if err := txn.Commit(ctx); err != nil {
-					return fmt.Errorf("failed to commit graph transaction: %w", err)
+			}
+
+			type transactionStarter interface {
+				BeginTxn() *graph.Txn
+			}
+
+			if len(c.deleteHooks) > 0 && c.graph != nil {
+				if starter, ok := c.graph.(transactionStarter); ok {
+					txn := starter.BeginTxn()
+					for _, hook := range c.deleteHooks {
+						if err := hook(txn, uint64(entry.Ordinal)); err != nil {
+							return fmt.Errorf("delete hook failed: %w", err)
+						}
+					}
+					if err := txn.Commit(ctx); err != nil {
+						return fmt.Errorf("failed to commit graph transaction: %w", err)
+					}
 				}
 			}
 		}
@@ -1420,25 +1430,35 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 	unlock := c.lockMutationIDs([]string{id})
 	defer unlock()
 
-	shard := c.getShard(id)
+	shardIdx := shardForID(id)
+	shard := &c.shards[shardIdx]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
+	entry, err := shard.storage.Get(ctx, id)
+	var hasEntry bool
+	if err == nil {
+		hasEntry = true
+	} else if !isNotFoundError(err) {
+		return fmt.Errorf("failed to get vector for deletion from shard %d: %w", shardIdx, err)
+	}
+
 	var indexErr error
-	if entry, err := shard.storage.Get(ctx, id); err == nil {
+	if hasEntry {
 		indexErr = deleteIndexEntry(ctx, shard.index, id, entry.Ordinal)
 	} else {
 		indexErr = shard.index.Delete(ctx, id)
 	}
 
-	if err := shard.storage.Delete(ctx, id); err != nil {
-		if !isNotFoundError(err) {
-			return fmt.Errorf("failed to write deletion to storage: %w", err)
+	if hasEntry {
+		if err := shard.storage.Delete(ctx, id); err != nil {
+			if !isNotFoundError(err) {
+				return fmt.Errorf("failed to write deletion to storage shard %d: %w", shardIdx, err)
+			}
 		}
 	}
 	if indexErr != nil {
 		if !isNotFoundError(indexErr) {
-			shardIdx := shardForID(id)
 			if rebuildErr := c.rebuildShardIndex(ctx, shardIdx); rebuildErr != nil {
 				return fmt.Errorf("failed to delete vector from shard index: %w; rebuild after delete also failed: %v", indexErr, rebuildErr)
 			}

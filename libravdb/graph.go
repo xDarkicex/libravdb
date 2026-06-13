@@ -7,16 +7,14 @@ import (
 // Graph defines the public consumer API for the graph layer.
 type Graph interface {
 	Stats() graph.GraphStats
+	InboundNeighbors(nodeID uint64) ([]Edge, error)
+	InboundDegree(nodeID uint64) (int, error)
+	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
 	Close() error
 }
 
 // Edge represents a directed edge in the graph.
-type Edge struct {
-	Target uint64
-	Weight float32
-	Kind   uint8
-	Stamp  uint32
-}
+type Edge = graph.Edge
 
 // KindSet represents a set of allowed edge kinds.
 type KindSet = graph.KindSet
