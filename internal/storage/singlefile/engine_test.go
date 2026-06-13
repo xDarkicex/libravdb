@@ -1680,7 +1680,7 @@ func TestEngine_Vacuum(t *testing.T) {
 func TestEngine_Backup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "backup_source.libravdb")
 	backupPath := filepath.Join(t.TempDir(), "backup_dest.libravdb")
-	
+
 	db, err := New(path)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1714,7 +1714,7 @@ func TestEngine_Backup(t *testing.T) {
 	if !exists {
 		t.Fatalf("Original engine lost record after backup")
 	}
-	
+
 	if err := engine.Close(); err != nil {
 		t.Fatalf("Close original: %v", err)
 	}
@@ -1726,12 +1726,12 @@ func TestEngine_Backup(t *testing.T) {
 	}
 	backupEngine := backupDB.(*Engine)
 	defer backupEngine.Close()
-	
+
 	backupColl, err := backupEngine.GetCollection("test_coll")
 	if err != nil {
 		t.Fatalf("Failed to get collection from backup: %v", err)
 	}
-	
+
 	for i := 0; i < 10; i++ {
 		exists, err := backupColl.Exists(context.Background(), fmt.Sprintf("id-%d", i))
 		if err != nil || !exists {
@@ -1742,29 +1742,29 @@ func TestEngine_Backup(t *testing.T) {
 
 func TestEngine_Drop(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "drop.libravdb")
-	
+
 	db, err := New(path)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	engine := db.(*Engine)
-	
+
 	// Create some data
 	coll, err := engine.CreateCollection("test_coll", &storage.CollectionConfig{Dimension: 2, Metric: 0})
 	if err != nil {
 		t.Fatalf("CreateCollection: %v", err)
 	}
-	
+
 	// Drop engine
 	if err := engine.Drop(context.Background()); err != nil {
 		t.Fatalf("Drop failed: %v", err)
 	}
-	
+
 	// Verify file is gone
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("Database file still exists after Drop")
 	}
-	
+
 	// Verify ops fail
 	if err := coll.Insert(context.Background(), &index.VectorEntry{ID: "test"}); err == nil {
 		t.Fatalf("Expected Insert to fail on dropped engine")

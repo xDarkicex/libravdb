@@ -240,7 +240,7 @@ type Engine struct {
 		mu       sync.Mutex
 		entries  []batchEntry
 		flusher  chan struct{}
-		flushNow []chan// accumulated entries awaiting flush
+		flushNow []chan // accumulated entries awaiting flush
 		// signal to wake up flusher
 		error
 		flushSignalPending int32
@@ -1440,7 +1440,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		e.mu.Unlock()
 		return fmt.Errorf("vacuum pre-checkpoint: %w", err)
 	}
-	
+
 	// Snapshot vectors for indexes safely
 	if e.indexProvider != nil {
 		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
@@ -1510,7 +1510,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("vacuum create temp file: %w", err)
 	}
-	
+
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -1545,7 +1545,9 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 
 	bufPtr := pagePool.Get().(*[]byte)
 	buf := *bufPtr
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("vacuum write header: %w", err)
@@ -1565,14 +1567,18 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		IndexLength:     indexLength,
 		IndexChecksum:   indexChecksum,
 	}
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("vacuum write meta A: %w", err)
 	}
-	
+
 	meta.RootFreelist = math.MaxUint64
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("vacuum write meta B: %w", err)
@@ -1631,7 +1637,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		if _, err := tmpFile.Seek(0, io.SeekEnd); err != nil {
 			return fmt.Errorf("vacuum seek temp file: %w", err)
 		}
-		
+
 		// Create section reader for the delta
 		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
 		if _, err := io.Copy(tmpFile, deltaReader); err != nil {
@@ -1667,7 +1673,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		}
 		return fmt.Errorf("vacuum rename: %w", err)
 	}
-	
+
 	f, err := os.OpenFile(e.path, os.O_RDWR, 0644)
 	if err != nil {
 		e.status.Store(int32(storage.StatusFailed))
@@ -1692,7 +1698,7 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		e.mu.Unlock()
 		return fmt.Errorf("backup pre-checkpoint: %w", err)
 	}
-	
+
 	if e.indexProvider != nil {
 		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
 			e.mu.Unlock()
@@ -1738,7 +1744,9 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 			if err != nil {
 				return fmt.Errorf("backup serialize index %s: %w", name, err)
 			}
-			if indexBytes == nil { continue }
+			if indexBytes == nil {
+				continue
+			}
 			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
 			entries = append(entries, indexBlockEntry{
 				name:            name,
@@ -1758,7 +1766,7 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("backup create file: %w", err)
 	}
-	
+
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -1793,7 +1801,9 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 
 	bufPtr := pagePool.Get().(*[]byte)
 	buf := *bufPtr
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(destFile, 0, encodeHeader(fh, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("backup write header: %w", err)
@@ -1813,14 +1823,18 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		IndexLength:     indexLength,
 		IndexChecksum:   indexChecksum,
 	}
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(destFile, 1, encodeMeta(meta, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("backup write meta A: %w", err)
 	}
-	
+
 	meta.RootFreelist = math.MaxUint64
-	for i := range buf { buf[i] = 0 }
+	for i := range buf {
+		buf[i] = 0
+	}
 	if err := writeFixedPage(destFile, 2, encodeMeta(meta, buf)); err != nil {
 		pagePool.Put(bufPtr)
 		return fmt.Errorf("backup write meta B: %w", err)
@@ -1902,15 +1916,15 @@ func (e *Engine) Drop(ctx context.Context) error {
 		return fmt.Errorf("database already closed")
 	}
 	e.mu.Unlock()
-	
+
 	if err := e.Close(); err != nil {
 		return fmt.Errorf("drop close: %w", err)
 	}
-	
+
 	if err := os.Remove(e.path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("drop remove: %w", err)
 	}
-	
+
 	return nil
 }
 

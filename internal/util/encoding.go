@@ -13,8 +13,8 @@ const (
 	MaxCodecBytes     = 16 * 1024 * 1024
 	MaxVectorSize     = 64 * 1024 * 1024
 	MaxMetadataFields = 65536
-	MaxStringLen      = 256 * 1024      // 256 KB per string
-	MaxMetadataKeyLen = 1024            // 1 KB per metadata key
+	MaxStringLen      = 256 * 1024 // 256 KB per string
+	MaxMetadataKeyLen = 1024       // 1 KB per metadata key
 )
 
 const (

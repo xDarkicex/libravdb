@@ -17,7 +17,7 @@ const (
 	OpInsert Operation = iota
 	OpUpdate
 	OpDelete
-	
+
 	// Graph operations
 	OpEdgeAdd      Operation = 0x40
 	OpEdgeRemove   Operation = 0x41

@@ -23,7 +23,6 @@ type WAL struct {
 	closed bool
 }
 
-
 // New creates a new WAL instance
 func New(path string) (*WAL, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)

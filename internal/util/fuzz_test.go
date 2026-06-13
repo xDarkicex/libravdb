@@ -52,11 +52,11 @@ func FuzzBinaryDecoderRoundtrip(f *testing.F) {
 // returns an error, not a panic.
 func FuzzBinaryDecoderCorrupt(f *testing.F) {
 	// Seed with valid and edge-case payloads.
-	f.Add([]byte{0, 0, 0, 0})                                  // zero-length vector
-	f.Add([]byte{0, 0, 0, 1, 0, 0, 0, 0})                      // 1-element zero
-	f.Add([]byte{0xff, 0xff, 0xff, 0xff})                       // max uint32 length
-	f.Add([]byte{0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0})         // 2-element (but only 1 full float)
-	f.Add([]byte{1, 2, 3})                                      // truncated header
+	f.Add([]byte{0, 0, 0, 0})                         // zero-length vector
+	f.Add([]byte{0, 0, 0, 1, 0, 0, 0, 0})             // 1-element zero
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff})             // max uint32 length
+	f.Add([]byte{0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0}) // 2-element (but only 1 full float)
+	f.Add([]byte{1, 2, 3})                            // truncated header
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dec := &BinaryDecoder{Data: data}
