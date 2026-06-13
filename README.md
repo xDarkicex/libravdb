@@ -9,9 +9,9 @@
 [![Coverage](https://img.shields.io/codecov/c/github/xDarkicex/libravdb)](https://codecov.io/gh/xDarkicex/libravdb)
 [![Go Reference](https://pkg.go.dev/badge/github.com/xDarkicex/libravdb.svg)](https://pkg.go.dev/github.com/xDarkicex/libravdb)
 
-**High-Performance Vector Database Library for Go**
+**High-Performance Hybrid Vector-Graph Database for Go**
 
-*Production-ready vector similarity search with advanced indexing, quantization, and filtering capabilities*
+*Vector similarity search meets directed relationship modeling — zero-allocation graph traversal with WAL durability*
 
 [**Quick Start**](#-quick-start) •
 [**Documentation**](#-documentation) •
@@ -46,15 +46,16 @@
 
 ## 🎯 Overview
 
-LibraVDB is a high-performance vector database library for Go applications. It provides similarity search, metadata-aware retrieval, batch and streaming ingestion, and persistent single-file storage with HNSW, IVF-PQ, and Flat indexing.
+LibraVDB is a high-performance hybrid vector-graph database library for Go applications. It provides similarity search, metadata-aware retrieval, directed edge relationship modeling, graph traversal, batch and streaming ingestion, and persistent single-file storage with HNSW, IVF-PQ, and Flat indexing.
 
 ### Why LibraVDB?
 
 - **🚀 Performance First**: Optimized for high-throughput insertions and sub-millisecond search latency
 - **🔧 Go Native**: Designed specifically for Go with idiomatic APIs and zero external dependencies
-- **📈 Durable by Default**: Single-file binary persistence with reopen/rebuild support
-- **🧠 Memory Efficient**: Advanced quantization and memory mapping for large-scale deployments
-- **🔍 Feature Rich**: Complex filtering, streaming operations, and automatic optimization
+- **📈 Durable by Default**: Single-file binary persistence with WAL-backed durability and crash recovery
+- **🧠 Memory Efficient**: Off-heap memory management via `github.com/xDarkicex/memory` — zero GC pressure on hot paths
+- **🔀 Hybrid Vector-Graph**: Directed typed edges, BFS traversal, reverse-index lookups, and graph-filtered similarity search
+- **🔍 Feature Rich**: Complex filtering, streaming operations, and automatic index optimization
 - **📊 Observable**: Built-in metrics, health checks, and performance monitoring
 - **🛡️ Safer Writes**: Bounded write admission for concurrent, batch, and streaming writers
 
@@ -66,6 +67,7 @@ LibraVDB is a high-performance vector database library for Go applications. It p
 - **Rich Metadata Filtering**: Complex AND/OR/NOT operations with type-safe schemas
 - **Streaming Operations**: High-throughput batch processing with backpressure control
 - **Memory Management**: Configurable limits, memory mapping, and automatic optimization
+- **Graph Layer** (`v2.1.0`): Directed typed edges between vectors with zero heap allocations. 16-byte fixed Edge (Target, Weight, Stamp/Kind), EdgeTable 4KB pages with inline-first-8 layout, lock-free reads via Hyaline SMR, BFS traversal with caller-managed off-heap buffers, reverse index for O(degree) node deletion, WAL durability (4 new op types, CRC32 checksums), segment persistence with zero-copy mmap I/O, graph-filtered similarity search across all index types, insert/delete hooks for automatic edge maintenance
 - **Persistent Storage**: Single-file binary storage with WAL-backed durability
 - **Storage-Owned HNSW**: Canonical vectors and metadata live in storage; HNSW owns graph topology plus optional compressed artifacts
 
@@ -348,6 +350,65 @@ recommendations, err := collection.Query(ctx).
     Execute()
 ```
 
+### Graph Layer
+
+```go
+// Create a graph for relationship modeling between vectors
+graph, err := libravdb.NewGraph(libravdb.GraphConfig{
+    EdgeSlots: 1000000,     // 1M edges
+    PageSlots: 65536,       // 64K pages
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+// Add typed, weighted edges between vectors
+graph.AddEdge(txn, 1, 2, 0.95, 1)   // kind=1: "similar_to"
+graph.AddEdge(txn, 2, 3, 0.87, 2)   // kind=2: "derived_from"
+
+// Query outgoing edges for a node
+edges, _ := graph.Neighbors(1)
+for _, e := range edges {
+    fmt.Printf("1 -> %d (kind=%d, weight=%.3f)\n", e.Target, e.Kind, e.Weight)
+}
+
+// Filter by edge kind with KindSet
+kindSet := libravdb.NewKindSet(1) // only "similar_to" edges
+similar, _ := graph.NeighborsAny(1, kindSet)
+
+// Degree and reverse lookups
+count, _ := graph.Degree(1)
+inbound, _ := graph.InboundNeighbors(1) // "what points to node 1?"
+
+// Graph-filtered vector search
+bitset, _ := graph.GetBitset()
+frontier, _ := graph.GetFrontierBuf()
+defer graph.PutBitset(bitset)
+defer graph.PutFrontierBuf(frontier)
+
+// BFS from node 1, collecting all reachable nodes into the bitset
+graph.BFS(1, 3, func(nodeID uint64, depth int) bool {
+    return true
+}, bitset, frontier)
+
+// Search only among nodes reachable from node 1
+results, _ := collection.Query(ctx).
+    WithVector(queryVector).
+    WithGraphFilter(bitset).
+    Limit(10).
+    Execute()
+
+// Iterate all edges
+graph.ForEachEdge(func(src, tgt uint64, edge libravdb.Edge) bool {
+    fmt.Printf("%d -> %d\n", src, tgt)
+    return true
+})
+
+// Remove edges
+graph.RemoveEdge(txn, 1, 2, 1) // remove kind=1 edge from 1->2
+graph.DropNodeEdges(txn, 1)    // remove all edges for node 1
+```
+
 More examples available in [docs/examples/](docs/examples/).
 
 ## 🏗️ Architecture
@@ -355,32 +416,33 @@ More examples available in [docs/examples/](docs/examples/).
 LibraVDB employs a layered architecture designed for performance, scalability, and maintainability:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Application Layer                        │
-├─────────────────────────────────────────────────────────────────┤
-│                         LibraVDB API                           │
-│  Database Management │ Collection Ops │ Query Builder │ Stream │
-├─────────────────────────────────────────────────────────────────┤
-│                        Processing Layer                         │
-│    Index Layer    │  Filter Layer  │  Memory Mgmt  │  Observ.  │
-├─────────────────────────────────────────────────────────────────┤
-│                       Algorithm Layer                           │
-│  HNSW │ IVF-PQ │ Flat │  Quantization  │  Cache  │  Monitoring │
-├─────────────────────────────────────────────────────────────────┤
-│                        Storage Layer                           │
-│ Single-File Engine │ Canonical Records │   WAL / Snapshot     │
-├─────────────────────────────────────────────────────────────────┤
-│                      Operating System                          │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Application Layer                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                           LibraVDB API                                 │
+│  Database Mgmt │ Collection Ops │ Query Builder │ Stream │ Graph API   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                          Processing Layer                               │
+│   Index Layer  │  Filter Layer  │  Memory Mgmt  │  Graph Layer │ Obs.  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                         Algorithm Layer                                 │
+│  HNSW │ IVF-PQ │ Flat │ BFS Traversal │ Quantization │ Cache │ Monitor  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                          Storage Layer                                 │
+│  Single-File Engine │ Canonical Records │ WAL / Snapshot │ Segments    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                        Operating System                                │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Components
 
 - **Database Layer**: Collection management, global configuration, health monitoring
-- **Collection Layer**: Vector operations, metadata management, index coordination, write admission
-- **Index Layer**: HNSW, IVF-PQ, and Flat algorithms with automatic selection
+- **Collection Layer**: Vector operations, metadata management, index coordination, write admission, hook execution
+- **Index Layer**: HNSW, IVF-PQ, and Flat algorithms with automatic selection and graph-filtered search
+- **Graph Layer**: Directed typed edges, EdgeTable pages, BFS traversal, reverse index, WAL durability, segment persistence
 - **Storage Layer**: Single-file canonical storage with WAL-backed durability and reopen/rebuild support
-- **Memory Layer**: Advanced memory management with limits, mapping, and optimization
+- **Memory Layer**: Off-heap memory management via `github.com/xDarkicex/memory` with Hyaline SMR, ShardedFreeList, Arena
 - **Observability Layer**: Metrics, tracing, health checks, and performance monitoring
 
 Detailed architecture documentation: [docs/design/architecture.md](docs/design/architecture.md)
@@ -798,11 +860,11 @@ go doc -all ./libravdb
 
 ```
 libravdb/
-├── libravdb/          # Main library package
+├── libravdb/          # Main library package (Graph, Hooks, Database, Collection)
 ├── internal/          # Internal packages
-│   ├── index/         # Indexing algorithms
-│   ├── storage/       # Storage layer
-│   ├── memory/        # Memory management
+│   ├── graph/         # Graph layer: edges, EdgeTable, BFS, WAL, segments, compaction
+│   ├── index/         # Indexing algorithms (HNSW, IVF-PQ, Flat)
+│   ├── storage/       # Storage layer (single-file engine, WAL)
 │   ├── filter/        # Query filtering
 │   ├── quant/         # Quantization
 │   ├── obs/           # Observability
