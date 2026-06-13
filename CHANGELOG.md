@@ -1,5 +1,68 @@
 # Changelog
 
+## [2.1.0] — 2026-06-13
+
+71 files changed, 5,135 insertions, 231 deletions across 8 commits.
+
+### Graph Layer (`internal/graph/`)
+
+New subsystem providing directed, typed edge relationships between vectors with zero heap allocations on the hot path.
+
+- **Edge primitive** — 16-byte fixed struct (`Target uint64`, `Weight float32`, `Stamp uint32`/`Kind uint8` packed). Allocated from `ShardedFreeList` (SlotSize=80, 3 edges per slot, 64 shards). Kind encoded in Stamp[31:24], 24-bit timestamp in Stamp[23:0] for MVCC.
+- **EdgeTable pages** — 4KB pages with inline-first-8 layout. First 8 edges stored directly in the header; overflow chaining activates for hub nodes (>8 edges). Per-page MVCC generation counter with per-page mutex for writes.
+- **KindSet** — 256-bit bitset (`[4]uint64`) providing branch-free edge kind filtering in ~1 CPU cycle.
+- **Operations** — `AddEdge`, `RemoveEdge`, `DropNodeEdges`, `Neighbors`, `NeighborsAny` (kind-filtered), `Degree` — all O(1). Lock-free reads via Hyaline SMR, writes via per-page mutex with 64-way sharding.
+- **BFS traversal** — `BFS(start, maxDepth, visit, bitset, frontier)` with caller-managed off-heap buffers. Visited-node dedup via Bitset, bounded depth enforcement, early termination on callback return. Target: ~30 CPU cycles per edge.
+- **Reverse index** — symmetric edge storage (forward A→B, reverse B→A) enabling O(degree) node deletion without full graph scan.
+- **Forward/reverse atomicity** — compensating rollback guarantees index symmetry on partial failures.
+
+### Durability
+
+- **WAL integration** — 4 new operation codes: `OpEdgeAdd` (0x40), `OpEdgeRemove` (0x41), `OpNodeEdgeDrop` (0x42), `OpTxnCommit` (0x4F). Fixed-width binary records with CRC32 checksums, exact-width deserialization, and atomic transaction commit/abort semantics.
+- **Transaction atomicity** — corrupted transactions marked and skipped entirely during replay. `lastFlushedGen` guarded against regression.
+- **Checkpoint coordinator** — background goroutine polling vector and edge subsystem generation counters every 100ms. Advances checkpoint when both confirm flush.
+- **Segment persistence** — `FlushToSegment`/`LoadFromSegment` with zero-copy mmap I/O via `memory.MmapFileReadOnly`. 32-byte binary header (version, node/edge count, CRC32) with embedded manifest pointers. Directory fsync after atomic rename for crash durability. SGMT 4-byte magic footer.
+- **Segment compaction** — `CompactSegment` performs CRC re-validation, opportunistic V1→V2 layout migration, defragmentation, and recomputes counts from consumed data. Self-verifying: asserts full payload consumption.
+- **KindManifest** — `DBManifest` with `MinReaderVersion` enforcement and `KindManifest` map (uint8→string). Embedded in segment between header and edge records — no sidecar files, no split-brain hazard.
+
+### Public API (`libravdb/`)
+
+- **Graph interface** — `AddEdge`, `RemoveEdge`, `DropNodeEdges`, `Neighbors`, `NeighborsAny`, `Degree`, `InboundNeighbors`, `InboundDegree`, `ForEachEdge`, `BFS`, `GetBitset`/`PutBitset`, `GetFrontierBuf`/`PutFrontierBuf`, `Stats`.
+- **GraphConfig** — configurable memory budget (Edge slots, page slots, Bitset/Frontier pool sizes, Arena pages).
+- **Insert hooks** — `InsertHook`/`DeleteHook` callbacks (max 4 each) fired before WAL append. Receive `GraphTx` interface exposing `AddEdge`/`RemoveEdge`. Nil hook rejection, error propagation aborts transaction.
+- **Graph-filtered search** — `QueryBuilder.WithGraphFilter(GraphFilter)` propagates bitset to all index types. `GraphFilter` interface with single `Test(uint64) bool` method.
+- **Edge, KindSet, Bitset** types exported alongside Graph interface.
+
+### Index Integration
+
+- All three index types (Flat, HNSW, IVF-PQ) accept `GraphFilter` in their `Search` signatures.
+- **Flat**: filter check on loop index `i` — no struct change, no serialization impact.
+- **HNSW**: filter check via `candidate.Ordinal` during traversal — filtered nodes traversed but excluded from results.
+- **IVF-PQ**: filter check via `entry.Ordinal` — early skip before distance computation.
+
+### Concurrency & Resilience
+
+- **Exponential backoff with jitter** — write-path retry on per-page mutex contention, randomized jitter prevents thundering-herd wakeups.
+- **Memory exhaustion** — `runtime.GC()` + retry before giving up on pool allocation failures.
+- **WAL replay resilience** — corrupted records skipped with warnings, not panics.
+- **Checkpoint coordinator idempotency** — `sync.Once`-guarded Start/Stop.
+- **BFS depth enforcement** — depth guard before visit callback, no enqueue at maxDepth.
+- **ForEachEdge global early-stop** — returning false from callback terminates full iteration.
+- **FrontierBuf overflow detection** — `Push` returns bool, BFS checks result, never silently drops reachable nodes.
+- **DropNodeEdges error propagation** — cleanup loop errors returned, not discarded.
+
+### Testing
+
+- **18 gopter property tests** (100 iterations each) covering all correctness properties: KindSet filtering, inline-first-8 layout, overflow activation, generation monotonicity, Neighbors completeness, Degree consistency, NeighborsAny filtering, BFS reachability, BFS early termination, forward/reverse symmetry, DropNodeEdges completeness, WAL CRC32 integrity, transaction atomicity, replay state reconstruction, replay reverse index reconstruction, metric counter correctness.
+- **Stress tests**: hub nodes with 100K+ edges, concurrent readers/writers on shared pages, memory exhaustion.
+- **Fuzz tests**: WAL record deserialization with random byte inputs, CRC32 corruption detection.
+- **Benchmarks**: EdgeTable page reads, BFS inner loop, AddEdge, Neighbors, Filter bitset check.
+- **CI**: GitHub Actions workflow targeting linux/amd64 + darwin/arm64 on PRs to main.
+
+### Dependency Changes
+
+- `github.com/xDarkicex/memory` — v1.0.2 → v1.0.3 (adds `MmapFileReadOnly`, `Munmap` for zero-copy segment I/O)
+
 ## [2.0.0] — 2026-06-12
 
 151 files changed, 7,763 insertions, 3,897 deletions across 59 commits.
