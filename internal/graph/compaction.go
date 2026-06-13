@@ -40,28 +40,42 @@ func CompactSegment(inPath, outPath string) error {
 		return err
 	}
 
+	// Overflow-safe bounds check
+	manifestEnd := int64(header.ManifestOffset) + int64(header.ManifestLength)
+	if manifestEnd < 0 || manifestEnd > info.Size() {
+		return fmt.Errorf("manifest bounds out of range")
+	}
+
 	// Check Magic Footer
 	hasFooter := false
-	if info.Size() >= int64(header.ManifestOffset+header.ManifestLength+4) {
+	if info.Size() >= manifestEnd+4 {
 		footer := data[len(data)-4:]
 		if footer[0] == 'S' && footer[1] == 'G' && footer[2] == 'M' && footer[3] == 'T' {
 			hasFooter = true
 		}
 	}
 
+	if !hasFooter {
+		return fmt.Errorf("segment %s is missing SGMT footer", inPath)
+	}
+
 	hashWriter := crc32.NewIEEE()
 	if header.ManifestLength > 0 {
-		hashWriter.Write(data[header.ManifestOffset : header.ManifestOffset+header.ManifestLength])
+		hashWriter.Write(data[header.ManifestOffset:manifestEnd])
 	}
 	dataEnd := len(data)
 	if hasFooter {
 		dataEnd -= 4
 	}
-	hashWriter.Write(data[header.ManifestOffset+header.ManifestLength : dataEnd])
+
+	if manifestEnd > int64(dataEnd) {
+		return fmt.Errorf("payload bounds out of range")
+	}
+	hashWriter.Write(data[manifestEnd:dataEnd])
 	if hasFooter {
 		hashWriter.Write([]byte{'S', 'G', 'M', 'T'})
 	}
-	
+
 	if hashWriter.Sum32() != header.CRC32 {
 		return fmt.Errorf("segment CRC mismatch: expected %d, got %d", hashWriter.Sum32(), header.CRC32)
 	}
@@ -123,21 +137,21 @@ func CompactSegment(inPath, outPath string) error {
 		if offset+16 > len(data) {
 			return fmt.Errorf("unexpected EOF reading node record")
 		}
-		
+
 		nodeBytes := data[offset : offset+16]
 		edgeCount := binary.LittleEndian.Uint16(nodeBytes[8:10])
 		offset += 16
-		
+
 		edgesBytesSize := int(edgeCount) * int(unsafe.Sizeof(Edge{}))
 		if offset+edgesBytesSize > len(data) {
 			return fmt.Errorf("unexpected EOF reading edges")
 		}
-		
+
 		if _, err = fOut.Write(nodeBytes); err != nil {
 			return err
 		}
 		crc.Write(nodeBytes)
-		
+
 		if edgeCount > 0 {
 			edgesBytes := data[offset : offset+edgesBytesSize]
 			if _, err = fOut.Write(edgesBytes); err != nil {
@@ -171,5 +185,9 @@ func CompactSegment(inPath, outPath string) error {
 		return err
 	}
 
-	return os.Rename(outPath+".tmp", outPath)
+	if err := os.Rename(outPath+".tmp", outPath); err != nil {
+		return err
+	}
+
+	return syncDir(filepath.Dir(outPath))
 }

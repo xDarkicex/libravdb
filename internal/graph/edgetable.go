@@ -20,14 +20,14 @@ type EdgeTablePage struct {
 
 // EdgeTableHeader contains page metadata
 type EdgeTableHeader struct {
-	Count       uint16  // Total edge count (inline + overflow)
-	InlineCap   uint16  // Always 8 for inline-first-8 layout
-	Overflow    uint32  // Offset to overflow chain (0 if none)
-	Generation  uint32  // MVCC version counter
-	Mutex       uint64  // Per-page spin lock word
-	HyalineSlot uint16  // Shard index for Hyaline SMR
-	LayoutTag   uint8   // Layout version tag (0 for backwards compat, 1=V1, 2=V2)
-	_           uint8   // Padding to 24 bytes
+	Count       uint16 // Total edge count (inline + overflow)
+	InlineCap   uint16 // Always 8 for inline-first-8 layout
+	Overflow    uint32 // Offset to overflow chain (0 if none)
+	Generation  uint32 // MVCC version counter
+	Mutex       uint64 // Per-page spin lock word
+	HyalineSlot uint16 // Shard index for Hyaline SMR
+	LayoutTag   uint8  // Layout version tag (0 for backwards compat, 1=V1, 2=V2)
+	_           uint8  // Padding to 24 bytes
 }
 
 const (
@@ -57,13 +57,13 @@ func NewEdgeTableIndex(capacity uint64) *EdgeTableIndex {
 	}
 	// Round up to next power of 2
 	capacity = nextPowerOf2(capacity)
-	
+
 	// Initialize with empty locators (NodeID 0, PageSlot 0)
-	// We need a way to distinguish empty slots, 
+	// We need a way to distinguish empty slots,
 	// assuming NodeID 0 is valid or we use a separate marker.
 	// For simplicity, we can reserve a specific state for empty slots.
 	// Actually, an open addressing table typically needs a way to mark empty/deleted.
-	
+
 	return &EdgeTableIndex{
 		table:      make([]EdgeTableLocator, capacity),
 		capacity:   capacity,

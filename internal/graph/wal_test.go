@@ -182,7 +182,7 @@ func TestWAL_ReplayStateReconstruction(t *testing.T) {
 			defer w.Close()
 
 			txn := &Txn{ID: 1, wal: w}
-			
+
 			for _, op := range ops {
 				if op.Add {
 					_ = store1.AddEdge(txn, op.Src, op.Tgt, op.Weight, op.Kind)
@@ -195,7 +195,7 @@ func TestWAL_ReplayStateReconstruction(t *testing.T) {
 			store2, _ := NewGraph(cfg)
 			defer store2.Close()
 			gs2 := store2.(*graphStore)
-			
+
 			err = ReplayWAL(w, gs2)
 			if err != nil {
 				return false
@@ -211,7 +211,7 @@ func TestWAL_ReplayStateReconstruction(t *testing.T) {
 			}
 
 			gs1 := store1.(*graphStore)
-			
+
 			for n := range nodes {
 				edges1, _ := store1.Neighbors(n)
 				edges2, _ := store2.Neighbors(n)
@@ -226,7 +226,7 @@ func TestWAL_ReplayStateReconstruction(t *testing.T) {
 					return false
 				}
 			}
-			
+
 			return true
 		},
 		gen.SliceOfN(100, genEdgeOp()),

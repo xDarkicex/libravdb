@@ -26,7 +26,7 @@ func TestHealthMonitorCallbackCleanup(t *testing.T) {
 
 	// Track callbacks ourselves so the test knows when they finish.
 	// The monitor's internal WaitGroup tracks goroutine completion.
-	wg.Add(1) // expect at least one callback during the run
+	wg.Add(1)                      // expect at least one callback during the run
 	hm.Start(context.Background()) // nil context triggers immediate status check via performHealthCheck
 
 	// Wait for the initial callback to be scheduled.

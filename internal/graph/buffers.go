@@ -80,7 +80,7 @@ func newFrontierBuf(slot []byte) *FrontierBuf {
 }
 
 // Push adds an item to the frontier queue.
-func (f *FrontierBuf) Push(nodeID uint64, depth int) {
+func (f *FrontierBuf) Push(nodeID uint64, depth int) bool {
 	if f.tail == len(f.data) {
 		// Shift items to the front if we have space
 		if f.head > 0 {
@@ -89,11 +89,12 @@ func (f *FrontierBuf) Push(nodeID uint64, depth int) {
 			f.head = 0
 		}
 		if f.tail == len(f.data) {
-			return // Queue full
+			return false // Queue full
 		}
 	}
 	f.data[f.tail] = NodeDepth{NodeID: nodeID, Depth: depth}
 	f.tail++
+	return true
 }
 
 // Pop removes and returns the first item in the frontier queue.

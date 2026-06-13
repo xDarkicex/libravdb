@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"runtime"
 	"sync/atomic"
@@ -11,7 +12,6 @@ import (
 	"github.com/xDarkicex/libravdb/internal/storage/wal"
 	"github.com/xDarkicex/memory"
 )
-
 
 // Txn is a minimal transaction context for graph operations.
 type Txn struct {
@@ -62,11 +62,11 @@ type Graph interface {
 	InboundDegree(nodeID uint64) (int, error)
 	NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error)
 	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
-	
+
 	BFS(start uint64, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error
-	GetBitset() *Bitset
+	GetBitset() (*Bitset, error)
 	PutBitset(b *Bitset)
-	GetFrontierBuf() *FrontierBuf
+	GetFrontierBuf() (*FrontierBuf, error)
 	PutFrontierBuf(f *FrontierBuf)
 	Stats() GraphStats
 
@@ -74,19 +74,20 @@ type Graph interface {
 }
 
 type graphStore struct {
-	cfg          GraphConfig
-	edgePool     *memory.ShardedFreeList
-	pagePool     *memory.ShardedFreeList
-	bitsetPool   *memory.ShardedFreeList
-	frontierPool *memory.ShardedFreeList
-	pageReg      *PageRegistry
-	index        *EdgeTableIndex
-	reverse      *ReverseIndex
-	manifest     *DBManifest
-	globalStamp  atomic.Uint32
-	metrics      storeMetrics
+	cfg            GraphConfig
+	edgePool       *memory.ShardedFreeList
+	pagePool       *memory.ShardedFreeList
+	bitsetPool     *memory.ShardedFreeList
+	frontierPool   *memory.ShardedFreeList
+	pageReg        *PageRegistry
+	index          *EdgeTableIndex
+	reverse        *ReverseIndex
+	manifest       *DBManifest
+	globalStamp    atomic.Uint32
+	metrics        storeMetrics
 	lastFlushedGen uint32
-	nextTxnID    atomic.Uint64
+	nextTxnID      atomic.Uint64
+	wal            *wal.WAL
 }
 
 // NewGraph initializes the Graph store with off-heap allocators.
@@ -229,7 +230,7 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 		}
 		// The user data area starts at offset 64.
 		page = (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
-		
+
 		page.Header.Count = 0
 		page.Header.InlineCap = 8
 		page.Header.Overflow = 0
@@ -237,7 +238,7 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 		page.Header.Mutex = 0
 		page.Header.HyalineSlot = uint16(shard)
 		page.Header.LayoutTag = LayoutV2
-		
+
 		pageSlot = g.pageReg.Register(page)
 		index.Insert(nodeID, pageSlot)
 	} else {
@@ -247,14 +248,14 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 	if !tryLockPage(&page.Header.Mutex) {
 		return ErrConcurrentModification
 	}
-	
+
 	totalCount := page.Header.Count
 	if totalCount < 8 {
 		page.Inline[totalCount] = edge
 	} else {
 		currPage := page
 		edgesToSkip := totalCount
-		
+
 		for edgesToSkip >= 250 {
 			if currPage.Header.Overflow == 0 {
 				slotBytes, err := pool.Allocate()
@@ -274,14 +275,14 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 				newPage := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
 				newPage.Header.Overflow = 0
 				newPage.Header.LayoutTag = LayoutV2
-				
+
 				newSlot := g.pageReg.Register(newPage)
 				currPage.Header.Overflow = newSlot
 			}
 			currPage = g.pageReg.Get(currPage.Header.Overflow)
 			edgesToSkip -= 250
 		}
-		
+
 		if edgesToSkip < 8 {
 			currPage.Inline[edgesToSkip] = edge
 		} else {
@@ -290,16 +291,14 @@ func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTabl
 			extra[idx] = edge
 		}
 	}
-	
+
 	page.Header.Count++
-	
+
 	atomic.AddUint32(&page.Header.Generation, 1)
 	unlockPage(&page.Header.Mutex)
 
 	return nil
 }
-
-
 
 func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, kindToRemove uint8, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
 	shard := nodeID % uint64(g.cfg.PageShards)
@@ -310,14 +309,14 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 	if pageSlot == 0 {
 		return ErrEdgeNotFound
 	}
-	
+
 	page := g.pageReg.Get(pageSlot)
-	
+
 	if !tryLockPage(&page.Header.Mutex) {
 		return ErrConcurrentModification
 	}
 	defer unlockPage(&page.Header.Mutex)
-	
+
 	totalCount := page.Header.Count
 	if totalCount == 0 {
 		return ErrEdgeNotFound
@@ -327,23 +326,23 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 	var lastEdgePtr *Edge
 	var prevToLastPage *EdgeTablePage
 	var lastPage *EdgeTablePage = page
-	
+
 	currPage := page
 	remaining := totalCount
-	
+
 	for currPage != nil && remaining > 0 {
 		pageCount := remaining
 		if pageCount > 250 {
 			pageCount = 250
 		}
-		
+
 		inlineLimit := pageCount
 		if inlineLimit > 8 {
 			inlineLimit = 8
 		}
 		for i := uint16(0); i < inlineLimit; i++ {
 			edge := &currPage.Inline[i]
-			if targetEdgePtr == nil && edge.Target == targetToRemove && edge.Kind == kindToRemove {
+			if targetEdgePtr == nil && edge.Target == targetToRemove && edge.GetKind() == kindToRemove {
 				targetEdgePtr = edge
 			}
 			if remaining == 1 {
@@ -351,13 +350,13 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 			}
 			remaining--
 		}
-		
+
 		if pageCount > 8 {
 			extraCount := pageCount - 8
 			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
 			for i := uint16(0); i < extraCount; i++ {
 				edge := &extra[i]
-				if targetEdgePtr == nil && edge.Target == targetToRemove && edge.Kind == kindToRemove {
+				if targetEdgePtr == nil && edge.Target == targetToRemove && edge.GetKind() == kindToRemove {
 					targetEdgePtr = edge
 				}
 				if remaining == 1 {
@@ -366,7 +365,7 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 				remaining--
 			}
 		}
-		
+
 		if remaining > 0 {
 			if currPage.Header.Overflow != 0 {
 				prevToLastPage = currPage
@@ -379,16 +378,16 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 			currPage = nil
 		}
 	}
-	
+
 	if targetEdgePtr == nil {
 		return ErrEdgeNotFound
 	}
-	
+
 	*targetEdgePtr = *lastEdgePtr
-	
+
 	page.Header.Count--
 	atomic.AddUint32(&page.Header.Generation, 1)
-	
+
 	if totalCount > 250 && (totalCount-1)%250 == 0 {
 		if prevToLastPage != nil {
 			prevToLastPage.Header.Overflow = 0
@@ -401,31 +400,31 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 
 func (g *graphStore) neighborsFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, numShards int) ([]Edge, error) {
 	shard := nodeID % uint64(numShards)
-	
+
 retry:
 	pool.HyalineEnter(int(shard))
-	
+
 	pageSlot := index.Lookup(nodeID)
 	if pageSlot == 0 {
 		pool.HyalineLeave(int(shard))
 		return []Edge{}, nil
 	}
-	
+
 	page := g.pageReg.Get(pageSlot)
 	gen := atomic.LoadUint32(&page.Header.Generation)
 	totalCount := page.Header.Count
-	
+
 	edges := make([]Edge, 0, totalCount)
-	
+
 	currPage := page
 	remaining := totalCount
-	
+
 	for currPage != nil && remaining > 0 {
 		pageCount := remaining
 		if pageCount > 250 {
 			pageCount = 250
 		}
-		
+
 		if pageCount <= 8 {
 			edges = append(edges, currPage.Inline[:pageCount]...)
 			remaining -= pageCount
@@ -436,7 +435,7 @@ retry:
 			edges = append(edges, extra[:extraCount]...)
 			remaining -= pageCount
 		}
-		
+
 		if currPage.Header.Overflow != 0 {
 			currPage = g.pageReg.Get(currPage.Header.Overflow)
 			if pool == g.pagePool {
@@ -446,12 +445,12 @@ retry:
 			currPage = nil
 		}
 	}
-	
+
 	if atomic.LoadUint32(&page.Header.Generation) != gen {
 		pool.HyalineLeave(int(shard))
 		goto retry
 	}
-	
+
 	pool.HyalineLeave(int(shard))
 	return edges, nil
 }
@@ -460,6 +459,7 @@ retry:
 func (g *graphStore) BeginTxn() *Txn {
 	return &Txn{
 		ID:    g.nextTxnID.Add(1),
+		wal:   g.wal,
 		store: g,
 	}
 }
@@ -469,11 +469,11 @@ func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool 
 	if pageSlot == 0 {
 		return
 	}
-	
+
 	index.Delete(nodeID)
-	
+
 	page := g.pageReg.Get(pageSlot)
-	
+
 	if !tryLockPage(&page.Header.Mutex) {
 		// retirePageChain is internal cleanup, if we fail to lock, we just skip it or retry
 		// But let's just spin in a fallback loop for cleanup since it must complete
@@ -482,13 +482,13 @@ func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool 
 		}
 	}
 	defer unlockPage(&page.Header.Mutex)
-	
+
 	currPage := page
 	for currPage != nil {
 		nextSlot := currPage.Header.Overflow
 		slotBytes := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(currPage), -64)), 4096)
 		pool.Retire(slotBytes)
-		
+
 		if nextSlot != 0 {
 			currPage = g.pageReg.Get(nextSlot)
 		} else {
@@ -506,7 +506,9 @@ func (g *graphStore) AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uin
 }
 
 func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32, kind uint8, stamp uint32) error {
-	fEdge := Edge{Target: tgt, Weight: weight, Stamp: stamp, Kind: kind}
+	fEdge := Edge{Target: tgt, Weight: weight}
+	fEdge.SetStamp(stamp)
+	fEdge.SetKind(kind)
 	err := retryOp(func() error {
 		return g.appendEdgeToTable(src, fEdge, g.index, g.pagePool)
 	})
@@ -514,11 +516,16 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 		return err
 	}
 
-	rEdge := Edge{Target: src, Weight: weight, Stamp: stamp, Kind: kind}
+	rEdge := Edge{Target: src, Weight: weight}
+	rEdge.SetStamp(stamp)
+	rEdge.SetKind(kind)
 	err = retryOp(func() error {
 		return g.appendEdgeToTable(tgt, rEdge, g.reverse.locator, g.reverse.pool)
 	})
 	if err != nil {
+		_ = retryOp(func() error {
+			return g.removeEdgeFromTable(src, tgt, kind, g.index, g.pagePool)
+		})
 		return err
 	}
 
@@ -543,17 +550,40 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 }
 
 func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
+	edges, _ := g.Neighbors(src)
+	var weight float32
+	var stamp uint32
+	var found bool
+	for _, e := range edges {
+		if e.Target == tgt && e.GetKind() == kind {
+			weight = e.Weight
+			stamp = e.GetStamp()
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrEdgeNotFound
+	}
+
 	err := retryOp(func() error {
 		return g.removeEdgeFromTable(src, tgt, kind, g.index, g.pagePool)
 	})
 	if err != nil {
 		return err
 	}
-	
+
 	err = retryOp(func() error {
 		return g.removeEdgeFromTable(tgt, src, kind, g.reverse.locator, g.reverse.pool)
 	})
 	if err != nil && err != ErrEdgeNotFound {
+		// Rollback forward remove
+		fEdge := Edge{Target: tgt, Weight: weight}
+		fEdge.SetStamp(stamp)
+		fEdge.SetKind(kind)
+		_ = retryOp(func() error {
+			return g.appendEdgeToTable(src, fEdge, g.index, g.pagePool)
+		})
 		return err
 	}
 
@@ -570,29 +600,36 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 			Data:      SerializeWALEdgeRemoveRecord(record),
 		})
 	}
-	
+
 	g.metrics.edgesRemoved.Add(1)
 	return nil
 }
 
 func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
+	var firstErr error
 	inboundEdges, _ := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 	for _, edge := range inboundEdges {
-		_ = retryOp(func() error {
-			return g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.index, g.pagePool)
+		err := retryOp(func() error {
+			return g.removeEdgeFromTable(edge.Target, nodeID, edge.GetKind(), g.index, g.pagePool)
 		})
+		if err != nil && err != ErrEdgeNotFound && firstErr == nil {
+			firstErr = err
+		}
 	}
 
 	outboundEdges, _ := g.neighborsFromTable(nodeID, g.index, g.pagePool, g.cfg.PageShards)
 	for _, edge := range outboundEdges {
-		_ = retryOp(func() error {
-			return g.removeEdgeFromTable(edge.Target, nodeID, edge.Kind, g.reverse.locator, g.reverse.pool)
+		err := retryOp(func() error {
+			return g.removeEdgeFromTable(edge.Target, nodeID, edge.GetKind(), g.reverse.locator, g.reverse.pool)
 		})
+		if err != nil && err != ErrEdgeNotFound && firstErr == nil {
+			firstErr = err
+		}
 	}
 
 	g.retirePageChain(nodeID, g.index, g.pagePool)
 	g.retirePageChain(nodeID, g.reverse.locator, g.reverse.pool)
-	
+
 	if txn != nil {
 		record := &WALNodeEdgeDropRecord{
 			TxnID:  txn.ID,
@@ -604,8 +641,8 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 			Data:      SerializeWALNodeEdgeDropRecord(record),
 		})
 	}
-	
-	return nil
+
+	return firstErr
 }
 
 func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
@@ -625,13 +662,18 @@ func (g *graphStore) InboundDegree(nodeID uint64) (int, error) {
 }
 
 func (g *graphStore) ForEachEdge(fn func(src, tgt uint64, edge Edge) bool) {
+	stop := false
 	g.index.Iterate(func(nodeID uint64) {
+		if stop {
+			return
+		}
 		edges, err := g.Neighbors(nodeID)
 		if err != nil {
 			return
 		}
 		for _, e := range edges {
 			if !fn(nodeID, e.Target, e) {
+				stop = true
 				return
 			}
 		}
@@ -640,25 +682,25 @@ func (g *graphStore) ForEachEdge(fn func(src, tgt uint64, edge Edge) bool) {
 
 func (g *graphStore) degreeFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, shards int) (int, error) {
 	shard := nodeID % uint64(shards)
-	
+
 retry:
 	pool.HyalineEnter(int(shard))
-	
+
 	pageSlot := index.Lookup(nodeID)
 	if pageSlot == 0 {
 		pool.HyalineLeave(int(shard))
 		return 0, nil
 	}
-	
+
 	page := g.pageReg.Get(pageSlot)
 	gen := atomic.LoadUint32(&page.Header.Generation)
 	count := int(page.Header.Count)
-	
+
 	if atomic.LoadUint32(&page.Header.Generation) != gen {
 		pool.HyalineLeave(int(shard))
 		goto retry
 	}
-	
+
 	pool.HyalineLeave(int(shard))
 	return count, nil
 }
@@ -668,10 +710,10 @@ func (g *graphStore) NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error
 	if err != nil {
 		return nil, err
 	}
-	
+
 	filtered := make([]Edge, 0, len(edges))
 	for _, e := range edges {
-		if kindSet.Has(e.Kind) {
+		if kindSet.Has(e.GetKind()) {
 			filtered = append(filtered, e)
 		}
 	}
@@ -687,15 +729,15 @@ func (g *graphStore) Stats() GraphStats {
 	return stats
 }
 
-func (g *graphStore) GetBitset() *Bitset {
+func (g *graphStore) GetBitset() (*Bitset, error) {
 	slot, err := g.bitsetPool.Allocate()
 	if err != nil {
-		panic("Bitset Allocate failed: " + err.Error())
+		return nil, fmt.Errorf("Bitset Allocate failed: %w", err)
 	}
 	if slot == nil {
-		panic("Bitset Allocate returned nil slot")
+		return nil, fmt.Errorf("Bitset Allocate returned nil slot")
 	}
-	return newBitset(slot)
+	return newBitset(slot), nil
 }
 
 func (g *graphStore) PutBitset(b *Bitset) {
@@ -703,7 +745,7 @@ func (g *graphStore) PutBitset(b *Bitset) {
 		return
 	}
 	// We can Retire the slot when we're done
-	// Normally if the buffer was used in a read-only way, we can Deallocate, 
+	// Normally if the buffer was used in a read-only way, we can Deallocate,
 	// but Retire is safer if it's managed via Hyaline.
 	// Actually, these pools are purely for temporary caller buffers,
 	// so we can use Retire or just Deallocate if it's strictly local to the caller.
@@ -711,12 +753,15 @@ func (g *graphStore) PutBitset(b *Bitset) {
 	g.bitsetPool.Retire(b.slot)
 }
 
-func (g *graphStore) GetFrontierBuf() *FrontierBuf {
+func (g *graphStore) GetFrontierBuf() (*FrontierBuf, error) {
 	slot, err := g.frontierPool.Allocate()
-	if err != nil || slot == nil {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("FrontierBuf Allocate failed: %w", err)
 	}
-	return newFrontierBuf(slot)
+	if slot == nil {
+		return nil, fmt.Errorf("FrontierBuf Allocate returned nil slot")
+	}
+	return newFrontierBuf(slot), nil
 }
 
 func (g *graphStore) PutFrontierBuf(f *FrontierBuf) {
@@ -762,7 +807,9 @@ func (g *graphStore) rebuildReverseIndex() {
 			nodeID := g.index.table[i].NodeID
 			edges, _ := g.Neighbors(nodeID)
 			for _, e := range edges {
-				rEdge := Edge{Target: nodeID, Weight: e.Weight, Stamp: e.Stamp, Kind: e.Kind}
+				rEdge := Edge{Target: nodeID, Weight: e.Weight}
+				rEdge.SetStamp(e.GetStamp())
+				rEdge.SetKind(e.GetKind())
 				_ = g.appendEdgeToTable(e.Target, rEdge, g.reverse.locator, g.reverse.pool)
 			}
 		}

@@ -285,8 +285,6 @@ func (idx *Index) acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
 	return nil, nil
 }
 
-
-
 // NewIVFPQ creates a new IVF-PQ index
 func NewIVFPQ(config *Config) (*Index, error) {
 	if config == nil {
@@ -1302,7 +1300,7 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 			if filter != nil && !filter.Test(uint64(entry.Ordinal)) {
 				continue
 			}
-			
+
 			distance, err := idx.distanceToEntry(query, cluster, entry, queryState)
 			if err != nil {
 				cluster.mutex.RUnlock()

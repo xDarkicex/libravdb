@@ -38,11 +38,11 @@ func (m *DBManifest) Serialize() []byte {
 	for _, name := range m.KindManifest {
 		size += 1 + 1 + len(name) // Code (1) + NameLen (1) + Name
 	}
-	
+
 	buf := make([]byte, size)
 	binary.LittleEndian.PutUint32(buf[0:4], m.MinReaderVersion)
 	binary.LittleEndian.PutUint16(buf[4:6], uint16(len(m.KindManifest)))
-	
+
 	offset := 6
 	for code, name := range m.KindManifest {
 		buf[offset] = code
@@ -50,11 +50,11 @@ func (m *DBManifest) Serialize() []byte {
 		copy(buf[offset+2:], name)
 		offset += 2 + len(name)
 	}
-	
+
 	return buf
 }
 
-// DeserializeManifest reads the binary manifest. 
+// DeserializeManifest reads the binary manifest.
 // A zero-length buffer assumes no manifest (defaults).
 func DeserializeManifest(data []byte) (*DBManifest, error) {
 	if len(data) == 0 {
@@ -63,15 +63,15 @@ func DeserializeManifest(data []byte) (*DBManifest, error) {
 	if len(data) < 6 {
 		return nil, fmt.Errorf("manifest data too short")
 	}
-	
+
 	m := &DBManifest{
 		MinReaderVersion: binary.LittleEndian.Uint32(data[0:4]),
 		KindManifest:     make(map[uint8]string),
 	}
-	
+
 	kindCount := binary.LittleEndian.Uint16(data[4:6])
 	offset := 6
-	
+
 	for i := uint16(0); i < kindCount; i++ {
 		if offset+2 > len(data) {
 			return nil, fmt.Errorf("unexpected EOF reading manifest kind header")
@@ -79,7 +79,7 @@ func DeserializeManifest(data []byte) (*DBManifest, error) {
 		code := data[offset]
 		nameLen := int(data[offset+1])
 		offset += 2
-		
+
 		if offset+nameLen > len(data) {
 			return nil, fmt.Errorf("unexpected EOF reading manifest kind name")
 		}
@@ -87,6 +87,6 @@ func DeserializeManifest(data []byte) (*DBManifest, error) {
 		m.KindManifest[code] = name
 		offset += nameLen
 	}
-	
+
 	return m, nil
 }

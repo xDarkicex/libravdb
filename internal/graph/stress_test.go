@@ -24,6 +24,7 @@ func TestStressHubNodeConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer g.Close()
 
 	const hubNodeID = uint64(1)
 	const numGoroutines = 50
@@ -38,10 +39,10 @@ func TestStressHubNodeConcurrency(t *testing.T) {
 		go func(routineID int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(int64(routineID) + time.Now().UnixNano()))
-			
+
 			for j := 0; j < opsPerGoroutine; j++ {
 				target := uint64(routineID*opsPerGoroutine + j + 10) // Unique targets
-				
+
 				// 90% writes, 10% reads to stress lock contention
 				if rng.Float32() < 0.9 {
 					err := g.(*graphStore).AddEdgeWithStamp(nil, hubNodeID, target, 1.0, 1, uint32(routineID*opsPerGoroutine+j))
@@ -67,7 +68,7 @@ func TestStressHubNodeConcurrency(t *testing.T) {
 	}
 
 	t.Logf("Stress test completed in %v. Hub node has %d edges.", duration, len(neighbors))
-	
+
 	// Ensure no page leak
 	stats := g.Stats()
 	t.Logf("Stats: %+v", stats)
@@ -89,6 +90,7 @@ func TestMemoryExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer g.Close()
 
 	// Just allocate heavily on one node
 	for i := 0; i < 50000; i++ {

@@ -27,11 +27,19 @@ func TestBFS_Reachability(t *testing.T) {
 			txn := &Txn{ID: 1}
 			for i := range edges {
 				// Chain: 1 -> 2 -> ... -> N
-				store.AddEdge(txn, uint64(i+1), uint64(i+2), 1.0, 0)
+				if err := store.AddEdge(txn, uint64(i+1), uint64(i+2), 1.0, 0); err != nil {
+					return false
+				}
 			}
 
-			bitset := store.GetBitset()
-			frontier := store.GetFrontierBuf()
+			bitset, err := store.GetBitset()
+			if err != nil {
+				t.Fatalf("GetBitset failed: %v", err)
+			}
+			frontier, err := store.GetFrontierBuf()
+			if err != nil {
+				t.Fatalf("GetFrontierBuf failed: %v", err)
+			}
 			defer store.PutBitset(bitset)
 			defer store.PutFrontierBuf(frontier)
 
@@ -68,21 +76,26 @@ func TestBFS_EarlyTermination(t *testing.T) {
 
 			txn := &Txn{ID: 1}
 			for i := 1; i <= 20; i++ {
-				store.AddEdge(txn, uint64(i), uint64(i+1), 1.0, 0)
+				if err := store.AddEdge(txn, uint64(i), uint64(i+1), 1.0, 0); err != nil {
+					return false
+				}
 			}
 
-			bitset := store.GetBitset()
-			frontier := store.GetFrontierBuf()
+			bitset, err := store.GetBitset()
+			if err != nil {
+				t.Fatalf("GetBitset failed: %v", err)
+			}
+			frontier, err := store.GetFrontierBuf()
+			if err != nil {
+				t.Fatalf("GetFrontierBuf failed: %v", err)
+			}
 			defer store.PutBitset(bitset)
 			defer store.PutFrontierBuf(frontier)
 
 			visitedCount := 0
 			err = store.BFS(1, 100, func(nodeID uint64, depth int) bool {
 				visitedCount++
-				if visitedCount == stopAt {
-					return false
-				}
-				return true
+				return visitedCount != stopAt
 			}, bitset, frontier)
 
 			if err != nil {
@@ -110,11 +123,19 @@ func TestBFS_ZeroAllocations(t *testing.T) {
 
 	txn := &Txn{ID: 1}
 	for i := 1; i <= 10; i++ {
-		store.AddEdge(txn, uint64(i), uint64(i+1), 1.0, 0)
+		if err := store.AddEdge(txn, uint64(i), uint64(i+1), 1.0, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	bitset := store.GetBitset()
-	frontier := store.GetFrontierBuf()
+	bitset, err := store.GetBitset()
+	if err != nil {
+		t.Fatalf("GetBitset failed: %v", err)
+	}
+	frontier, err := store.GetFrontierBuf()
+	if err != nil {
+		t.Fatalf("GetFrontierBuf failed: %v", err)
+	}
 	defer store.PutBitset(bitset)
 	defer store.PutFrontierBuf(frontier)
 

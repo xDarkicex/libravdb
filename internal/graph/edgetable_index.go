@@ -4,6 +4,7 @@ import (
 	"sync/atomic"
 )
 
+// Node 0 is reserved as an empty-slot sentinel.
 // Tombstone represents a deleted slot
 const Tombstone uint32 = 0xFFFFFFFF
 
@@ -26,24 +27,45 @@ func (idx *EdgeTableIndex) Insert(nodeID uint64, pageSlot uint32) {
 
 	mask := idx.capacity - 1
 	start := hashUint64(nodeID) & mask
-	
+
+	insertPos := int64(-1)
+
 	for i := uint64(0); i < idx.capacity; i++ {
 		pos := (start + i) & mask
 		entry := &idx.table[pos]
-		
-		if slot := atomic.LoadUint32(&entry.PageSlot); slot == 0 || slot == Tombstone {
-			// Found empty slot or tombstone
+
+		slot := atomic.LoadUint32(&entry.PageSlot)
+		if slot == 0 {
+			if insertPos != -1 {
+				pos = uint64(insertPos)
+				entry = &idx.table[pos]
+			}
 			entry.NodeID = nodeID
 			atomic.StoreUint32(&entry.PageSlot, pageSlot)
 			idx.size++
 			return
 		}
-		
+
+		if slot == Tombstone {
+			if insertPos == -1 {
+				insertPos = int64(pos)
+			}
+			continue
+		}
+
 		if entry.NodeID == nodeID {
 			// Update existing
 			atomic.StoreUint32(&entry.PageSlot, pageSlot)
 			return
 		}
+	}
+
+	if insertPos != -1 {
+		pos := uint64(insertPos)
+		entry := &idx.table[pos]
+		entry.NodeID = nodeID
+		atomic.StoreUint32(&entry.PageSlot, pageSlot)
+		idx.size++
 	}
 }
 
@@ -53,14 +75,14 @@ func (idx *EdgeTableIndex) Lookup(nodeID uint64) uint32 {
 	if idx.size == 0 {
 		return 0
 	}
-	
+
 	mask := idx.capacity - 1
 	start := hashUint64(nodeID) & mask
-	
+
 	for i := uint64(0); i < idx.capacity; i++ {
 		pos := (start + i) & mask
 		entry := &idx.table[pos]
-		
+
 		slot := atomic.LoadUint32(&entry.PageSlot)
 		if slot == 0 {
 			// Hit empty slot, node not in table
@@ -69,12 +91,12 @@ func (idx *EdgeTableIndex) Lookup(nodeID uint64) uint32 {
 		if slot == Tombstone {
 			continue
 		}
-		
+
 		if entry.NodeID == nodeID {
 			return slot
 		}
 	}
-	
+
 	return 0
 }
 
@@ -84,7 +106,7 @@ func (idx *EdgeTableIndex) resize() {
 	idx.table = make([]EdgeTableLocator, newCap)
 	idx.capacity = newCap
 	idx.size = 0 // Recalculated during insertion
-	
+
 	for i := range oldTable {
 		slot := oldTable[i].PageSlot
 		if slot != 0 && slot != Tombstone {
@@ -98,19 +120,19 @@ func (idx *EdgeTableIndex) Delete(nodeID uint64) {
 	if idx.size == 0 {
 		return
 	}
-	
+
 	mask := idx.capacity - 1
 	start := hashUint64(nodeID) & mask
-	
+
 	for i := uint64(0); i < idx.capacity; i++ {
 		pos := (start + i) & mask
 		entry := &idx.table[pos]
-		
+
 		slot := atomic.LoadUint32(&entry.PageSlot)
 		if slot == 0 {
 			return // Not found
 		}
-		
+
 		if slot != Tombstone && entry.NodeID == nodeID {
 			atomic.StoreUint32(&entry.PageSlot, Tombstone)
 			idx.size--

@@ -17,7 +17,7 @@ func TestKindSet_FilteringCorrectness(t *testing.T) {
 	properties.Property("Set and Has consistency", prop.ForAll(
 		func(kinds []uint8) bool {
 			ks := NewKindSet(kinds...)
-			
+
 			// Build a map for exact verification
 			expected := make(map[uint8]bool)
 			for _, k := range kinds {

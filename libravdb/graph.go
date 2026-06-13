@@ -64,6 +64,6 @@ func NewGraph(config GraphConfig) (Graph, error) {
 	if config.ArenaPages > 0 {
 		internalConfig.ArenaPages = config.ArenaPages
 	}
-	
+
 	return graph.NewGraph(internalConfig)
 }

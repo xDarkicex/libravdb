@@ -32,7 +32,7 @@ func FuzzDeserializeWALEdgeRemoveRecord(f *testing.F) {
 		Kind:  2,
 	}
 	f.Add(SerializeWALEdgeRemoveRecord(validRec))
-	
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = DeserializeWALEdgeRemoveRecord(data)
 	})
@@ -44,7 +44,7 @@ func FuzzDeserializeWALNodeEdgeDropRecord(f *testing.F) {
 		NodeID: 456,
 	}
 	f.Add(SerializeWALNodeEdgeDropRecord(validRec))
-	
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = DeserializeWALNodeEdgeDropRecord(data)
 	})
@@ -55,7 +55,7 @@ func FuzzDeserializeWALTxnCommitRecord(f *testing.F) {
 		TxnID: 123,
 	}
 	f.Add(SerializeWALTxnCommitRecord(validRec))
-	
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = DeserializeWALTxnCommitRecord(data)
 	})

@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: 'go.mod'
 
       - name: Run internal/graph tests
         run: GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go test -v -race ./internal/graph/...

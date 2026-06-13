@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"testing"
+
 	"go.uber.org/goleak"
 )
 

@@ -59,7 +59,7 @@ func SerializeWALEdgeAddRecord(r *WALEdgeAddRecord) []byte {
 	binary.LittleEndian.PutUint32(buf[28:32], r.Stamp)
 	buf[32] = r.Kind
 	// 33,34,35 are padding
-	
+
 	r.CRC32 = crc32.ChecksumIEEE(buf[:36])
 	binary.LittleEndian.PutUint32(buf[36:40], r.CRC32)
 	return buf
@@ -67,8 +67,8 @@ func SerializeWALEdgeAddRecord(r *WALEdgeAddRecord) []byte {
 
 // DeserializeWALEdgeAddRecord deserializes the record and validates its CRC32.
 func DeserializeWALEdgeAddRecord(data []byte) (*WALEdgeAddRecord, error) {
-	if len(data) < 40 {
-		return nil, fmt.Errorf("WALEdgeAddRecord too short: %d bytes", len(data))
+	if len(data) != 40 {
+		return nil, fmt.Errorf("WALEdgeAddRecord invalid size: %d bytes", len(data))
 	}
 	r := &WALEdgeAddRecord{
 		TxnID:  binary.LittleEndian.Uint64(data[0:8]),
@@ -79,7 +79,7 @@ func DeserializeWALEdgeAddRecord(data []byte) (*WALEdgeAddRecord, error) {
 		Kind:   data[32],
 		CRC32:  binary.LittleEndian.Uint32(data[36:40]),
 	}
-	
+
 	expectedCRC := crc32.ChecksumIEEE(data[:36])
 	if expectedCRC != r.CRC32 {
 		return nil, fmt.Errorf("CRC32 mismatch in WALEdgeAddRecord: expected %d, got %d", expectedCRC, r.CRC32)
@@ -95,7 +95,7 @@ func SerializeWALEdgeRemoveRecord(r *WALEdgeRemoveRecord) []byte {
 	binary.LittleEndian.PutUint64(buf[16:24], r.To)
 	buf[24] = r.Kind
 	// 25,26,27 are padding
-	
+
 	r.CRC32 = crc32.ChecksumIEEE(buf[:28])
 	binary.LittleEndian.PutUint32(buf[28:32], r.CRC32)
 	return buf
@@ -103,8 +103,8 @@ func SerializeWALEdgeRemoveRecord(r *WALEdgeRemoveRecord) []byte {
 
 // DeserializeWALEdgeRemoveRecord deserializes the record and validates its CRC32.
 func DeserializeWALEdgeRemoveRecord(data []byte) (*WALEdgeRemoveRecord, error) {
-	if len(data) < 32 {
-		return nil, fmt.Errorf("WALEdgeRemoveRecord too short: %d bytes", len(data))
+	if len(data) != 32 {
+		return nil, fmt.Errorf("WALEdgeRemoveRecord invalid size: %d bytes", len(data))
 	}
 	r := &WALEdgeRemoveRecord{
 		TxnID: binary.LittleEndian.Uint64(data[0:8]),
@@ -113,7 +113,7 @@ func DeserializeWALEdgeRemoveRecord(data []byte) (*WALEdgeRemoveRecord, error) {
 		Kind:  data[24],
 		CRC32: binary.LittleEndian.Uint32(data[28:32]),
 	}
-	
+
 	expectedCRC := crc32.ChecksumIEEE(data[:28])
 	if expectedCRC != r.CRC32 {
 		return nil, fmt.Errorf("CRC32 mismatch in WALEdgeRemoveRecord: expected %d, got %d", expectedCRC, r.CRC32)
@@ -126,7 +126,7 @@ func SerializeWALNodeEdgeDropRecord(r *WALNodeEdgeDropRecord) []byte {
 	buf := make([]byte, 24)
 	binary.LittleEndian.PutUint64(buf[0:8], r.TxnID)
 	binary.LittleEndian.PutUint64(buf[8:16], r.NodeID)
-	
+
 	r.CRC32 = crc32.ChecksumIEEE(buf[:16])
 	binary.LittleEndian.PutUint32(buf[16:20], r.CRC32)
 	// 20,21,22,23 are padding
@@ -135,15 +135,15 @@ func SerializeWALNodeEdgeDropRecord(r *WALNodeEdgeDropRecord) []byte {
 
 // DeserializeWALNodeEdgeDropRecord deserializes the record and validates its CRC32.
 func DeserializeWALNodeEdgeDropRecord(data []byte) (*WALNodeEdgeDropRecord, error) {
-	if len(data) < 24 {
-		return nil, fmt.Errorf("WALNodeEdgeDropRecord too short: %d bytes", len(data))
+	if len(data) != 24 {
+		return nil, fmt.Errorf("WALNodeEdgeDropRecord invalid size: %d bytes", len(data))
 	}
 	r := &WALNodeEdgeDropRecord{
 		TxnID:  binary.LittleEndian.Uint64(data[0:8]),
 		NodeID: binary.LittleEndian.Uint64(data[8:16]),
 		CRC32:  binary.LittleEndian.Uint32(data[16:20]),
 	}
-	
+
 	expectedCRC := crc32.ChecksumIEEE(data[:16])
 	if expectedCRC != r.CRC32 {
 		return nil, fmt.Errorf("CRC32 mismatch in WALNodeEdgeDropRecord: expected %d, got %d", expectedCRC, r.CRC32)
@@ -155,7 +155,7 @@ func DeserializeWALNodeEdgeDropRecord(data []byte) (*WALNodeEdgeDropRecord, erro
 func SerializeWALTxnCommitRecord(r *WALTxnCommitRecord) []byte {
 	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[0:8], r.TxnID)
-	
+
 	r.CRC32 = crc32.ChecksumIEEE(buf[:8])
 	binary.LittleEndian.PutUint32(buf[8:12], r.CRC32)
 	// 12,13,14,15 are padding
@@ -164,14 +164,14 @@ func SerializeWALTxnCommitRecord(r *WALTxnCommitRecord) []byte {
 
 // DeserializeWALTxnCommitRecord deserializes the record and validates its CRC32.
 func DeserializeWALTxnCommitRecord(data []byte) (*WALTxnCommitRecord, error) {
-	if len(data) < 16 {
-		return nil, fmt.Errorf("WALTxnCommitRecord too short: %d bytes", len(data))
+	if len(data) != 16 {
+		return nil, fmt.Errorf("WALTxnCommitRecord invalid size: %d bytes", len(data))
 	}
 	r := &WALTxnCommitRecord{
 		TxnID: binary.LittleEndian.Uint64(data[0:8]),
 		CRC32: binary.LittleEndian.Uint32(data[8:12]),
 	}
-	
+
 	expectedCRC := crc32.ChecksumIEEE(data[:8])
 	if expectedCRC != r.CRC32 {
 		return nil, fmt.Errorf("CRC32 mismatch in WALTxnCommitRecord: expected %d, got %d", expectedCRC, r.CRC32)
@@ -192,22 +192,32 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 	// We only care about graph ops. We group graph ops by TxnID.
 	txnGroups := make(map[uint64][]*wal.Entry)
 	txnCommitted := make(map[uint64]bool)
+	txnCorrupt := make(map[uint64]bool)
 
 	for _, entry := range entries {
 		switch entry.Operation {
 		case wal.OpEdgeAdd:
 			if len(entry.Data) >= 8 {
 				txnID := binary.LittleEndian.Uint64(entry.Data[0:8])
+				if _, err := DeserializeWALEdgeAddRecord(entry.Data); err != nil {
+					txnCorrupt[txnID] = true
+				}
 				txnGroups[txnID] = append(txnGroups[txnID], entry)
 			}
 		case wal.OpEdgeRemove:
 			if len(entry.Data) >= 8 {
 				txnID := binary.LittleEndian.Uint64(entry.Data[0:8])
+				if _, err := DeserializeWALEdgeRemoveRecord(entry.Data); err != nil {
+					txnCorrupt[txnID] = true
+				}
 				txnGroups[txnID] = append(txnGroups[txnID], entry)
 			}
 		case wal.OpNodeEdgeDrop:
 			if len(entry.Data) >= 8 {
 				txnID := binary.LittleEndian.Uint64(entry.Data[0:8])
+				if _, err := DeserializeWALNodeEdgeDropRecord(entry.Data); err != nil {
+					txnCorrupt[txnID] = true
+				}
 				txnGroups[txnID] = append(txnGroups[txnID], entry)
 			}
 		case wal.OpTxnCommit:
@@ -232,7 +242,11 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 				continue
 			}
 			txnID := binary.LittleEndian.Uint64(entry.Data[0:8])
-			if !txnCommitted[txnID] {
+			if !txnCommitted[txnID] || txnCorrupt[txnID] {
+				if txnCorrupt[txnID] && txnCommitted[txnID] {
+					log.Printf("WAL replay warning: skipping corrupt committed txn %d", txnID)
+					txnCommitted[txnID] = false // Log only once
+				}
 				continue
 			}
 
@@ -275,7 +289,10 @@ func ReplayWAL(w *wal.WAL, forwardIndex *graphStore) error {
 	}
 
 	// Restore lastFlushedGen
-	atomic.StoreUint32(&forwardIndex.lastFlushedGen, maxStamp)
+	current := atomic.LoadUint32(&forwardIndex.lastFlushedGen)
+	if maxStamp > current {
+		atomic.StoreUint32(&forwardIndex.lastFlushedGen, maxStamp)
+	}
 
 	forwardIndex.metrics.walReplayDuration.Store(time.Since(start).Nanoseconds())
 

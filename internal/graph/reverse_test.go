@@ -42,7 +42,7 @@ func TestReverseIndex_Symmetry(t *testing.T) {
 
 			txn := &Txn{ID: 1}
 			expected := make(map[uint64]map[uint64]map[uint8]bool)
-			
+
 			for _, op := range ops {
 				if op.Add {
 					_ = store.AddEdge(txn, op.Src, op.Tgt, op.Weight, op.Kind)
@@ -62,7 +62,7 @@ func TestReverseIndex_Symmetry(t *testing.T) {
 			}
 
 			gs := store.(*graphStore)
-			
+
 			for src, tgts := range expected {
 				for tgt, kinds := range tgts {
 					for kind, exists := range kinds {
@@ -70,7 +70,7 @@ func TestReverseIndex_Symmetry(t *testing.T) {
 							revEdges, _ := gs.neighborsFromTable(tgt, gs.reverse.locator, gs.reverse.pool, gs.cfg.PageShards)
 							found := false
 							for _, re := range revEdges {
-								if re.Target == src && re.Kind == kind {
+								if re.Target == src && re.GetKind() == kind {
 									found = true
 									break
 								}
@@ -82,7 +82,7 @@ func TestReverseIndex_Symmetry(t *testing.T) {
 					}
 				}
 			}
-			
+
 			return true
 		},
 		gen.SliceOfN(100, genEdgeOp()),
@@ -105,36 +105,36 @@ func TestDropNodeEdges_Completeness(t *testing.T) {
 			defer store.Close()
 
 			txn := &Txn{ID: 1}
-			
+
 			for _, op := range ops {
 				store.AddEdge(txn, op.Src, op.Tgt, op.Weight, op.Kind)
 			}
-			
+
 			store.AddEdge(txn, dropNode, 101, 1.0, 1)
 			store.AddEdge(txn, 102, dropNode, 1.0, 1)
 			store.AddEdge(txn, dropNode, dropNode, 1.0, 1) // test self loop
-			
+
 			err = store.DropNodeEdges(txn, dropNode)
 			if err != nil {
 				return false
 			}
-			
+
 			deg, _ := store.Degree(dropNode)
 			if deg != 0 {
 				return false
 			}
-			
+
 			neighbors, _ := store.Neighbors(dropNode)
 			if len(neighbors) != 0 {
 				return false
 			}
-			
+
 			gs := store.(*graphStore)
 			revEdges, _ := gs.neighborsFromTable(dropNode, gs.reverse.locator, gs.reverse.pool, gs.cfg.PageShards)
 			if len(revEdges) != 0 {
 				return false
 			}
-			
+
 			nodes := make(map[uint64]bool)
 			for _, op := range ops {
 				nodes[op.Src] = true
@@ -142,7 +142,7 @@ func TestDropNodeEdges_Completeness(t *testing.T) {
 			}
 			nodes[101] = true
 			nodes[102] = true
-			
+
 			for n := range nodes {
 				if n == dropNode {
 					continue
@@ -154,7 +154,7 @@ func TestDropNodeEdges_Completeness(t *testing.T) {
 					}
 				}
 			}
-			
+
 			return true
 		},
 		gen.SliceOfN(50, genEdgeOp()), gen.UInt64Range(1, 100),

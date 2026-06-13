@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,8 @@ type CheckpointCoordinator struct {
 	w                    *wal.WAL
 	ticker               *time.Ticker
 	quit                 chan struct{}
+	startOnce            sync.Once
+	stopOnce             sync.Once
 }
 
 // NewCheckpointCoordinator creates a new CheckpointCoordinator.
@@ -30,16 +33,20 @@ func NewCheckpointCoordinator(vectorGen, edgeGen, chkGen *uint32, w *wal.WAL) *C
 
 // Start begins the polling loop in a background goroutine.
 func (c *CheckpointCoordinator) Start() {
-	c.ticker = time.NewTicker(100 * time.Millisecond)
-	go c.run()
+	c.startOnce.Do(func() {
+		c.ticker = time.NewTicker(100 * time.Millisecond)
+		go c.run()
+	})
 }
 
 // Stop halts the polling loop.
 func (c *CheckpointCoordinator) Stop() {
-	if c.ticker != nil {
-		c.ticker.Stop()
-	}
-	close(c.quit)
+	c.stopOnce.Do(func() {
+		if c.ticker != nil {
+			c.ticker.Stop()
+		}
+		close(c.quit)
+	})
 }
 
 func (c *CheckpointCoordinator) run() {
@@ -48,7 +55,7 @@ func (c *CheckpointCoordinator) run() {
 		case <-c.ticker.C:
 			vGen := atomic.LoadUint32(c.vectorLastFlushedGen)
 			eGen := atomic.LoadUint32(c.edgeLastFlushedGen)
-			
+
 			minGen := vGen
 			if eGen < minGen {
 				minGen = eGen

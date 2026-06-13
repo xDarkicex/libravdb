@@ -10,11 +10,12 @@ import (
 	"sync"
 	"time"
 
+	"unsafe"
+
 	internalmemory "github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
-	"unsafe"
 )
 
 // VectorEntry represents a vector entry for HNSW indexing
