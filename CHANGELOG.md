@@ -1,6 +1,8 @@
 # Changelog
 
-## [2.1.1] — 2026-06-13
+All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+
+## [v2.1.1] / Go v1.2.1 — 2026-06-13
 
 11 files changed, 251 insertions, 74 deletions across 3 commits.
 
@@ -19,7 +21,7 @@
 
 - **gofmt pass** — whitespace and import ordering cleanup across `internal/storage`, `internal/util`, `internal/storage/wal`.
 
-## [2.1.0] — 2026-06-13
+## [v2.1.0] / Go v1.2.0 — 2026-06-13
 
 71 files changed, 5,135 insertions, 231 deletions across 8 commits.
 
@@ -82,7 +84,7 @@ New subsystem providing directed, typed edge relationships between vectors with 
 
 - `github.com/xDarkicex/memory` — v1.0.2 → v1.0.3 (adds `MmapFileReadOnly`, `Munmap` for zero-copy segment I/O)
 
-## [2.0.0] — 2026-06-12
+## [v2.0.0] / Go v1.1.0 — 2026-06-12
 
 151 files changed, 7,763 insertions, 3,897 deletions across 59 commits.
 

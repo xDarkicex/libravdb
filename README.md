@@ -67,7 +67,7 @@ LibraVDB is a high-performance hybrid vector-graph database library for Go appli
 - **Rich Metadata Filtering**: Complex AND/OR/NOT operations with type-safe schemas
 - **Streaming Operations**: High-throughput batch processing with backpressure control
 - **Memory Management**: Configurable limits, memory mapping, and automatic optimization
-- **Graph Layer** (`v2.1.0`): Directed typed edges between vectors with zero heap allocations. 16-byte fixed Edge (Target, Weight, Stamp/Kind), EdgeTable 4KB pages with inline-first-8 layout, lock-free reads via Hyaline SMR, BFS traversal with caller-managed off-heap buffers, reverse index for O(degree) node deletion, WAL durability (4 new op types, CRC32 checksums), segment persistence with zero-copy mmap I/O, graph-filtered similarity search across all index types, insert/delete hooks for automatic edge maintenance
+- **Graph Layer** (`v1.2.0`): Directed typed edges between vectors with zero heap allocations. 16-byte fixed Edge (Target, Weight, Stamp/Kind), EdgeTable 4KB pages with inline-first-8 layout, lock-free reads via Hyaline SMR, BFS traversal with caller-managed off-heap buffers, reverse index for O(degree) node deletion, WAL durability (4 new op types, CRC32 checksums), segment persistence with zero-copy mmap I/O, graph-filtered similarity search across all index types, insert/delete hooks for automatic edge maintenance
 - **Persistent Storage**: Single-file binary storage with WAL-backed durability
 - **Storage-Owned HNSW**: Canonical vectors and metadata live in storage; HNSW owns graph topology plus optional compressed artifacts
 
