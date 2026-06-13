@@ -132,9 +132,10 @@ func CompactSegment(inPath, outPath string) error {
 		offset = SegmentHeaderSize
 	}
 
-	for i := uint64(0); i < header.NodeCount; i++ {
-		if offset+16 > len(data) {
-			return fmt.Errorf("unexpected EOF reading node record")
+	var writtenNodes, writtenEdges uint64
+	for int(offset) < dataEnd {
+		if offset+16 > dataEnd {
+			return fmt.Errorf("unexpected EOF reading node record at offset %d", offset)
 		}
 
 		nodeBytes := data[offset : offset+16]
@@ -142,14 +143,15 @@ func CompactSegment(inPath, outPath string) error {
 		offset += 16
 
 		edgesBytesSize := int(edgeCount) * int(unsafe.Sizeof(Edge{}))
-		if offset+edgesBytesSize > len(data) {
-			return fmt.Errorf("unexpected EOF reading edges")
+		if offset+edgesBytesSize > dataEnd {
+			return fmt.Errorf("unexpected EOF reading edges at offset %d", offset)
 		}
 
 		if _, err = fOut.Write(nodeBytes); err != nil {
 			return err
 		}
 		crc.Write(nodeBytes)
+		writtenNodes++
 
 		if edgeCount > 0 {
 			edgesBytes := data[offset : offset+edgesBytesSize]
@@ -158,8 +160,16 @@ func CompactSegment(inPath, outPath string) error {
 			}
 			crc.Write(edgesBytes)
 			offset += edgesBytesSize
+			writtenEdges += uint64(edgeCount)
 		}
 	}
+
+	if offset != dataEnd {
+		return fmt.Errorf("segment payload mismatch: %d trailing bytes", dataEnd-offset)
+	}
+
+	outHeader.NodeCount = writtenNodes
+	outHeader.EdgeCount = writtenEdges
 	// Write magic footer "SGMT"
 	footer := [4]byte{'S', 'G', 'M', 'T'}
 	if _, err = fOut.Write(footer[:]); err != nil {

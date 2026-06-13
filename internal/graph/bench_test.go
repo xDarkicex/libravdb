@@ -21,7 +21,7 @@ func BenchmarkAddEdge(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := g.(*graphStore).AddEdgeWithStamp(nil, uint64(i), uint64(i+1), 1.0, 1, uint32(i)); err != nil {
+		if err := g.(*graphStore).AddEdgeWithStamp(&Txn{ID: 1}, uint64(i), uint64(i+1), 1.0, 1, uint32(i)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -42,7 +42,7 @@ func BenchmarkNeighbors(b *testing.B) {
 
 	// Add some edges to node 1
 	for i := 0; i < 1000; i++ {
-		if err := g.(*graphStore).AddEdgeWithStamp(nil, 1, uint64(10+i), 1.0, 1, uint32(i)); err != nil {
+		if err := g.(*graphStore).AddEdgeWithStamp(&Txn{ID: 1}, 1, uint64(10+i), 1.0, 1, uint32(i)); err != nil {
 			b.Fatal(err)
 		}
 	}
