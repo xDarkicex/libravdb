@@ -371,7 +371,15 @@ collection, err := db.CreateCollection(ctx, "nodes",
 // Or attach it to an existing collection later
 collection.SetGraph(graph)
 
-// Begin a transaction to perform mutations
+// Register an insert hook to automatically create edges based on vector metadata
+collection.RegisterInsertHook(func(txn libravdb.GraphTx, id uint64, vector []float32, metadata map[string]interface{}) error {
+    if parentID, ok := metadata["parent_id"].(uint64); ok {
+        return txn.AddEdge(id, parentID, 1.0, 2) // kind=2: "child_of"
+    }
+    return nil
+})
+
+// Begin a transaction to perform manual mutations
 txn := graph.BeginTxn()
 graph.AddEdge(txn, 1, 2, 0.95, 1)   // kind=1: "similar_to"
 graph.AddEdge(txn, 2, 3, 0.87, 2)   // kind=2: "derived_from"
