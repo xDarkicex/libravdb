@@ -362,7 +362,17 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Add typed, weighted edges between vectors
+// Attach the graph to a new collection during creation
+collection, err := db.CreateCollection(ctx, "nodes",
+    libravdb.WithDimension(768),
+    libravdb.WithGraph(graph),
+)
+
+// Or attach it to an existing collection later
+collection.SetGraph(graph)
+
+// Begin a transaction to perform mutations
+txn := graph.BeginTxn()
 graph.AddEdge(txn, 1, 2, 0.95, 1)   // kind=1: "similar_to"
 graph.AddEdge(txn, 2, 3, 0.87, 2)   // kind=2: "derived_from"
 
