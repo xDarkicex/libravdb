@@ -95,6 +95,13 @@ func (c *Collection) Dimension() int {
 	return c.config.Dimension
 }
 
+// SetGraph attaches a Graph interface to an existing collection.
+func (c *Collection) SetGraph(g Graph) {
+	c.mu.Lock()
+	c.graph = g
+	c.mu.Unlock()
+}
+
 func (c *Collection) mutationStripe(id string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(id))
