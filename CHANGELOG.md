@@ -1,6 +1,16 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+## [v2.1.2] / Go v1.2.12 — 2026-06-17
+
+### Graph API & Hooks
+
+- **Expanded `InsertHook` signature** — The `InsertHook` callback now receives a `metadata map[string]interface{}` parameter alongside the vector, enabling hooks to dynamically access node attributes (like `parent_id`) during graph edge construction.
+
+### Documentation
+
+- **Insert Hook Example** — Added a practical code snippet to the `README.md` Graph Layer section demonstrating how to use `RegisterInsertHook` to automatically map metadata properties into graph edges on vector insertion.
+
 
 ## [v2.1.1] / Go v1.2.1 — 2026-06-13
 
