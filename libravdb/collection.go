@@ -767,7 +767,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 			}
 
 			for _, hook := range c.insertHooks {
-				if err := hook(txn, uint64(storageEntry.Ordinal), vector); err != nil {
+				if err := hook(txn, uint64(storageEntry.Ordinal), vector, storageEntry.Metadata); err != nil {
 					return fmt.Errorf("insert hook failed: %w", err)
 				}
 			}
@@ -827,7 +827,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		}
 
 		for _, hook := range c.insertHooks {
-			if err := hook(txn, uint64(storageEntry.Ordinal), vector); err != nil {
+			if err := hook(txn, uint64(storageEntry.Ordinal), vector, storageEntry.Metadata); err != nil {
 				return fmt.Errorf("insert hook failed: %w", err)
 			}
 		}

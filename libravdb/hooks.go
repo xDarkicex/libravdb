@@ -7,7 +7,7 @@ type GraphTx interface {
 }
 
 // InsertHook is a callback invoked before a vector insertion is committed to the WAL.
-type InsertHook func(txn GraphTx, id uint64, vector []float32) error
+type InsertHook func(txn GraphTx, id uint64, vector []float32, metadata map[string]interface{}) error
 
 // DeleteHook is a callback invoked before a vector deletion is committed to the WAL.
 type DeleteHook func(txn GraphTx, id uint64) error
