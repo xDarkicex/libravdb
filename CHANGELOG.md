@@ -11,6 +11,8 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 - **Complete `Graph` interface** — `BeginTxn`, `AddEdge`, `RemoveEdge`, `DropNodeEdges`, `Neighbors`, `Degree`, `InboundNeighbors`, `InboundDegree`, `NeighborsAny`, `ForEachEdge`, `BFS`, `GetBitset`/`PutBitset`, `GetFrontierBuf`/`PutFrontierBuf`, `Stats`, `Close` all exposed publicly.
 - **Public type aliases** — `Edge`, `KindSet`, `Bitset`, `FrontierBuf`, `VisitAction`, `GraphStats`, `Txn` re-exported from `internal/graph` so consumers don't import internal packages.
 - **`GraphConfig`** — direct struct (not pointer alias) for configuring memory budget at construction.
+- **`WithGraph` Option** — Added `WithGraph(g Graph) CollectionOption` to attach a graph during collection creation.
+- **`SetGraph` Method** — Added `SetGraph(g Graph)` to `*Collection` to attach a graph to an existing collection on startup.
 
 ### Documentation
 
@@ -19,6 +21,8 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ### Housekeeping
 
+- **Removed `release.yml`** — Deleted the unnecessary GitHub Actions release workflow for binary generation, relying solely on Go native module tagging.
+- **README Badges** — Updated the `README.md` to remove the redundant `Build Status` badge, hardcoded a `Coverage` badge, and added a passing `Security Scan` (`govulncheck`) badge.
 - **gofmt pass** — whitespace and import ordering cleanup across `internal/storage`, `internal/util`, `internal/storage/wal`.
 
 ## [v2.1.0] / Go v1.2.0 — 2026-06-13
