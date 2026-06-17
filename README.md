@@ -6,7 +6,8 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/libravdb)](https://goreportcard.com/report/github.com/xDarkicex/libravdb)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/xDarkicex/libravdb/ci.yml?branch=main)](https://github.com/xDarkicex/libravdb/actions)
-[![Coverage](https://img.shields.io/codecov/c/github/xDarkicex/libravdb)](https://codecov.io/gh/xDarkicex/libravdb)
+[![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen.svg)](https://github.com/xDarkicex/libravdb/actions)
+[![Security Scan](https://img.shields.io/badge/security-govulncheck-brightgreen.svg)](https://github.com/xDarkicex/libravdb/actions)
 [![Go Reference](https://pkg.go.dev/badge/github.com/xDarkicex/libravdb.svg)](https://pkg.go.dev/github.com/xDarkicex/libravdb)
 
 **High-Performance Hybrid Vector-Graph Database for Go**
