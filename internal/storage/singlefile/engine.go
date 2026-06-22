@@ -1018,7 +1018,7 @@ func (c *persistedCollection) initVectorSFL() error {
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 16,
-	}, 64)
+	}, 8)
 	if err != nil {
 		return fmt.Errorf("init vector SFL: %w", err)
 	}
