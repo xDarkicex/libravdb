@@ -16,6 +16,7 @@ func Migrate(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open v1 database: %w", err)
 	}
+	defer v1Engine.Close()
 
 	migratingPath := path + ".migrating"
 	stagedPath := path + ".staged"
@@ -29,17 +30,18 @@ func Migrate(ctx context.Context, path string) error {
 		return fmt.Errorf("cleanup stale staged file: %w", err)
 	}
 
-	v2DB, err := Open(WithStoragePath(migratingPath))
-	if err != nil {
-		v1Engine.Close()
-		return fmt.Errorf("failed to create v2 database: %w", err)
-	}
-
+	// Count collections before creating the v2 database so the limit
+	// can be sized to fit. Production databases routinely exceed the
+	// default 100-collection cap, especially session-scoped stores.
 	colNames, err := v1Engine.ListCollections()
 	if err != nil {
-		v1Engine.Close()
-		v2DB.Close()
 		return fmt.Errorf("failed to list collections: %w", err)
+	}
+	limit := len(colNames) + 1000 // headroom for future collections
+
+	v2DB, err := Open(WithStoragePath(migratingPath), WithMaxCollections(limit))
+	if err != nil {
+		return fmt.Errorf("failed to create v2 database: %w", err)
 	}
 
 	for _, name := range colNames {
@@ -96,16 +98,11 @@ func Migrate(ctx context.Context, path string) error {
 			return nil
 		}()
 		if err != nil {
-			v1Engine.Close()
 			v2DB.Close()
 			return err
 		}
 	}
 
-	if err := v1Engine.Close(); err != nil {
-		v2DB.Close()
-		return fmt.Errorf("failed to close v1 engine: %w", err)
-	}
 
 	if err := v2DB.Close(); err != nil {
 		return fmt.Errorf("failed to close v2 database: %w", err)
