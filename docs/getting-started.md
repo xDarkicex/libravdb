@@ -1,30 +1,18 @@
 # Getting Started with LibraVDB
 
-This guide will help you get up and running with LibraVDB quickly.
+This guide walks you through installing LibraVDB, creating your first database
+and collection, inserting vectors, running searches, and configuring for
+production.
 
 ## Installation
-
-Add LibraVDB to your Go project:
 
 ```bash
 go get github.com/xDarkicex/libravdb
 ```
 
-## Basic Concepts
+Requires Go 1.25+. No CGo, no system dependencies beyond the Go toolchain.
 
-### Database
-The `Database` is the top-level container that manages multiple collections and provides global configuration.
-
-### Collection
-A `Collection` is a named group of vectors with the same dimensionality and configuration. Each collection has its own index and storage.
-
-### Vector Entry
-A vector entry consists of:
-- **ID**: Unique identifier (string)
-- **Vector**: Float32 array of fixed dimension
-- **Metadata**: Optional key-value pairs for filtering
-
-## Your First Vector Database
+## Quick Start
 
 ### 1. Create a Database
 
@@ -33,19 +21,18 @@ package main
 
 import (
     "context"
+    "fmt"
     "log"
-    
+
     "github.com/xDarkicex/libravdb/libravdb"
 )
 
 func main() {
-    // Create database with custom storage path
-    db, err := libravdb.New(
-        libravdb.WithStoragePath("./my_vector_db"),
-        libravdb.WithMetrics(true),
+    db, err := libravdb.Open(
+        libravdb.WithStoragePath("./my_data"),
     )
     if err != nil {
-        log.Fatal("Failed to create database:", err)
+        log.Fatal(err)
     }
     defer db.Close()
 }
@@ -54,198 +41,190 @@ func main() {
 ### 2. Create a Collection
 
 ```go
-// Create a collection for 768-dimensional vectors (common for text embeddings)
-collection, err := db.CreateCollection(
-    context.Background(),
-    "documents",
+col, err := db.CreateCollection(context.Background(), "embeddings",
     libravdb.WithDimension(768),
     libravdb.WithMetric(libravdb.CosineDistance),
-    libravdb.WithHNSW(32, 200, 50), // M=32, EfConstruction=200, EfSearch=50
+    libravdb.WithHNSW(32, 200, 100),
 )
 if err != nil {
-    log.Fatal("Failed to create collection:", err)
+    log.Fatal(err)
 }
 ```
 
 ### 3. Insert Vectors
 
 ```go
-// Insert a single vector
-vector := make([]float32, 768)
-// ... populate vector with your embedding data ...
+// Single insert
+err = col.Insert(ctx, "doc-1", embedding, map[string]interface{}{
+    "title": "Introduction to Vector Search",
+    "score": 0.95,
+})
 
-metadata := map[string]interface{}{
-    "title":    "My Document",
-    "category": "research",
-    "author":   "John Doe",
-    "tags":     []string{"ai", "machine-learning"},
+// Batch insert
+entries := []libravdb.VectorEntry{
+    {ID: "vec-1", Vector: vec1},
+    {ID: "vec-2", Vector: vec2},
 }
+err = col.InsertBatch(ctx, entries)
+```
 
-err = collection.Insert(context.Background(), "doc_1", vector, metadata)
+### 4. Search
+
+```go
+results, err := col.Search(ctx, queryEmbedding, 10)
 if err != nil {
-    log.Fatal("Failed to insert vector:", err)
+    log.Fatal(err)
+}
+for _, r := range results.Results {
+    fmt.Printf("ID: %s  Score: %.4f\n", r.ID, r.Score)
 }
 ```
 
-### 4. Search for Similar Vectors
+## Choosing a Distance Metric
+
+| Metric | Go Constant | Best For |
+|--------|------------|----------|
+| Cosine | `libravdb.CosineDistance` | Text embeddings, normalized vectors |
+| Euclidean (L2) | `libravdb.L2Distance` | Image embeddings, geometric data |
+| Inner Product | `libravdb.InnerProduct` | Custom similarity, non-normalized vectors |
 
 ```go
-// Search for the 10 most similar vectors
-queryVector := make([]float32, 768)
-// ... populate with your query embedding ...
-
-results, err := collection.Search(context.Background(), queryVector, 10)
-if err != nil {
-    log.Fatal("Search failed:", err)
-}
-
-fmt.Printf("Found %d results in %v\n", len(results.Results), results.Took)
-for i, result := range results.Results {
-    fmt.Printf("%d. ID: %s, Score: %.3f, Title: %s\n", 
-        i+1, result.ID, result.Score, result.Metadata["title"])
-}
-```
-
-## Distance Metrics
-
-Choose the appropriate distance metric for your use case:
-
-```go
-// Cosine Distance (recommended for normalized embeddings)
+// Cosine distance for text embeddings (most common)
 libravdb.WithMetric(libravdb.CosineDistance)
 
-// L2 (Euclidean) Distance
+// L2 distance for image embeddings
 libravdb.WithMetric(libravdb.L2Distance)
-
-// Inner Product (for embeddings that aren't normalized)
-libravdb.WithMetric(libravdb.InnerProduct)
 ```
 
-## Index Types
-
-LibraVDB supports multiple indexing algorithms:
-
-### HNSW (Hierarchical Navigable Small World)
-Best for most use cases - good balance of speed and accuracy:
+## Choosing an Index
 
 ```go
-libravdb.WithHNSW(32, 200, 50)
-// M: max connections per node (16-64 typical)
-// EfConstruction: search width during construction (100-800)
-// EfSearch: search width during queries (50-200)
-```
+// HNSW — best for most use cases (10K–10M vectors)
+libravdb.WithHNSW(32, 200, 100)
 
-### Flat Index
-Exact search, good for small collections (<10K vectors):
-
-```go
+// Flat — exact results for small collections (<10K)
 libravdb.WithFlat()
-```
 
-### Auto Selection
-Let LibraVDB choose the best index based on collection size:
+// IVF-PQ — memory-efficient for large collections (>1M)
+libravdb.WithIVFPQ(1024, 64)
 
-```go
+// Auto — let the library choose
 libravdb.WithAutoIndexSelection(true)
 ```
 
-## Error Handling
+## Metadata Filtering
 
-LibraVDB provides detailed error information:
+Define a schema for type-safe filtering:
 
 ```go
-if err != nil {
-    if libravdbErr, ok := err.(*libravdb.Error); ok {
-        fmt.Printf("Error Code: %s\n", libravdbErr.Code)
-        fmt.Printf("Message: %s\n", libravdbErr.Message)
-        fmt.Printf("Component: %s\n", libravdbErr.Component)
-    }
-    return err
+schema := libravdb.MetadataSchema{
+    "category": libravdb.StringField,
+    "score":    libravdb.FloatField,
+    "tags":     libravdb.StringArrayField,
 }
-```
 
-## Complete Example
-
-Here's a complete working example:
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-    "math/rand"
-    
-    "github.com/xDarkicex/libravdb/libravdb"
+col, err := db.CreateCollection(ctx, "docs",
+    libravdb.WithDimension(768),
+    libravdb.WithMetadataSchema(schema),
+    libravdb.WithIndexedFields("category", "score"),
 )
+```
 
-func main() {
-    // Create database
-    db, err := libravdb.New(libravdb.WithStoragePath("./example_db"))
-    if err != nil {
-        log.Fatal(err)
+Query with filters:
+
+```go
+results, err := col.Query(ctx).
+    WithVector(queryVec).
+    Eq("category", "technology").
+    Gt("score", 0.8).
+    Limit(10).
+    Execute()
+```
+
+## High-Throughput Ingestion
+
+For large datasets, use the streaming API:
+
+```go
+opts := libravdb.DefaultStreamingOptions()
+opts.ChunkSize = 2000
+opts.MaxConcurrency = 8
+opts.ProgressCallback = func(stats *libravdb.StreamingStats) {
+    fmt.Printf("\r%.0f vectors/sec", stats.ItemsPerSecond)
+}
+
+stream := col.NewStreamingBatchInsert(opts)
+stream.Start()
+
+for _, entry := range largeDataset {
+    stream.Send(&libravdb.VectorEntry{
+        ID:     entry.ID,
+        Vector: entry.Vector,
+    })
+}
+
+stream.Close()
+stream.Wait()
+```
+
+## Transactions
+
+For atomic cross-collection mutations:
+
+```go
+err := db.WithTx(ctx, func(tx libravdb.Tx) error {
+    if err := tx.Insert(ctx, "users", "u1", userVec, userMeta); err != nil {
+        return err // rollback
     }
-    defer db.Close()
+    if err := tx.Insert(ctx, "profiles", "p1", profileVec, nil); err != nil {
+        return err // rollback
+    }
+    return nil // commit
+})
+```
 
-    // Create collection
-    collection, err := db.CreateCollection(
-        context.Background(),
-        "example_vectors",
-        libravdb.WithDimension(128),
-        libravdb.WithMetric(libravdb.CosineDistance),
+## Memory Management
+
+```go
+col, err := db.CreateCollection(ctx, "large",
+    libravdb.WithDimension(768),
+    libravdb.WithMemoryLimit(8 * 1024 * 1024 * 1024), // 8 GB
+    libravdb.WithMemoryMapping(true),                  // mmap for overflow
+    libravdb.WithCachePolicy(libravdb.LRUCache),
+)
+```
+
+Monitor memory:
+
+```go
+stats := col.Stats()
+if stats.MemoryStats != nil {
+    fmt.Printf("Memory: %d MB / %d MB (pressure: %s)\n",
+        stats.MemoryStats.Total/1024/1024,
+        stats.MemoryStats.Limit/1024/1024,
+        stats.MemoryStats.PressureLevel,
     )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Insert some example vectors
-    for i := 0; i < 1000; i++ {
-        vector := make([]float32, 128)
-        for j := range vector {
-            vector[j] = rand.Float32()
-        }
-        
-        metadata := map[string]interface{}{
-            "index":    i,
-            "category": fmt.Sprintf("cat_%d", i%5),
-        }
-        
-        err := collection.Insert(context.Background(), fmt.Sprintf("vec_%d", i), vector, metadata)
-        if err != nil {
-            log.Printf("Failed to insert vector %d: %v", i, err)
-        }
-    }
-
-    // Search for similar vectors
-    queryVector := make([]float32, 128)
-    for i := range queryVector {
-        queryVector[i] = rand.Float32()
-    }
-
-    results, err := collection.Search(context.Background(), queryVector, 5)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    fmt.Printf("Search completed in %v\n", results.Took)
-    for i, result := range results.Results {
-        fmt.Printf("%d. ID: %s, Score: %.3f, Category: %s\n",
-            i+1, result.ID, result.Score, result.Metadata["category"])
-    }
-
-    // Get collection statistics
-    stats := collection.Stats()
-    fmt.Printf("\nCollection Stats:\n")
-    fmt.Printf("- Vectors: %d\n", stats.VectorCount)
-    fmt.Printf("- Memory Usage: %d bytes\n", stats.MemoryUsage)
-    fmt.Printf("- Index Type: %s\n", stats.IndexType)
 }
 ```
+
+## Production Checklist
+
+- [ ] Set `WithStoragePath` to an absolute path on fast storage (SSD).
+- [ ] Enable `WithMetrics(true)` for Prometheus monitoring.
+- [ ] Set `WithMemoryLimit` based on available system RAM (≤75%).
+- [ ] Use `WithMemoryMapping(true)` for datasets larger than RAM.
+- [ ] Define `WithMetadataSchema` for type-safe metadata.
+- [ ] Index frequently-filtered metadata fields.
+- [ ] Tune HNSW parameters (`M`, `EfConstruction`, `EfSearch`) for your recall/latency tradeoff.
+- [ ] Use batch/streaming APIs for bulk ingestion, not individual inserts.
+- [ ] Set `WithLogger` to capture index rebuild timing.
+- [ ] Close the database gracefully on shutdown (`defer db.Close()`).
 
 ## Next Steps
 
-- Learn about [Advanced Filtering](concepts/filtering.md)
-- Explore [Performance Tuning](performance-tuning.md)
-- Check out [Configuration Options](configuration.md)
-- See [Real-world Examples](examples/)
+- [API Reference](api-reference.md) — Complete public API documentation
+- [Configuration Guide](configuration/configuration.md) — All configuration options
+- [Performance Tuning](configuration/performance-tuning.md) — Optimization strategies
+- [Collections](concepts/collections.md) — Collection lifecycle and management
+- [Indexing](concepts/indexing.md) — Index algorithm selection and tuning
+- [Design Documents](design/README.md) — Internal architecture and algorithms

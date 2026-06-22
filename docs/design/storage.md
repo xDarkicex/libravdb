@@ -642,3 +642,107 @@ type EngineConfig struct {
 - More frequent compaction
 
 This storage layer design provides LibraVDB with a robust, scalable foundation for persistent vector data management while maintaining high performance for both read and write operations.
+
+## Implementation: Single-File Engine
+
+The conceptual LSM design above is implemented as a **single-file page-based
+engine** in `internal/storage/singlefile`. See [Single-File Storage Spec](single-file-storage-spec.md)
+for the complete binary format specification. Key implementation details:
+
+### File Layout
+
+The engine stores all data in one `*.libravdb` file with these regions:
+
+| Page(s) | Region | Content |
+|---------|--------|---------|
+| 0 | File header | Magic `"LIBRAVDB"`, format version, WAL boundaries, active metapage |
+| 1 | Metapage A | Durable root pointers, epoch, checksum |
+| 2 | Metapage B | Alternate metapage for crash-safe checkpoint switching |
+| 3+ | WAL region | Append-only write-ahead log with framed records |
+| Variable | Data pages | B+tree catalog, per-collection record trees, index blobs |
+| Variable | Freelist | Free page tracking for reuse |
+
+### Page Types
+
+```
+META               — metapage
+CATALOG_INTERNAL   — catalog B+tree internal node
+CATALOG_LEAF       — catalog B+tree leaf
+COLLECTION_INTERNAL — collection record B+tree internal node
+COLLECTION_LEAF    — collection record B+tree leaf
+VECTOR_BLOB        — inline vector data
+INDEX_BLOB         — serialized index snapshot
+FREELIST           — free page list
+WAL_FRAME          — WAL record
+OVERFLOW           — large value overflow chain
+```
+
+### WAL Integration
+
+The `internal/storage/wal` package provides a standalone WAL with:
+
+- **Frame-based format**: Each frame has magic, version, record type, LSN,
+  txid, previous LSN, payload length, and CRC32C checksum.
+- **Transaction bracketing**: `TX_BEGIN` and `TX_COMMIT` frames bracket
+  multi-operation transactions.
+- **Recovery**: Only committed transactions are replayed; uncommitted frames
+  are skipped.
+- **Checksum validation**: Each frame is independently checksummed for
+  corruption detection.
+
+### Checkpoint Protocol
+
+1. Freeze new checkpoint epoch.
+2. Copy live pages reachable from current logical roots to new clean pages.
+3. Build new freelist from unreachable pages.
+4. Write `CHECKPOINT_BEGIN` to WAL.
+5. Flush new pages.
+6. Write new metapage with updated roots and `last_applied_lsn`.
+7. Write `CHECKPOINT_END`.
+8. Advance WAL tail, truncating reclaimable WAL region.
+
+This copy-on-write protocol ensures readers always see a consistent snapshot
+and crashes at any point leave a valid root (either the old or new metapage).
+
+### Recovery Algorithm
+
+On startup:
+1. Read file header to locate WAL boundaries and active metapage.
+2. Read both metapages; select the valid one with the highest epoch.
+3. Load catalog root, freelist root, and `last_applied_lsn` from metapage.
+4. Scan WAL from `last_applied_lsn + 1`.
+5. Group frames by `txid`; replay only committed transactions in LSN order.
+6. Rebuild in-memory collection handles from catalog.
+7. Optionally trigger checkpoint if replay volume exceeds threshold.
+
+### Platform Support
+
+Platform-specific I/O is isolated in `sys_unix.go` and `sys_windows.go`:
+- **Unix**: `fallocate`, `fdatasync`, `msync`, `mmap`
+- **Windows**: `syscall.MapViewOfFile`, `syscall.FlushFileBuffers`
+
+### Interface Design
+
+The storage layer exposes clean interfaces to the rest of the system:
+
+```go
+// storage.Engine — top-level database operations
+type Engine interface {
+    CreateCollection(name string, config *CollectionConfig) (Collection, error)
+    GetCollection(name string) (Collection, error)
+    ListCollections() ([]string, error)
+    DeleteCollection(name string) error
+    Close() error
+}
+
+// storage.Collection — per-collection record operations
+type Collection interface {
+    Insert(ctx context.Context, entry *VectorEntry) (uint32, error)
+    Update(ctx context.Context, id string, fn func(entry *VectorEntry) error) error
+    Delete(ctx context.Context, id string) error
+    Get(ctx context.Context, id string) (*VectorEntry, error)
+    Count(ctx context.Context) (int, error)
+    Iterate(ctx context.Context, fn func(entry *VectorEntry) error) error
+    Close() error
+}
+```
