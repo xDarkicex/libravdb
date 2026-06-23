@@ -5,7 +5,7 @@ go 1.25.7
 require (
 	github.com/leanovate/gopter v0.2.11
 	github.com/prometheus/client_golang v1.17.0
-	github.com/xDarkicex/memory v1.0.33
+	github.com/xDarkicex/memory v1.0.34
 	go.uber.org/goleak v1.3.0
 	golang.org/x/sys v0.43.0
 )
