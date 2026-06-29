@@ -70,11 +70,12 @@ func TestEnsureCollectionDimensionMismatchIsNonDestructive(t *testing.T) {
 
 func TestEnsureCollectionRecreateOnDimensionMismatchOptIn(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(WithStoragePath(testDBPath(t)))
+	path := testDBPath(t)
+	db, err := Open(WithStoragePath(path))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 
 	collection, err := db.EnsureCollection(ctx, "embeddings", 3, WithFlat())
 	if err != nil {
@@ -91,8 +92,20 @@ func TestEnsureCollectionRecreateOnDimensionMismatchOptIn(t *testing.T) {
 	if recreated == collection {
 		t.Fatal("Expected collection to be recreated through explicit opt-in")
 	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close before reopen: %v", err)
+	}
+
+	db, err = Open(WithStoragePath(path))
+	if err != nil {
+		t.Fatalf("Reopen after recreate: %v", err)
+	}
+	recreated, err = db.GetCollection("embeddings")
+	if err != nil {
+		t.Fatalf("GetCollection after reopen: %v", err)
+	}
 	if recreated.Dimension() != 4 {
-		t.Fatalf("Expected recreated dimension 4, got %d", recreated.Dimension())
+		t.Fatalf("Expected recreated dimension 4 after reopen, got %d", recreated.Dimension())
 	}
 	if stats := recreated.Stats(ctx); stats.VectorCount != 0 {
 		t.Fatalf("Expected recreated collection to start empty, got %d vectors", stats.VectorCount)
