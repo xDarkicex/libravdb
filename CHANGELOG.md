@@ -1,7 +1,7 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
-## [Unreleased] — 2026-06-30
+## [v2.1.3] / Go v1.2.13 — 2026-06-30
 
 ### Collection API
 
