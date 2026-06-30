@@ -3,6 +3,7 @@ package graph
 import (
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // PageRegistry provides a lock-free read map from uint32 slot index to *EdgeTablePage.
@@ -17,7 +18,7 @@ type PageRegistry struct {
 
 type registryShard struct {
 	sync.RWMutex
-	pages map[uint32]*EdgeTablePage
+	pages map[uint32]uintptr
 }
 
 func NewPageRegistry() *PageRegistry {
@@ -27,7 +28,7 @@ func NewPageRegistry() *PageRegistry {
 
 	for i := 0; i < 64; i++ {
 		r.shards[i] = &registryShard{
-			pages: make(map[uint32]*EdgeTablePage),
+			pages: make(map[uint32]uintptr),
 		}
 	}
 	return r
@@ -39,12 +40,13 @@ func (r *PageRegistry) Register(page *EdgeTablePage) uint32 {
 
 	shard := r.shards[shardIdx]
 	shard.Lock()
-	shard.pages[id] = page
+	shard.pages[id] = uintptr(unsafe.Pointer(page))
 	shard.Unlock()
 
 	return id
 }
 
+//go:nocheckptr
 func (r *PageRegistry) Get(id uint32) *EdgeTablePage {
 	if id == 0 {
 		return nil
@@ -57,11 +59,11 @@ func (r *PageRegistry) Get(id uint32) *EdgeTablePage {
 	ptr := shard.pages[id]
 	shard.RUnlock()
 
-	if ptr == nil {
+	if ptr == 0 {
 		return nil
 	}
 
-	return ptr
+	return (*EdgeTablePage)(unsafe.Pointer(ptr))
 }
 
 func (r *PageRegistry) Unregister(id uint32) {
