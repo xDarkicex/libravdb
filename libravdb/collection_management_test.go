@@ -2,12 +2,115 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/memory"
 )
+
+func TestEnsureCollectionDimensionMismatchIsNonDestructive(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.EnsureCollection(ctx, "embeddings", 3, WithFlat())
+	if err != nil {
+		t.Fatalf("EnsureCollection create: %v", err)
+	}
+
+	if err := collection.Insert(ctx, "vec_1", []float32{0.1, 0.2, 0.3}, map[string]interface{}{"source": "original"}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	_, err = db.EnsureCollection(ctx, "embeddings", 4, WithFlat())
+	if err == nil {
+		t.Fatal("Expected dimension mismatch error, got nil")
+	}
+	if !errors.Is(err, ErrDimensionMismatch) {
+		t.Fatalf("Expected ErrDimensionMismatch, got %v", err)
+	}
+
+	var mismatch *CollectionDimensionMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Expected CollectionDimensionMismatchError, got %T: %v", err, err)
+	}
+	if mismatch.Collection != "embeddings" || mismatch.ExistingDimension != 3 || mismatch.RequestedDimension != 4 {
+		t.Fatalf("Unexpected mismatch details: %+v", mismatch)
+	}
+
+	surviving, err := db.GetCollection("embeddings")
+	if err != nil {
+		t.Fatalf("GetCollection after mismatch: %v", err)
+	}
+	if surviving != collection {
+		t.Fatal("Expected original collection instance to remain loaded")
+	}
+	if surviving.Dimension() != 3 {
+		t.Fatalf("Expected original dimension 3 to survive, got %d", surviving.Dimension())
+	}
+
+	record, err := surviving.Get(ctx, "vec_1")
+	if err != nil {
+		t.Fatalf("Expected original vector to survive mismatch: %v", err)
+	}
+	if len(record.Vector) != 3 || record.Vector[0] != 0.1 || record.Vector[1] != 0.2 || record.Vector[2] != 0.3 {
+		t.Fatalf("Unexpected surviving vector: %#v", record.Vector)
+	}
+
+	stats := surviving.Stats(ctx)
+	if stats.VectorCount != 1 {
+		t.Fatalf("Expected one vector after mismatch, got %d", stats.VectorCount)
+	}
+}
+
+func TestEnsureCollectionRecreateOnDimensionMismatchOptIn(t *testing.T) {
+	ctx := context.Background()
+	path := testDBPath(t)
+	db, err := Open(WithStoragePath(path))
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	collection, err := db.EnsureCollection(ctx, "embeddings", 3, WithFlat())
+	if err != nil {
+		t.Fatalf("EnsureCollection create: %v", err)
+	}
+	if err := collection.Insert(ctx, "vec_1", []float32{0.1, 0.2, 0.3}, nil); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	recreated, err := db.EnsureCollectionRecreateOnDimensionMismatch(ctx, "embeddings", 4, WithFlat())
+	if err != nil {
+		t.Fatalf("EnsureCollectionRecreateOnDimensionMismatch: %v", err)
+	}
+	if recreated == collection {
+		t.Fatal("Expected collection to be recreated through explicit opt-in")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close before reopen: %v", err)
+	}
+
+	db, err = Open(WithStoragePath(path))
+	if err != nil {
+		t.Fatalf("Reopen after recreate: %v", err)
+	}
+	recreated, err = db.GetCollection("embeddings")
+	if err != nil {
+		t.Fatalf("GetCollection after reopen: %v", err)
+	}
+	if recreated.Dimension() != 4 {
+		t.Fatalf("Expected recreated dimension 4 after reopen, got %d", recreated.Dimension())
+	}
+	if stats := recreated.Stats(ctx); stats.VectorCount != 0 {
+		t.Fatalf("Expected recreated collection to start empty, got %d vectors", stats.VectorCount)
+	}
+}
 
 func TestCollectionMemoryManagement(t *testing.T) {
 	// Create database

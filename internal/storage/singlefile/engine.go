@@ -965,7 +965,7 @@ func (e *Engine) applyCommittedFrames(frames []walRecord) error {
 }
 
 func (e *Engine) applyCreateCollection(name string, config storage.CollectionConfig, lsn uint64) {
-	if _, exists := e.state.Collections[name]; exists {
+	if collection := e.state.Collections[name]; collection != nil && !collection.Deleted {
 		return
 	}
 	e.state.Collections[name] = &persistedCollection{

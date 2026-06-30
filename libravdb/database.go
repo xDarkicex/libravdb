@@ -187,11 +187,23 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 
 // EnsureCollection gets an existing collection, or creates it with the given options.
 // If the collection exists but its dimension differs from the requested dimension,
-// it is dropped and recreated atomically before being returned.
-// This prevents corrupted-DB scenarios where EnsureAuthoredCollections ran before
-// the embedding model loaded, creating a dim=1 collection instead of the model's
-// actual dimension.
+// it returns a CollectionDimensionMismatchError without modifying the existing
+// collection.
 func (db *Database) EnsureCollection(ctx context.Context, name string, dimension int, opts ...CollectionOption) (*Collection, error) {
+	return db.ensureCollection(ctx, name, dimension, false, opts...)
+}
+
+// EnsureCollectionRecreateOnDimensionMismatch gets an existing collection, or
+// creates it with the given options. If the collection exists but its dimension
+// differs from the requested dimension, it is dropped and recreated.
+//
+// Prefer EnsureCollection unless destructive recovery from a known-bad schema is
+// explicitly intended.
+func (db *Database) EnsureCollectionRecreateOnDimensionMismatch(ctx context.Context, name string, dimension int, opts ...CollectionOption) (*Collection, error) {
+	return db.ensureCollection(ctx, name, dimension, true, opts...)
+}
+
+func (db *Database) ensureCollection(ctx context.Context, name string, dimension int, recreateOnDimensionMismatch bool, opts ...CollectionOption) (*Collection, error) {
 	if dimension <= 0 {
 		return nil, ErrInvalidDimension
 	}
@@ -208,14 +220,16 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 		if col.Dimension() == dimension {
 			return col, nil
 		}
-		// Dimension mismatch — drop and recreate atomically.
+		if !recreateOnDimensionMismatch {
+			return nil, newCollectionDimensionMismatchError(name, col.Dimension(), dimension)
+		}
 		if err := db.deleteCollectionLocked(col, name); err != nil {
 			return nil, fmt.Errorf("failed to drop mismatched collection %q: %w", name, err)
 		}
 		// Fall through to create.
 	}
 
-	col, err := db.createCollectionLocked(ctx, name, opts...)
+	col, err := db.createCollectionLocked(ctx, name, ensureCollectionOptions(dimension, opts)...)
 	if err == nil {
 		return col, nil
 	}
@@ -225,10 +239,25 @@ func (db *Database) EnsureCollection(ctx context.Context, name string, dimension
 			if col.Dimension() == dimension {
 				return col, nil
 			}
-			return nil, fmt.Errorf("%w: collection %q has dimension %d, want %d", ErrDimensionMismatch, name, col.Dimension(), dimension)
+			return nil, newCollectionDimensionMismatchError(name, col.Dimension(), dimension)
 		}
 	}
 	return nil, err
+}
+
+func newCollectionDimensionMismatchError(name string, existing, requested int) error {
+	return &CollectionDimensionMismatchError{
+		Collection:         name,
+		ExistingDimension:  existing,
+		RequestedDimension: requested,
+	}
+}
+
+func ensureCollectionOptions(dimension int, opts []CollectionOption) []CollectionOption {
+	createOpts := make([]CollectionOption, 0, len(opts)+1)
+	createOpts = append(createOpts, opts...)
+	createOpts = append(createOpts, WithDimension(dimension))
+	return createOpts
 }
 
 // createCollectionLocked creates a collection. Caller must hold db.mu.

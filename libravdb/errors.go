@@ -23,6 +23,23 @@ var (
 	ErrEmptyIndex         = errors.New("index is empty")
 )
 
+// CollectionDimensionMismatchError describes an existing collection whose
+// stored vector dimension is incompatible with the requested dimension.
+type CollectionDimensionMismatchError struct {
+	Collection         string
+	ExistingDimension  int
+	RequestedDimension int
+}
+
+func (e *CollectionDimensionMismatchError) Error() string {
+	return fmt.Sprintf("%v: collection %q has dimension %d, want %d",
+		ErrDimensionMismatch, e.Collection, e.ExistingDimension, e.RequestedDimension)
+}
+
+func (e *CollectionDimensionMismatchError) Unwrap() error {
+	return ErrDimensionMismatch
+}
+
 // Streaming errors
 var (
 	ErrBackpressureActive = errors.New("backpressure is active, cannot send more data")
