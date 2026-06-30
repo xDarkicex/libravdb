@@ -1,6 +1,16 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+## [Unreleased] — 2026-06-30
+
+### Collection API
+
+- **`EnsureCollection` made non-destructive** — Dimension mismatch now returns `CollectionDimensionMismatchError` instead of silently dropping and recreating the collection. Use `EnsureCollectionRecreateOnDimensionMismatch` for the explicit opt-in destructive path. Thanks [@jason-allen-oneal](https://github.com/jason-allen-oneal).
+
+### Bug Fixes
+
+- **WAL replay: deleted collection re-creation** — `applyCreateCollection` now allows re-creating a previously deleted collection on replay by checking `!collection.Deleted`.
+
 ## [v2.1.2] / Go v1.2.12 — 2026-06-17
 
 ### Graph API & Hooks
