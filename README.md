@@ -15,7 +15,6 @@
 
 [**Quick Start**](#-quick-start) •
 [**Documentation**](#-documentation) •
-[**Performance**](#-performance-benchmarks) •
 [**Examples**](#-usage-examples) •
 [**Contributing**](#-contributing)
 
@@ -27,7 +26,6 @@
 
 - [Overview](#-overview)
 - [Key Features](#-key-features)
-- [Performance Benchmarks](#-performance-benchmarks)
 - [Quick Start](#-quick-start)
 - [Usage Examples](#-usage-examples)
 - [Architecture](#-architecture)
@@ -71,14 +69,6 @@ LibraVDB is a high-performance hybrid vector-graph database library for Go appli
 - **Persistent Storage**: Single-file binary storage with WAL-backed durability
 - **Storage-Owned HNSW**: Canonical vectors and metadata live in storage; HNSW owns graph topology plus optional compressed artifacts
 
-### Enterprise Features
-- **Observability**: Prometheus metrics, health checks, and distributed tracing
-- **Error Recovery**: Automatic recovery mechanisms and circuit breakers
-- **Performance Monitoring**: Real-time performance metrics and optimization suggestions
-- **Concurrent Access**: Thread-safe operations with bounded write admission and queueing
-- **Configuration Management**: Extensive configuration options with validation
-- **Documentation**: Comprehensive API documentation and usage guides
-
 ## 📦 Persistence Model
 
 LibraVDB persists databases as a single `.libravdb` file.
@@ -105,56 +95,6 @@ LibraVDB now includes a Phase 1 write-admission layer intended to make local and
 - batch and streaming worker counts are clamped to collection write parallelism
 
 This improves safety under bursty or subagent-style write traffic, but it is not yet the full adaptive scheduler. If you expect very heavy write concurrency, keep batch and streaming concurrency conservative and prefer one coordinated writer path per collection.
-
-## 📊 Performance Benchmarks
-
-LibraVDB delivers exceptional performance across various workloads and scales:
-
-### Insertion Performance
-```
-Dataset Size    | Throughput      | Memory Usage | Index Type
-1M vectors      | 150K ops/sec    | 2.1 GB      | HNSW
-10M vectors     | 120K ops/sec    | 18.5 GB     | HNSW + PQ
-100M vectors    | 95K ops/sec     | 45.2 GB     | IVF-PQ
-```
-
-### Search Performance
-```
-Collection Size | Latency (p95)   | Throughput   | Recall@10
-1M vectors      | 0.8ms          | 12K qps      | 98.5%
-10M vectors     | 1.2ms          | 8.5K qps     | 97.8%
-100M vectors    | 2.1ms          | 5.2K qps     | 96.2%
-```
-
-### Memory Efficiency
-```
-Configuration           | Memory Usage | Compression Ratio
-Uncompressed           | 100%         | 1:1
-Product Quantization   | 12.5%        | 8:1
-Scalar Quantization    | 25%          | 4:1
-Memory Mapping         | 15%*         | Variable
-```
-*Active memory usage; total data on disk
-
-> **Performance Update**: HNSW implementation has been optimized for large datasets! Now supports 500+ vectors with excellent performance (300+ ops/sec insertion, sub-millisecond search). Includes optimized neighbor selection, better memory management, and BatchInsert API for 6x faster bulk operations. See [HNSW Performance Optimizations](docs/hnsw-performance-optimizations.md) for details.
-
-### Detailed Benchmarks
-
-Run comprehensive benchmarks on your hardware:
-
-```bash
-# Performance benchmarks
-go test -bench=. -benchmem ./benchmark/
-
-# Validation benchmarks
-./benchmark/run_benchmarks.sh
-
-# Memory profiling
-go test -memprofile=mem.prof -bench=BenchmarkInsert ./...
-go tool pprof mem.prof
-```
-
-See [benchmark/](benchmark/) directory for detailed performance analysis and comparison with other vector databases.
 
 ## 🚀 Quick Start
 
