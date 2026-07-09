@@ -323,10 +323,54 @@ func admitBatch4MaxHeap(candidates *candidateMaxHeap, working *candidateMinHeap,
 			return
 		}
 	}
-	admitCandidateMaxHeap(candidates, working, ef, ids[0], d0)
-	admitCandidateMaxHeap(candidates, working, ef, ids[1], d1)
-	admitCandidateMaxHeap(candidates, working, ef, ids[2], d2)
-	admitCandidateMaxHeap(candidates, working, ef, ids[3], d3)
+
+	if len(candidates.items) >= ef {
+		if d0 < candidates.items[0].Distance {
+			candidate := util.Candidate{ID: ids[0], Distance: d0}
+			candidates.ReplaceTop(candidate)
+			working.PushCandidate(candidate)
+		}
+	} else {
+		candidate := util.Candidate{ID: ids[0], Distance: d0}
+		candidates.PushCandidate(candidate)
+		working.PushCandidate(candidate)
+	}
+
+	if len(candidates.items) >= ef {
+		if d1 < candidates.items[0].Distance {
+			candidate := util.Candidate{ID: ids[1], Distance: d1}
+			candidates.ReplaceTop(candidate)
+			working.PushCandidate(candidate)
+		}
+	} else {
+		candidate := util.Candidate{ID: ids[1], Distance: d1}
+		candidates.PushCandidate(candidate)
+		working.PushCandidate(candidate)
+	}
+
+	if len(candidates.items) >= ef {
+		if d2 < candidates.items[0].Distance {
+			candidate := util.Candidate{ID: ids[2], Distance: d2}
+			candidates.ReplaceTop(candidate)
+			working.PushCandidate(candidate)
+		}
+	} else {
+		candidate := util.Candidate{ID: ids[2], Distance: d2}
+		candidates.PushCandidate(candidate)
+		working.PushCandidate(candidate)
+	}
+
+	if len(candidates.items) >= ef {
+		if d3 < candidates.items[0].Distance {
+			candidate := util.Candidate{ID: ids[3], Distance: d3}
+			candidates.ReplaceTop(candidate)
+			working.PushCandidate(candidate)
+		}
+		return
+	}
+	candidate := util.Candidate{ID: ids[3], Distance: d3}
+	candidates.PushCandidate(candidate)
+	working.PushCandidate(candidate)
 }
 
 func admitCandidateUnsorted(candidates *unsortedTopK, working *candidateMinHeap, ef int, id uint32, distance float32) {
