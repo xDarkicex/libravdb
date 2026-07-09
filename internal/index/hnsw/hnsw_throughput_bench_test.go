@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"context"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -21,9 +22,16 @@ const (
 	benchVectorPoolSize = 8192
 )
 
+var benchNomicMatryoshkaDims = []int{64, 256, 768}
+var benchNomicEfSweep = []int{100, 150, 200, 300, 400, 600}
+
 func benchmarkHNSWConfig() Config {
+	return benchmarkHNSWConfigDim(benchDim)
+}
+
+func benchmarkHNSWConfigDim(dim int) Config {
 	return Config{
-		Dimension:      benchDim,
+		Dimension:      dim,
 		M:              16,
 		EfConstruction: 100,
 		EfSearch:       50,
@@ -34,12 +42,38 @@ func benchmarkHNSWConfig() Config {
 }
 
 func benchmarkVectors(n int, seed int64) [][]float32 {
+	return benchmarkVectorsDim(n, benchDim, seed)
+}
+
+func benchmarkVectorsDim(n int, dim int, seed int64) [][]float32 {
 	rng := rand.New(rand.NewSource(seed))
 	vectors := make([][]float32, n)
 	for i := range vectors {
-		vec := make([]float32, benchDim)
+		vec := make([]float32, dim)
 		for j := range vec {
 			vec[j] = rng.Float32()
+		}
+		vectors[i] = vec
+	}
+	return vectors
+}
+
+func benchmarkNormalizedVectorsDim(n int, dim int, seed int64) [][]float32 {
+	rng := rand.New(rand.NewSource(seed))
+	vectors := make([][]float32, n)
+	for i := range vectors {
+		vec := make([]float32, dim)
+		var sum float64
+		for j := range vec {
+			v := rng.Float32()*2 - 1
+			vec[j] = v
+			sum += float64(v * v)
+		}
+		if sum > 0 {
+			invNorm := float32(1 / math.Sqrt(sum))
+			for j := range vec {
+				vec[j] *= invNorm
+			}
 		}
 		vectors[i] = vec
 	}
@@ -57,7 +91,12 @@ func benchmarkIDs(n int) []string {
 func buildBenchmarkIndex(b testing.TB, vectors [][]float32, ids []string) *Index {
 	b.Helper()
 
-	config := benchmarkHNSWConfig()
+	return buildBenchmarkIndexWithConfig(b, benchmarkHNSWConfig(), vectors, ids)
+}
+
+func buildBenchmarkIndexWithConfig(b testing.TB, config Config, vectors [][]float32, ids []string) *Index {
+	b.Helper()
+
 	index, err := NewHNSW(&config)
 	if err != nil {
 		b.Fatalf("failed to create HNSW index: %v", err)
@@ -266,6 +305,61 @@ func BenchmarkHNSWBuildFixedSize(b *testing.B) {
 	}
 }
 
+func BenchmarkHNSWNomicDimBuildFixedSize(b *testing.B) {
+	ids := benchmarkIDs(benchBuildSize)
+
+	for _, dim := range benchNomicMatryoshkaDims {
+		dim := dim
+		vectors := benchmarkNormalizedVectorsDim(benchBuildSize, dim, 42)
+
+		for _, tc := range []struct {
+			name string
+			ids  []string
+		}{
+			{name: "external_ids", ids: ids},
+			{name: "ordinal_only"},
+		} {
+			tc := tc
+			b.Run("dim_"+strconv.Itoa(dim)+"/"+tc.name, func(b *testing.B) {
+				b.ReportAllocs()
+				var totalInserts uint64
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					config := benchmarkHNSWConfigDim(dim)
+					index, err := NewHNSW(&config)
+					if err != nil {
+						b.Fatalf("failed to create HNSW index: %v", err)
+					}
+					ctx := context.Background()
+					b.StartTimer()
+
+					for j, vec := range vectors {
+						entry := VectorEntry{Vector: vec}
+						if tc.ids != nil {
+							entry.ID = tc.ids[j]
+						}
+						if err := index.Insert(ctx, &entry); err != nil {
+							b.Fatalf("insert %d failed: %v", j, err)
+						}
+					}
+					totalInserts += uint64(len(vectors))
+
+					b.StopTimer()
+					index.Close()
+				}
+				elapsed := b.Elapsed()
+				if elapsed > 0 {
+					b.ReportMetric(float64(totalInserts)/elapsed.Seconds(), "insert/s")
+				}
+				b.ReportMetric(float64(dim), "dim")
+				b.ReportMetric(float64(benchBuildSize), "nodes/build")
+			})
+		}
+	}
+}
+
 func searchExplicitEFOrdinals(ctx context.Context, index *Index, query []float32, k int, ef int, ordinals []uint32) ([]uint32, int, error) {
 	ordinals = ordinals[:0]
 
@@ -433,6 +527,118 @@ func BenchmarkHNSWEfSweepRecallLatency(b *testing.B) {
 				b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
 				b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
 				b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+			}
+		})
+	}
+}
+
+func BenchmarkHNSWNomicDimEf200RecallLatency(b *testing.B) {
+	ctx := context.Background()
+	const ef = 200
+
+	for _, dim := range benchNomicMatryoshkaDims {
+		dim := dim
+		b.Run("dim_"+strconv.Itoa(dim), func(b *testing.B) {
+			vectors := benchmarkNormalizedVectorsDim(benchBuildSize, dim, 42)
+			queries := benchmarkNormalizedVectorsDim(benchSearchQueries, dim, 99)
+			truth := bruteForceTruth(vectors, queries, benchSearchK)
+			truthSets := benchmarkTruthSets(truth)
+			config := benchmarkHNSWConfigDim(dim)
+			index := buildBenchmarkIndexWithConfig(b, config, vectors, benchmarkIDs(len(vectors)))
+			defer index.Close()
+
+			latencies := make([]int64, b.N)
+			ordinalBufs := make([][]uint32, len(queries))
+			for i := range ordinalBufs {
+				ordinalBufs[i] = make([]uint32, 0, benchSearchK)
+			}
+
+			var totalCandidates uint64
+			var totalRecall float64
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				qi := i % len(queries)
+				start := time.Now()
+				ordinals, candidateCount, err := searchExplicitEFOrdinals(ctx, index, queries[qi], benchSearchK, ef, ordinalBufs[qi])
+				latencies[i] = time.Since(start).Nanoseconds()
+				if err != nil {
+					b.Fatalf("explicit ef search failed: %v", err)
+				}
+				ordinalBufs[qi] = ordinals
+				totalCandidates += uint64(candidateCount)
+				totalRecall += recallOrdinalsAtK(ordinals, truthSets[qi], benchSearchK)
+			}
+			b.StopTimer()
+
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			if b.N > 0 {
+				b.ReportMetric(float64(dim), "dim")
+				b.ReportMetric(float64(ef), "ef")
+				b.ReportMetric(totalRecall/float64(b.N), "recall@10")
+				b.ReportMetric(float64(totalCandidates)/float64(b.N), "candidates/op")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+			}
+		})
+	}
+}
+
+func BenchmarkHNSWNomicDimEfSweepRecallLatency(b *testing.B) {
+	ctx := context.Background()
+
+	for _, dim := range benchNomicMatryoshkaDims {
+		dim := dim
+		b.Run("dim_"+strconv.Itoa(dim), func(b *testing.B) {
+			vectors := benchmarkNormalizedVectorsDim(benchBuildSize, dim, 42)
+			queries := benchmarkNormalizedVectorsDim(benchSearchQueries, dim, 99)
+			truth := bruteForceTruth(vectors, queries, benchSearchK)
+			truthSets := benchmarkTruthSets(truth)
+			config := benchmarkHNSWConfigDim(dim)
+			index := buildBenchmarkIndexWithConfig(b, config, vectors, benchmarkIDs(len(vectors)))
+			defer index.Close()
+
+			for _, ef := range benchNomicEfSweep {
+				ef := ef
+				b.Run("ef_"+strconv.Itoa(ef), func(b *testing.B) {
+					latencies := make([]int64, b.N)
+					ordinalBufs := make([][]uint32, len(queries))
+					for i := range ordinalBufs {
+						ordinalBufs[i] = make([]uint32, 0, benchSearchK)
+					}
+
+					var totalCandidates uint64
+					var totalRecall float64
+
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						qi := i % len(queries)
+						start := time.Now()
+						ordinals, candidateCount, err := searchExplicitEFOrdinals(ctx, index, queries[qi], benchSearchK, ef, ordinalBufs[qi])
+						latencies[i] = time.Since(start).Nanoseconds()
+						if err != nil {
+							b.Fatalf("explicit ef search failed: %v", err)
+						}
+						ordinalBufs[qi] = ordinals
+						totalCandidates += uint64(candidateCount)
+						totalRecall += recallOrdinalsAtK(ordinals, truthSets[qi], benchSearchK)
+					}
+					b.StopTimer()
+
+					sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+					if b.N > 0 {
+						b.ReportMetric(float64(dim), "dim")
+						b.ReportMetric(float64(ef), "ef")
+						b.ReportMetric(totalRecall/float64(b.N), "recall@10")
+						b.ReportMetric(float64(totalCandidates)/float64(b.N), "candidates/op")
+						b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
+						b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
+						b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+					}
+				})
 			}
 		})
 	}
