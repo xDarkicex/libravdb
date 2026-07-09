@@ -103,14 +103,14 @@ func (h *candidateMinHeap) PopCandidate() util.Candidate {
 }
 
 // CandidateMode selects the candidate tracking data structure used during
-// search. "heap" remains the production default until the admission shootout is
-// stable across alternating multi-count runs. "unsorted" keeps the cached-worst
-// array path available for targeted throughput/recall testing.
+// search. "heap" is the current production default; repeated shootouts on the
+// current graph shape keep it ahead of the cached-worst unsorted path.
+// "unsorted" remains available for targeted throughput/recall testing.
 var CandidateMode = "heap"
 
 // unsortedTopK tracks the K closest candidates found so far using an
 // unsorted array with a cached worst-element index. For small K (ef ≤ 200),
-// this dominates sorted slices and binary heaps because:
+// this can beat sorted slices and binary heaps when rejects dominate because:
 //
 //   - ~85-90% of pushes are rejects: a single float compare against cached worst
 //   - ~10-15% are accepts: replace worst in-place + one full rescan (K compares)
@@ -118,7 +118,9 @@ var CandidateMode = "heap"
 // The full rescan over a contiguous 800-byte block touching 2 cache lines is
 // faster than a binary heap's log₂K ≈ 7 levels of branch-mispredicting
 // bubble-up/down, especially on wide OoO cores (Apple Firestorm, Intel/
-// AMD). USearch's sorted_buffer_gt uses the same strategy for K < 128.
+// AMD). On the current HNSW benchmarks, the binary heap remains faster because
+// accepted replacements are still common enough for full rescans to cost more
+// than heap repair.
 type unsortedTopK struct {
 	items    []util.Candidate // backing array: len == logical size, cap >= maxSize
 	maxSize  int              // target K — stop accepting new entries at this size
@@ -189,9 +191,8 @@ func (u *unsortedTopK) PopCandidate() util.Candidate {
 	return removed
 }
 
-// candidateMaxHeap is a standard binary max-heap over a slice. It is retained
-// for the cold sort-results path (searchLevelValuesWithScratch, sortResults=true).
-// The hot search loop uses unsortedTopK instead.
+// candidateMaxHeap is a standard binary max-heap over a slice. It is the
+// current hot-path default for candidate tracking.
 type candidateMaxHeap struct {
 	items []util.Candidate
 }
