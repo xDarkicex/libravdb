@@ -17,6 +17,11 @@ type NeighborSelector struct {
 	levelMultiplier float64
 }
 
+// level0LinkMultiplier lets level 0 use a small portion of the preallocated
+// link slack. With M=16 this keeps 36 links: enough for stable ef=200 recall
+// on the current benchmark, without paying for the full 40-link capacity.
+const level0LinkMultiplier = 2.25
+
 func compareCandidatePtrs(a, b *util.Candidate) int {
 	if a.Distance < b.Distance {
 		return -1
@@ -309,6 +314,9 @@ func (ns *NeighborSelector) PruneConnections(
 	if level == 0 {
 		maxM = int(float64(maxM) * ns.levelMultiplier)
 	}
+	if capacity := linkArrayCapacity(index.config.M, level); maxM > capacity {
+		maxM = capacity
+	}
 
 	nodeVector, err := index.getNodeVector(node)
 	if err != nil {
@@ -440,8 +448,14 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 	}
 	newDistance := index.distance(targetVector, newVector)
 
-	maxM := levelMaxLinks(index.config.M, level)
 	maxCapacity := linkArrayCapacity(index.config.M, level)
+	maxM := ns.maxConnections
+	if level == 0 {
+		maxM = int(float64(maxM) * ns.levelMultiplier)
+	}
+	if maxM > maxCapacity {
+		maxM = maxCapacity
+	}
 
 	var originalBuf [256]uint32
 	original := originalBuf[:0]

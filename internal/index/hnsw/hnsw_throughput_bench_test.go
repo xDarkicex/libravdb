@@ -445,7 +445,7 @@ func BenchmarkHNSWSearchTraversalOnly(b *testing.B) {
 	defer index.Close()
 
 	ctx := context.Background()
-	ef := max(index.config.EfSearch, benchSearchK, index.config.EfConstruction*3)
+	ef := max(index.config.EfSearch, benchSearchK, index.config.EfConstruction*2)
 	latencies := make([]int64, b.N)
 	var totalCandidates uint64
 

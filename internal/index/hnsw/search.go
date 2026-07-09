@@ -819,7 +819,6 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 					}
 				}
 			}
-
 			if useRawNEONPtrL2 {
 				for i := 0; i < len(scratch.prefetchedIDs); {
 					if i+3 < len(scratch.prefetchedIDs) {

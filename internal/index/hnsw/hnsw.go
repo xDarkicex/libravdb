@@ -718,7 +718,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	}
 
 	size := int(h.size.Load())
-	exactCutoff := max(h.config.EfConstruction*3, h.config.EfSearch, k)
+	exactCutoff := max(h.config.EfConstruction*2, h.config.EfSearch, k)
 	if size <= exactCutoff {
 		return h.searchExact(ctx, query, k, filter)
 	}
@@ -744,10 +744,10 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	// produce unacceptable tail recall even when the graph topology is sound,
 	// so keep a degree/construction-aware floor while still honoring larger
 	// caller-specified beams.
-	qualityFloor := h.config.EfConstruction * 3
+	qualityFloor := h.config.EfConstruction * 2
 	ef := max(h.config.EfSearch, k, qualityFloor)
 	if h.quantizer != nil {
-		ef = max(ef, min(int(h.size.Load()), h.config.EfConstruction*3))
+		ef = max(ef, min(int(h.size.Load()), h.config.EfConstruction*2))
 	}
 	scratch := h.acquireSearchScratchWithEF(ef)
 	defer h.releaseSearchScratch(scratch)

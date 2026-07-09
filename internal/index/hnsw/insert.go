@@ -26,7 +26,7 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 
 	// Initialize neighbor selector if not already done
 	if h.neighborSelector == nil {
-		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
+		h.neighborSelector = NewNeighborSelector(h.config.M, level0LinkMultiplier)
 	}
 
 	// Phase 1: Search from top level down to node.Level + 1 with ef=1 (greedy search)
@@ -75,7 +75,7 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 			currentNode,
 			h.config.EfConstruction,
 			level,
-			levelMaxLinks(h.config.M, level),
+			levelConstructionMaxLinks(h.config.M, level),
 			scratch,
 			queryState,
 		)
@@ -173,7 +173,7 @@ func (h *Index) appendFallbackEntryPoint(dst []util.Candidate, searchVector []fl
 // Legacy method for backward compatibility - delegates to optimized version
 func (h *Index) selectNeighborsHeuristic(queryVector []float32, candidates []*util.Candidate, level int) []*util.Candidate {
 	if h.neighborSelector == nil {
-		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
+		h.neighborSelector = NewNeighborSelector(h.config.M, level0LinkMultiplier)
 	}
 	return h.neighborSelector.SelectNeighborsOptimized(queryVector, candidates, level, h)
 }
@@ -193,9 +193,6 @@ func (h *Index) connectBidirectional(nodeID uint32, neighbors []*util.Candidate,
 		if neighborNode != nil && level < (neighborNode.Level+1) {
 			h.appendWithSpinlock(neighborNode, neighborNode.Backlinks[level], nodeID, h.config.M, level)
 		}
-	}
-	if node != nil && level < (node.Level+1) {
-		atomic.StoreUint32(&node.LinkHeuristic[level], atomic.LoadUint32(&node.LinkCounts[level]))
 	}
 
 	for _, neighbor := range neighbors {
@@ -234,6 +231,9 @@ func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []u
 			h.appendWithSpinlock(neighborNode, neighborNode.Backlinks[level], nodeID, h.config.M, level)
 		}
 	}
+	if node != nil && level < (node.Level+1) {
+		atomic.StoreUint32(&node.LinkHeuristic[level], atomic.LoadUint32(&node.LinkCounts[level]))
+	}
 
 	for _, neighbor := range neighbors {
 		if int(neighbor.ID) >= h.nodes.Len() {
@@ -256,7 +256,7 @@ func (h *Index) connectBidirectionalOptimizedValues(nodeID uint32, neighbors []u
 // pruneNeighborConnectionsOptimized ensures neighbors don't exceed maxM connections using optimized algorithm
 func (h *Index) pruneNeighborConnectionsOptimized(neighbors []*util.Candidate, level int) {
 	if h.neighborSelector == nil {
-		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
+		h.neighborSelector = NewNeighborSelector(h.config.M, level0LinkMultiplier)
 	}
 
 	pruneThreshold := linkArrayCapacity(h.config.M, level) - 1
@@ -277,7 +277,7 @@ func (h *Index) pruneNeighborConnectionsOptimized(neighbors []*util.Candidate, l
 
 func (h *Index) pruneNeighborConnectionsOptimizedValues(neighbors []util.Candidate, level int) {
 	if h.neighborSelector == nil {
-		h.neighborSelector = NewNeighborSelector(h.config.M, 2.0)
+		h.neighborSelector = NewNeighborSelector(h.config.M, level0LinkMultiplier)
 	}
 
 	pruneThreshold := linkArrayCapacity(h.config.M, level) - 1
@@ -306,6 +306,13 @@ func levelMaxLinks(base int, level int) int {
 		return base * 2
 	}
 	return base
+}
+
+func levelConstructionMaxLinks(base int, level int) int {
+	if level == 0 {
+		return linkArrayCapacity(base, level)
+	}
+	return levelMaxLinks(base, level)
 }
 
 func levelOverflowSlack(maxLinks int) int {
