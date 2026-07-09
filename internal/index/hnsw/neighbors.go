@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/libravdb/internal/util/simd"
 	"github.com/xDarkicex/memory"
 )
 
@@ -233,6 +234,13 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 		selectedVectors = make([][]float32, 0, maxM)
 	}
 
+	usePtrNEON := index.useHeuristicPtrNEON()
+	var selectedPtrBuf [128]unsafe.Pointer
+	selectedPtrs := selectedPtrBuf[:0]
+	if maxM > len(selectedPtrBuf) {
+		selectedPtrs = make([]unsafe.Pointer, 0, maxM)
+	}
+
 	var picked [512]uint64
 	setPicked := func(idx int) {
 		if idx < len(picked)*64 {
@@ -249,36 +257,34 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 	selected = append(selected, candidates[0])
 	setPicked(0)
 
-	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
+	if vector, ptr, ok := index.nodeVectorAndPtrForHeuristic(candidates[0].ID); ok {
 		selectedVectors = append(selectedVectors, vector)
+		selectedPtrs = append(selectedPtrs, ptr)
 	} else {
 		selectedVectors = append(selectedVectors, nil)
+		selectedPtrs = append(selectedPtrs, nil)
 	}
 
 	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
 		candidate := candidates[i]
-		shouldSelect := true
-		candidateVector, ok := index.nodeVectorForHeuristic(candidate.ID)
+		candidateVector, candidatePtr, ok := index.nodeVectorAndPtrForHeuristic(candidate.ID)
 		if !ok {
 			continue
 		}
 
-		for j := 0; j < len(selected); j++ {
-			selectedVector := selectedVectors[j]
-			if selectedVector == nil {
-				continue
-			}
-			distToSelected := index.distance(candidateVector, selectedVector)
-			if distToSelected < candidate.Distance {
-				shouldSelect = false
-				break
-			}
-		}
+		shouldSelect := !index.rejectBySelectedHeuristic(
+			candidateVector,
+			selectedVectors,
+			selectedPtrs,
+			candidate.Distance,
+			usePtrNEON,
+		)
 
 		if shouldSelect {
 			selected = append(selected, candidate)
 			setPicked(i)
 			selectedVectors = append(selectedVectors, candidateVector)
+			selectedPtrs = append(selectedPtrs, candidatePtr)
 		}
 	}
 
@@ -291,6 +297,62 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 
 	copy(candidates, selected)
 	return candidates[:len(selected)]
+}
+
+func (h *Index) useHeuristicPtrNEON() bool {
+	return runtime.GOARCH == "arm64" &&
+		h.config != nil &&
+		h.config.Metric == util.L2Distance &&
+		h.quantizer == nil &&
+		h.provider == nil
+}
+
+func (h *Index) rejectBySelectedHeuristic(
+	candidateVector []float32,
+	selectedVectors [][]float32,
+	selectedPtrs []unsafe.Pointer,
+	cutoff float32,
+	usePtrNEON bool,
+) bool {
+	if usePtrNEON && len(selectedPtrs) == len(selectedVectors) {
+		j := 0
+		for j+3 < len(selectedPtrs) {
+			p0 := selectedPtrs[j]
+			p1 := selectedPtrs[j+1]
+			p2 := selectedPtrs[j+2]
+			p3 := selectedPtrs[j+3]
+			if p0 != nil && p1 != nil && p2 != nil && p3 != nil {
+				d0, d1, d2, d3 := simd.L2Distance4PtrNEON(candidateVector, p0, p1, p2, p3)
+				if d0 < cutoff || d1 < cutoff || d2 < cutoff || d3 < cutoff {
+					return true
+				}
+				j += 4
+				continue
+			}
+			selectedVector := selectedVectors[j]
+			if selectedVector != nil && h.distance(candidateVector, selectedVector) < cutoff {
+				return true
+			}
+			j++
+		}
+		for ; j < len(selectedVectors); j++ {
+			selectedVector := selectedVectors[j]
+			if selectedVector != nil && h.distance(candidateVector, selectedVector) < cutoff {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, selectedVector := range selectedVectors {
+		if selectedVector == nil {
+			continue
+		}
+		if h.distance(candidateVector, selectedVector) < cutoff {
+			return true
+		}
+	}
+	return false
 }
 
 // PruneConnections optimizes the connections of a node to maintain graph quality
@@ -685,16 +747,28 @@ func uint32SliceContains(values []uint32, id uint32) bool {
 }
 
 func (h *Index) nodeVectorForHeuristic(nodeID uint32) ([]float32, bool) {
+	vector, _, ok := h.nodeVectorAndPtrForHeuristic(nodeID)
+	return vector, ok
+}
+
+func (h *Index) nodeVectorAndPtrForHeuristic(nodeID uint32) ([]float32, unsafe.Pointer, bool) {
 	if int(nodeID) >= h.nodes.Len() {
-		return nil, false
+		return nil, nil, false
 	}
 	node := h.nodes.Get(nodeID)
 	if node == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	if node.Vector != nil {
-		return node.Vector, true
+		return node.Vector, node.VectorPtr, true
 	}
 	vector, err := h.getNodeVector(node)
-	return vector, err == nil && vector != nil
+	if err != nil || vector == nil {
+		return nil, nil, false
+	}
+	var ptr unsafe.Pointer
+	if len(vector) > 0 {
+		ptr = unsafe.Pointer(&vector[0])
+	}
+	return vector, ptr, true
 }
