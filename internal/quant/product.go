@@ -74,7 +74,7 @@ func (pq *ProductQuantizer) Configure(config *QuantizationConfig) error {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 16)
 	if err != nil {
 		return fmt.Errorf("failed to init compressedSFL: %w", err)
 	}
@@ -133,7 +133,7 @@ func (pq *ProductQuantizer) Train(ctx context.Context, vectors [][]float32) erro
 		SlabSize:  2 * 1024 * 1024,  // 2MB slabs
 		SlabCount: 4,
 		Prealloc:  false,
-	})
+	}, 64)
 	if err != nil {
 		return fmt.Errorf("failed to create memory pool for kmeans: %w", err)
 	}

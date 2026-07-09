@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/memory"
@@ -103,6 +104,7 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 		c.M = m
 		c.EfConstruction = efConstruction
 		c.EfSearch = efSearch
+		c.ML = 1.0 / math.Log(float64(m))
 		return nil
 	}
 }
@@ -123,6 +125,19 @@ func WithRawVectorStoreSlabby(segmentCapacity int) CollectionOption {
 		}
 		c.RawVectorStore = "slabby"
 		c.RawStoreCap = segmentCapacity
+		return nil
+	}
+}
+
+// WithIDMapCapacity pre-sizes the HNSW external-ID map for the expected
+// collection cardinality. Larger values reduce hashmap resize churn and cold
+// mmap page faults during high-throughput inserts with user-provided IDs.
+func WithIDMapCapacity(capacity int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if capacity <= 0 {
+			return fmt.Errorf("ID map capacity must be positive")
+		}
+		c.IDMapCapacity = capacity
 		return nil
 	}
 }
@@ -202,6 +217,26 @@ func WithScalarQuantization(bits int, trainRatio float64) CollectionOption {
 		}
 		if err := config.Validate(); err != nil {
 			return fmt.Errorf("invalid scalar quantization config: %w", err)
+		}
+		c.Quantization = config
+		return nil
+	}
+}
+
+// WithFSQQuantization enables codebook-free Finite Scalar Quantization.
+// levels is optional; when omitted, a uniform 2^bits level count is used.
+func WithFSQQuantization(bits int, trainRatio float64, levels ...int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		config := &quant.QuantizationConfig{
+			Type:       quant.FiniteScalarQuantization,
+			Bits:       bits,
+			TrainRatio: trainRatio,
+		}
+		if len(levels) > 0 {
+			config.Levels = append([]int(nil), levels...)
+		}
+		if err := config.Validate(); err != nil {
+			return fmt.Errorf("invalid FSQ config: %w", err)
 		}
 		c.Quantization = config
 		return nil

@@ -65,6 +65,7 @@ func Migrate(ctx context.Context, path string) error {
 				c.Version = config.Version
 				c.RawVectorStore = config.RawVectorStore
 				c.RawStoreCap = config.RawStoreCap
+				c.IDMapCapacity = config.IDMapCapacity
 				return nil
 			})
 			if err != nil {
@@ -102,7 +103,6 @@ func Migrate(ctx context.Context, path string) error {
 			return err
 		}
 	}
-
 
 	if err := v2DB.Close(); err != nil {
 		return fmt.Errorf("failed to close v2 database: %w", err)

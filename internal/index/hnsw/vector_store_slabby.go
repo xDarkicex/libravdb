@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/xDarkicex/memory"
@@ -15,18 +16,19 @@ const (
 	userDataOffset               = 48
 )
 
-type slabbySlot struct {
+type slabbyRawVectorSlot struct {
 	slot   []byte
-	active bool
+	active atomic.Bool
 }
 
 type SlabbyRawVectorStore struct {
 	sfl             *memory.ShardedFreeList
-	slots           []slabbySlot
+	slots           rawSlotArray[slabbyRawVectorSlot]
 	dim             int
 	bytesPerVector  int
 	segmentCapacity int
-	activeCount     int
+	activeCount     atomic.Int32
+	nextSlot        atomic.Uint32
 }
 
 func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, error) {
@@ -45,7 +47,7 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 16,
-	}, 64)
+	}, 64, 16)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memory pool for slabby store: %w", err)
 	}
@@ -55,7 +57,6 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		bytesPerVector:  bytesPerVector,
 		segmentCapacity: segmentCapacity,
 		sfl:             sfl,
-		slots:           make([]slabbySlot, 0),
 	}
 	return store, nil
 }
@@ -71,16 +72,18 @@ func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
 	}
 
 	writeVectorBytes(slot[userDataOffset:], vec)
-	s.slots = append(s.slots, slabbySlot{
-		slot:   slot,
-		active: true,
-	})
-	s.activeCount++
-	slotIndex := len(s.slots) - 1
+	slotIndex := s.nextSlot.Add(1) - 1
+	descriptor := &slabbyRawVectorSlot{slot: slot}
+	descriptor.active.Store(true)
+	if err := s.slots.Store(slotIndex, descriptor); err != nil {
+		_ = s.sfl.Retire(slot)
+		return VectorRef{}, err
+	}
+	s.activeCount.Add(1)
 
 	return VectorRef{
 		Kind:  VectorEncodingRaw,
-		Slot:  uint32(slotIndex),
+		Slot:  slotIndex,
 		Bytes: uint32(s.bytesPerVector),
 		Valid: true,
 	}, nil
@@ -90,11 +93,11 @@ func (s *SlabbyRawVectorStore) Get(ref VectorRef) ([]float32, error) {
 	if !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil, fmt.Errorf("invalid raw vector reference")
 	}
-	if int(ref.Slot) >= len(s.slots) {
+	slot := s.slots.Load(ref.Slot)
+	if slot == nil {
 		return nil, fmt.Errorf("raw vector slot out of range: %d", ref.Slot)
 	}
-	slot := s.slots[ref.Slot]
-	if !slot.active {
+	if !slot.active.Load() || slot.slot == nil {
 		return nil, fmt.Errorf("raw vector slot %d is inactive", ref.Slot)
 	}
 	return bytesAsFloat32View(slot.slot[userDataOffset:], s.dim), nil
@@ -104,19 +107,15 @@ func (s *SlabbyRawVectorStore) Delete(ref VectorRef) error {
 	if !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil
 	}
-	if int(ref.Slot) >= len(s.slots) {
+	slot := s.slots.Load(ref.Slot)
+	if slot == nil {
 		return nil
 	}
-	slot := &s.slots[ref.Slot]
-	if !slot.active {
-		return nil
+	if slot.active.CompareAndSwap(true, false) {
+		// Do not retire the slab here. Lock-free readers may already hold a
+		// slice view into this slot; safe reuse requires epoch reclamation.
+		s.activeCount.Add(-1)
 	}
-	if err := s.sfl.Retire(slot.slot); err != nil {
-		return fmt.Errorf("failed to retire vector slot: %w", err)
-	}
-	slot.active = false
-	slot.slot = nil
-	s.activeCount--
 	return nil
 }
 
@@ -124,8 +123,9 @@ func (s *SlabbyRawVectorStore) Reset() error {
 	if s.sfl != nil {
 		s.sfl.Reset()
 	}
-	s.slots = nil
-	s.activeCount = 0
+	s.slots.Reset()
+	s.activeCount.Store(0)
+	s.nextSlot.Store(0)
 	return nil
 }
 
@@ -147,7 +147,7 @@ func (s *SlabbyRawVectorStore) MemoryUsage() int64 {
 func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
 	profile := RawVectorStoreProfile{
 		Backend:        RawVectorStoreSlabby,
-		VectorCount:    s.activeCount,
+		VectorCount:    int(s.activeCount.Load()),
 		Dimension:      s.dim,
 		BytesPerVector: s.bytesPerVector,
 	}

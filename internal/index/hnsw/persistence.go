@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -26,8 +27,6 @@ var HNSWMagicBytes = []byte("LIBRAHNS")
 
 // Core serialization functions
 func (h *Index) saveToDiskImpl(ctx context.Context, path string) error {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 	return h.saveToDiskWithoutLock(ctx, path)
 }
 
@@ -182,20 +181,20 @@ func (h *Index) writeConfig(writer io.Writer) error {
 
 func (h *Index) writeNodes(writer io.Writer) error {
 	// Write total node count
-	nodeCount := uint32(len(h.nodes))
+	nodeCount := uint32(h.nodes.Len())
 	if err := binary.Write(writer, binary.LittleEndian, nodeCount); err != nil {
 		return err
 	}
 
 	// Write nodes in chunks for memory efficiency
-	for i := 0; i < len(h.nodes); i += ChunkSize {
+	for i := 0; i < h.nodes.Len(); i += ChunkSize {
 		end := i + ChunkSize
-		if end > len(h.nodes) {
-			end = len(h.nodes)
+		if end > h.nodes.Len() {
+			end = h.nodes.Len()
 		}
 
 		for j := i; j < end; j++ {
-			node := h.nodes[j]
+			node := h.nodes.Get(uint32(j))
 			if node == nil {
 				// Write marker for nil node
 				if err := binary.Write(writer, binary.LittleEndian, uint8(0)); err != nil {
@@ -213,7 +212,7 @@ func (h *Index) writeNodes(writer io.Writer) error {
 				return err
 			}
 
-			idBytes := []byte(h.ordinalToID[node.Ordinal])
+			idBytes := []byte(h.ordinalToID.Get(node.Ordinal))
 			if err := binary.Write(writer, binary.LittleEndian, uint32(len(idBytes))); err != nil {
 				return err
 			}
@@ -250,8 +249,12 @@ func (h *Index) writeNodes(writer io.Writer) error {
 func (h *Index) writeLinks(writer io.Writer) error {
 	// Count nodes with links
 	nodeCount := 0
-	for _, node := range h.nodes {
-		if node != nil && len(node.Links) > 0 {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
+		if node != nil && (node.Level+1) > 0 {
 			nodeCount++
 		}
 	}
@@ -262,8 +265,12 @@ func (h *Index) writeLinks(writer io.Writer) error {
 	}
 
 	// Write links for each node
-	for i, node := range h.nodes {
-		if node == nil || len(node.Links) == 0 {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
+		if node == nil || (node.Level+1) == 0 {
 			continue
 		}
 
@@ -273,12 +280,13 @@ func (h *Index) writeLinks(writer io.Writer) error {
 		}
 
 		// Write number of levels
-		if err := binary.Write(writer, binary.LittleEndian, uint32(len(node.Links))); err != nil {
+		if err := binary.Write(writer, binary.LittleEndian, uint32((node.Level + 1))); err != nil {
 			return err
 		}
 
 		// Write each level's connections
-		for level, connections := range node.Links {
+		for level := 0; level <= node.Level; level++ {
+			connections := h.getNodeLinks(node, level)
 			if err := binary.Write(writer, binary.LittleEndian, uint32(level)); err != nil {
 				return err
 			}
@@ -299,11 +307,11 @@ func (h *Index) writeLinks(writer io.Writer) error {
 
 func (h *Index) writeMetadata(writer io.Writer) error {
 	// Write entry point
-	if h.entryPoint != nil {
+	if h.getEntryPoint() != nil {
 		if err := binary.Write(writer, binary.LittleEndian, uint8(1)); err != nil {
 			return err
 		}
-		if err := binary.Write(writer, binary.LittleEndian, h.entryPoint.Ordinal); err != nil {
+		if err := binary.Write(writer, binary.LittleEndian, h.getEntryPoint().Ordinal); err != nil {
 			return err
 		}
 	} else {
@@ -323,7 +331,7 @@ func (h *Index) calculateCRC32() uint32 {
 	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.M))
 	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.EfConstruction))
 	_ = binary.Write(crc, binary.LittleEndian, uint32(h.config.Dimension))
-	_ = binary.Write(crc, binary.LittleEndian, uint32(len(h.nodes)))
+	_ = binary.Write(crc, binary.LittleEndian, uint32(h.nodes.Len()))
 
 	return crc.Sum32()
 }
@@ -470,7 +478,7 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 	}
 
 	// Initialize nodes slice
-	h.nodes = make([]*Node, nodeCount)
+	// h.nodes = newSegmentedNodeArray() handled
 
 	// Use the scratch arena for temporary per-node buffers (id bytes, vector
 	// data) so deserialization doesn't allocate on the Go heap.
@@ -498,7 +506,7 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 
 		if marker == 0 {
 			// Nil node
-			h.nodes[i] = nil
+			// nil removed
 			continue
 		}
 
@@ -551,6 +559,7 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 		node := &Node{
 			Ordinal: ordinal,
 			Level:   int(level),
+			Slot:    SentinelNodeID,
 		}
 		if h.rawVectorStore != nil {
 			ref, err := h.rawVectorStore.Put(vector)
@@ -558,17 +567,16 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 				return fmt.Errorf("failed to restore raw vector into store: %w", err)
 			}
 			node.Slot = ref.Slot
+			if vec, err := h.rawVectorStore.Get(ref); err == nil {
+				node.setVector(vec)
+			}
 		}
-		if int(ordinal) >= len(h.nodes) {
-			newCap := nextNodeCapacity(len(h.nodes), int(ordinal)+1)
-			grown := make([]*Node, int(ordinal)+1, newCap)
-			copy(grown, h.nodes)
-			h.nodes = grown
-		}
-		h.nodes[ordinal] = node
+
+		h.nodes.Set(ordinal, node)
 		if nodeID != "" {
-			h.idToIndex[nodeID] = ordinal
-			h.ordinalToID[ordinal] = nodeID
+			node := h.nodes.Get(ordinal)
+			h.idToIndex.Put(hashID(nodeID), node)
+			h.ordinalToID.Set(ordinal, nodeID)
 		}
 
 		// Reset the arena after each node to prevent exhaustion on large files
@@ -602,11 +610,11 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 		}
 
 		// Validate node index
-		if int(nodeIndex) >= len(h.nodes) || h.nodes[nodeIndex] == nil {
+		if int(nodeIndex) >= h.nodes.Len() || h.nodes.Get(nodeIndex) == nil {
 			return fmt.Errorf("invalid node index: %d", nodeIndex)
 		}
 
-		node := h.nodes[nodeIndex]
+		node := h.nodes.Get(nodeIndex)
 
 		// Read number of levels
 		var levelCount uint32
@@ -616,9 +624,7 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 
 		// Initialize links for this node. Allocate from SFL (not Go heap)
 		// so freeNodeLinks can safely deallocate them during Delete.
-		node.Links = make([][]uint32, levelCount)
-
-		// Read each level's connections
+		node.Links, node.Backlinks = h.newNodeArrays(node.Level, h.config.M)
 		for j := uint32(0); j < levelCount; j++ {
 			var level uint32
 			if err := binary.Read(reader, binary.LittleEndian, &level); err != nil {
@@ -630,36 +636,26 @@ func (h *Index) readLinks(ctx context.Context, reader io.Reader) error {
 				return err
 			}
 
-			// Use the same SFL allocation as newNodeLinks: level 0 uses
-			// link0SFL (larger slot for 2×M connections), higher levels
-			// use linkSFL.
-			var slot []byte
-			var slotErr error
-			if level == 0 {
-				slot, slotErr = h.link0SFL.Allocate()
-			} else {
-				slot, slotErr = h.linkSFL.Allocate()
-			}
-			if slotErr != nil {
-				return fmt.Errorf("sfl allocate links for node %d level %d: %w", nodeIndex, level, slotErr)
-			}
-
-			// Data starts after SFLMetadataOverhead. Capacity matches what
-			// newNodeLinks configures (capacity + slack).
-			maxCap := (len(slot) - SFLMetadataOverhead) / 4
-			if uint32(maxCap) < connectionCount {
-				return fmt.Errorf("sfl slot too small for node %d level %d: need %d, have %d",
-					nodeIndex, level, connectionCount, maxCap)
-			}
-			connections := unsafe.Slice((*uint32)(unsafe.Pointer(&slot[SFLMetadataOverhead])), maxCap)[:connectionCount]
-			for k := uint32(0); k < connectionCount; k++ {
-				if err := binary.Read(reader, binary.LittleEndian, &connections[k]); err != nil {
-					return err
+			if int(level) < (node.Level + 1) {
+				maxCount := uint32(linkArrayCapacity(h.config.M, int(level)))
+				if connectionCount > maxCount {
+					return fmt.Errorf("connection count %d exceeds level %d capacity %d", connectionCount, level, maxCount)
 				}
-			}
-
-			if int(level) < len(node.Links) {
-				node.Links[level] = connections
+				destSlice := unsafe.Slice(node.Links[level], int(maxCount))
+				for k := uint32(0); k < connectionCount; k++ {
+					if err := binary.Read(reader, binary.LittleEndian, &destSlice[k]); err != nil {
+						return err
+					}
+				}
+				atomic.StoreUint32(&node.LinkCounts[level], connectionCount)
+			} else {
+				// Skip the bytes if the level is invalid, to keep reader in sync
+				for k := uint32(0); k < connectionCount; k++ {
+					var dummy uint32
+					if err := binary.Read(reader, binary.LittleEndian, &dummy); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
@@ -679,8 +675,8 @@ func (h *Index) readMetadata(reader io.Reader) error {
 		if err := binary.Read(reader, binary.LittleEndian, &entryPointOrdinal); err != nil {
 			return err
 		}
-		if int(entryPointOrdinal) < len(h.nodes) {
-			h.entryPoint = h.nodes[entryPointOrdinal]
+		if int(entryPointOrdinal) < h.nodes.Len() {
+			h.setEntryPoint(h.nodes.Get(entryPointOrdinal))
 		}
 	}
 
@@ -690,49 +686,47 @@ func (h *Index) readMetadata(reader io.Reader) error {
 // rebuildIndexState reconstructs internal state after loading from disk
 func (h *Index) rebuildIndexState() error {
 	// Reset state
-	h.size = 0
-	h.nextOrdinal = 0
-	h.maxLevel = 0
-	h.idToIndex = make(map[string]uint32)
-	h.entryPoint = nil
+	h.size.Store(0)
+	h.nextOrdinal.Store(0)
+	/* maxLevel handled by globalState */
+	h.setEntryPoint(nil)
 
 	// Rebuild state from loaded nodes
-	for i, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
 		if node != nil {
-			h.size++
-			if h.provider == nil && node.Ordinal >= h.nextOrdinal {
-				h.nextOrdinal = node.Ordinal + 1
+			h.size.Add(1)
+			if h.provider == nil && node.Ordinal >= h.nextOrdinal.Load() {
+				h.nextOrdinal.Store(node.Ordinal + 1)
 			}
-			if id, ok := h.ordinalToID[uint32(i)]; ok && id != "" {
-				h.idToIndex[id] = uint32(i)
-			}
-
-			// Update max level
-			if node.Level > h.maxLevel {
-				h.maxLevel = node.Level
-			}
+			// Note: idToIndex and ordinalToID are already populated during readNodes
 
 			// Set entry point (highest level node, or first high-level node found)
-			if h.entryPoint == nil || node.Level > h.entryPoint.Level {
-				h.entryPoint = node
+			if h.getEntryPoint() == nil || node.Level > h.getEntryPoint().Level {
+				h.setEntryPoint(node)
 			}
 		}
 	}
 
 	// Rebuild Backlinks
-	for _, node := range h.nodes {
-		if node != nil {
-			node.Backlinks = make([][]uint32, len(node.Links))
+	// We no longer clear Backlinks since newNodeArrays already sets them to SentinelNodeID
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
 		}
-	}
-	for i, node := range h.nodes {
 		if node != nil {
-			for level, links := range node.Links {
+			for level := 0; level <= node.Level; level++ {
+				links := h.getNodeLinks(node, level)
 				for _, linkID := range links {
-					if int(linkID) < len(h.nodes) {
-						linkNode := h.nodes[linkID]
-						if linkNode != nil && level < len(linkNode.Backlinks) {
-							linkNode.Backlinks[level] = append(linkNode.Backlinks[level], uint32(i))
+					if int(linkID) < h.nodes.Len() {
+						linkNode := h.nodes.Get(linkID)
+						if linkNode != nil && level < (linkNode.Level+1) {
+							// Lock-free append to backlink
+							h.appendWithSpinlock(linkNode, linkNode.Backlinks[level], uint32(i), h.config.M, level)
 						}
 					}
 				}

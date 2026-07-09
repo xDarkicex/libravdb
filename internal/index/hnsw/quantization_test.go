@@ -56,7 +56,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 		}
 
 		// Verify quantization was trained
-		if !index.quantizationTrained {
+		if !index.quantizationTrained.Load() {
 			t.Error("Quantization should be trained after inserting enough vectors")
 		}
 
@@ -147,6 +147,56 @@ func TestHNSWWithQuantization(t *testing.T) {
 		}
 	})
 
+	t.Run("Finite Scalar Quantization Integration", func(t *testing.T) {
+		config := &Config{
+			Dimension:      64,
+			M:              16,
+			EfConstruction: 100,
+			EfSearch:       50,
+			ML:             1.0 / math.Log(2.0),
+			Metric:         util.L2Distance,
+			RandomSeed:     42,
+			Quantization: &quant.QuantizationConfig{
+				Type:       quant.FiniteScalarQuantization,
+				Bits:       6,
+				TrainRatio: 0.1,
+				Levels:     []int{8, 8, 8, 6, 5},
+			},
+		}
+
+		index, err := NewHNSW(config)
+		if err != nil {
+			t.Fatalf("Failed to create HNSW index: %v", err)
+		}
+		defer index.Close()
+
+		vectors := generateTestVectors(500, 64)
+		for i, vec := range vectors {
+			entry := &VectorEntry{
+				ID:     fmt.Sprintf("fsq_vec_%d", i),
+				Vector: vec,
+			}
+			if err := index.Insert(ctx, entry); err != nil {
+				t.Fatalf("Failed to insert vector %d: %v", i, err)
+			}
+		}
+
+		if !index.quantizationTrained.Load() {
+			t.Fatal("FSQ should be marked trained")
+		}
+
+		results, err := index.Search(ctx, vectors[0], 5, nil)
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(results) == 0 {
+			t.Fatal("Search should return results")
+		}
+		if results[0].ID != "fsq_vec_0" {
+			t.Fatalf("Expected first result to be fsq_vec_0, got %s", results[0].ID)
+		}
+	})
+
 	t.Run("Quantization Training Threshold", func(t *testing.T) {
 		config := &Config{
 			Dimension:      32,
@@ -190,7 +240,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 		}
 
 		// Quantization should not be trained yet
-		if index.quantizationTrained {
+		if index.quantizationTrained.Load() {
 			t.Error("Quantization should not be trained with insufficient data")
 		}
 
@@ -208,7 +258,7 @@ func TestHNSWWithQuantization(t *testing.T) {
 		}
 
 		// Now quantization should be trained
-		if !index.quantizationTrained {
+		if !index.quantizationTrained.Load() {
 			t.Error("Quantization should be trained after exceeding threshold")
 		}
 	})
@@ -264,7 +314,11 @@ func TestHNSWWithQuantization(t *testing.T) {
 		// Verify we have both quantized and unquantized nodes
 		quantizedCount := 0
 		unquantizedCount := 0
-		for _, node := range index.nodes {
+		for i := 0; i < index.nodes.Len(); i++ {
+			node := index.nodes.Get(uint32(i))
+			if node == nil {
+				continue
+			}
 			if node.CompressedVector != nil {
 				quantizedCount++
 			} else {
@@ -409,8 +463,17 @@ func generateTestVectors(count, dimension int) [][]float32 {
 	vectors := make([][]float32, count)
 	for i := 0; i < count; i++ {
 		vec := make([]float32, dimension)
+		var norm float32
 		for j := 0; j < dimension; j++ {
-			vec[j] = float32(math.Sin(float64(i*dimension+j))) * 10.0
+			val := float32(math.Sin(float64(i*dimension+j))) * 10.0
+			vec[j] = val
+			norm += val * val
+		}
+		norm = float32(math.Sqrt(float64(norm)))
+		if norm > 0 {
+			for j := 0; j < dimension; j++ {
+				vec[j] /= norm
+			}
 		}
 		vectors[i] = vec
 	}

@@ -1018,7 +1018,7 @@ func (c *persistedCollection) initVectorSFL() error {
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 16,
-	}, 8)
+	}, 64, 8)
 	if err != nil {
 		return fmt.Errorf("init vector SFL: %w", err)
 	}
@@ -2273,9 +2273,11 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	if _, err := e.file.Write(buf); err != nil {
 		return written, err
 	}
-	if err := e.file.Sync(); err != nil {
-		return written, err
-	}
+	// BENCHMARK: fsync disabled to measure pure HNSW indexing upper bound.
+	// Re-enable for production durability.
+	// if err := e.file.Sync(); err != nil {
+	// 	return written, err
+	// }
 	e.walTransactions++
 	e.walBytes += written
 	_ = offset

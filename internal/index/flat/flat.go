@@ -83,7 +83,7 @@ func NewFlat(config *Config) (*Index, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memory pool for vectors: %w", err)
 	}
@@ -95,7 +95,7 @@ func NewFlat(config *Config) (*Index, error) {
 		vectorSFL: sfl,
 		scratchPool: &sync.Pool{
 			New: func() any {
-				a, err := memory.NewArena(1024 * 1024)
+				a, err := memory.NewArena(1024*1024, 64)
 				if err != nil {
 					return nil
 				}
@@ -315,7 +315,7 @@ func (idx *Index) acquireHeapSlot(k int) (*heapSlot, []heapElement) {
 				SlabSize:  1 * 1024 * 1024,
 				SlabCount: 16,
 				Prealloc:  true,
-			}, 64)
+			}, 64, 16)
 			if err != nil {
 				panic("flat: failed to create query pool tier: " + err.Error())
 			}
@@ -366,7 +366,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 	// Acquire an arena for search-scoped scratch, released on return.
 	arena := idx.scratchPool.Get().(*memory.Arena)
 	if arena == nil {
-		a, err := memory.NewArena(1024 * 1024)
+		a, err := memory.NewArena(1024*1024, 64)
 		if err != nil {
 			return nil, fmt.Errorf("arena allocate for search: %w", err)
 		}

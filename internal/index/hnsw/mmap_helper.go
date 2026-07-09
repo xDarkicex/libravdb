@@ -19,7 +19,8 @@ func (h *Index) createMmapRawVectorStore(mmapPath string) (*MmapRawVectorStore, 
 	bytesPerVector := h.config.Dimension * 4
 	active := 0
 
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
 		if node == nil {
 			// Write zeros for empty slots to maintain O(1) alignment
 			zeros := make([]byte, bytesPerVector)
@@ -73,7 +74,8 @@ func (h *Index) createMmapCompressedVectorStore(mmapPath string) (*internalmemor
 	}
 	bytesPerVector := numCodebooks // For typical PQ where 1 codebook = 1 byte
 
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
 		if node == nil || node.CompressedVector == nil {
 			zeros := make([]byte, bytesPerVector)
 			if _, err := file.Write(zeros); err != nil {
@@ -99,7 +101,8 @@ func (h *Index) createMmapCompressedVectorStore(mmapPath string) (*internalmemor
 
 	// Slice into mmap data
 	data := mmap.Data()
-	for i, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
 		if node != nil && node.CompressedVector != nil {
 			offset := int64(i) * int64(bytesPerVector)
 			node.CompressedVector = data[offset : offset+int64(bytesPerVector)]

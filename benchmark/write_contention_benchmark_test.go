@@ -84,6 +84,7 @@ func benchShardedInsertBatch(tb testing.TB, ctx context.Context, dim, totalVecto
 
 	coll, err := db.CreateCollection(ctx, "bench",
 		libravdb.WithDimension(dim),
+		libravdb.WithMetric(libravdb.L2Distance),
 		libravdb.WithHNSW(16, 100, 50),
 	)
 	if err != nil {
@@ -174,6 +175,7 @@ func benchConcurrentDirectInsert(tb testing.TB, ctx context.Context, dim, totalV
 
 	coll, err := db.CreateCollection(ctx, "bench",
 		libravdb.WithDimension(dim),
+		libravdb.WithMetric(libravdb.L2Distance),
 		libravdb.WithFlat(),
 	)
 	if err != nil {

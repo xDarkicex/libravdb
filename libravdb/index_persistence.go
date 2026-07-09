@@ -99,11 +99,12 @@ func (b *indexPersistenceBridge) RebuildIndex(collectionName string, config *sto
 	}
 
 	if len(entries) > 0 {
-		if err := prepareIndexForEntries(context.Background(), idx, entries); err != nil {
+		metric := DistanceMetric(config.Metric)
+		if err := prepareIndexForEntries(context.Background(), idx, metric, entries); err != nil {
 			idx.Close()
 			return fmt.Errorf("rebuild: prepare entries for %s: %w", collectionName, err)
 		}
-		if err := insertEntriesIntoIndex(context.Background(), idx, entries); err != nil {
+		if err := insertEntriesIntoIndex(context.Background(), idx, metric, entries); err != nil {
 			idx.Close()
 			return fmt.Errorf("rebuild: insert entries for %s: %w", collectionName, err)
 		}
@@ -178,6 +179,7 @@ func (b *indexPersistenceBridge) createIndexFromEngineConfig(config *storage.Col
 		NProbes:        config.NProbes,
 		RawVectorStore: config.RawVectorStore,
 		RawStoreCap:    config.RawStoreCap,
+		IDMapCapacity:  config.IDMapCapacity,
 	}
 	return createIndexForCollection(libraConfig, nil)
 }

@@ -98,7 +98,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 32,
 		Prealloc:  false,
-	}, cfg.EdgeShards)
+	}, 64, cfg.EdgeShards)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 32,
 		Prealloc:  false,
-	}, cfg.PageShards)
+	}, 64, cfg.PageShards)
 	if err != nil {
 		edgePool.Free()
 		return nil, err
@@ -121,7 +121,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		SlabSize:  uint64(cfg.BitsetPoolSize * 131072),
 		SlabCount: 2,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 64)
 	if err != nil {
 		edgePool.Free()
 		pagePool.Free()
@@ -134,7 +134,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		SlabSize:  uint64(cfg.FrontierPoolSize * 65536),
 		SlabCount: 2,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 64)
 	if err != nil {
 		edgePool.Free()
 		pagePool.Free()

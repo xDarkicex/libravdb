@@ -24,6 +24,7 @@ type CollectionConfig struct {
 	ML             float64
 	Version        int
 	RawStoreCap    int
+	IDMapCapacity  int
 }
 
 // Engine defines the storage engine interface

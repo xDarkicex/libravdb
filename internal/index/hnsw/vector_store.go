@@ -1,6 +1,11 @@
 package hnsw
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+
+	"github.com/xDarkicex/memory"
+)
 
 type VectorEncoding uint8
 
@@ -43,16 +48,27 @@ type RawVectorStore interface {
 }
 
 type InMemoryRawVectorStore struct {
-	vectors [][]float32
-	dim     int
-	bytes   int64
-	active  int
+	pool     *memory.Pool
+	slots    rawSlotArray[inMemoryRawVectorSlot]
+	dim      int
+	bytes    atomic.Int64
+	active   atomic.Int32
+	nextSlot atomic.Uint32
+}
+
+type inMemoryRawVectorSlot struct {
+	vec    []float32
+	active atomic.Bool
 }
 
 func NewInMemoryRawVectorStore(dim int) *InMemoryRawVectorStore {
+	pool, err := memory.NewPool(memory.AllocatorConfig{}, 64)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create memory pool for vector store: %v", err))
+	}
 	return &InMemoryRawVectorStore{
-		dim:     dim,
-		vectors: make([][]float32, 0),
+		pool: pool,
+		dim:  dim,
 	}
 }
 
@@ -64,15 +80,25 @@ func (s *InMemoryRawVectorStore) Put(vec []float32) (VectorRef, error) {
 		return VectorRef{}, fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dim, len(vec))
 	}
 
-	stored := make([]float32, len(vec))
+	storedSlice, err := memory.PoolSlice[float32](s.pool, len(vec))
+	if err != nil {
+		return VectorRef{}, fmt.Errorf("failed to allocate aligned vector: %w", err)
+	}
+	stored := storedSlice[:len(vec)]
 	copy(stored, vec)
-	s.vectors = append(s.vectors, stored)
-	s.bytes += int64(len(stored) * 4)
-	s.active++
+
+	slotIndex := s.nextSlot.Add(1) - 1
+	slot := &inMemoryRawVectorSlot{vec: stored}
+	slot.active.Store(true)
+	if err := s.slots.Store(slotIndex, slot); err != nil {
+		return VectorRef{}, err
+	}
+	s.bytes.Add(int64(len(stored) * 4))
+	s.active.Add(1)
 
 	return VectorRef{
 		Kind:  VectorEncodingRaw,
-		Slot:  uint32(len(s.vectors) - 1),
+		Slot:  slotIndex,
 		Bytes: uint32(len(stored) * 4),
 		Valid: true,
 	}, nil
@@ -85,27 +111,27 @@ func (s *InMemoryRawVectorStore) Get(ref VectorRef) ([]float32, error) {
 	if !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil, fmt.Errorf("invalid raw vector reference")
 	}
-	if int(ref.Slot) >= len(s.vectors) {
+	slot := s.slots.Load(ref.Slot)
+	if slot == nil {
 		return nil, fmt.Errorf("raw vector slot out of range: %d", ref.Slot)
 	}
-	vec := s.vectors[ref.Slot]
-	if vec == nil {
+	if !slot.active.Load() || slot.vec == nil {
 		return nil, fmt.Errorf("raw vector slot %d is empty", ref.Slot)
 	}
-	return vec, nil
+	return slot.vec, nil
 }
 
 func (s *InMemoryRawVectorStore) Delete(ref VectorRef) error {
 	if s == nil || !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil
 	}
-	if int(ref.Slot) >= len(s.vectors) {
+	slot := s.slots.Load(ref.Slot)
+	if slot == nil {
 		return nil
 	}
-	if vec := s.vectors[ref.Slot]; vec != nil {
-		s.bytes -= int64(len(vec) * 4)
-		s.vectors[ref.Slot] = nil
-		s.active--
+	if slot.active.CompareAndSwap(true, false) {
+		s.bytes.Add(-int64(len(slot.vec) * 4))
+		s.active.Add(-1)
 	}
 	return nil
 }
@@ -114,9 +140,10 @@ func (s *InMemoryRawVectorStore) Reset() error {
 	if s == nil {
 		return nil
 	}
-	s.vectors = nil
-	s.bytes = 0
-	s.active = 0
+	s.slots.Reset()
+	s.bytes.Store(0)
+	s.active.Store(0)
+	s.nextSlot.Store(0)
 	return nil
 }
 
@@ -124,25 +151,32 @@ func (s *InMemoryRawVectorStore) MemoryUsage() int64 {
 	if s == nil {
 		return 0
 	}
-	return s.bytes
+	return s.bytes.Load()
 }
 
 func (s *InMemoryRawVectorStore) Close() error {
-	return s.Reset()
+	if err := s.Reset(); err != nil {
+		return err
+	}
+	if s.pool != nil {
+		s.pool.Free()
+	}
+	return nil
 }
 
 func (s *InMemoryRawVectorStore) Profile() RawVectorStoreProfile {
+	bytes := s.bytes.Load()
 	return RawVectorStoreProfile{
 		Backend:             RawVectorStoreMemory,
-		VectorCount:         s.active,
+		VectorCount:         int(s.active.Load()),
 		Dimension:           s.dim,
 		BytesPerVector:      s.dim * 4,
-		MemoryUsage:         s.bytes,
-		ReservedBytes:       s.bytes,
-		ReservedDataBytes:   s.bytes,
+		MemoryUsage:         bytes,
+		ReservedBytes:       bytes,
+		ReservedDataBytes:   bytes,
 		ReservedMetaBytes:   0,
 		ReservedGuardBytes:  0,
-		LiveBytes:           s.bytes,
+		LiveBytes:           bytes,
 		FreeBytes:           0,
 		CapacityUtilization: 1.0,
 	}

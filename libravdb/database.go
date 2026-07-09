@@ -107,7 +107,7 @@ func Open(opts ...Option) (*Database, error) {
 		logger:      config.Logger,
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
-				arena, err := memory.NewArena(1024 * 1024)
+				arena, err := memory.NewArena(1024*1024, 64)
 				if err != nil {
 					panic(fmt.Sprintf("failed to allocate scratch arena: %v", err))
 				}

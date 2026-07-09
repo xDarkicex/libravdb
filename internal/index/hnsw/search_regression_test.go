@@ -116,8 +116,14 @@ func TestSearchScratchResultsCorrect(t *testing.T) {
 	sort.Slice(brute, func(i, j int) bool { return brute[i].dist < brute[j].dist })
 
 	// Build a set of expected IDs for each unique distance band.
+	// Include all candidates within the K-th distance to handle ties
+	// (e.g. both vec_45 and vec_55 at distance 25 for K=10).
 	byDist := make(map[float32]map[string]bool)
-	for _, p := range brute[:k] {
+	cutoffDist := brute[k-1].dist
+	for _, p := range brute {
+		if p.dist > cutoffDist {
+			break
+		}
 		if byDist[p.dist] == nil {
 			byDist[p.dist] = make(map[string]bool)
 		}

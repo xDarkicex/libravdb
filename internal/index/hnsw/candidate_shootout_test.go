@@ -1,0 +1,164 @@
+package hnsw
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/xDarkicex/libravdb/internal/util"
+)
+
+// TestCandidateStructureShootout compares heap vs unsorted on both
+// insertion throughput and search recall, side by side.
+func TestCandidateStructureShootout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	const (
+		dim     = 128
+		numVecs = 5000
+		k       = 10
+		M       = 16
+		efCons  = 100
+	)
+
+	// Generate deterministic vectors.
+	rng := NewPCG(42)
+	vectors := make([][]float32, numVecs)
+	for i := range numVecs {
+		v := make([]float32, dim)
+		for j := range dim {
+			v[j] = float32(rng.Float64()*2 - 1)
+		}
+		vectors[i] = v
+	}
+
+	// Generate query vectors from a different seed.
+	rng2 := NewPCG(99)
+	queries := make([][]float32, 20)
+	for i := range 20 {
+		q := make([]float32, dim)
+		for j := range dim {
+			q[j] = float32(rng2.Float64()*2 - 1)
+		}
+		queries[i] = q
+	}
+
+	// Brute-force ground truth for recall measurement.
+	type pair struct {
+		id   int
+		dist float32
+	}
+	groundTruth := make([][]int, len(queries))
+	for qi, q := range queries {
+		all := make([]pair, numVecs)
+		for i, v := range vectors {
+			all[i] = pair{id: i, dist: util.L2Distance_func(q, v)}
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].dist < all[j].dist })
+		top := make([]int, k)
+		for i := range k {
+			top[i] = all[i].id
+		}
+		groundTruth[qi] = top
+	}
+
+	modes := []string{"heap", "unsorted"}
+
+	for _, mode := range modes {
+		t.Run(mode, func(t *testing.T) {
+			// Set the package-level candidate mode for this sub-test.
+			oldMode := CandidateMode
+			CandidateMode = mode
+			defer func() { CandidateMode = oldMode }()
+
+			cfg := &Config{
+				Dimension:      dim,
+				M:              M,
+				EfConstruction: efCons,
+				EfSearch:       50,
+				ML:             1.0,
+				Metric:         util.L2Distance,
+				RandomSeed:     42,
+			}
+			idx, err := NewHNSW(cfg)
+			if err != nil {
+				t.Fatalf("NewHNSW: %v", err)
+			}
+			defer idx.Close()
+
+			ctx := context.Background()
+
+			// Measure insertion throughput.
+			start := time.Now()
+			for i, vec := range vectors {
+				entry := &VectorEntry{
+					ID:     fmt.Sprintf("v_%06d", i),
+					Vector: vec,
+				}
+				if err := idx.Insert(ctx, entry); err != nil {
+					t.Fatalf("Insert %d: %v", i, err)
+				}
+			}
+			insertDur := time.Since(start)
+			opsPerSec := float64(numVecs) / insertDur.Seconds()
+
+			// Measure search recall.
+			var totalRecall float64
+			minRecall := 1.0
+			for qi, q := range queries {
+				results, err := idx.Search(ctx, q, k, nil)
+				if err != nil {
+					t.Fatalf("Search: %v", err)
+				}
+
+				truthSet := make(map[int]bool, k)
+				for _, id := range groundTruth[qi] {
+					truthSet[id] = true
+				}
+
+				hits := 0
+				for _, r := range results {
+					if truthSet[int(r.Ordinal)] {
+						hits++
+					}
+				}
+				recall := float64(hits) / float64(k)
+				totalRecall += recall
+				if recall < minRecall {
+					minRecall = recall
+				}
+			}
+			avgRecall := totalRecall / float64(len(queries))
+
+			t.Logf("throughput=%.0f ops/s | avg_recall=%.4f | min_recall=%.4f",
+				opsPerSec, avgRecall, minRecall)
+		})
+	}
+}
+
+// PCG is a minimal permuted-congruential generator for deterministic random data.
+type PCG struct {
+	state uint64
+}
+
+func NewPCG(seed uint64) *PCG {
+	p := &PCG{state: seed + 1442695040888963407}
+	p.Uint32()
+	return p
+}
+
+func (p *PCG) Uint32() uint32 {
+	old := p.state
+	p.state = old*6364136223846793005 + 1442695040888963407
+	xorshifted := uint32(((old >> 18) ^ old) >> 27)
+	rot := uint32(old >> 59)
+	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
+}
+
+func (p *PCG) Float64() float64 {
+	return float64(p.Uint32()) / float64(1<<32)
+}

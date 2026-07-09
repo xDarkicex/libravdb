@@ -2,7 +2,10 @@ package hnsw
 
 import (
 	"fmt"
+	"runtime"
 	"slices"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
@@ -136,8 +139,11 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 	}
 
 	selected := make([]*util.Candidate, 0, maxM)
-	var selectedVectorBuf [4][]float32
+	var selectedVectorBuf [128][]float32
 	selectedVectors := selectedVectorBuf[:0]
+	if maxM > len(selectedVectorBuf) {
+		selectedVectors = make([][]float32, 0, maxM)
+	}
 
 	// Stack-allocated bitset for up to 32768 candidates
 	var picked [512]uint64
@@ -162,29 +168,21 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 		selectedVectors = append(selectedVectors, nil)
 	}
 
-	// For remaining selections, use distance-based selection with simple diversity check
 	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
 		candidate := candidates[i]
-
-		// Simple diversity check: ensure candidate is not too close to already selected nodes
 		shouldSelect := true
 		candidateVector, ok := index.nodeVectorForHeuristic(candidate.ID)
 		if !ok {
 			continue // Skip if we can't get the vector
 		}
 
-		// Check against a limited number of already selected nodes for efficiency
-		checkLimit := min(len(selected), 3) // Only check against 3 closest selected nodes
-		for j := 0; j < checkLimit; j++ {
+		for j := 0; j < len(selected); j++ {
 			selectedVector := selectedVectors[j]
 			if selectedVector == nil {
 				continue
 			}
-
-			// Simple distance check - if candidate is much closer to selected node
-			// than to query, it might be redundant
 			distToSelected := index.distance(candidateVector, selectedVector)
-			if distToSelected < candidate.Distance*0.8 { // 80% threshold
+			if distToSelected < candidate.Distance {
 				shouldSelect = false
 				break
 			}
@@ -193,9 +191,7 @@ func (ns *NeighborSelector) selectWithSimpleHeuristic(
 		if shouldSelect {
 			selected = append(selected, candidate)
 			setPicked(i)
-			if len(selectedVectors) < 4 {
-				selectedVectors = append(selectedVectors, candidateVector)
-			}
+			selectedVectors = append(selectedVectors, candidateVector)
 		}
 	}
 
@@ -220,9 +216,17 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 		return candidates
 	}
 
-	selectedCount := 1
-	var selectedVectorBuf [4][]float32
+	var selectedBuf [128]util.Candidate
+	selected := selectedBuf[:0]
+	if maxM > len(selectedBuf) {
+		selected = make([]util.Candidate, 0, maxM)
+	}
+
+	var selectedVectorBuf [128][]float32
 	selectedVectors := selectedVectorBuf[:0]
+	if maxM > len(selectedVectorBuf) {
+		selectedVectors = make([][]float32, 0, maxM)
+	}
 
 	var picked [512]uint64
 	setPicked := func(idx int) {
@@ -236,6 +240,8 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 		}
 		return false
 	}
+
+	selected = append(selected, candidates[0])
 	setPicked(0)
 
 	if vector, ok := index.nodeVectorForHeuristic(candidates[0].ID); ok {
@@ -244,7 +250,7 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 		selectedVectors = append(selectedVectors, nil)
 	}
 
-	for i := 1; i < len(candidates) && selectedCount < maxM; i++ {
+	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
 		candidate := candidates[i]
 		shouldSelect := true
 		candidateVector, ok := index.nodeVectorForHeuristic(candidate.ID)
@@ -252,38 +258,34 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 			continue
 		}
 
-		checkLimit := min(selectedCount, 3)
-		for j := 0; j < checkLimit; j++ {
+		for j := 0; j < len(selected); j++ {
 			selectedVector := selectedVectors[j]
 			if selectedVector == nil {
 				continue
 			}
 			distToSelected := index.distance(candidateVector, selectedVector)
-			if distToSelected < candidate.Distance*0.8 {
+			if distToSelected < candidate.Distance {
 				shouldSelect = false
 				break
 			}
 		}
 
 		if shouldSelect {
-			candidates[selectedCount] = candidate
+			selected = append(selected, candidate)
 			setPicked(i)
-			selectedCount++
-			if len(selectedVectors) < 4 {
-				selectedVectors = append(selectedVectors, candidateVector)
-			}
+			selectedVectors = append(selectedVectors, candidateVector)
 		}
 	}
 
-	for i := 1; i < len(candidates) && selectedCount < maxM; i++ {
+	for i := 1; i < len(candidates) && len(selected) < maxM; i++ {
 		if !isPicked(i) {
-			candidates[selectedCount] = candidates[i]
+			selected = append(selected, candidates[i])
 			setPicked(i)
-			selectedCount++
 		}
 	}
 
-	return candidates[:selectedCount]
+	copy(candidates, selected)
+	return candidates[:len(selected)]
 }
 
 // PruneConnections optimizes the connections of a node to maintain graph quality
@@ -295,11 +297,11 @@ func (ns *NeighborSelector) PruneConnections(
 	scratch := index.acquireSearchScratch()
 	defer index.releaseSearchScratch(scratch)
 
-	node := index.nodes[nodeID]
+	node := index.nodes.Get(nodeID)
 	if node == nil {
 		return nil
 	}
-	if level >= len(node.Links) {
+	if level >= (node.Level + 1) {
 		return nil
 	}
 
@@ -308,32 +310,37 @@ func (ns *NeighborSelector) PruneConnections(
 		maxM = int(float64(maxM) * ns.levelMultiplier)
 	}
 
-	overflowSlack := levelOverflowSlack(maxM)
 	nodeVector, err := index.getNodeVector(node)
 	if err != nil {
 		return err
 	}
 
-	originalLinks := node.Links[level]
+	for !index.acquirePruneLock(node) {
+		runtime.Gosched()
+	}
+
+	originalLinks := index.getNodeLinks(node, level)
 
 	// Create candidates from current live connections and compact stale links.
 	// Always re-allocate from the arena — the previous buffer is stale after Reset.
 	pruneBuf, err := memory.ArenaSlice[util.Candidate](scratch.arena, len(originalLinks))
 	if err != nil {
+		index.releasePruneLock(node)
 		return fmt.Errorf("arena allocate pruneBuf: %w", err)
 	}
 	scratch.pruneBuf = pruneBuf[:0]
 	candidates := scratch.pruneBuf
 	liveLinks, err := memory.ArenaSlice[uint32](scratch.arena, len(originalLinks))
 	if err != nil {
+		index.releasePruneLock(node)
 		return fmt.Errorf("arena allocate liveLinks: %w", err)
 	}
 	liveLinks = liveLinks[:0]
 	for _, linkID := range originalLinks {
-		if int(linkID) >= len(index.nodes) {
+		if int(linkID) >= index.nodes.Len() {
 			continue
 		}
-		linkNode := index.nodes[linkID]
+		linkNode := index.nodes.Get(linkID)
 		if linkNode == nil {
 			continue
 		}
@@ -350,65 +357,330 @@ func (ns *NeighborSelector) PruneConnections(
 		})
 	}
 
-	if len(candidates) <= maxM+overflowSlack && len(liveLinks) == len(originalLinks) {
+	if len(candidates) <= maxM && len(liveLinks) == len(originalLinks) {
+		index.releasePruneLock(node)
 		return nil
 	}
 
-	keepIDs := make(map[uint32]struct{}, min(len(candidates), maxM))
+	maxCapacity := linkArrayCapacity(index.config.M, level)
+	slice := unsafe.Slice(node.Links[level], maxCapacity)
+
+	keepIDs, _ := memory.ArenaSlice[uint32](scratch.arena, min(len(candidates), maxM))
+	keepIDs = keepIDs[:0]
 	if len(candidates) <= maxM {
-		newLinks := node.Links[level][:0]
-		for _, candidate := range candidates {
-			newLinks = append(newLinks, candidate.ID)
-			keepIDs[candidate.ID] = struct{}{}
+		// Write directly to fixed-size array
+		for i, candidate := range candidates {
+			atomic.StoreUint32(&slice[i], candidate.ID)
+			keepIDs = append(keepIDs, candidate.ID)
 		}
-		node.Links[level] = newLinks
+		// Sentinel the rest
+		for i := len(candidates); i < maxCapacity; i++ {
+			if atomic.LoadUint32(&slice[i]) == SentinelNodeID {
+				break
+			}
+			atomic.StoreUint32(&slice[i], SentinelNodeID)
+		}
+		atomic.StoreUint32(&node.LinkCounts[level], uint32(len(candidates)))
+		atomic.StoreUint32(&node.LinkHeuristic[level], 0)
+
+		index.releasePruneLock(node)
 		ns.removeDroppedBacklinks(nodeID, level, liveLinks, keepIDs, index)
 		return nil
 	}
 
-	// Pruning runs on every insertion and is a major write-path hot loop.
-	// Keeping the closest neighbors is much cheaper here than re-running the
-	// full diversity heuristic, while still preserving bounded graph degree.
+	// Qdrant applies the same diversity heuristic when an existing link
+	// container overflows. Closest-only pruning is faster, but it clusters
+	// backlinks and forces wider beams to recover recall.
 	slices.SortFunc(candidates, compareCandidateValues)
+	selected := ns.selectWithSimpleHeuristicValues(nodeVector, candidates, maxM, index)
 
 	// Update the node's connections
-	newLinks := node.Links[level][:0]
-	for _, sel := range candidates[:maxM] {
-		newLinks = append(newLinks, sel.ID)
-		keepIDs[sel.ID] = struct{}{}
+	// Update the node's connections in the fixed array
+	for i, sel := range selected {
+		atomic.StoreUint32(&slice[i], sel.ID)
+		keepIDs = append(keepIDs, sel.ID)
 	}
-	node.Links[level] = newLinks
+	// Sentinel the rest
+	for i := len(selected); i < maxCapacity; i++ {
+		if atomic.LoadUint32(&slice[i]) == SentinelNodeID {
+			break
+		}
+		atomic.StoreUint32(&slice[i], SentinelNodeID)
+	}
+	atomic.StoreUint32(&node.LinkCounts[level], uint32(len(selected)))
+	atomic.StoreUint32(&node.LinkHeuristic[level], uint32(len(selected)))
+
+	index.releasePruneLock(node)
 	ns.removeDroppedBacklinks(nodeID, level, liveLinks, keepIDs, index)
 
 	return nil
+}
+
+func (ns *NeighborSelector) connectLinkWithHeuristic(
+	targetID uint32,
+	newID uint32,
+	level int,
+	index *Index,
+) bool {
+	if int(targetID) >= index.nodes.Len() || int(newID) >= index.nodes.Len() {
+		return false
+	}
+	targetNode := index.nodes.Get(targetID)
+	if targetNode == nil || level >= (targetNode.Level+1) {
+		return false
+	}
+
+	targetVector, ok := index.nodeVectorForHeuristic(targetID)
+	if !ok {
+		return index.appendWithSpinlock(targetNode, targetNode.Links[level], newID, index.config.M, level)
+	}
+	newVector, ok := index.nodeVectorForHeuristic(newID)
+	if !ok {
+		return false
+	}
+	newDistance := index.distance(targetVector, newVector)
+
+	maxM := levelMaxLinks(index.config.M, level)
+	maxCapacity := linkArrayCapacity(index.config.M, level)
+
+	var originalBuf [256]uint32
+	original := originalBuf[:0]
+	if maxCapacity > len(originalBuf) {
+		original = make([]uint32, 0, maxCapacity)
+	}
+
+	var candidateBuf [257]util.Candidate
+	candidates := candidateBuf[:0]
+	if maxCapacity+1 > len(candidateBuf) {
+		candidates = make([]util.Candidate, 0, maxCapacity+1)
+	}
+
+	var droppedBuf [256]uint32
+	dropped := droppedBuf[:0]
+	if maxCapacity > len(droppedBuf) {
+		dropped = make([]uint32, 0, maxCapacity)
+	}
+
+	for !index.acquirePruneLock(targetNode) {
+		runtime.Gosched()
+	}
+
+	accepted := false
+	func() {
+		defer index.releasePruneLock(targetNode)
+
+		slice := unsafe.Slice(targetNode.Links[level], maxCapacity)
+		count := int(atomic.LoadUint32(&targetNode.LinkCounts[level]))
+		if count > maxCapacity {
+			count = maxCapacity
+		}
+		heuristicCount := int(atomic.LoadUint32(&targetNode.LinkHeuristic[level]))
+
+		for i := 0; i < count; i++ {
+			linkID := atomic.LoadUint32(&slice[i])
+			if linkID == SentinelNodeID {
+				continue
+			}
+			if linkID == newID {
+				return
+			}
+			if int(linkID) >= index.nodes.Len() || index.nodes.Get(linkID) == nil {
+				continue
+			}
+			original = append(original, linkID)
+		}
+
+		if len(original) < maxM {
+			atomic.StoreUint32(&slice[len(original)], newID)
+			atomic.StoreUint32(&targetNode.LinkCounts[level], uint32(len(original)+1))
+			atomic.StoreUint32(&targetNode.LinkHeuristic[level], 0)
+			accepted = true
+			return
+		}
+
+		if heuristicCount >= len(original) && len(original) > 0 {
+			worstID := original[len(original)-1]
+			worstVector, ok := index.nodeVectorForHeuristic(worstID)
+			if ok && newDistance >= index.distance(targetVector, worstVector) {
+				return
+			}
+			var selectedIDBuf [256]uint32
+			selectedIDs := selectedIDBuf[:0]
+			if maxM > len(selectedIDBuf) {
+				selectedIDs = make([]uint32, 0, maxM)
+			}
+
+			newInserted := false
+			newAccepted := false
+			tryInsertNew := func() bool {
+				for _, selectedID := range selectedIDs {
+					selectedVector, ok := index.nodeVectorForHeuristic(selectedID)
+					if !ok {
+						continue
+					}
+					if index.distance(newVector, selectedVector) < newDistance {
+						newInserted = true
+						return false
+					}
+				}
+				selectedIDs = append(selectedIDs, newID)
+				newInserted = true
+				newAccepted = true
+				return true
+			}
+
+			for _, linkID := range original {
+				linkVector, ok := index.nodeVectorForHeuristic(linkID)
+				if !ok {
+					continue
+				}
+				linkDistance := index.distance(targetVector, linkVector)
+				if !newInserted && (newDistance < linkDistance || (newDistance == linkDistance && newID < linkID)) {
+					if !tryInsertNew() {
+						return
+					}
+					if len(selectedIDs) >= maxM {
+						break
+					}
+				}
+
+				if newAccepted && index.distance(linkVector, newVector) < linkDistance {
+					continue
+				}
+				selectedIDs = append(selectedIDs, linkID)
+				if len(selectedIDs) >= maxM {
+					break
+				}
+			}
+			if !newInserted && len(selectedIDs) < maxM {
+				_ = tryInsertNew()
+			}
+			if !newAccepted {
+				return
+			}
+
+			for i, selectedID := range selectedIDs {
+				atomic.StoreUint32(&slice[i], selectedID)
+			}
+			for i := len(selectedIDs); i < maxCapacity; i++ {
+				if atomic.LoadUint32(&slice[i]) == SentinelNodeID {
+					break
+				}
+				atomic.StoreUint32(&slice[i], SentinelNodeID)
+			}
+			atomic.StoreUint32(&targetNode.LinkCounts[level], uint32(len(selectedIDs)))
+			atomic.StoreUint32(&targetNode.LinkHeuristic[level], uint32(len(selectedIDs)))
+			accepted = true
+
+			for _, linkID := range original {
+				if !uint32SliceContains(selectedIDs, linkID) {
+					dropped = append(dropped, linkID)
+				}
+			}
+			return
+		}
+
+		for _, linkID := range original {
+			linkVector, ok := index.nodeVectorForHeuristic(linkID)
+			if !ok {
+				continue
+			}
+			candidates = append(candidates, util.Candidate{
+				ID:       linkID,
+				Distance: index.distance(targetVector, linkVector),
+			})
+		}
+		candidates = append(candidates, util.Candidate{
+			ID:       newID,
+			Distance: newDistance,
+		})
+		if len(candidates) == 0 {
+			atomic.StoreUint32(&targetNode.LinkCounts[level], 0)
+			return
+		}
+
+		slices.SortFunc(candidates, compareCandidateValues)
+		selected := ns.selectWithSimpleHeuristicValues(targetVector, candidates, maxM, index)
+
+		for i, selectedCandidate := range selected {
+			atomic.StoreUint32(&slice[i], selectedCandidate.ID)
+			if selectedCandidate.ID == newID {
+				accepted = true
+			}
+		}
+		for i := len(selected); i < maxCapacity; i++ {
+			if atomic.LoadUint32(&slice[i]) == SentinelNodeID {
+				break
+			}
+			atomic.StoreUint32(&slice[i], SentinelNodeID)
+		}
+		atomic.StoreUint32(&targetNode.LinkCounts[level], uint32(len(selected)))
+		atomic.StoreUint32(&targetNode.LinkHeuristic[level], uint32(len(selected)))
+
+		for _, linkID := range original {
+			if !candidateValuesContainID(selected, linkID) {
+				dropped = append(dropped, linkID)
+			}
+		}
+	}()
+
+	for _, linkID := range dropped {
+		index.removeConnection(targetID, linkID, level)
+	}
+	return accepted
 }
 
 func (ns *NeighborSelector) removeDroppedBacklinks(
 	nodeID uint32,
 	level int,
 	original []uint32,
-	keepIDs map[uint32]struct{},
+	keepIDs []uint32,
 	index *Index,
 ) {
 	for _, linkID := range original {
-		if _, keep := keepIDs[linkID]; keep {
+		keep := false
+		for _, k := range keepIDs {
+			if k == linkID {
+				keep = true
+				break
+			}
+		}
+		if keep {
 			continue
 		}
-		index.removeConnection(linkID, nodeID, level)
+		index.removeConnection(nodeID, linkID, level)
 	}
 }
 
+func candidateValuesContainID(candidates []util.Candidate, id uint32) bool {
+	for _, candidate := range candidates {
+		if candidate.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func uint32SliceContains(values []uint32, id uint32) bool {
+	for _, value := range values {
+		if value == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Index) nodeVectorForHeuristic(nodeID uint32) ([]float32, bool) {
-	if int(nodeID) >= len(h.nodes) {
+	if int(nodeID) >= h.nodes.Len() {
 		return nil, false
 	}
-	node := h.nodes[nodeID]
+	node := h.nodes.Get(nodeID)
 	if node == nil {
 		return nil, false
 	}
-	vector, err := h.getNodeVector(node)
-	if err != nil {
-		return nil, false
+	if node.Vector != nil {
+		return node.Vector, true
 	}
-	return vector, true
+	vector, err := h.getNodeVector(node)
+	return vector, err == nil && vector != nil
 }

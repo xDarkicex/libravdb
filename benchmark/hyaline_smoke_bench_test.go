@@ -50,7 +50,7 @@ func BenchmarkHyalineSMR(b *testing.B) {
 		SlabSize:  smokeSlabSize,
 		SlabCount: smokeSlabCount,
 		Prealloc:  true,
-	}, smokeNumShards)
+	}, 64, smokeNumShards)
 	if err != nil {
 		b.Fatal(err)
 	}

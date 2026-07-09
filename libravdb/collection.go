@@ -60,6 +60,7 @@ type CollectionConfig struct {
 	EfSearch           int            `json:"ef_search"`
 	ML                 float64        `json:"ml"`
 	RawStoreCap        int            `json:"raw_store_cap,omitempty"`
+	IDMapCapacity      int            `json:"id_map_capacity,omitempty"`
 	Metric             DistanceMetric `json:"metric"`
 	SaveInterval       time.Duration  `json:"save_interval"`
 	Graph              Graph          `json:"-"`
@@ -176,7 +177,7 @@ func (c *Collection) ivfpqConfig() *index.IVFPQConfig {
 	}
 }
 
-func prepareIndexForEntries(ctx context.Context, idx index.Index, entries []*index.VectorEntry) error {
+func prepareIndexForEntries(ctx context.Context, idx index.Index, metric DistanceMetric, entries []*index.VectorEntry) error {
 	trainable, ok := trainingIndexState(idx)
 	if !ok {
 		return nil
@@ -185,8 +186,9 @@ func prepareIndexForEntries(ctx context.Context, idx index.Index, entries []*ind
 		return nil
 	}
 
+	indexEntries := entriesForIndex(metric, entries)
 	vectors := make([][]float32, len(entries))
-	for i, entry := range entries {
+	for i, entry := range indexEntries {
 		vectors[i] = entry.Vector
 	}
 
@@ -196,15 +198,58 @@ func prepareIndexForEntries(ctx context.Context, idx index.Index, entries []*ind
 	return nil
 }
 
-func insertEntriesIntoIndex(ctx context.Context, idx index.Index, entries []*index.VectorEntry) error {
+func insertEntriesIntoIndex(ctx context.Context, idx index.Index, metric DistanceMetric, entries []*index.VectorEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	if err := idx.BatchInsert(ctx, entries); err != nil {
+	if err := idx.BatchInsert(ctx, entriesForIndex(metric, entries)); err != nil {
 		return fmt.Errorf("failed to batch insert into index: %w", err)
 	}
 	return nil
+}
+
+func entryForIndex(metric DistanceMetric, entry *index.VectorEntry) *index.VectorEntry {
+	if metric != CosineDistance || entry == nil || len(entry.Vector) == 0 {
+		return entry
+	}
+	indexEntry := *entry
+	indexEntry.Vector = vectorForIndex(metric, entry.Vector)
+	return &indexEntry
+}
+
+func entriesForIndex(metric DistanceMetric, entries []*index.VectorEntry) []*index.VectorEntry {
+	if metric != CosineDistance {
+		return entries
+	}
+	indexEntries := make([]*index.VectorEntry, len(entries))
+	for i, entry := range entries {
+		indexEntries[i] = entryForIndex(metric, entry)
+	}
+	return indexEntries
+}
+
+func vectorForIndex(metric DistanceMetric, vector []float32) []float32 {
+	if metric != CosineDistance || len(vector) == 0 {
+		return vector
+	}
+	var normSq float64
+	for _, v := range vector {
+		normSq += float64(v) * float64(v)
+	}
+	if normSq == 0 {
+		return append([]float32(nil), vector...)
+	}
+	norm := math.Sqrt(normSq)
+	if math.Abs(norm-1) <= 1e-5 {
+		return vector
+	}
+	normalized := make([]float32, len(vector))
+	invNorm := float32(1 / norm)
+	for i, v := range vector {
+		normalized[i] = v * invNorm
+	}
+	return normalized
 }
 
 func createIndexForCollection(config *CollectionConfig, provider interface {
@@ -223,6 +268,7 @@ func createIndexForCollection(config *CollectionConfig, provider interface {
 			Provider:       provider,
 			RawVectorStore: config.RawVectorStore,
 			RawStoreCap:    config.RawStoreCap,
+			IDMapCapacity:  config.IDMapCapacity,
 			Quantization:   config.Quantization,
 		})
 	case IVFPQ:
@@ -247,11 +293,11 @@ func buildIndexForEntries(ctx context.Context, config *CollectionConfig, provide
 	if err != nil {
 		return nil, err
 	}
-	if err := prepareIndexForEntries(ctx, idx, entries); err != nil {
+	if err := prepareIndexForEntries(ctx, idx, config.Metric, entries); err != nil {
 		idx.Close()
 		return nil, err
 	}
-	if err := insertEntriesIntoIndex(ctx, idx, entries); err != nil {
+	if err := insertEntriesIntoIndex(ctx, idx, config.Metric, entries); err != nil {
 		idx.Close()
 		return nil, fmt.Errorf("failed to insert vectors into index: %w", err)
 	}
@@ -308,7 +354,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		EfSearch:       50,
 		NClusters:      100,
 		NProbes:        10,
-		ML:             1.0 / math.Log(2.0),
+		ML:             1.0 / math.Log(32.0),
 		RawVectorStore: "slabby",
 		RawStoreCap:    4096,
 		// Default memory management settings
@@ -370,6 +416,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		Version:        2,
 		RawVectorStore: config.RawVectorStore,
 		RawStoreCap:    config.RawStoreCap,
+		IDMapCapacity:  config.IDMapCapacity,
 	}
 
 	// Initialize memory manager if memory management is configured
@@ -459,6 +506,7 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 		Version:        engineConfig.Version,
 		RawVectorStore: engineConfig.RawVectorStore,
 		RawStoreCap:    engineConfig.RawStoreCap,
+		IDMapCapacity:  engineConfig.IDMapCapacity,
 	}
 	if config.NClusters <= 0 {
 		config.NClusters = 100
@@ -615,6 +663,7 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 		Version:        engineConfig.Version,
 		RawVectorStore: engineConfig.RawVectorStore,
 		RawStoreCap:    engineConfig.RawStoreCap,
+		IDMapCapacity:  engineConfig.IDMapCapacity,
 		Sharded:        true, // Mark as sharded so lifecycle methods work correctly
 	}
 	if config.NClusters <= 0 {
@@ -677,10 +726,10 @@ func (c *Collection) rebuildShardIndex(ctx context.Context, shardIdx int) error 
 	if err != nil {
 		return err
 	}
-	if err := prepareIndexForEntries(ctx, shard.index, vectors); err != nil {
+	if err := prepareIndexForEntries(ctx, shard.index, c.config.Metric, vectors); err != nil {
 		return err
 	}
-	return insertEntriesIntoIndex(ctx, shard.index, vectors)
+	return insertEntriesIntoIndex(ctx, shard.index, c.config.Metric, vectors)
 }
 
 // getAllVectorsFromShard returns all vectors from a specific shard's storage
@@ -702,10 +751,10 @@ func (c *Collection) rebuildIndex(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := prepareIndexForEntries(ctx, c.index, vectors); err != nil {
+	if err := prepareIndexForEntries(ctx, c.index, c.config.Metric, vectors); err != nil {
 		return err
 	}
-	return insertEntriesIntoIndex(ctx, c.index, vectors)
+	return insertEntriesIntoIndex(ctx, c.index, c.config.Metric, vectors)
 }
 
 // Insert adds or updates a vector in the collection
@@ -782,7 +831,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
 
-		if err := c.index.Insert(ctx, storageEntry); err != nil {
+		if err := c.index.Insert(ctx, entryForIndex(c.config.Metric, storageEntry)); err != nil {
 			if delErr := c.storage.Delete(ctx, id); delErr != nil {
 				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
 			}
@@ -841,7 +890,7 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	if err := shard.storage.Insert(ctx, storageEntry); err != nil {
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
-	if err := shard.index.Insert(ctx, storageEntry); err != nil {
+	if err := shard.index.Insert(ctx, entryForIndex(c.config.Metric, storageEntry)); err != nil {
 		if delErr := shard.storage.Delete(ctx, id); delErr != nil {
 			return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
 		}
@@ -906,14 +955,6 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	}
 
 	if shards != nil {
-		unlock := c.lockMutationIDs(func() []string {
-			ids := make([]string, 0, len(entries))
-			for _, entry := range entries {
-				ids = append(ids, entry.ID)
-			}
-			return ids
-		}())
-		defer unlock()
 		defer c.mu.RUnlock()
 		return c.insertBatchSharded(ctx, entries, shards)
 	}
@@ -942,7 +983,7 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	if err := storage.InsertBatch(ctx, entries); err != nil {
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
-	if err := prepareIndexForEntries(ctx, index, entries); err != nil {
+	if err := prepareIndexForEntries(ctx, index, c.config.Metric, entries); err != nil {
 		var rollbackErrs []error
 		for _, storedEntry := range entries {
 			if delErr := storage.Delete(ctx, storedEntry.ID); delErr != nil {
@@ -954,7 +995,7 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		}
 		return fmt.Errorf("failed to prepare index for batch insert: %w", err)
 	}
-	if err := insertEntriesIntoIndex(ctx, index, entries); err != nil {
+	if err := insertEntriesIntoIndex(ctx, index, c.config.Metric, entries); err != nil {
 		var rollbackErrs []error
 		for _, storedEntry := range entries {
 			if delErr := storage.Delete(ctx, storedEntry.ID); delErr != nil {
@@ -1016,7 +1057,7 @@ func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.Ve
 				errCh <- fmt.Errorf("failed to write batch to storage: %w", err)
 				return
 			}
-			if err := prepareIndexForEntries(ctx, s.index, shardEntries); err != nil {
+			if err := prepareIndexForEntries(ctx, s.index, c.config.Metric, shardEntries); err != nil {
 				var rollbackErrs []error
 				for _, storedEntry := range shardEntries {
 					if delErr := s.storage.Delete(ctx, storedEntry.ID); delErr != nil {
@@ -1030,7 +1071,7 @@ func (c *Collection) insertBatchSharded(ctx context.Context, entries []*index.Ve
 				}
 				return
 			}
-			if err := insertEntriesIntoIndex(ctx, s.index, shardEntries); err != nil {
+			if err := insertEntriesIntoIndex(ctx, s.index, c.config.Metric, shardEntries); err != nil {
 				var rollbackErrs []error
 				for _, storedEntry := range shardEntries {
 					if delErr := s.storage.Delete(ctx, storedEntry.ID); delErr != nil {
@@ -1154,7 +1195,7 @@ func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []f
 	if err := c.storage.Insert(ctx, updatedEntry); err != nil {
 		return fmt.Errorf("failed to write update to storage: %w", err)
 	}
-	if err := c.index.Insert(ctx, updatedEntry); err != nil {
+	if err := c.index.Insert(ctx, entryForIndex(c.config.Metric, updatedEntry)); err != nil {
 		return fmt.Errorf("failed to insert updated vector into index: %w", err)
 	}
 
@@ -1212,7 +1253,7 @@ func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []f
 		if err := c.storage.Insert(ctx, entry); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
-		if err := c.index.Insert(ctx, entry); err != nil {
+		if err := c.index.Insert(ctx, entryForIndex(c.config.Metric, entry)); err != nil {
 			if delErr := c.storage.Delete(ctx, id); delErr != nil {
 				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
 			}
@@ -1243,7 +1284,7 @@ func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []f
 	if err := c.storage.Insert(ctx, entry); err != nil {
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
-	if err := c.index.Insert(ctx, entry); err != nil {
+	if err := c.index.Insert(ctx, entryForIndex(c.config.Metric, entry)); err != nil {
 		if rebuildErr := c.rebuildIndex(ctx); rebuildErr != nil {
 			return fmt.Errorf("index insert failed: %w; rebuild after index insert also failed: %v", err, rebuildErr)
 		}
@@ -1310,7 +1351,7 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 	if err := shard.storage.Insert(ctx, updatedEntry); err != nil {
 		return fmt.Errorf("failed to write update to storage: %w", err)
 	}
-	if err := shard.index.Insert(ctx, updatedEntry); err != nil {
+	if err := shard.index.Insert(ctx, entryForIndex(c.config.Metric, updatedEntry)); err != nil {
 		return fmt.Errorf("failed to insert updated vector into index: %w", err)
 	}
 
@@ -1345,7 +1386,7 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 		if err := shard.storage.Insert(ctx, entry); err != nil {
 			return fmt.Errorf("failed to write to storage: %w", err)
 		}
-		if err := shard.index.Insert(ctx, entry); err != nil {
+		if err := shard.index.Insert(ctx, entryForIndex(c.config.Metric, entry)); err != nil {
 			if delErr := shard.storage.Delete(ctx, id); delErr != nil {
 				return fmt.Errorf("failed to insert into index: %w (CRITICAL: rollback storage.Delete failed: %v)", err, delErr)
 			}
@@ -1376,7 +1417,7 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 	if err := shard.storage.Insert(ctx, entry); err != nil {
 		return fmt.Errorf("failed to write to storage: %w", err)
 	}
-	if err := shard.index.Insert(ctx, entry); err != nil {
+	if err := shard.index.Insert(ctx, entryForIndex(c.config.Metric, entry)); err != nil {
 		shardIdx := shardForID(id)
 		if rebuildErr := c.rebuildShardIndex(ctx, shardIdx); rebuildErr != nil {
 			return fmt.Errorf("index insert failed: %w; rebuild after index insert also failed: %v", err, rebuildErr)
@@ -1796,6 +1837,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 
 	// Start timing
 	start := time.Now()
+	indexVector := vectorForIndex(c.config.Metric, vector)
 
 	// Search all shards in parallel and collect results
 	type shardResult struct {
@@ -1815,7 +1857,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 				defer wg.Done()
 				// Each shard only needs its local top-k; the parent merges all shard results.
 				shardK := k
-				results, err := shardIndexes[shardIdx].Search(ctx, vector, shardK, indexFilter)
+				results, err := shardIndexes[shardIdx].Search(ctx, indexVector, shardK, indexFilter)
 				resultsCh <- shardResult{results: results, err: err}
 			}(i)
 		}
@@ -1825,7 +1867,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results, err := idx.Search(ctx, vector, k, indexFilter)
+			results, err := idx.Search(ctx, indexVector, k, indexFilter)
 			resultsCh <- shardResult{results: results, err: err}
 		}()
 	}

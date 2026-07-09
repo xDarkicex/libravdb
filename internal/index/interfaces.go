@@ -105,6 +105,7 @@ type HNSWConfig struct {
 	ML             float64
 	Metric         util.DistanceMetric
 	RawStoreCap    int
+	IDMapCapacity  int
 }
 
 // IVFPQConfig holds configuration for IVF-PQ index
@@ -274,6 +275,7 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		RandomSeed:     0, // Default seed for Phase 1
 		RawVectorStore: config.RawVectorStore,
 		RawStoreCap:    config.RawStoreCap,
+		IDMapCapacity:  config.IDMapCapacity,
 		Quantization:   config.Quantization,
 	}
 
@@ -291,7 +293,7 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 4,
-	}, 64)
+	}, 64, 16)
 	if err != nil {
 		hnswIndex.Close()
 		return nil, err
@@ -486,7 +488,7 @@ func NewIVFPQ(config *IVFPQConfig) (Index, error) {
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 4,
-	}, 64)
+	}, 64, 16)
 	if err != nil {
 		ivfpqIndex.Close()
 		return nil, err
@@ -645,7 +647,7 @@ func NewFlat(config *FlatConfig) (Index, error) {
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 4,
-	}, 64)
+	}, 64, 16)
 	if err != nil {
 		flatIndex.Close()
 		return nil, err

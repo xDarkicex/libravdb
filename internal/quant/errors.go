@@ -294,6 +294,18 @@ func (qrm *QuantizationRecoveryManager) reduceQuantizationComplexity(
 		if simplifiedConfig.Bits > 4 {
 			simplifiedConfig.Bits = 4
 		}
+	case FiniteScalarQuantization:
+		if simplifiedConfig.Bits > 4 {
+			simplifiedConfig.Bits = 4
+		}
+		if len(simplifiedConfig.Levels) > 0 {
+			simplifiedConfig.Levels = append([]int(nil), simplifiedConfig.Levels...)
+			for i, level := range simplifiedConfig.Levels {
+				if level > 16 {
+					simplifiedConfig.Levels[i] = 16
+				}
+			}
+		}
 	}
 
 	// Reduce training ratio and cache size

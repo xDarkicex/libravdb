@@ -57,7 +57,7 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 	if err := store.Reset(); err != nil {
 		t.Fatalf("reset failed: %v", err)
 	}
-	if store.sfl != nil && store.sfl.Stats().Allocated != 0 || len(store.slots) != 0 {
+	if store.sfl != nil && store.sfl.Stats().Allocated != 0 || store.activeCount.Load() != 0 || store.nextSlot.Load() != 0 {
 		t.Fatalf("expected reset to clear slabby store")
 	}
 }
@@ -115,7 +115,7 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		t.Fatalf("load failed: %v", err)
 	}
 
-	if _, err := loaded.getNodeVector(loaded.nodes[0]); err != nil {
+	if _, err := loaded.getNodeVector(loaded.nodes.Get(0)); err != nil {
 		t.Fatalf("failed to access loaded slabby-backed node vector: %v", err)
 	}
 
@@ -124,6 +124,10 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		t.Fatalf("post-load search failed: %v", err)
 	}
 	if len(loadedResults) == 0 || loadedResults[0].ID != "vec_0" {
-		t.Fatalf("expected vec_0 as nearest result after load, got %#v", loadedResults)
+		var ids []string
+		for _, r := range loadedResults {
+			ids = append(ids, r.ID)
+		}
+		t.Fatalf("expected vec_0 as nearest result after load, got %v", ids)
 	}
 }

@@ -13,6 +13,8 @@ const (
 	ProductQuantization QuantizationType = iota
 	// ScalarQuantization uses linear quantization to fixed-point representation
 	ScalarQuantization
+	// FiniteScalarQuantization uses codebook-free bounded scalar quantization
+	FiniteScalarQuantization
 )
 
 // String returns the string representation of the quantization type
@@ -22,6 +24,8 @@ func (qt QuantizationType) String() string {
 		return "product"
 	case ScalarQuantization:
 		return "scalar"
+	case FiniteScalarQuantization:
+		return "fsq"
 	default:
 		return "unknown"
 	}
@@ -43,6 +47,10 @@ type QuantizationConfig struct {
 
 	// CacheSize specifies the size of the codebook cache
 	CacheSize int `json:"cache_size,omitempty"`
+
+	// Levels specifies the per-coordinate FSQ level cycle. If omitted for FSQ,
+	// a uniform level count derived from Bits is used.
+	Levels []int `json:"levels,omitempty"`
 }
 
 // Validate checks if the quantization configuration is valid
@@ -65,6 +73,12 @@ func (qc *QuantizationConfig) Validate() error {
 		}
 	case ScalarQuantization:
 		// No additional validation needed for scalar quantization
+	case FiniteScalarQuantization:
+		for _, level := range qc.Levels {
+			if level < 2 {
+				return fmt.Errorf("fsq levels must be >= 2, got %d", level)
+			}
+		}
 	default:
 		return fmt.Errorf("unsupported quantization type: %v", qc.Type)
 	}
@@ -86,6 +100,12 @@ func DefaultConfig(qType QuantizationType) *QuantizationConfig {
 	case ScalarQuantization:
 		return &QuantizationConfig{
 			Type:       ScalarQuantization,
+			Bits:       8,
+			TrainRatio: 0.1,
+		}
+	case FiniteScalarQuantization:
+		return &QuantizationConfig{
+			Type:       FiniteScalarQuantization,
 			Bits:       8,
 			TrainRatio: 0.1,
 		}
