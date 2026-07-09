@@ -604,7 +604,7 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 	// Evaluate in-flight nodes to resolve concurrency paradox perfectly.
 	// This static snapshot of concurrent insertions allows mutually unaware nodes
 	// to establish bidirectional edges without global locks.
-	if h.inFlightNodes != nil {
+	if h.inFlightNodes != nil && h.inFlightNodes.Active() > 1 {
 		scratch.inFlightBuf = h.inFlightNodes.GetSnapshot(scratch.inFlightBuf)
 		for _, inFlightID := range scratch.inFlightBuf {
 			inFlightNode := h.nodes.Get(inFlightID)
@@ -699,6 +699,10 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	useNEONBatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && !useRawNEONPtrL2
 	useAVX2BatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "amd64" && cpu.X86.HasAVX2 && cpu.X86.HasFMA
 	useSIMDBatchL2 := useNEONBatchL2 || useAVX2BatchL2
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
 
 	// Initialize with entry point
 	entryID := h.findNodeID(entryPoint)
@@ -723,10 +727,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	visited[entryID] = visitMark
 
 	for w.Len() > 0 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if done != nil {
+			select {
+			case <-done:
+				return nil, ctx.Err()
+			default:
+			}
 		}
 
 		current := w.PopCandidate()

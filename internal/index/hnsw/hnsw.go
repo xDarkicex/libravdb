@@ -39,8 +39,9 @@ const inFlightRegistrySize = 65536 // Power of 2 for fast modulo
 const defaultIDMapCapacity = 8192
 
 type inFlightRegistry struct {
-	idx   atomic.Uint64
-	nodes []uint32
+	idx    atomic.Uint64
+	active atomic.Int32
+	nodes  []uint32
 }
 
 func newInFlightRegistry(arena *memory.Arena) *inFlightRegistry {
@@ -69,6 +70,7 @@ func (r *inFlightRegistry) Add(id uint32) {
 	if r == nil || r.nodes == nil {
 		return
 	}
+	r.active.Add(1)
 	i := r.idx.Add(1) - 1
 	atomic.StoreUint32(&r.nodes[i&(inFlightRegistrySize-1)], id)
 }
@@ -76,6 +78,17 @@ func (r *inFlightRegistry) Add(id uint32) {
 func (r *inFlightRegistry) Remove(id uint32) {
 	// Ring buffer implicitly removes items by overwriting them.
 	// The InFlight flag on the Node struct is cleared instead.
+	if r == nil || r.nodes == nil {
+		return
+	}
+	r.active.Add(-1)
+}
+
+func (r *inFlightRegistry) Active() int32 {
+	if r == nil || r.nodes == nil {
+		return 0
+	}
+	return r.active.Load()
 }
 
 func (r *inFlightRegistry) GetSnapshot(buf []uint32) []uint32 {
