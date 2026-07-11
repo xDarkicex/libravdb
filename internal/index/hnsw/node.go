@@ -20,6 +20,8 @@ type Node struct {
 	Slot             uint32
 	InFlight         uint32 // Atomic boolean (1=in flight, 0=committed)
 	PruneLock        uint32 // 1-byte micro-spinlock padded to uint32 for atomics
+	RepairMask       uint32 // Atomic per-level dirty bitmask for deferred pruning
+	RepairQueued     uint32 // Atomic boolean (1=queued/in repair, 0=idle)
 }
 
 func (n *Node) setVector(vec []float32) {

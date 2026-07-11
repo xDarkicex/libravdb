@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"hash/maphash"
 	"math"
-	"math/rand"
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +37,8 @@ func hashID(id string) uint64 {
 
 const inFlightRegistrySize = 65536 // Power of 2 for fast modulo
 const defaultIDMapCapacity = 8192
+const defaultRepairQueueSize = 65536
+const defaultRepairBatchSize = 64
 
 type inFlightRegistry struct {
 	idx    atomic.Uint64
@@ -140,7 +142,8 @@ type VectorProvider interface {
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
-	searchScratchPool   sync.Pool
+	searchScratchFree   atomic.Uint64
+	searchScratches     []searchScratch
 	provider            VectorProvider
 	quantizer           quant.Quantizer
 	rawVectorStore      RawVectorStore
@@ -154,10 +157,13 @@ type Index struct {
 	ordinalToID         *segmentedStringArray
 	linkSFL             *memory.ShardedFreeList
 	neighborSelector    *NeighborSelector
-	levelGenerator      *rand.Rand
+	registryPool        *memory.Pool
 	scratchPool         *sync.Pool
 	nodeSFL             *memory.ShardedFreeList
 	inFlightNodes       *inFlightRegistry // registry for concurrent insertions
+	repairCh            chan uint32
+	repairStop          chan struct{}
+	repairDone          chan struct{}
 	mmapPath            string
 	trainingVectors     [][]float32
 	trainingCount       atomic.Int32
@@ -167,23 +173,29 @@ type Index struct {
 	originalMemUsage    int64
 	nextOrdinal         atomic.Uint32
 	quantizationTrained atomic.Bool
+	repairOverflow      atomic.Bool
 	memoryMapped        bool
 }
 
 // Config holds HNSW configuration parameters
 type Config struct {
-	Provider       VectorProvider
-	Quantization   *quant.QuantizationConfig
-	RawVectorStore string
-	Dimension      int
-	M              int
-	EfConstruction int
-	EfSearch       int
-	ML             float64
-	Metric         util.DistanceMetric
-	RandomSeed     int64
-	RawStoreCap    int
-	IDMapCapacity  int
+	Provider             VectorProvider
+	Quantization         *quant.QuantizationConfig
+	RawVectorStore       string
+	Dimension            int
+	M                    int
+	EfConstruction       int
+	EfSearch             int
+	ML                   float64
+	Metric               util.DistanceMetric
+	PruneAlpha           float32
+	Level0LinkMultiplier float64
+	RepairEnabled        bool
+	RepairQueueSize      int
+	RepairBatchSize      int
+	RandomSeed           int64
+	RawStoreCap          int
+	IDMapCapacity        int
 }
 
 func (c *Config) idMapCapacity() uint64 {
@@ -191,6 +203,33 @@ func (c *Config) idMapCapacity() uint64 {
 		return uint64(c.IDMapCapacity)
 	}
 	return defaultIDMapCapacity
+}
+
+func (c *Config) level0LinkMultiplier() float64 {
+	if c == nil || c.Level0LinkMultiplier <= 0 {
+		return level0LinkMultiplier
+	}
+	return c.Level0LinkMultiplier
+}
+
+func (c *Config) repairQueueSize() int {
+	if c == nil {
+		return 0
+	}
+	if c.RepairQueueSize > 0 {
+		return c.RepairQueueSize
+	}
+	if c.RepairEnabled {
+		return defaultRepairQueueSize
+	}
+	return 0
+}
+
+func (c *Config) repairBatchSize() int {
+	if c == nil || c.RepairBatchSize <= 0 {
+		return defaultRepairBatchSize
+	}
+	return c.RepairBatchSize
 }
 
 // NewHNSW creates a new HNSW index
@@ -237,7 +276,7 @@ func NewHNSW(config *Config) (*Index, error) {
 
 	nodeSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(SFLMetadataOverhead) + uint64(unsafe.Sizeof(Node{})),
+		SlotSize:  uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(config.M),
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -264,28 +303,55 @@ func NewHNSW(config *Config) (*Index, error) {
 		nodeSFL.Free()
 		return nil, fmt.Errorf("failed to create idToIndex map: %w", err)
 	}
+	registryPool, err := newSegmentedArrayPool()
+	if err != nil {
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap registry pool: %w", err)
+	}
+	nodes, err := newSegmentedNodeArrayWithPool(registryPool)
+	if err != nil {
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap node registry: %w", err)
+	}
+	ordinalToID, err := newSegmentedStringArrayWithPool(registryPool)
+	if err != nil {
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap ordinal registry: %w", err)
+	}
 
 	index := &Index{
-		config:          config,
-		nodes:           newSegmentedNodeArray(),
-		levelGenerator:  rand.New(rand.NewSource(config.RandomSeed)),
-		distance:        distanceFunc,
-		provider:        config.Provider,
-		idToIndex:       idToIndexMap,
-		ordinalToID:     newSegmentedStringArray(),
-		trainingVectors: nil,
-		linkSFL:         linkSFL,
-		link0SFL:        link0SFL,
-		nodeSFL:         nodeSFL,
-		inFlightNodes:   inFlight,
-		scratchPool:     scratchPool,
+		config:           config,
+		nodes:            nodes,
+		neighborSelector: NewNeighborSelector(config.M, config.level0LinkMultiplier()),
+		distance:         distanceFunc,
+		provider:         config.Provider,
+		idToIndex:        idToIndexMap,
+		ordinalToID:      ordinalToID,
+		trainingVectors:  nil,
+		linkSFL:          linkSFL,
+		link0SFL:         link0SFL,
+		nodeSFL:          nodeSFL,
+		registryPool:     registryPool,
+		inFlightNodes:    inFlight,
+		scratchPool:      scratchPool,
 	}
-	index.searchScratchPool.New = func() interface{} {
-		return &searchScratch{}
+	if repairQueueSize := config.repairQueueSize(); repairQueueSize > 0 {
+		index.repairCh = make(chan uint32, repairQueueSize)
+		if config.RepairEnabled {
+			index.startRepairWorker()
+		}
 	}
 	switch config.RawVectorStore {
 	case "", RawVectorStoreMemory:
-		index.rawVectorStore = NewInMemoryRawVectorStore(config.Dimension)
+		index.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(config.Dimension, config.RawStoreCap)
 	case RawVectorStoreSlabby:
 		store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
 		if err != nil {
@@ -308,6 +374,44 @@ func NewHNSW(config *Config) (*Index, error) {
 	// Pre-allocate training vectors array if quantization is enabled
 	if config.Quantization != nil {
 		index.trainingVectors = make([][]float32, index.getTrainingThreshold())
+	}
+
+	// Force allocator growth and initialize the reusable search contexts before
+	// the index is published. Inserts and searches must not pay first-use mmap
+	// wrappers or scratch allocation on their latency-critical paths.
+	allocators := [...]struct {
+		name  string
+		value *memory.ShardedFreeList
+	}{
+		{name: "node", value: index.nodeSFL},
+		{name: "link", value: index.linkSFL},
+		{name: "link0", value: index.link0SFL},
+	}
+	for _, allocator := range allocators {
+		slot, err := allocator.value.Allocate()
+		if err != nil {
+			return nil, fmt.Errorf("prewarm %s allocator: %w", allocator.name, err)
+		}
+		if err := allocator.value.Deallocate(slot); err != nil {
+			return nil, fmt.Errorf("return prewarmed %s slot: %w", allocator.name, err)
+		}
+	}
+	scratchCount := min(64, max(32, runtime.GOMAXPROCS(0)*4))
+	index.searchScratches = make([]searchScratch, scratchCount)
+	scratchNodeCapacity := config.RawStoreCap
+	if scratchNodeCapacity <= 0 {
+		scratchNodeCapacity = int(config.idMapCapacity())
+	}
+	scratchEF := max(config.EfConstruction*2, config.EfSearch)
+	for i := range index.searchScratches {
+		scratch := &index.searchScratches[i]
+		scratch.slot = uint8(i)
+		index.prepareSearchScratch(scratch, scratchNodeCapacity, scratchEF)
+	}
+	if scratchCount == 64 {
+		index.searchScratchFree.Store(^uint64(0))
+	} else {
+		index.searchScratchFree.Store((uint64(1) << scratchCount) - 1)
 	}
 
 	return index, nil
@@ -391,13 +495,13 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 	}
 
 	// Create new node with optimized memory allocation
-	level := h.generateLevel()
 	var ordinal uint32
 	if h.provider == nil {
 		ordinal = h.nextOrdinal.Add(1) - 1
 	} else {
 		ordinal = entry.Ordinal
 	}
+	level := h.generateLevel(ordinal)
 	if int(ordinal) < h.nodes.Len() && h.nodes.Get(ordinal) != nil {
 		return nil, fmt.Errorf("node with ordinal %d already exists", ordinal)
 	}
@@ -411,7 +515,7 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 		Level:   level,
 		Slot:    SentinelNodeID,
 	}
-	node.Links, node.Backlinks = h.newNodeArrays(level, h.config.M)
+	h.initNodeArrays(node, level, h.config.M)
 
 	if h.rawVectorStore != nil {
 		ref, err := h.rawVectorStore.Put(entry.Vector)
@@ -517,6 +621,71 @@ func (h *Index) newNodeArrays(level int, baseM int) (links, backlinks [MaxLevel]
 	return links, backlinks
 }
 
+func inlineNodeLinkOffset() uintptr {
+	const align = uintptr(8)
+	size := uintptr(unsafe.Sizeof(Node{}))
+	return (size + align - 1) &^ (align - 1)
+}
+
+func inlineNodeSlotPayloadSize(baseM int) uint64 {
+	linkCap := uintptr(linkArrayCapacity(baseM, 0))
+	return uint64(inlineNodeLinkOffset() + linkCap*4*2)
+}
+
+func (h *Index) initNodeArrays(node *Node, level int, baseM int) {
+	if node == nil {
+		return
+	}
+	h.initInlineLevel0Arrays(node, baseM)
+	for i := 1; i <= level; i++ {
+		slotL, err := h.linkSFL.Allocate()
+		if err != nil {
+			panic(fmt.Sprintf("hnsw: failed to allocate upper links: %v", err))
+		}
+		slotB, err := h.linkSFL.Allocate()
+		if err != nil {
+			panic(fmt.Sprintf("hnsw: failed to allocate upper backlinks: %v", err))
+		}
+		ptrL := (*uint32)(unsafe.Pointer(&slotL[SFLMetadataOverhead]))
+		ptrB := (*uint32)(unsafe.Pointer(&slotB[SFLMetadataOverhead]))
+		maxCapacity := linkArrayCapacity(baseM, i)
+		sliceL := unsafe.Slice(ptrL, maxCapacity)
+		sliceB := unsafe.Slice(ptrB, maxCapacity)
+		for j := 0; j < maxCapacity; j++ {
+			sliceL[j] = SentinelNodeID
+			sliceB[j] = SentinelNodeID
+		}
+		node.Links[i] = ptrL
+		node.Backlinks[i] = ptrB
+	}
+}
+
+func (h *Index) initInlineLevel0Arrays(node *Node, baseM int) {
+	linkCap := linkArrayCapacity(baseM, 0)
+	base := uintptr(unsafe.Pointer(node)) + inlineNodeLinkOffset()
+	links := (*uint32)(unsafe.Pointer(base))
+	backlinks := (*uint32)(unsafe.Pointer(base + uintptr(linkCap*4)))
+	linkSlice := unsafe.Slice(links, linkCap)
+	backlinkSlice := unsafe.Slice(backlinks, linkCap)
+	for i := 0; i < linkCap; i++ {
+		linkSlice[i] = SentinelNodeID
+		backlinkSlice[i] = SentinelNodeID
+	}
+	node.Links[0] = links
+	node.Backlinks[0] = backlinks
+}
+
+func isInlineLevel0LinkPtr(node *Node, baseM int, ptr *uint32) bool {
+	if node == nil || ptr == nil {
+		return false
+	}
+	linkCap := linkArrayCapacity(baseM, 0)
+	base := uintptr(unsafe.Pointer(node)) + inlineNodeLinkOffset()
+	links := (*uint32)(unsafe.Pointer(base))
+	backlinks := (*uint32)(unsafe.Pointer(base + uintptr(linkCap*4)))
+	return ptr == links || ptr == backlinks
+}
+
 func initialNodeLinkCapacity(baseM int, level int) int {
 	maxLinks := levelMaxLinks(baseM, level)
 	if level == 0 {
@@ -572,11 +741,11 @@ func (h *Index) appendWithSpinlock(node *Node, ptr *uint32, newID uint32, baseM 
 	defer h.releasePruneLock(node)
 
 	maxCapacity := linkArrayCapacity(baseM, level)
-	slice := unsafe.Slice(ptr, maxCapacity)
 	countPtr := node.linkCountPtr(ptr, level)
 	if countPtr == nil {
 		return false
 	}
+	slice := unsafe.Slice(ptr, maxCapacity)
 	count := int(atomic.LoadUint32(countPtr))
 	if count > maxCapacity {
 		count = maxCapacity
@@ -744,11 +913,11 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	// Phase 1: Search from top level to level 1
 	ep := h.getEntryPoint()
 	for level := h.getMaxLevel(); level > 0; level-- {
-		candidate, err := h.greedySearchLevel(ctx, query, ep, level, queryState)
+		candidate, ok, err := h.greedySearchLevelValue(ctx, query, ep, level, queryState)
 		if err != nil {
 			return nil, err
 		}
-		if candidate != nil {
+		if ok {
 			ep = h.nodes.Get(candidate.ID)
 		}
 	}
@@ -792,7 +961,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 
 		results = append(results, &SearchResult{
 			Ordinal: node.Ordinal,
-			ID:      h.ordinalToID.Get(node.Ordinal),
+			ID:      strings.Clone(h.ordinalToID.Get(node.Ordinal)),
 			Score:   candidate.Distance,
 			Vector:  resultVector,
 		})
@@ -890,7 +1059,7 @@ func (h *Index) searchExact(ctx context.Context, query []float32, k int, filter 
 		}
 		results = append(results, &SearchResult{
 			Ordinal: node.Ordinal,
-			ID:      h.ordinalToID.Get(node.Ordinal),
+			ID:      strings.Clone(h.ordinalToID.Get(node.Ordinal)),
 			Score:   candidate.distance,
 			Vector:  resultVector,
 		})
@@ -1028,6 +1197,16 @@ func (h *Index) calculateMemoryUsage() int64 {
 
 // Close shuts down the index
 func (h *Index) Close() error {
+	h.stopRepairWorker()
+	h.setEntryPoint(nil)
+	h.searchScratchFree.Store(0)
+	for i := range h.searchScratches {
+		if arena := h.searchScratches[i].arena; arena != nil {
+			_ = arena.Free()
+			h.searchScratches[i].arena = nil
+		}
+	}
+	h.searchScratches = nil
 
 	// Free off-heap link storage.
 	if h.nodeSFL != nil {
@@ -1043,13 +1222,25 @@ func (h *Index) Close() error {
 		h.link0SFL = nil
 	}
 
-	// Clear all data structures
+	// Clear all data structures. Registry directories and chunks are off-heap
+	// and share registryPool, so detach them before unmapping the pool.
+	if h.nodes != nil {
+		_ = h.nodes.Close()
+		h.nodes = nil
+	}
+	if h.ordinalToID != nil {
+		_ = h.ordinalToID.Close()
+		h.ordinalToID = nil
+	}
+	if h.registryPool != nil {
+		h.registryPool.Free()
+		h.registryPool = nil
+	}
+
 	h.nodes = nil
-	h.setEntryPoint(nil)
 	h.size.Store(0)
 	h.nextOrdinal.Store(0)
-	h.idToIndex, _ = memory.NewTypedMap[Node](memory.HashMapConfig{Capacity: h.config.idMapCapacity(), Alignment: 128})
-	h.ordinalToID = newSegmentedStringArray()
+	h.idToIndex = nil
 	if h.rawVectorStore != nil {
 		_ = h.rawVectorStore.Close()
 	}
@@ -1060,12 +1251,14 @@ func (h *Index) Close() error {
 	return nil
 }
 
-// generateLevel returns a random level for a new node
-func (h *Index) generateLevel() int {
-	u := h.levelGenerator.Float64()
-	for u <= 0 {
-		u = h.levelGenerator.Float64()
-	}
+// generateLevel derives an independent uniform sample from the stable ordinal.
+// This avoids a shared PRNG and synchronization on parallel inserts.
+func (h *Index) generateLevel(ordinal uint32) int {
+	z := uint64(ordinal) + uint64(h.config.RandomSeed) + 0x9e3779b97f4a7c15
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	z ^= z >> 31
+	u := (float64(z>>11) + 1) / (float64(uint64(1)<<53) + 1)
 	level := int(-math.Log(u) * h.config.ML)
 	if level >= MaxLevel {
 		return MaxLevel - 1
@@ -1106,6 +1299,18 @@ func (c *Config) validate() error {
 	}
 	if c.IDMapCapacity < 0 {
 		return fmt.Errorf("IDMapCapacity must be non-negative")
+	}
+	if c.PruneAlpha > 0 && c.PruneAlpha < 1 {
+		return fmt.Errorf("PruneAlpha must be >= 1 when set")
+	}
+	if c.Level0LinkMultiplier > 0 && c.Level0LinkMultiplier < 1 {
+		return fmt.Errorf("Level0LinkMultiplier must be >= 1 when set")
+	}
+	if c.RepairQueueSize < 0 {
+		return fmt.Errorf("RepairQueueSize must be non-negative")
+	}
+	if c.RepairBatchSize < 0 {
+		return fmt.Errorf("RepairBatchSize must be non-negative")
 	}
 
 	// Validate quantization config if present
@@ -1259,7 +1464,7 @@ func (h *Index) SnapshotVectorsFromProvider(ctx context.Context) error {
 		return nil
 	}
 	if h.rawVectorStore == nil {
-		h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+		h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
 	}
 
 	for i := 0; i < h.nodes.Len(); i++ {
@@ -1540,7 +1745,7 @@ func (h *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	if h.rawVectorStore == nil {
 		switch h.config.RawVectorStore {
 		case "", RawVectorStoreMemory:
-			h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+			h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
 		case RawVectorStoreSlabby:
 			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
 			if err != nil {
@@ -1634,12 +1839,16 @@ func (h *Index) freeNodeLinks(node *Node) {
 		return
 	}
 	for i, ptr := range node.Links {
-		h.freeLinkArray(i, ptr)
+		if i != 0 || !isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			h.freeLinkArray(i, ptr)
+		}
 		node.Links[i] = nil
 		atomic.StoreUint32(&node.LinkCounts[i], 0)
 	}
 	for i, ptr := range node.Backlinks {
-		h.freeLinkArray(i, ptr)
+		if i != 0 || !isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			h.freeLinkArray(i, ptr)
+		}
 		node.Backlinks[i] = nil
 		atomic.StoreUint32(&node.BacklinkCounts[i], 0)
 	}

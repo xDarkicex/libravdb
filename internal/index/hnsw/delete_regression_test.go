@@ -3,12 +3,61 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
+
+func TestLinkMutationRejectsNodeUnpublishedWhileWaiting(t *testing.T) {
+	ctx := context.Background()
+	index, err := NewHNSW(&Config{
+		Dimension:      4,
+		M:              2,
+		EfConstruction: 16,
+		EfSearch:       8,
+		ML:             1,
+		Metric:         util.L2Distance,
+		RandomSeed:     42,
+	})
+	if err != nil {
+		t.Fatalf("new hnsw: %v", err)
+	}
+	defer index.Close()
+
+	for i := 0; i < 2; i++ {
+		vec := []float32{float32(i), float32(i + 1), float32(i + 2), float32(i + 3)}
+		if err := index.Insert(ctx, &VectorEntry{ID: fmt.Sprintf("vec_%d", i), Vector: vec}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	target := index.nodes.Get(0)
+	if target == nil || target.Links[0] == nil {
+		t.Fatal("target node has no level-zero link storage")
+	}
+	if !index.acquirePruneLock(target) {
+		t.Fatal("failed to acquire target mutation lock")
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- index.neighborSelector.connectLinkWithHeuristic(0, 1, 0, index)
+	}()
+
+	// Give the writer time to capture target before it blocks on PruneLock.
+	for range 100 {
+		runtime.Gosched()
+	}
+	index.nodes.Set(0, nil)
+	index.releasePruneLock(target)
+
+	if accepted := <-done; accepted {
+		t.Fatal("stale writer accepted a link for an unpublished node")
+	}
+}
 
 func TestDeleteRepairsAsymmetricIncomingLinksBeforePrune(t *testing.T) {
 	ctx := context.Background()

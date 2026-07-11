@@ -70,8 +70,8 @@ func TestGenerateLevelUsesExponentialDistribution(t *testing.T) {
 	const samples = 1000
 	level0 := 0
 	maxLevel := 0
-	for range samples {
-		level := idx.generateLevel()
+	for i := range samples {
+		level := idx.generateLevel(uint32(i))
 		if level == 0 {
 			level0++
 		}

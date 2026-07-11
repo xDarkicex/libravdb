@@ -38,8 +38,7 @@ func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Nod
 	// Handle special case: deleting the only node
 	if h.size.Load() == 1 {
 		h.deleteStoredVector(node)
-		h.freeNodeLinks(node) // release off-heap SFL link slots
-		h.nodes.Set(nodeID, nil)
+		h.retireNodeStorage(nodeID, node)
 		h.globalState.Store(0)
 		if id != "" {
 			h.idToIndex.Delete(hashID(id))
@@ -457,11 +456,26 @@ func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
 		if node == nil {
 			return
 		}
-		h.freeNodeLinks(node)
-		node.CompressedVector = nil
-		node.setVector(nil)
-		h.nodes.Set(nodeID, nil)
+		h.retireNodeStorage(nodeID, node)
 	}
+}
+
+// retireNodeStorage removes a node from the registry before reclaiming any of
+// its off-heap link storage. Writers that captured the old pointer serialize
+// on PruneLock and revalidate the registry after acquiring it.
+func (h *Index) retireNodeStorage(nodeID uint32, node *Node) {
+	if node == nil {
+		return
+	}
+
+	h.nodes.Set(nodeID, nil)
+	for !h.acquirePruneLock(node) {
+		runtime.Gosched()
+	}
+	h.freeNodeLinks(node)
+	node.CompressedVector = nil
+	node.setVector(nil)
+	h.releasePruneLock(node)
 }
 
 func (h *Index) deleteStoredVector(node *Node) {

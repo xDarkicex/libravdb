@@ -3,6 +3,7 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"math/bits"
 	"runtime"
 	"slices"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 )
 
 type searchScratch struct {
+	slot          uint8
 	arena         *memory.Arena
 	arenaBytes    uint64
 	visitedMarks  []uint32
@@ -43,6 +45,8 @@ type candidateMinHeap struct {
 	items []util.Candidate
 }
 
+const candidateHeapFanout = 4
+
 func (h candidateMinHeap) Len() int { return len(h.items) }
 
 func (h *candidateMinHeap) PushCandidate(c util.Candidate) {
@@ -52,7 +56,7 @@ func (h *candidateMinHeap) PushCandidate(c util.Candidate) {
 	items = h.items // update items
 
 	for idx > 0 {
-		parent := (idx - 1) / 2
+		parent := (idx - 1) / candidateHeapFanout
 		p := items[parent]
 		if p.Distance < c.Distance || (p.Distance == c.Distance && p.ID <= c.ID) {
 			break
@@ -75,27 +79,43 @@ func (h *candidateMinHeap) PopCandidate() util.Candidate {
 
 	idx := 0
 	for {
-		left := idx*2 + 1
-		if left >= n {
+		first := idx*candidateHeapFanout + 1
+		if first >= n {
 			break
 		}
-		right := left + 1
-		smallest := left
-		lItem := items[left]
+		smallest := first
+		child := items[first]
 
-		if right < n {
-			rItem := items[right]
-			if rItem.Distance < lItem.Distance || (rItem.Distance == lItem.Distance && rItem.ID < lItem.ID) {
-				smallest = right
-				lItem = rItem
+		childIdx := first + 1
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance < child.Distance || (item.Distance == child.Distance && item.ID < child.ID) {
+				smallest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 2
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance < child.Distance || (item.Distance == child.Distance && item.ID < child.ID) {
+				smallest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 3
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance < child.Distance || (item.Distance == child.Distance && item.ID < child.ID) {
+				smallest = childIdx
+				child = item
 			}
 		}
 
-		if lItem.Distance > c.Distance || (lItem.Distance == c.Distance && lItem.ID >= c.ID) {
+		if child.Distance > c.Distance || (child.Distance == c.Distance && child.ID >= c.ID) {
 			break
 		}
 
-		items[idx] = lItem
+		items[idx] = child
 		idx = smallest
 	}
 	items[idx] = c
@@ -103,9 +123,8 @@ func (h *candidateMinHeap) PopCandidate() util.Candidate {
 }
 
 // CandidateMode selects the candidate tracking data structure used during
-// search. "heap" is the current production default; repeated shootouts on the
-// current graph shape keep it ahead of the cached-worst unsorted path.
-// "unsorted" remains available for targeted throughput/recall testing.
+// search. "heap" is the current production default. "unsorted" and
+// "reservoir" remain available for targeted throughput/recall testing.
 var CandidateMode = "heap"
 
 // unsortedTopK tracks the K closest candidates found so far using an
@@ -191,8 +210,152 @@ func (u *unsortedTopK) PopCandidate() util.Candidate {
 	return removed
 }
 
-// candidateMaxHeap is a standard binary max-heap over a slice. It is the
-// current hot-path default for candidate tracking.
+// reservoirTopK follows Elasticsearch's bulk collector shape: append accepted
+// candidates into a 2*K reservoir, then compact back to K with selection. The
+// threshold can be stale between compactions, which may over-admit work into the
+// frontier, but it never drops candidates that could belong to the exact top-K.
+type reservoirTopK struct {
+	items     []util.Candidate
+	maxSize   int
+	threshold util.Candidate
+	full      bool
+}
+
+func (r reservoirTopK) Len() int {
+	if len(r.items) < r.maxSize {
+		return len(r.items)
+	}
+	return r.maxSize
+}
+
+func (r *reservoirTopK) Full() bool { return r.full }
+
+func (r *reservoirTopK) Threshold() util.Candidate { return r.threshold }
+
+func (r *reservoirTopK) PushCandidate(c util.Candidate) bool {
+	if r.maxSize <= 0 {
+		return false
+	}
+	if len(r.items) < r.maxSize {
+		r.items = append(r.items, c)
+		if len(r.items) == r.maxSize {
+			r.refreshThreshold()
+		}
+		return true
+	}
+	if !candidateBetter(c, r.threshold) {
+		return false
+	}
+	r.items = append(r.items, c)
+	if len(r.items) == cap(r.items) {
+		r.compact()
+	}
+	return true
+}
+
+func (r *reservoirTopK) Items() []util.Candidate {
+	r.compact()
+	return r.items
+}
+
+func (r *reservoirTopK) compact() {
+	if len(r.items) <= r.maxSize {
+		if len(r.items) == r.maxSize {
+			r.refreshThreshold()
+		}
+		return
+	}
+	selectTopKCandidates(r.items, r.maxSize)
+	r.items = r.items[:r.maxSize]
+	r.refreshThreshold()
+}
+
+func (r *reservoirTopK) refreshThreshold() {
+	if len(r.items) < r.maxSize {
+		r.full = false
+		return
+	}
+	worstIdx := 0
+	worst := r.items[0]
+	for i := 1; i < r.maxSize; i++ {
+		item := r.items[i]
+		if candidateWorse(item, worst) {
+			worstIdx = i
+			worst = item
+		}
+	}
+	r.threshold = r.items[worstIdx]
+	r.full = true
+}
+
+func candidateBetter(a, b util.Candidate) bool {
+	return a.Distance < b.Distance || (a.Distance == b.Distance && a.ID < b.ID)
+}
+
+func candidateWorse(a, b util.Candidate) bool {
+	return a.Distance > b.Distance || (a.Distance == b.Distance && a.ID > b.ID)
+}
+
+func candidateWorseOrEqual(a, b util.Candidate) bool {
+	return a.Distance > b.Distance || (a.Distance == b.Distance && a.ID >= b.ID)
+}
+
+func selectTopKCandidates(items []util.Candidate, k int) {
+	if k <= 0 || k >= len(items) {
+		return
+	}
+	target := k - 1
+	left, right := 0, len(items)-1
+	for left < right {
+		pivot := partitionCandidates(items, left, right, medianCandidateIndex(items, left, right))
+		if pivot == target {
+			return
+		}
+		if target < pivot {
+			right = pivot - 1
+		} else {
+			left = pivot + 1
+		}
+	}
+}
+
+func medianCandidateIndex(items []util.Candidate, left, right int) int {
+	mid := left + (right-left)/2
+	a, b, c := items[left], items[mid], items[right]
+	if candidateBetter(b, a) {
+		if candidateBetter(c, b) {
+			return mid
+		}
+		if candidateBetter(c, a) {
+			return right
+		}
+		return left
+	}
+	if candidateBetter(c, a) {
+		return left
+	}
+	if candidateBetter(c, b) {
+		return right
+	}
+	return mid
+}
+
+func partitionCandidates(items []util.Candidate, left, right, pivotIdx int) int {
+	pivot := items[pivotIdx]
+	items[pivotIdx], items[right] = items[right], items[pivotIdx]
+	store := left
+	for i := left; i < right; i++ {
+		if candidateBetter(items[i], pivot) {
+			items[store], items[i] = items[i], items[store]
+			store++
+		}
+	}
+	items[right], items[store] = items[store], items[right]
+	return store
+}
+
+// candidateMaxHeap is a standard max-heap over a slice. It is the current
+// hot-path default for candidate tracking.
 type candidateMaxHeap struct {
 	items []util.Candidate
 }
@@ -206,7 +369,7 @@ func (h *candidateMaxHeap) PushCandidate(c util.Candidate) {
 	items = h.items
 
 	for idx > 0 {
-		parent := (idx - 1) / 2
+		parent := (idx - 1) / candidateHeapFanout
 		p := items[parent]
 		if p.Distance > c.Distance || (p.Distance == c.Distance && p.ID >= c.ID) {
 			break
@@ -229,27 +392,43 @@ func (h *candidateMaxHeap) PopCandidate() util.Candidate {
 
 	idx := 0
 	for {
-		left := idx*2 + 1
-		if left >= n {
+		first := idx*candidateHeapFanout + 1
+		if first >= n {
 			break
 		}
-		right := left + 1
-		largest := left
-		lItem := items[left]
+		largest := first
+		child := items[first]
 
-		if right < n {
-			rItem := items[right]
-			if rItem.Distance > lItem.Distance || (rItem.Distance == lItem.Distance && rItem.ID > lItem.ID) {
-				largest = right
-				lItem = rItem
+		childIdx := first + 1
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 2
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 3
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
 			}
 		}
 
-		if lItem.Distance < c.Distance || (lItem.Distance == c.Distance && lItem.ID <= c.ID) {
+		if child.Distance < c.Distance || (child.Distance == c.Distance && child.ID <= c.ID) {
 			break
 		}
 
-		items[idx] = lItem
+		items[idx] = child
 		idx = largest
 	}
 	items[idx] = c
@@ -265,27 +444,43 @@ func (h *candidateMaxHeap) ReplaceTop(c util.Candidate) {
 
 	idx := 0
 	for {
-		left := idx*2 + 1
-		if left >= n {
+		first := idx*candidateHeapFanout + 1
+		if first >= n {
 			break
 		}
-		right := left + 1
-		largest := left
-		lItem := items[left]
+		largest := first
+		child := items[first]
 
-		if right < n {
-			rItem := items[right]
-			if rItem.Distance > lItem.Distance || (rItem.Distance == lItem.Distance && rItem.ID > lItem.ID) {
-				largest = right
-				lItem = rItem
+		childIdx := first + 1
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 2
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
+			}
+		}
+		childIdx = first + 3
+		if childIdx < n {
+			item := items[childIdx]
+			if item.Distance > child.Distance || (item.Distance == child.Distance && item.ID > child.ID) {
+				largest = childIdx
+				child = item
 			}
 		}
 
-		if lItem.Distance < c.Distance || (lItem.Distance == c.Distance && lItem.ID <= c.ID) {
+		if child.Distance < c.Distance || (child.Distance == c.Distance && child.ID <= c.ID) {
 			break
 		}
 
-		items[idx] = lItem
+		items[idx] = child
 		idx = largest
 	}
 	items[idx] = c
@@ -402,6 +597,29 @@ func admitBatch4Unsorted(candidates *unsortedTopK, working *candidateMinHeap, ef
 	admitCandidateUnsorted(candidates, working, ef, ids[3], d3)
 }
 
+func admitCandidateReservoir(candidates *reservoirTopK, working *candidateMinHeap, id uint32, distance float32) {
+	candidate := util.Candidate{ID: id, Distance: distance}
+	if candidates.PushCandidate(candidate) {
+		working.PushCandidate(candidate)
+	}
+}
+
+func admitBatch4Reservoir(candidates *reservoirTopK, working *candidateMinHeap, ids []uint32, d0, d1, d2, d3 float32) {
+	if candidates.Full() {
+		threshold := candidates.Threshold()
+		if candidateWorseOrEqual(util.Candidate{ID: ids[0], Distance: d0}, threshold) &&
+			candidateWorseOrEqual(util.Candidate{ID: ids[1], Distance: d1}, threshold) &&
+			candidateWorseOrEqual(util.Candidate{ID: ids[2], Distance: d2}, threshold) &&
+			candidateWorseOrEqual(util.Candidate{ID: ids[3], Distance: d3}, threshold) {
+			return
+		}
+	}
+	admitCandidateReservoir(candidates, working, ids[0], d0)
+	admitCandidateReservoir(candidates, working, ids[1], d1)
+	admitCandidateReservoir(candidates, working, ids[2], d2)
+	admitCandidateReservoir(candidates, working, ids[3], d3)
+}
+
 func (h *Index) acquireSearchScratch() *searchScratch {
 	return h.acquireSearchScratchWithEF(0)
 }
@@ -415,16 +633,35 @@ func (h *Index) acquireSearchScratchWithNodeCount(nodeCount int) *searchScratch 
 }
 
 func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *searchScratch {
-	scratch := h.searchScratchPool.Get().(*searchScratch)
+	var scratch *searchScratch
+	for scratch == nil {
+		free := h.searchScratchFree.Load()
+		if free == 0 {
+			runtime.Gosched()
+			continue
+		}
+		slot := bits.TrailingZeros64(free)
+		bit := uint64(1) << slot
+		if h.searchScratchFree.CompareAndSwap(free, free&^bit) {
+			scratch = &h.searchScratches[slot]
+		}
+	}
+	h.prepareSearchScratch(scratch, nodeCount, ef)
+	return scratch
+}
 
+func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef int) {
 	maxCap, minCap := searchHeapCaps(nodeCount, ef)
 	prefetchCap := max(128, linkArrayCapacity(h.config.M, 0)*2)
 	candidateBytes := uint64(maxCap+minCap) * uint64(unsafe.Sizeof(util.Candidate{}))
+	prefetchBytes := uint64(prefetchCap) * uint64(
+		unsafe.Sizeof(uint32(0))+unsafe.Sizeof(unsafe.Pointer(nil))+unsafe.Sizeof([]float32(nil)),
+	)
 	// Ensure the Arena is sized for visitedMarks, prefetch ID buffer, and the
 	// two candidate frontiers used by this search. ef may be much larger than
 	// the default headroom during quality sweeps and user-tuned high-recall
 	// searches, so fixed scratch sizing can panic under valid configurations.
-	needed := uint64(nodeCount*4+prefetchCap*4) + candidateBytes + 64*1024 + 8*64
+	needed := uint64(nodeCount*4) + prefetchBytes + candidateBytes + 64*1024 + 8*64
 	if needed < 320*1024 {
 		needed = 320 * 1024
 	}
@@ -457,16 +694,16 @@ func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *s
 	}
 	scratch.prefetchedIDs = prefetchBuf[:0]
 
-	if cap(scratch.prefetchVecs) < prefetchCap {
-		scratch.prefetchVecs = make([][]float32, 0, prefetchCap)
-	} else {
-		scratch.prefetchVecs = scratch.prefetchVecs[:0]
+	prefetchVecs, err := memory.ArenaSlice[[]float32](scratch.arena, prefetchCap)
+	if err != nil {
+		panic("hnsw: arena prefetchVecs: " + err.Error())
 	}
-	if cap(scratch.prefetchPtrs) < prefetchCap {
-		scratch.prefetchPtrs = make([]unsafe.Pointer, 0, prefetchCap)
-	} else {
-		scratch.prefetchPtrs = scratch.prefetchPtrs[:0]
+	scratch.prefetchVecs = prefetchVecs[:0]
+	prefetchPtrs, err := memory.ArenaSlice[unsafe.Pointer](scratch.arena, prefetchCap)
+	if err != nil {
+		panic("hnsw: arena prefetchPtrs: " + err.Error())
 	}
+	scratch.prefetchPtrs = prefetchPtrs[:0]
 
 	maxHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, maxCap)
 	if err != nil {
@@ -479,7 +716,6 @@ func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *s
 	}
 	scratch.minHeapBuf = minHeap[:0]
 
-	return scratch
 }
 
 func searchHeapCaps(nodeCount int, ef int) (int, int) {
@@ -501,7 +737,10 @@ func (h *Index) releaseSearchScratch(scratch *searchScratch) {
 	// Arena.Reset() rewinds the bump pointer, keeping the mmap'd region
 	// so the next acquireSearchScratch can reuse it without a new mmap.
 	scratch.arena.Reset()
-	h.searchScratchPool.Put(scratch)
+	bit := uint64(1) << scratch.slot
+	if previous := h.searchScratchFree.Or(bit); previous&bit != 0 {
+		panic("hnsw: search scratch released twice")
+	}
 }
 
 // greedySearchLevel performs the ef=1 greedy descent used by HNSW on upper layers.
@@ -736,9 +975,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	visitMark := scratch.nextVisitMark()
 	scratch.maxHeapBuf = scratch.maxHeapBuf[:0]
 	scratch.minHeapBuf = scratch.minHeapBuf[:0]
-	heapMode := CandidateMode == "heap"
+	candidateMode := CandidateMode
+	heapMode := candidateMode != "unsorted" && candidateMode != "reservoir"
+	reservoirMode := candidateMode == "reservoir"
 	heapCandidates := candidateMaxHeap{items: scratch.maxHeapBuf}
 	unsortedCandidates := unsortedTopK{items: scratch.maxHeapBuf, maxSize: ef}
+	reservoirCandidates := reservoirTopK{items: scratch.maxHeapBuf, maxSize: ef}
 	w := &candidateMinHeap{items: scratch.minHeapBuf}
 	useRawNEONPtrL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && h.quantizer == nil && h.provider == nil
 	useNEONBatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && !useRawNEONPtrL2
@@ -763,9 +1005,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 	candidate := util.Candidate{ID: entryID, Distance: distance}
 
-	if heapMode {
+	switch {
+	case heapMode:
 		heapCandidates.PushCandidate(candidate)
-	} else {
+	case reservoirMode:
+		reservoirCandidates.PushCandidate(candidate)
+	default:
 		unsortedCandidates.PushCandidate(candidate)
 	}
 	w.PushCandidate(candidate)
@@ -785,6 +1030,10 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 		// Early termination condition - optimized for large datasets
 		if heapMode {
 			if len(heapCandidates.items) >= ef && current.Distance > heapCandidates.items[0].Distance {
+				break
+			}
+		} else if reservoirMode {
+			if reservoirCandidates.Full() && candidateWorse(current, reservoirCandidates.Threshold()) {
 				break
 			}
 		} else {
@@ -872,6 +1121,32 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			}
 			if useRawNEONPtrL2 {
 				for i := 0; i < len(scratch.prefetchedIDs); {
+					if i+7 < len(scratch.prefetchedIDs) {
+						d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(
+							query,
+							scratch.prefetchPtrs[i],
+							scratch.prefetchPtrs[i+1],
+							scratch.prefetchPtrs[i+2],
+							scratch.prefetchPtrs[i+3],
+							scratch.prefetchPtrs[i+4],
+							scratch.prefetchPtrs[i+5],
+							scratch.prefetchPtrs[i+6],
+							scratch.prefetchPtrs[i+7],
+						)
+						batchIDs := scratch.prefetchedIDs[i : i+8]
+						if heapMode {
+							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs[:4], d0, d1, d2, d3)
+							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs[4:], d4, d5, d6, d7)
+						} else if reservoirMode {
+							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs[:4], d0, d1, d2, d3)
+							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs[4:], d4, d5, d6, d7)
+						} else {
+							admitBatch4Unsorted(&unsortedCandidates, w, ef, batchIDs[:4], d0, d1, d2, d3)
+							admitBatch4Unsorted(&unsortedCandidates, w, ef, batchIDs[4:], d4, d5, d6, d7)
+						}
+						i += 8
+						continue
+					}
 					if i+3 < len(scratch.prefetchedIDs) {
 						d0, d1, d2, d3 := simd.L2Distance4PtrNEON(
 							query,
@@ -883,6 +1158,8 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						batchIDs := scratch.prefetchedIDs[i : i+4]
 						if heapMode {
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs, d0, d1, d2, d3)
+						} else if reservoirMode {
+							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs, d0, d1, d2, d3)
 						} else {
 							admitBatch4Unsorted(&unsortedCandidates, w, ef, batchIDs, d0, d1, d2, d3)
 						}
@@ -895,6 +1172,8 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 					neighborDistance := h.distance(query, vec)
 					if heapMode {
 						admitCandidateMaxHeap(&heapCandidates, w, ef, neighborID, neighborDistance)
+					} else if reservoirMode {
+						admitCandidateReservoir(&reservoirCandidates, w, neighborID, neighborDistance)
 					} else {
 						admitCandidateUnsorted(&unsortedCandidates, w, ef, neighborID, neighborDistance)
 					}
@@ -919,6 +1198,8 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						batchIDs := scratch.prefetchedIDs[i : i+4]
 						if heapMode {
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs, d0, d1, d2, d3)
+						} else if reservoirMode {
+							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs, d0, d1, d2, d3)
 						} else {
 							admitBatch4Unsorted(&unsortedCandidates, w, ef, batchIDs, d0, d1, d2, d3)
 						}
@@ -949,6 +1230,8 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 				if heapMode {
 					admitCandidateMaxHeap(&heapCandidates, w, ef, neighborID, neighborDistance)
+				} else if reservoirMode {
+					admitCandidateReservoir(&reservoirCandidates, w, neighborID, neighborDistance)
 				} else {
 					admitCandidateUnsorted(&unsortedCandidates, w, ef, neighborID, neighborDistance)
 				}
@@ -958,6 +1241,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	}
 	if heapMode {
 		return heapCandidates.items, nil
+	}
+	if reservoirMode {
+		return reservoirCandidates.Items(), nil
 	}
 	return unsortedCandidates.items, nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -35,6 +36,9 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 		got, err := store.Get(ref)
 		if err != nil {
 			t.Fatalf("get vector %d failed: %v", i, err)
+		}
+		if uintptr(unsafe.Pointer(&got[0]))%64 != 0 {
+			t.Fatalf("vector %d is not 64-byte aligned", i)
 		}
 		for j := range vec {
 			if got[j] != vec[j] {

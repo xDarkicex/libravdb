@@ -93,7 +93,7 @@ func (h *Index) loadFromDiskImpl(ctx context.Context, path string) error {
 	if h.rawVectorStore == nil {
 		switch h.config.RawVectorStore {
 		case "", RawVectorStoreMemory:
-			h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+			h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
 		case RawVectorStoreSlabby:
 			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
 			if err != nil {

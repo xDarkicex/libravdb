@@ -3,6 +3,7 @@ package hnsw
 import (
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/xDarkicex/memory"
 )
@@ -49,27 +50,46 @@ type RawVectorStore interface {
 
 type InMemoryRawVectorStore struct {
 	pool     *memory.Pool
-	slots    rawSlotArray[inMemoryRawVectorSlot]
+	slots    rawSlotArray[float32]
 	dim      int
 	bytes    atomic.Int64
 	active   atomic.Int32
 	nextSlot atomic.Uint32
 }
 
-type inMemoryRawVectorSlot struct {
-	vec    []float32
-	active atomic.Bool
+func NewInMemoryRawVectorStore(dim int) *InMemoryRawVectorStore {
+	return NewInMemoryRawVectorStoreWithCapacity(dim, 0)
 }
 
-func NewInMemoryRawVectorStore(dim int) *InMemoryRawVectorStore {
-	pool, err := memory.NewPool(memory.AllocatorConfig{}, 64)
+func NewInMemoryRawVectorStoreWithCapacity(dim, capacity int) *InMemoryRawVectorStore {
+	const minimumPoolSize = uint64(64 * 1024 * 1024)
+	poolSize := minimumPoolSize
+	if capacity > 0 {
+		vectorStride := uint64((dim*4 + 63) &^ 63)
+		chunkCount := uint64((capacity + rawSlotChunkSize - 1) / rawSlotChunkSize)
+		required := uint64(capacity)*vectorStride + chunkCount*uint64(unsafe.Sizeof(rawSlotChunk[float32]{})) + uint64(unsafe.Sizeof(rawSlotDirectory[float32]{}))
+		if required > poolSize {
+			poolSize = (required + 2*1024*1024 - 1) &^ (2*1024*1024 - 1)
+		}
+	}
+	pool, err := memory.NewPool(memory.AllocatorConfig{
+		PoolSize:  poolSize,
+		SlabSize:  poolSize,
+		SlabCount: 1,
+		Prealloc:  true,
+	}, 64)
 	if err != nil {
 		panic(fmt.Sprintf("failed to create memory pool for vector store: %v", err))
 	}
-	return &InMemoryRawVectorStore{
+	store := &InMemoryRawVectorStore{
 		pool: pool,
 		dim:  dim,
 	}
+	if err := store.slots.Init(pool); err != nil {
+		pool.Free()
+		panic(fmt.Sprintf("failed to initialize raw vector slots: %v", err))
+	}
+	return store
 }
 
 func (s *InMemoryRawVectorStore) Put(vec []float32) (VectorRef, error) {
@@ -88,9 +108,7 @@ func (s *InMemoryRawVectorStore) Put(vec []float32) (VectorRef, error) {
 	copy(stored, vec)
 
 	slotIndex := s.nextSlot.Add(1) - 1
-	slot := &inMemoryRawVectorSlot{vec: stored}
-	slot.active.Store(true)
-	if err := s.slots.Store(slotIndex, slot); err != nil {
+	if err := s.slots.Store(slotIndex, &stored[0]); err != nil {
 		return VectorRef{}, err
 	}
 	s.bytes.Add(int64(len(stored) * 4))
@@ -111,27 +129,23 @@ func (s *InMemoryRawVectorStore) Get(ref VectorRef) ([]float32, error) {
 	if !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil, fmt.Errorf("invalid raw vector reference")
 	}
-	slot := s.slots.Load(ref.Slot)
-	if slot == nil {
+	ptr := s.slots.Load(ref.Slot)
+	if ptr == nil {
 		return nil, fmt.Errorf("raw vector slot out of range: %d", ref.Slot)
 	}
-	if !slot.active.Load() || slot.vec == nil {
-		return nil, fmt.Errorf("raw vector slot %d is empty", ref.Slot)
-	}
-	return slot.vec, nil
+	return unsafe.Slice(ptr, s.dim), nil
 }
 
 func (s *InMemoryRawVectorStore) Delete(ref VectorRef) error {
 	if s == nil || !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil
 	}
-	slot := s.slots.Load(ref.Slot)
-	if slot == nil {
-		return nil
-	}
-	if slot.active.CompareAndSwap(true, false) {
-		s.bytes.Add(-int64(len(slot.vec) * 4))
-		s.active.Add(-1)
+	for ptr := s.slots.Load(ref.Slot); ptr != nil; ptr = s.slots.Load(ref.Slot) {
+		if s.slots.CompareAndSwap(ref.Slot, ptr, nil) {
+			s.bytes.Add(-int64(s.dim * 4))
+			s.active.Add(-1)
+			break
+		}
 	}
 	return nil
 }
@@ -141,6 +155,12 @@ func (s *InMemoryRawVectorStore) Reset() error {
 		return nil
 	}
 	s.slots.Reset()
+	if s.pool != nil {
+		s.pool.Reset()
+		if err := s.slots.Init(s.pool); err != nil {
+			return err
+		}
+	}
 	s.bytes.Store(0)
 	s.active.Store(0)
 	s.nextSlot.Store(0)
@@ -155,9 +175,7 @@ func (s *InMemoryRawVectorStore) MemoryUsage() int64 {
 }
 
 func (s *InMemoryRawVectorStore) Close() error {
-	if err := s.Reset(); err != nil {
-		return err
-	}
+	s.slots.Detach()
 	if s.pool != nil {
 		s.pool.Free()
 	}
@@ -166,18 +184,19 @@ func (s *InMemoryRawVectorStore) Close() error {
 
 func (s *InMemoryRawVectorStore) Profile() RawVectorStoreProfile {
 	bytes := s.bytes.Load()
+	stats := s.pool.Stats()
 	return RawVectorStoreProfile{
 		Backend:             RawVectorStoreMemory,
 		VectorCount:         int(s.active.Load()),
 		Dimension:           s.dim,
 		BytesPerVector:      s.dim * 4,
 		MemoryUsage:         bytes,
-		ReservedBytes:       bytes,
-		ReservedDataBytes:   bytes,
+		ReservedBytes:       int64(stats.Reserved),
+		ReservedDataBytes:   int64(stats.Reserved),
 		ReservedMetaBytes:   0,
 		ReservedGuardBytes:  0,
 		LiveBytes:           bytes,
-		FreeBytes:           0,
-		CapacityUtilization: 1.0,
+		FreeBytes:           int64(stats.Reserved) - bytes,
+		CapacityUtilization: float64(bytes) / float64(max(uint64(1), stats.Reserved)),
 	}
 }

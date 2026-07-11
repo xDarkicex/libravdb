@@ -95,17 +95,22 @@ func (it IndexType) String() string {
 
 // HNSWConfig holds configuration for HNSW index
 type HNSWConfig struct {
-	Provider       hnsw.VectorProvider
-	Quantization   *quant.QuantizationConfig
-	RawVectorStore string
-	Dimension      int
-	M              int
-	EfConstruction int
-	EfSearch       int
-	ML             float64
-	Metric         util.DistanceMetric
-	RawStoreCap    int
-	IDMapCapacity  int
+	Provider             hnsw.VectorProvider
+	Quantization         *quant.QuantizationConfig
+	RawVectorStore       string
+	Dimension            int
+	M                    int
+	EfConstruction       int
+	EfSearch             int
+	ML                   float64
+	Metric               util.DistanceMetric
+	PruneAlpha           float32
+	Level0LinkMultiplier float64
+	RepairEnabled        bool
+	RepairQueueSize      int
+	RepairBatchSize      int
+	RawStoreCap          int
+	IDMapCapacity        int
 }
 
 // IVFPQConfig holds configuration for IVF-PQ index
@@ -265,18 +270,23 @@ func (w *hnswWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 func NewHNSW(config *HNSWConfig) (Index, error) {
 	// Convert to internal HNSW config
 	hnswConfig := &hnsw.Config{
-		Dimension:      config.Dimension,
-		M:              config.M,
-		EfConstruction: config.EfConstruction,
-		EfSearch:       config.EfSearch,
-		ML:             config.ML,
-		Metric:         config.Metric,
-		Provider:       config.Provider,
-		RandomSeed:     0, // Default seed for Phase 1
-		RawVectorStore: config.RawVectorStore,
-		RawStoreCap:    config.RawStoreCap,
-		IDMapCapacity:  config.IDMapCapacity,
-		Quantization:   config.Quantization,
+		Dimension:            config.Dimension,
+		M:                    config.M,
+		EfConstruction:       config.EfConstruction,
+		EfSearch:             config.EfSearch,
+		ML:                   config.ML,
+		Metric:               config.Metric,
+		PruneAlpha:           config.PruneAlpha,
+		Level0LinkMultiplier: config.Level0LinkMultiplier,
+		RepairEnabled:        config.RepairEnabled,
+		RepairQueueSize:      config.RepairQueueSize,
+		RepairBatchSize:      config.RepairBatchSize,
+		Provider:             config.Provider,
+		RandomSeed:           0, // Default seed for Phase 1
+		RawVectorStore:       config.RawVectorStore,
+		RawStoreCap:          config.RawStoreCap,
+		IDMapCapacity:        config.IDMapCapacity,
+		Quantization:         config.Quantization,
 	}
 
 	hnswIndex, err := hnsw.NewHNSW(hnswConfig)

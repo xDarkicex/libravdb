@@ -261,7 +261,7 @@ func TestFlatSearchAccuracy(t *testing.T) {
 
 	// Verify exact search results
 	expectedOrder := []string{"origin", "x1", "y1", "diagonal", "x2"}
-	expectedDistances := []float32{0.0, 1.0, 1.0, float32(math.Sqrt(2)), 2.0}
+	expectedDistances := []float32{0.0, 1.0, 1.0, 2.0, 4.0}
 
 	for i, expected := range expectedOrder {
 		if i >= len(results) {

@@ -90,6 +90,57 @@ func TestL2Distance4PtrNEONMatchesScalar(t *testing.T) {
 	}
 }
 
+func TestL2Distance8PtrNEONMatchesScalar(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skipf("NEON pointer batch implementation only enabled for arm64")
+	}
+	for _, n := range []int{1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 127, 128, 129} {
+		q, b0 := deterministicVectors(n)
+		_, b1 := deterministicVectors(n + 1)
+		_, b2 := deterministicVectors(n + 2)
+		_, b3 := deterministicVectors(n + 3)
+		_, b4 := deterministicVectors(n + 4)
+		_, b5 := deterministicVectors(n + 5)
+		_, b6 := deterministicVectors(n + 6)
+		_, b7 := deterministicVectors(n + 7)
+		b1 = b1[:n]
+		b2 = b2[:n]
+		b3 = b3[:n]
+		b4 = b4[:n]
+		b5 = b5[:n]
+		b6 = b6[:n]
+		b7 = b7[:n]
+
+		got0, got1, got2, got3, got4, got5, got6, got7 := L2Distance8PtrNEON(
+			q,
+			unsafe.Pointer(&b0[0]),
+			unsafe.Pointer(&b1[0]),
+			unsafe.Pointer(&b2[0]),
+			unsafe.Pointer(&b3[0]),
+			unsafe.Pointer(&b4[0]),
+			unsafe.Pointer(&b5[0]),
+			unsafe.Pointer(&b6[0]),
+			unsafe.Pointer(&b7[0]),
+		)
+		want := [8]float32{
+			scalarL2(q, b0),
+			scalarL2(q, b1),
+			scalarL2(q, b2),
+			scalarL2(q, b3),
+			scalarL2(q, b4),
+			scalarL2(q, b5),
+			scalarL2(q, b6),
+			scalarL2(q, b7),
+		}
+		got := [8]float32{got0, got1, got2, got3, got4, got5, got6, got7}
+		for i := range got {
+			if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-3 {
+				t.Fatalf("L2Distance8PtrNEON len=%d lane=%d got=%v want=%v diff=%v", n, i, got[i], want[i], diff)
+			}
+		}
+	}
+}
+
 func TestL2Distance4AVX2MatchesScalar(t *testing.T) {
 	if runtime.GOARCH != "amd64" || !cpu.X86.HasAVX2 || !cpu.X86.HasFMA {
 		t.Skipf("AVX2 batch implementation not enabled on this machine")

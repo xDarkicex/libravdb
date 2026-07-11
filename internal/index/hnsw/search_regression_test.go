@@ -3,6 +3,7 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -38,9 +39,11 @@ func TestSearchScratchZeroAllocs(t *testing.T) {
 		}
 	}
 
-	// acqureSearchScratch + releaseSearchScratch should not allocate
+	// A GC must not discard scratch state and turn the next search into an
+	// allocation spike. acquireSearchScratch + releaseSearchScratch should not allocate
 	// from the Go heap: visitedMarks, maxHeapBuf, and minHeapBuf are
 	// backed by the per-scratch memory.Arena.
+	runtime.GC()
 	allocs := testing.AllocsPerRun(100, func() {
 		scratch := idx.acquireSearchScratch()
 		idx.releaseSearchScratch(scratch)

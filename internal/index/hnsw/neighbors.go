@@ -314,8 +314,33 @@ func (h *Index) rejectBySelectedHeuristic(
 	cutoff float32,
 	usePtrNEON bool,
 ) bool {
+	relaxedCutoff := h.relaxedHeuristicCutoff(cutoff)
 	if usePtrNEON && len(selectedPtrs) == len(selectedVectors) {
 		j := 0
+		for j+7 < len(selectedPtrs) {
+			p0 := selectedPtrs[j]
+			p1 := selectedPtrs[j+1]
+			p2 := selectedPtrs[j+2]
+			p3 := selectedPtrs[j+3]
+			p4 := selectedPtrs[j+4]
+			p5 := selectedPtrs[j+5]
+			p6 := selectedPtrs[j+6]
+			p7 := selectedPtrs[j+7]
+			if p0 != nil && p1 != nil && p2 != nil && p3 != nil && p4 != nil && p5 != nil && p6 != nil && p7 != nil {
+				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(candidateVector, p0, p1, p2, p3, p4, p5, p6, p7)
+				if d0 < relaxedCutoff || d1 < relaxedCutoff || d2 < relaxedCutoff || d3 < relaxedCutoff ||
+					d4 < relaxedCutoff || d5 < relaxedCutoff || d6 < relaxedCutoff || d7 < relaxedCutoff {
+					return true
+				}
+				j += 8
+				continue
+			}
+			selectedVector := selectedVectors[j]
+			if selectedVector != nil && h.distance(candidateVector, selectedVector) < relaxedCutoff {
+				return true
+			}
+			j++
+		}
 		for j+3 < len(selectedPtrs) {
 			p0 := selectedPtrs[j]
 			p1 := selectedPtrs[j+1]
@@ -323,21 +348,21 @@ func (h *Index) rejectBySelectedHeuristic(
 			p3 := selectedPtrs[j+3]
 			if p0 != nil && p1 != nil && p2 != nil && p3 != nil {
 				d0, d1, d2, d3 := simd.L2Distance4PtrNEON(candidateVector, p0, p1, p2, p3)
-				if d0 < cutoff || d1 < cutoff || d2 < cutoff || d3 < cutoff {
+				if d0 < relaxedCutoff || d1 < relaxedCutoff || d2 < relaxedCutoff || d3 < relaxedCutoff {
 					return true
 				}
 				j += 4
 				continue
 			}
 			selectedVector := selectedVectors[j]
-			if selectedVector != nil && h.distance(candidateVector, selectedVector) < cutoff {
+			if selectedVector != nil && h.distance(candidateVector, selectedVector) < relaxedCutoff {
 				return true
 			}
 			j++
 		}
 		for ; j < len(selectedVectors); j++ {
 			selectedVector := selectedVectors[j]
-			if selectedVector != nil && h.distance(candidateVector, selectedVector) < cutoff {
+			if selectedVector != nil && h.distance(candidateVector, selectedVector) < relaxedCutoff {
 				return true
 			}
 		}
@@ -348,11 +373,26 @@ func (h *Index) rejectBySelectedHeuristic(
 		if selectedVector == nil {
 			continue
 		}
-		if h.distance(candidateVector, selectedVector) < cutoff {
+		if h.distance(candidateVector, selectedVector) < relaxedCutoff {
 			return true
 		}
 	}
 	return false
+}
+
+func (h *Index) pruneAlphaSquared() float32 {
+	if h == nil || h.config == nil || h.config.PruneAlpha <= 1 {
+		return 1
+	}
+	return h.config.PruneAlpha * h.config.PruneAlpha
+}
+
+func (h *Index) relaxedHeuristicCutoff(cutoff float32) float32 {
+	alphaSquared := h.pruneAlphaSquared()
+	if alphaSquared <= 1 {
+		return cutoff
+	}
+	return cutoff / alphaSquared
 }
 
 // PruneConnections optimizes the connections of a node to maintain graph quality
@@ -406,26 +446,7 @@ func (ns *NeighborSelector) PruneConnections(
 		return fmt.Errorf("arena allocate liveLinks: %w", err)
 	}
 	liveLinks = liveLinks[:0]
-	for _, linkID := range originalLinks {
-		if int(linkID) >= index.nodes.Len() {
-			continue
-		}
-		linkNode := index.nodes.Get(linkID)
-		if linkNode == nil {
-			continue
-		}
-		linkVector, err := index.getNodeVector(linkNode)
-		if err != nil {
-			continue
-		}
-
-		distance := index.distance(nodeVector, linkVector)
-		liveLinks = append(liveLinks, linkID)
-		candidates = append(candidates, util.Candidate{
-			ID:       linkID,
-			Distance: distance,
-		})
-	}
+	liveLinks, candidates = index.appendHeuristicCandidatesFromIDs(nodeVector, originalLinks, liveLinks, candidates)
 
 	if len(candidates) <= maxM && len(liveLinks) == len(originalLinks) {
 		index.releasePruneLock(node)
@@ -509,6 +530,7 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 		return false
 	}
 	newDistance := index.distance(targetVector, newVector)
+	newRelaxedDistance := index.relaxedHeuristicCutoff(newDistance)
 
 	maxCapacity := linkArrayCapacity(index.config.M, level)
 	maxM := ns.maxConnections
@@ -545,6 +567,16 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 	func() {
 		defer index.releasePruneLock(targetNode)
 
+		// Deletion unpublishes a node before taking PruneLock and reclaiming
+		// its link arrays. A writer may have captured targetNode before that
+		// unpublish, so revalidate both identity and storage under the lock.
+		if index.nodes.Get(targetID) != targetNode || targetNode.Links[level] == nil {
+			return
+		}
+		if index.nodes.Get(newID) == nil {
+			return
+		}
+
 		slice := unsafe.Slice(targetNode.Links[level], maxCapacity)
 		count := int(atomic.LoadUint32(&targetNode.LinkCounts[level]))
 		if count > maxCapacity {
@@ -574,6 +606,21 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 			return
 		}
 
+		// Defer expensive diversity pruning into the fixed overflow slack.
+		// Immediate backlink pruning makes high-M construction pay O(M^3)
+		// work on nearly every accepted edge. The slack is preallocated for
+		// this exact purpose: extra edges are visible to search, improve
+		// routing during construction, and get collapsed by the next full
+		// prune once the array reaches physical capacity.
+		if len(original) < maxCapacity {
+			atomic.StoreUint32(&slice[len(original)], newID)
+			atomic.StoreUint32(&targetNode.LinkCounts[level], uint32(len(original)+1))
+			atomic.StoreUint32(&targetNode.LinkHeuristic[level], 0)
+			index.markRepairDirty(targetNode, level)
+			accepted = true
+			return
+		}
+
 		if heuristicCount >= len(original) && len(original) > 0 {
 			worstID := original[len(original)-1]
 			worstVector, ok := index.nodeVectorForHeuristic(worstID)
@@ -594,7 +641,7 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 					if !ok {
 						continue
 					}
-					if index.distance(newVector, selectedVector) < newDistance {
+					if index.distance(newVector, selectedVector) < newRelaxedDistance {
 						newInserted = true
 						return false
 					}
@@ -620,8 +667,10 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 					}
 				}
 
-				if newAccepted && index.distance(linkVector, newVector) < linkDistance {
-					continue
+				if newAccepted {
+					if index.distance(linkVector, newVector) < index.relaxedHeuristicCutoff(linkDistance) {
+						continue
+					}
 				}
 				selectedIDs = append(selectedIDs, linkID)
 				if len(selectedIDs) >= maxM {
@@ -656,16 +705,7 @@ func (ns *NeighborSelector) connectLinkWithHeuristic(
 			return
 		}
 
-		for _, linkID := range original {
-			linkVector, ok := index.nodeVectorForHeuristic(linkID)
-			if !ok {
-				continue
-			}
-			candidates = append(candidates, util.Candidate{
-				ID:       linkID,
-				Distance: index.distance(targetVector, linkVector),
-			})
-		}
+		_, candidates = index.appendHeuristicCandidatesFromIDs(targetVector, original, nil, candidates)
 		candidates = append(candidates, util.Candidate{
 			ID:       newID,
 			Distance: newDistance,
@@ -744,6 +784,103 @@ func uint32SliceContains(values []uint32, id uint32) bool {
 		}
 	}
 	return false
+}
+
+func (h *Index) appendHeuristicCandidatesFromIDs(
+	queryVector []float32,
+	ids []uint32,
+	liveLinks []uint32,
+	candidates []util.Candidate,
+) ([]uint32, []util.Candidate) {
+	trackLiveLinks := liveLinks != nil || cap(liveLinks) > 0
+	if h.useHeuristicPtrNEON() {
+		var idBuf [8]uint32
+		var ptrBuf [8]unsafe.Pointer
+		for i := 0; i < len(ids); {
+			n := 0
+			for i < len(ids) && n < len(idBuf) {
+				id := ids[i]
+				i++
+				_, ptr, ok := h.nodeVectorAndPtrForHeuristic(id)
+				if !ok || ptr == nil {
+					continue
+				}
+				idBuf[n] = id
+				ptrBuf[n] = ptr
+				n++
+			}
+			if n == 0 {
+				continue
+			}
+			if n == 8 {
+				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(
+					queryVector,
+					ptrBuf[0],
+					ptrBuf[1],
+					ptrBuf[2],
+					ptrBuf[3],
+					ptrBuf[4],
+					ptrBuf[5],
+					ptrBuf[6],
+					ptrBuf[7],
+				)
+				if trackLiveLinks {
+					liveLinks = append(liveLinks, idBuf[0], idBuf[1], idBuf[2], idBuf[3], idBuf[4], idBuf[5], idBuf[6], idBuf[7])
+				}
+				candidates = append(candidates,
+					util.Candidate{ID: idBuf[0], Distance: d0},
+					util.Candidate{ID: idBuf[1], Distance: d1},
+					util.Candidate{ID: idBuf[2], Distance: d2},
+					util.Candidate{ID: idBuf[3], Distance: d3},
+					util.Candidate{ID: idBuf[4], Distance: d4},
+					util.Candidate{ID: idBuf[5], Distance: d5},
+					util.Candidate{ID: idBuf[6], Distance: d6},
+					util.Candidate{ID: idBuf[7], Distance: d7},
+				)
+				continue
+			}
+			j := 0
+			if n >= 4 {
+				d0, d1, d2, d3 := simd.L2Distance4PtrNEON(queryVector, ptrBuf[0], ptrBuf[1], ptrBuf[2], ptrBuf[3])
+				if trackLiveLinks {
+					liveLinks = append(liveLinks, idBuf[0], idBuf[1], idBuf[2], idBuf[3])
+				}
+				candidates = append(candidates,
+					util.Candidate{ID: idBuf[0], Distance: d0},
+					util.Candidate{ID: idBuf[1], Distance: d1},
+					util.Candidate{ID: idBuf[2], Distance: d2},
+					util.Candidate{ID: idBuf[3], Distance: d3},
+				)
+				j = 4
+			}
+			for ; j < n; j++ {
+				vector := unsafe.Slice((*float32)(ptrBuf[j]), len(queryVector))
+				if trackLiveLinks {
+					liveLinks = append(liveLinks, idBuf[j])
+				}
+				candidates = append(candidates, util.Candidate{
+					ID:       idBuf[j],
+					Distance: h.distance(queryVector, vector),
+				})
+			}
+		}
+		return liveLinks, candidates
+	}
+
+	for _, id := range ids {
+		vector, ok := h.nodeVectorForHeuristic(id)
+		if !ok {
+			continue
+		}
+		if trackLiveLinks {
+			liveLinks = append(liveLinks, id)
+		}
+		candidates = append(candidates, util.Candidate{
+			ID:       id,
+			Distance: h.distance(queryVector, vector),
+		})
+	}
+	return liveLinks, candidates
 }
 
 func (h *Index) nodeVectorForHeuristic(nodeID uint32) ([]float32, bool) {

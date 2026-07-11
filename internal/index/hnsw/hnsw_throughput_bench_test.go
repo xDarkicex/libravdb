@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -24,6 +25,44 @@ const (
 
 var benchNomicMatryoshkaDims = []int{64, 256, 768}
 var benchNomicEfSweep = []int{100, 150, 200, 300, 400, 600}
+var benchNomic768BuildParamSweep = []struct {
+	m              int
+	efConstruction int
+	pruneAlpha     float32
+	level0Links    float64
+	repairFlush    bool
+}{
+	{m: 16, efConstruction: 100},
+	{m: 16, efConstruction: 100, repairFlush: true},
+	{m: 16, efConstruction: 200},
+	{m: 16, efConstruction: 400},
+	{m: 16, efConstruction: 600},
+	{m: 24, efConstruction: 200},
+	{m: 24, efConstruction: 200, repairFlush: true},
+	{m: 24, efConstruction: 200, pruneAlpha: 1.05},
+	{m: 24, efConstruction: 200, pruneAlpha: 1.10},
+	{m: 24, efConstruction: 200, pruneAlpha: 1.15},
+	{m: 32, efConstruction: 200},
+	{m: 32, efConstruction: 200, repairFlush: true},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.05},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.10},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.15},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.20},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.30},
+	{m: 32, efConstruction: 200, level0Links: 2.50},
+	{m: 32, efConstruction: 200, pruneAlpha: 1.10, level0Links: 2.50},
+	{m: 36, efConstruction: 200},
+	{m: 36, efConstruction: 200, pruneAlpha: 1.10},
+	{m: 32, efConstruction: 400},
+	{m: 32, efConstruction: 600},
+	{m: 40, efConstruction: 200},
+	{m: 40, efConstruction: 400},
+	{m: 44, efConstruction: 200},
+	{m: 44, efConstruction: 400},
+	{m: 48, efConstruction: 200},
+	{m: 48, efConstruction: 400},
+	{m: 48, efConstruction: 600},
+}
 
 func benchmarkHNSWConfig() Config {
 	return benchmarkHNSWConfigDim(benchDim)
@@ -39,6 +78,10 @@ func benchmarkHNSWConfigDim(dim int) Config {
 		Metric:         util.L2Distance,
 		RandomSeed:     42,
 	}
+}
+
+func benchmarkNormalizedHNSWConfigDim(dim int) Config {
+	return benchmarkHNSWConfigDim(dim)
 }
 
 func benchmarkVectors(n int, seed int64) [][]float32 {
@@ -88,6 +131,50 @@ func benchmarkIDs(n int) []string {
 	return ids
 }
 
+// benchmarkPreloadedRawVectorStore replays references to vectors already owned
+// by the real off-heap store. It isolates graph construction from the ingestion
+// allocation and copy without changing the Insert or graph-building paths.
+type benchmarkPreloadedRawVectorStore struct {
+	RawVectorStore
+	refs []VectorRef
+	next int
+	dim  int
+}
+
+func (s *benchmarkPreloadedRawVectorStore) Put(vec []float32) (VectorRef, error) {
+	if len(vec) != s.dim {
+		return VectorRef{}, fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dim, len(vec))
+	}
+	if s.next >= len(s.refs) {
+		return VectorRef{}, fmt.Errorf("preloaded vector references exhausted at %d", s.next)
+	}
+	ref := s.refs[s.next]
+	s.next++
+	return ref, nil
+}
+
+func preloadBenchmarkRawVectors(b testing.TB, index *Index, vectors [][]float32) {
+	b.Helper()
+
+	store := index.rawVectorStore
+	if store == nil {
+		b.Fatal("benchmark index has no raw vector store")
+	}
+	refs := make([]VectorRef, len(vectors))
+	for i, vec := range vectors {
+		ref, err := store.Put(vec)
+		if err != nil {
+			b.Fatalf("preload vector %d failed: %v", i, err)
+		}
+		refs[i] = ref
+	}
+	index.rawVectorStore = &benchmarkPreloadedRawVectorStore{
+		RawVectorStore: store,
+		refs:           refs,
+		dim:            index.config.Dimension,
+	}
+}
+
 func buildBenchmarkIndex(b testing.TB, vectors [][]float32, ids []string) *Index {
 	b.Helper()
 
@@ -97,12 +184,20 @@ func buildBenchmarkIndex(b testing.TB, vectors [][]float32, ids []string) *Index
 func buildBenchmarkIndexWithConfig(b testing.TB, config Config, vectors [][]float32, ids []string) *Index {
 	b.Helper()
 
+	index, _ := buildBenchmarkIndexWithConfigMeasured(b, config, vectors, ids)
+	return index
+}
+
+func buildBenchmarkIndexWithConfigMeasured(b testing.TB, config Config, vectors [][]float32, ids []string) (*Index, time.Duration) {
+	b.Helper()
+
 	index, err := NewHNSW(&config)
 	if err != nil {
 		b.Fatalf("failed to create HNSW index: %v", err)
 	}
 
 	ctx := context.Background()
+	start := time.Now()
 	for i, vec := range vectors {
 		entry := VectorEntry{Vector: vec}
 		if ids != nil {
@@ -114,7 +209,7 @@ func buildBenchmarkIndexWithConfig(b testing.TB, config Config, vectors [][]floa
 		}
 	}
 
-	return index
+	return index, time.Since(start)
 }
 
 func bruteForceTruth(vectors, queries [][]float32, k int) [][]int {
@@ -254,54 +349,93 @@ func BenchmarkHNSWLockFreeThroughput(b *testing.B) {
 func BenchmarkHNSWBuildFixedSize(b *testing.B) {
 	vectors := benchmarkVectors(benchBuildSize, 42)
 	ids := benchmarkIDs(benchBuildSize)
+	vectorBytes := int64(benchBuildSize * benchDim * 4)
 
-	for _, tc := range []struct {
+	buildModes := []struct {
+		name    string
+		preload bool
+	}{
+		{name: "ingestion_with_storage"},
+		{name: "graph_only_preloaded", preload: true},
+	}
+	idModes := []struct {
 		name string
 		ids  []string
 	}{
-		{name: "external_ids"},
+		{name: "external_ids", ids: ids},
 		{name: "ordinal_only"},
-	} {
-		tc := tc
-		if tc.name == "external_ids" {
-			tc.ids = ids
-		}
+	}
 
-		b.Run(tc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			var totalInserts uint64
+	for _, buildMode := range buildModes {
+		buildMode := buildMode
+		b.Run(buildMode.name, func(b *testing.B) {
+			for _, idMode := range idModes {
+				idMode := idMode
+				b.Run(idMode.name, func(b *testing.B) {
+					b.ReportAllocs()
+					var totalInserts uint64
 
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				config := benchmarkHNSWConfig()
-				index, err := NewHNSW(&config)
-				if err != nil {
-					b.Fatalf("failed to create HNSW index: %v", err)
-				}
-				ctx := context.Background()
-				b.StartTimer()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						b.StopTimer()
+						config := benchmarkHNSWConfig()
+						index, err := NewHNSW(&config)
+						if err != nil {
+							b.Fatalf("failed to create HNSW index: %v", err)
+						}
+						if buildMode.preload {
+							preloadBenchmarkRawVectors(b, index, vectors)
+						}
+						ctx := context.Background()
+						b.StartTimer()
 
-				for j, vec := range vectors {
-					entry := VectorEntry{Vector: vec}
-					if tc.ids != nil {
-						entry.ID = tc.ids[j]
+						for j, vec := range vectors {
+							entry := VectorEntry{Vector: vec}
+							if idMode.ids != nil {
+								entry.ID = idMode.ids[j]
+							}
+							if err := index.Insert(ctx, &entry); err != nil {
+								b.Fatalf("insert %d failed: %v", j, err)
+							}
+						}
+						totalInserts += uint64(len(vectors))
+
+						b.StopTimer()
+						index.Close()
 					}
-					if err := index.Insert(ctx, &entry); err != nil {
-						b.Fatalf("insert %d failed: %v", j, err)
+					elapsed := b.Elapsed()
+					if elapsed > 0 {
+						metric := "ingestion_insert/s"
+						if buildMode.preload {
+							metric = "graph_insert/s"
+						}
+						b.ReportMetric(float64(totalInserts)/elapsed.Seconds(), metric)
 					}
-				}
-				totalInserts += uint64(len(vectors))
-
-				b.StopTimer()
-				index.Close()
+					b.ReportMetric(float64(benchBuildSize), "nodes/build")
+					if buildMode.preload {
+						b.ReportMetric(float64(vectorBytes), "preloaded_vector_bytes/build")
+					} else {
+						b.ReportMetric(float64(vectorBytes), "copied_vector_bytes/build")
+					}
+				})
 			}
-			elapsed := b.Elapsed()
-			if elapsed > 0 {
-				b.ReportMetric(float64(totalInserts)/elapsed.Seconds(), "insert/s")
-			}
-			b.ReportMetric(float64(benchBuildSize), "nodes/build")
 		})
+	}
+}
+
+func BenchmarkHNSWSearchScratchAcquireRelease(b *testing.B) {
+	config := benchmarkHNSWConfig()
+	index, err := NewHNSW(&config)
+	if err != nil {
+		b.Fatalf("failed to create HNSW index: %v", err)
+	}
+	defer index.Close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		scratch := index.acquireSearchScratchWithNodeCountAndEF(benchBuildSize, config.EfConstruction)
+		index.releaseSearchScratch(scratch)
 	}
 }
 
@@ -327,7 +461,7 @@ func BenchmarkHNSWNomicDimBuildFixedSize(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					b.StopTimer()
-					config := benchmarkHNSWConfigDim(dim)
+					config := benchmarkNormalizedHNSWConfigDim(dim)
 					index, err := NewHNSW(&config)
 					if err != nil {
 						b.Fatalf("failed to create HNSW index: %v", err)
@@ -370,11 +504,11 @@ func searchExplicitEFOrdinals(ctx context.Context, index *Index, query []float32
 
 	ep := index.getEntryPoint()
 	for level := index.getMaxLevel(); level > 0; level-- {
-		candidate, err := index.greedySearchLevel(ctx, query, ep, level, queryState)
+		candidate, ok, err := index.greedySearchLevelValue(ctx, query, ep, level, queryState)
 		if err != nil {
 			return ordinals, 0, err
 		}
-		if candidate != nil {
+		if ok {
 			ep = index.nodes.Get(candidate.ID)
 		}
 	}
@@ -543,7 +677,7 @@ func BenchmarkHNSWNomicDimEf200RecallLatency(b *testing.B) {
 			queries := benchmarkNormalizedVectorsDim(benchSearchQueries, dim, 99)
 			truth := bruteForceTruth(vectors, queries, benchSearchK)
 			truthSets := benchmarkTruthSets(truth)
-			config := benchmarkHNSWConfigDim(dim)
+			config := benchmarkNormalizedHNSWConfigDim(dim)
 			index := buildBenchmarkIndexWithConfig(b, config, vectors, benchmarkIDs(len(vectors)))
 			defer index.Close()
 
@@ -596,7 +730,7 @@ func BenchmarkHNSWNomicDimEfSweepRecallLatency(b *testing.B) {
 			queries := benchmarkNormalizedVectorsDim(benchSearchQueries, dim, 99)
 			truth := bruteForceTruth(vectors, queries, benchSearchK)
 			truthSets := benchmarkTruthSets(truth)
-			config := benchmarkHNSWConfigDim(dim)
+			config := benchmarkNormalizedHNSWConfigDim(dim)
 			index := buildBenchmarkIndexWithConfig(b, config, vectors, benchmarkIDs(len(vectors)))
 			defer index.Close()
 
@@ -644,6 +778,106 @@ func BenchmarkHNSWNomicDimEfSweepRecallLatency(b *testing.B) {
 	}
 }
 
+func BenchmarkHNSWNomic768BuildParamEf200RecallLatency(b *testing.B) {
+	ctx := context.Background()
+	const (
+		dim = 768
+		ef  = 200
+	)
+
+	vectors := benchmarkNormalizedVectorsDim(benchBuildSize, dim, 42)
+	queries := benchmarkNormalizedVectorsDim(benchSearchQueries, dim, 99)
+	truth := bruteForceTruth(vectors, queries, benchSearchK)
+	truthSets := benchmarkTruthSets(truth)
+
+	for _, params := range benchNomic768BuildParamSweep {
+		params := params
+		name := "M_" + strconv.Itoa(params.m) + "/efConstruction_" + strconv.Itoa(params.efConstruction)
+		if params.pruneAlpha > 0 {
+			name += "/alpha_" + strconv.FormatFloat(float64(params.pruneAlpha), 'f', 2, 32)
+		}
+		if params.level0Links > 0 {
+			name += "/level0_" + strconv.FormatFloat(params.level0Links, 'f', 2, 64)
+		}
+		if params.repairFlush {
+			name += "/repair_flush"
+		}
+		b.Run(name, func(b *testing.B) {
+			config := benchmarkNormalizedHNSWConfigDim(dim)
+			config.M = params.m
+			config.EfConstruction = params.efConstruction
+			config.PruneAlpha = params.pruneAlpha
+			config.Level0LinkMultiplier = params.level0Links
+			if params.repairFlush {
+				config.RepairQueueSize = benchBuildSize * 2
+				config.RepairBatchSize = 256
+			}
+
+			index, buildDuration := buildBenchmarkIndexWithConfigMeasured(b, config, vectors, nil)
+			defer index.Close()
+			repairDuration := time.Duration(0)
+			repairCount := 0
+			if params.repairFlush {
+				repairStart := time.Now()
+				repairCount = index.FlushRepairs(0)
+				repairDuration = time.Since(repairStart)
+			}
+
+			latencies := make([]int64, b.N)
+			ordinalBufs := make([][]uint32, len(queries))
+			for i := range ordinalBufs {
+				ordinalBufs[i] = make([]uint32, 0, benchSearchK)
+			}
+
+			var totalCandidates uint64
+			var totalRecall float64
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				qi := i % len(queries)
+				start := time.Now()
+				ordinals, candidateCount, err := searchExplicitEFOrdinals(ctx, index, queries[qi], benchSearchK, ef, ordinalBufs[qi])
+				latencies[i] = time.Since(start).Nanoseconds()
+				if err != nil {
+					b.Fatalf("explicit ef search failed: %v", err)
+				}
+				ordinalBufs[qi] = ordinals
+				totalCandidates += uint64(candidateCount)
+				totalRecall += recallOrdinalsAtK(ordinals, truthSets[qi], benchSearchK)
+			}
+			b.StopTimer()
+
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			if b.N > 0 {
+				b.ReportMetric(float64(dim), "dim")
+				b.ReportMetric(float64(params.m), "M")
+				b.ReportMetric(float64(params.efConstruction), "efConstruction")
+				reportAlpha := config.PruneAlpha
+				if reportAlpha <= 0 {
+					reportAlpha = 1
+				}
+				b.ReportMetric(float64(reportAlpha), "alpha")
+				b.ReportMetric(config.level0LinkMultiplier(), "level0_mult")
+				b.ReportMetric(float64(ef), "ef")
+				b.ReportMetric(totalRecall/float64(b.N), "recall@10")
+				b.ReportMetric(float64(totalCandidates)/float64(b.N), "candidates/op")
+				b.ReportMetric(float64(benchBuildSize)/buildDuration.Seconds(), "build_insert/s")
+				readyDuration := buildDuration + repairDuration
+				if readyDuration > 0 {
+					b.ReportMetric(float64(benchBuildSize)/readyDuration.Seconds(), "ready_insert/s")
+				}
+				b.ReportMetric(float64(buildDuration.Milliseconds()), "build_ms")
+				b.ReportMetric(float64(repairCount), "repair_count")
+				b.ReportMetric(float64(repairDuration.Milliseconds()), "repair_ms")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+			}
+		})
+	}
+}
+
 func BenchmarkHNSWSearchTraversalOnly(b *testing.B) {
 	vectors := benchmarkVectors(benchBuildSize, 42)
 	queries := benchmarkVectors(benchSearchQueries, 99)
@@ -667,11 +901,11 @@ func BenchmarkHNSWSearchTraversalOnly(b *testing.B) {
 
 		ep := index.getEntryPoint()
 		for level := index.getMaxLevel(); level > 0; level-- {
-			candidate, err := index.greedySearchLevel(ctx, query, ep, level, queryState)
+			candidate, ok, err := index.greedySearchLevelValue(ctx, query, ep, level, queryState)
 			if err != nil {
 				b.Fatalf("greedy search failed: %v", err)
 			}
-			if candidate != nil {
+			if ok {
 				ep = index.nodes.Get(candidate.ID)
 			}
 		}
@@ -693,5 +927,66 @@ func BenchmarkHNSWSearchTraversalOnly(b *testing.B) {
 		b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
 		b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
 		b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+	}
+}
+
+func BenchmarkHNSWSearchTraversalCandidateModes(b *testing.B) {
+	vectors := benchmarkVectors(benchBuildSize, 42)
+	queries := benchmarkVectors(benchSearchQueries, 99)
+	index := buildBenchmarkIndex(b, vectors, benchmarkIDs(len(vectors)))
+	defer index.Close()
+
+	ctx := context.Background()
+	ef := max(index.config.EfSearch, benchSearchK, index.config.EfConstruction*2)
+
+	for _, mode := range []string{"heap", "unsorted", "reservoir"} {
+		b.Run(mode, func(b *testing.B) {
+			oldMode := CandidateMode
+			CandidateMode = mode
+			defer func() { CandidateMode = oldMode }()
+
+			latencies := make([]int64, b.N)
+			var totalCandidates uint64
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				query := queries[i%len(queries)]
+				var queryState any
+				if index.quantizer != nil {
+					queryState = index.quantizer.PrepareQuery(query)
+				}
+
+				ep := index.getEntryPoint()
+				for level := index.getMaxLevel(); level > 0; level-- {
+					candidate, ok, err := index.greedySearchLevelValue(ctx, query, ep, level, queryState)
+					if err != nil {
+						b.Fatalf("greedy search failed: %v", err)
+					}
+					if ok {
+						ep = index.nodes.Get(candidate.ID)
+					}
+				}
+
+				scratch := index.acquireSearchScratchWithEF(ef)
+				candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil)
+				index.releaseSearchScratch(scratch)
+				if err != nil {
+					b.Fatalf("level search failed: %v", err)
+				}
+				totalCandidates += uint64(len(candidates))
+				latencies[i] = time.Since(start).Nanoseconds()
+			}
+			b.StopTimer()
+
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			if b.N > 0 {
+				b.ReportMetric(float64(totalCandidates)/float64(b.N), "candidates/op")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.50).Nanoseconds()), "p50-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.95).Nanoseconds()), "p95-ns")
+				b.ReportMetric(float64(percentileDuration(latencies, 0.99).Nanoseconds()), "p99-ns")
+			}
+		})
 	}
 }

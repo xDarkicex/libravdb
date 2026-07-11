@@ -66,7 +66,7 @@ func TestCandidateStructureShootout(t *testing.T) {
 		groundTruth[qi] = top
 	}
 
-	modes := []string{"heap", "unsorted"}
+	modes := []string{"heap", "unsorted", "reservoir"}
 
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
@@ -137,6 +137,47 @@ func TestCandidateStructureShootout(t *testing.T) {
 			t.Logf("throughput=%.0f ops/s | avg_recall=%.4f | min_recall=%.4f",
 				opsPerSec, avgRecall, minRecall)
 		})
+	}
+}
+
+func TestReservoirTopKMatchesSortedExact(t *testing.T) {
+	const (
+		k     = 32
+		count = 257
+	)
+
+	rng := NewPCG(123)
+	candidates := make([]util.Candidate, count)
+	for i := range candidates {
+		// Force some ties so ID tie-breaking is covered too.
+		distance := float32(rng.Uint32()%4096) / 17
+		candidates[i] = util.Candidate{ID: uint32(count - i), Distance: distance}
+	}
+
+	expected := append([]util.Candidate(nil), candidates...)
+	sort.Slice(expected, func(i, j int) bool {
+		return compareCandidateValues(expected[i], expected[j]) < 0
+	})
+	expected = expected[:k]
+
+	buf := make([]util.Candidate, 0, k*2)
+	reservoir := reservoirTopK{items: buf, maxSize: k}
+	working := candidateMinHeap{items: make([]util.Candidate, 0, count)}
+	for _, candidate := range candidates {
+		admitCandidateReservoir(&reservoir, &working, candidate.ID, candidate.Distance)
+	}
+	got := append([]util.Candidate(nil), reservoir.Items()...)
+	sort.Slice(got, func(i, j int) bool {
+		return compareCandidateValues(got[i], got[j]) < 0
+	})
+
+	if len(got) != len(expected) {
+		t.Fatalf("got %d candidates, expected %d", len(got), len(expected))
+	}
+	for i := range expected {
+		if got[i] != expected[i] {
+			t.Fatalf("candidate %d mismatch: got %+v expected %+v", i, got[i], expected[i])
+		}
 	}
 }
 

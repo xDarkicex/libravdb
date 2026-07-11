@@ -31,13 +31,13 @@ func TestCosineDistance_Orthogonal(t *testing.T) {
 	}
 }
 
-func TestCosineDistance_ZeroVectorReturnsNaN(t *testing.T) {
+func TestCosineDistance_ZeroVectorUsesNormalizedDotContract(t *testing.T) {
 	a := []float32{1, 2, 3}
 	zero := []float32{0, 0, 0}
 	for _, pair := range [][2][]float32{{a, zero}, {zero, a}, {zero, zero}} {
 		d := CosineDistance_func(pair[0], pair[1])
-		if !math.IsNaN(float64(d)) {
-			t.Errorf("zero vector pair %v: want NaN, got %v", pair, d)
+		if d != 1 {
+			t.Errorf("zero vector pair %v: want normalized-dot distance 1, got %v", pair, d)
 		}
 	}
 }
