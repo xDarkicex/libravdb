@@ -68,6 +68,67 @@ func (p *recoveryIndexProvider) CanRestoreIndex(string, uint8, uint16) bool {
 
 func (*recoveryIndexProvider) SnapshotVectors(context.Context) error { return nil }
 
+type replayedIndexPut struct {
+	name            string
+	id              string
+	ordinal         uint32
+	previousOrdinal uint32
+	replace         bool
+}
+
+type replayedIndexDelete struct {
+	name    string
+	id      string
+	ordinal uint32
+}
+
+type incrementalRecoveryIndexProvider struct {
+	recoveryIndexProvider
+	puts      []replayedIndexPut
+	deletes   []replayedIndexDelete
+	discarded []string
+}
+
+func (*incrementalRecoveryIndexProvider) CanApplyIndexDeltas(string, *storage.CollectionConfig) bool {
+	return true
+}
+
+func (p *incrementalRecoveryIndexProvider) ApplyIndexPut(
+	name string,
+	entry *index.VectorEntry,
+	replace bool,
+	previousOrdinal uint32,
+	_ *storage.CollectionConfig,
+) error {
+	p.mu.Lock()
+	p.puts = append(p.puts, replayedIndexPut{
+		name:            name,
+		id:              entry.ID,
+		ordinal:         entry.Ordinal,
+		previousOrdinal: previousOrdinal,
+		replace:         replace,
+	})
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *incrementalRecoveryIndexProvider) ApplyIndexDelete(
+	name, id string,
+	ordinal uint32,
+	_ *storage.CollectionConfig,
+) error {
+	p.mu.Lock()
+	p.deletes = append(p.deletes, replayedIndexDelete{name: name, id: id, ordinal: ordinal})
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *incrementalRecoveryIndexProvider) DiscardIndex(name string) {
+	p.mu.Lock()
+	p.discarded = append(p.discarded, name)
+	p.mu.Unlock()
+}
+
 func TestWALWriteBufferUsesReusableOffHeapArena(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal_arena.libravdb")
 	engineIface, err := New(path, WithWALSync(false))
@@ -302,6 +363,154 @@ func TestRecoveryRebuildsIndexTouchedAfterCheckpoint(t *testing.T) {
 	}
 	if exists, err := recoveredCollection.Exists(context.Background(), "wal-only"); err != nil || !exists {
 		t.Fatalf("post-checkpoint record recovery: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestRecoveryReplaysIndexDeltasWithoutSecondRebuild(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "index-delta-source.libravdb")
+	copyPath := filepath.Join(dir, "index-delta-copy.libravdb")
+	provider := &recoveryIndexProvider{}
+	engineIface, err := New(sourcePath, WithIndexSnapshotProvider(provider))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{Dimension: 2, IndexType: 0})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	for _, entry := range []*index.VectorEntry{
+		{ID: "update", Vector: []float32{1, 0}},
+		{ID: "delete", Vector: []float32{0, 1}},
+	} {
+		if err := collection.Insert(context.Background(), entry); err != nil {
+			t.Fatalf("insert checkpoint entry %s: %v", entry.ID, err)
+		}
+	}
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	if err := collection.Insert(context.Background(), &index.VectorEntry{ID: "update", Vector: []float32{0.5, 0.5}}); err != nil {
+		t.Fatalf("update after checkpoint: %v", err)
+	}
+	if err := collection.Insert(context.Background(), &index.VectorEntry{ID: "new", Vector: []float32{0.25, 0.75}}); err != nil {
+		t.Fatalf("insert after checkpoint: %v", err)
+	}
+	if err := collection.Delete(context.Background(), "delete"); err != nil {
+		t.Fatalf("delete after checkpoint: %v", err)
+	}
+
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read live database: %v", err)
+	}
+	if err := os.WriteFile(copyPath, contents, 0o600); err != nil {
+		t.Fatalf("write live copy: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
+
+	recoveryProvider := &incrementalRecoveryIndexProvider{}
+	reopenedIface, err := New(copyPath, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen live copy: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+
+	recoveryProvider.mu.Lock()
+	deserialized := append([]string(nil), recoveryProvider.deserialized...)
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	puts := append([]replayedIndexPut(nil), recoveryProvider.puts...)
+	deletes := append([]replayedIndexDelete(nil), recoveryProvider.deletes...)
+	recoveryProvider.mu.Unlock()
+	if fmt.Sprint(deserialized) != "[vectors]" {
+		t.Fatalf("deserialized indexes = %v, want [vectors]", deserialized)
+	}
+	if len(rebuilt) != 0 {
+		t.Fatalf("index was rebuilt after WAL replay: %v", rebuilt)
+	}
+	if len(puts) != 2 || puts[0].id != "update" || !puts[0].replace || puts[0].ordinal != puts[0].previousOrdinal ||
+		puts[1].id != "new" || puts[1].replace {
+		t.Fatalf("replayed puts = %+v", puts)
+	}
+	if len(deletes) != 1 || deletes[0].id != "delete" {
+		t.Fatalf("replayed deletes = %+v", deletes)
+	}
+	stats := reopened.RecoveryStats()
+	if stats.RebuiltIndexes != 0 || stats.ReplayedIndexPuts != 2 || stats.ReplayedIndexDeletes != 1 {
+		t.Fatalf("recovery stats = %+v", stats)
+	}
+}
+
+func TestRecoveryReplaysIndexLifecycleDeltas(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "index-lifecycle-source.libravdb")
+	copyPath := filepath.Join(dir, "index-lifecycle-copy.libravdb")
+	engineIface, err := New(sourcePath, WithIndexSnapshotProvider(&recoveryIndexProvider{}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	for _, name := range []string{"created", "dropped"} {
+		collection, err := engine.CreateCollection(name, &storage.CollectionConfig{Dimension: 2, IndexType: 0})
+		if err != nil {
+			t.Fatalf("create collection %s: %v", name, err)
+		}
+		if err := collection.Insert(context.Background(), &index.VectorEntry{ID: name, Vector: []float32{1, 0}}); err != nil {
+			t.Fatalf("insert collection %s: %v", name, err)
+		}
+	}
+	if err := engine.DeleteCollection("dropped"); err != nil {
+		t.Fatalf("delete collection: %v", err)
+	}
+
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read live database: %v", err)
+	}
+	if err := os.WriteFile(copyPath, contents, 0o600); err != nil {
+		t.Fatalf("write live copy: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
+
+	recoveryProvider := &incrementalRecoveryIndexProvider{}
+	reopenedIface, err := New(copyPath, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen live copy: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+	names, err := reopened.ListCollections()
+	if err != nil {
+		t.Fatalf("list collections: %v", err)
+	}
+	if fmt.Sprint(names) != "[created]" {
+		t.Fatalf("recovered collections = %v, want [created]", names)
+	}
+
+	recoveryProvider.mu.Lock()
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	puts := append([]replayedIndexPut(nil), recoveryProvider.puts...)
+	discarded := append([]string(nil), recoveryProvider.discarded...)
+	recoveryProvider.mu.Unlock()
+	if fmt.Sprint(rebuilt) != "[created dropped]" || len(puts) != 2 {
+		t.Fatalf("lifecycle rebuilds=%v puts=%+v", rebuilt, puts)
+	}
+	if fmt.Sprint(discarded) != "[created dropped dropped]" {
+		t.Fatalf("discarded indexes = %v", discarded)
+	}
+	stats := reopened.RecoveryStats()
+	if stats.RebuiltIndexes != 2 || stats.ReplayedIndexPuts != 2 {
+		t.Fatalf("recovery stats = %+v", stats)
 	}
 }
 

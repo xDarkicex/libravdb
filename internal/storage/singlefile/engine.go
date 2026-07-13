@@ -233,10 +233,10 @@ type IndexSnapshotProvider interface {
 	SnapshotVectors(ctx context.Context) error
 }
 
-// CoordinatedIndexSnapshotProvider attaches a transaction-commit frontier to
+// CoordinatedIndexSnapshotProvider attaches a WAL frontier to
 // each serialized derived index. Recovery only trusts an index whose frontier
-// covers that collection's latest durable mutation; lagging snapshots are
-// rebuilt until delta replay is available.
+// covers that collection's state at the selected snapshot; lagging images are
+// rebuilt once at that boundary before later WAL deltas are applied.
 type CoordinatedIndexSnapshotProvider interface {
 	SerializeIndexAt(collectionName string, checkpointLSN uint64) (indexBytes []byte, appliedLSN uint64, err error)
 }
@@ -245,6 +245,17 @@ type CoordinatedIndexSnapshotProvider interface {
 // compatible persisted index. Rejected indexes are rebuilt from durable records.
 type IndexRestorePolicy interface {
 	CanRestoreIndex(collectionName string, indexType uint8, indexVersion uint16) bool
+}
+
+// IncrementalIndexRecoveryProvider applies committed WAL mutations to an index
+// that already represents the selected snapshot. Recovery invokes these methods
+// in transaction and LSN order; returning an error aborts open before the index
+// can become visible.
+type IncrementalIndexRecoveryProvider interface {
+	CanApplyIndexDeltas(collectionName string, config *storage.CollectionConfig) bool
+	ApplyIndexPut(collectionName string, entry *index.VectorEntry, replace bool, previousOrdinal uint32, config *storage.CollectionConfig) error
+	ApplyIndexDelete(collectionName, id string, ordinal uint32, config *storage.CollectionConfig) error
+	DiscardIndex(collectionName string)
 }
 
 // indexBlockEntry is a single collection's serialized index within the index chunk.
@@ -281,29 +292,32 @@ type Engine struct {
 		flushSignalPending int32
 		pendingWaiters     int32
 	}
-	dirtyOps            int
-	compactionErrors    uint64
-	lastTxID            uint64
-	fileID              uint64
-	dirtyBytes          uint64
-	metaEpoch           uint64
-	walTransactions     uint64
-	walBytes            uint64
-	batchFlushes        uint64
-	batchedEntries      uint64
-	checkpoints         uint64
-	replayedTxs         uint64
-	discardedTxs        uint64
-	lastLSN             uint64
-	activeMetaPage      uint64
-	mu                  sync.RWMutex
-	status              atomic.Int32
-	closed              atomic.Bool
-	walSync             bool
-	groupCommitTarget   int32
-	groupCommitMaxDelay time.Duration
-	walSyncFn           func(*os.File) error // test hook; nil uses (*os.File).Sync
-	dirty               bool                 // completion channels for foreground flushes
+	dirtyOps             int
+	compactionErrors     uint64
+	lastTxID             uint64
+	fileID               uint64
+	dirtyBytes           uint64
+	metaEpoch            uint64
+	walTransactions      uint64
+	walBytes             uint64
+	batchFlushes         uint64
+	batchedEntries       uint64
+	checkpoints          uint64
+	replayedTxs          uint64
+	discardedTxs         uint64
+	rebuiltIndexes       uint64
+	replayedIndexPuts    uint64
+	replayedIndexDeletes uint64
+	lastLSN              uint64
+	activeMetaPage       uint64
+	mu                   sync.RWMutex
+	status               atomic.Int32
+	closed               atomic.Bool
+	walSync              bool
+	groupCommitTarget    int32
+	groupCommitMaxDelay  time.Duration
+	walSyncFn            func(*os.File) error // test hook; nil uses (*os.File).Sync
+	dirty                bool                 // completion channels for foreground flushes
 }
 
 // batchEntry holds a buffered record pending WAL flush.
@@ -351,10 +365,13 @@ var startBatchFlusher = func(e *Engine) {
 	go e.batchFlusher()
 }
 
-// RecoveryStats exposes WAL replay outcomes for debugging and tests.
+// RecoveryStats exposes WAL and derived-index recovery outcomes.
 type RecoveryStats struct {
 	ReplayedTransactions  uint64
 	DiscardedTransactions uint64
+	RebuiltIndexes        uint64
+	ReplayedIndexPuts     uint64
+	ReplayedIndexDeletes  uint64
 }
 
 // Collection is a storage-backed collection view.
@@ -649,8 +666,8 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 		// A derived index is directly recoverable when its transaction frontier
 		// covers this collection's latest mutation. Unrelated collections may
 		// advance the database checkpoint without invalidating this index.
-		// Legacy blocks and genuinely lagging snapshots rebuild until delta replay
-		// is available.
+		// Legacy blocks and genuinely lagging snapshots rebuild once at the
+		// selected snapshot boundary before post-snapshot WAL delta replay.
 		if !entry.hasAppliedLSN || entry.appliedLSN < collection.UpdatedLSN || entry.appliedLSN > chosen.LastAppliedLSN {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
@@ -729,7 +746,11 @@ func (e *Engine) rebuildCollectionIndexFromRecords(name string, collection *pers
 	if e.indexProvider == nil {
 		return nil
 	}
-	return e.indexProvider.RebuildIndex(name, &collection.Config)
+	if err := e.indexProvider.RebuildIndex(name, &collection.Config); err != nil {
+		return err
+	}
+	e.rebuiltIndexes++
+	return nil
 }
 
 // fail transitions the engine to storage.StatusFailed and stores the error.
@@ -1050,6 +1071,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 	fileSize := stat.Size()
 	pending := make(map[uint64][]walRecord)
 	touchedCollections := make(map[string]struct{})
+	deltaProvider, _ := e.indexProvider.(IncrementalIndexRecoveryProvider)
 
 	for fileSize >= 16 && offset >= 0 && offset <= fileSize-16 {
 		headerBuf := make([]byte, 16)
@@ -1106,7 +1128,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 			pending[record.Header.TxID] = []walRecord{record}
 		case recordTypeTxCommit:
 			frames := append(pending[record.Header.TxID], record)
-			if err := e.applyCommittedFrames(frames, touchedCollections); err != nil {
+			if err := e.applyCommittedFrames(frames, touchedCollections, deltaProvider); err != nil {
 				return err
 			}
 			e.replayedTxs++
@@ -1141,7 +1163,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 				}
 				continue
 			}
-			if err := e.indexProvider.RebuildIndex(name, &collection.Config); err != nil {
+			if err := e.rebuildCollectionIndexFromRecords(name, collection); err != nil {
 				return fmt.Errorf("rebuild replayed index %s: %w", name, err)
 			}
 		}
@@ -1173,7 +1195,11 @@ func decodeWALRecord(payload []byte) (walRecord, error) {
 	return walRecord{Header: header, Payload: body}, nil
 }
 
-func (e *Engine) applyCommittedFrames(frames []walRecord, touchedCollections map[string]struct{}) error {
+func (e *Engine) applyCommittedFrames(
+	frames []walRecord,
+	touchedCollections map[string]struct{},
+	deltaProvider IncrementalIndexRecoveryProvider,
+) error {
 	for _, record := range frames {
 		switch record.Header.RecordType {
 		case recordTypeCollectionCreate:
@@ -1181,31 +1207,104 @@ func (e *Engine) applyCommittedFrames(frames []walRecord, touchedCollections map
 			if err != nil {
 				return err
 			}
+			previous := e.state.Collections[payload.Name]
+			created := previous == nil || previous.Deleted
 			e.applyCreateCollection(payload.Name, payload.Config, record.Header.LSN)
-			touchedCollections[payload.Name] = struct{}{}
+			if !created {
+				continue
+			}
+			if deltaProvider == nil || !deltaProvider.CanApplyIndexDeltas(payload.Name, &payload.Config) {
+				touchedCollections[payload.Name] = struct{}{}
+				continue
+			}
+			deltaProvider.DiscardIndex(payload.Name)
+			collection := e.state.Collections[payload.Name]
+			if err := e.rebuildCollectionIndexFromRecords(payload.Name, collection); err != nil {
+				return fmt.Errorf("initialize replayed index %s at LSN %d: %w", payload.Name, record.Header.LSN, err)
+			}
 		case recordTypeCollectionDelete:
 			payload, err := decodeCollectionDeletePayloadBinary(record.Payload)
 			if err != nil {
 				return err
 			}
+			collection := e.state.Collections[payload.Name]
+			deleted := collection != nil && !collection.Deleted
+			var config *storage.CollectionConfig
+			if collection != nil {
+				config = &collection.Config
+			}
 			e.applyDeleteCollection(payload.Name, record.Header.LSN)
-			touchedCollections[payload.Name] = struct{}{}
+			if !deleted {
+				continue
+			}
+			if deltaProvider == nil || !deltaProvider.CanApplyIndexDeltas(payload.Name, config) {
+				touchedCollections[payload.Name] = struct{}{}
+				continue
+			}
+			deltaProvider.DiscardIndex(payload.Name)
 		case recordTypeRecordPut:
 			payload, err := decodeRecordPutPayloadBinary(record.Payload)
 			if err != nil {
 				return err
 			}
+			collection := e.state.Collections[payload.Collection]
+			if collection == nil || collection.Deleted {
+				return fmt.Errorf("collection %s not found during index delta replay", payload.Collection)
+			}
+			previous := collection.Records[payload.ID]
+			replace := previous != nil && !previous.Deleted
+			var previousOrdinal uint32
+			if replace {
+				previousOrdinal = previous.Ordinal
+			}
 			if err := e.applyRecordPut(payload, record.Header.LSN); err != nil {
 				return err
 			}
-			touchedCollections[payload.Collection] = struct{}{}
+			if deltaProvider == nil || !deltaProvider.CanApplyIndexDeltas(payload.Collection, &collection.Config) {
+				touchedCollections[payload.Collection] = struct{}{}
+				continue
+			}
+			current := collection.Records[payload.ID]
+			entry := &index.VectorEntry{
+				ID:       payload.ID,
+				Vector:   current.Vector,
+				Metadata: current.Metadata,
+				Version:  current.Version,
+				Ordinal:  current.Ordinal,
+			}
+			if err := deltaProvider.ApplyIndexPut(payload.Collection, entry, replace, previousOrdinal, &collection.Config); err != nil {
+				return fmt.Errorf("replay index put %s/%s at LSN %d: %w", payload.Collection, payload.ID, record.Header.LSN, err)
+			}
+			e.replayedIndexPuts++
 		case recordTypeRecordDelete:
 			payload, err := decodeRecordDeletePayloadBinary(record.Payload)
 			if err != nil {
 				return err
 			}
+			collection := e.state.Collections[payload.Collection]
+			var (
+				ordinal uint32
+				present bool
+			)
+			if collection != nil && !collection.Deleted {
+				current := collection.Records[payload.ID]
+				if current != nil && !current.Deleted {
+					ordinal = current.Ordinal
+					present = true
+				}
+			}
 			e.applyRecordDelete(payload.Collection, payload.ID, record.Header.LSN)
-			touchedCollections[payload.Collection] = struct{}{}
+			if !present {
+				continue
+			}
+			if deltaProvider == nil || !deltaProvider.CanApplyIndexDeltas(payload.Collection, &collection.Config) {
+				touchedCollections[payload.Collection] = struct{}{}
+				continue
+			}
+			if err := deltaProvider.ApplyIndexDelete(payload.Collection, payload.ID, ordinal, &collection.Config); err != nil {
+				return fmt.Errorf("replay index delete %s/%s at LSN %d: %w", payload.Collection, payload.ID, record.Header.LSN, err)
+			}
+			e.replayedIndexDeletes++
 		}
 	}
 	return nil
@@ -3487,6 +3586,9 @@ func (e *Engine) RecoveryStats() RecoveryStats {
 	return RecoveryStats{
 		ReplayedTransactions:  e.replayedTxs,
 		DiscardedTransactions: e.discardedTxs,
+		RebuiltIndexes:        e.rebuiltIndexes,
+		ReplayedIndexPuts:     e.replayedIndexPuts,
+		ReplayedIndexDeletes:  e.replayedIndexDeletes,
 	}
 }
 

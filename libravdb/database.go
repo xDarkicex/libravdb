@@ -111,14 +111,17 @@ func Open(opts ...Option) (*Database, error) {
 	if err != nil {
 		if errors.Is(err, storage.ErrV1FormatMigrationRequired) {
 			if err := Migrate(context.Background(), config.StoragePath); err != nil {
+				bridge.closeCachedIndexes()
 				return nil, fmt.Errorf("auto-migration failed: %w", err)
 			}
 			// Retry opening the newly migrated database
 			storageEngine, err = singlefile.New(config.StoragePath, storageOptions...)
 			if err != nil {
+				bridge.closeCachedIndexes()
 				return nil, fmt.Errorf("failed to open database after migration: %w", err)
 			}
 		} else {
+			bridge.closeCachedIndexes()
 			return nil, fmt.Errorf("failed to initialize storage engine: %w", err)
 		}
 	}
@@ -167,7 +170,8 @@ func Open(opts ...Option) (*Database, error) {
 		return HealthHealthy, nil
 	})
 	if err := db.healthMonitor.Start(context.Background()); err != nil {
-		storageEngine.Close()
+		_ = storageEngine.Close()
+		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to start health monitor: %w", err)
 	}
 
@@ -175,7 +179,8 @@ func Open(opts ...Option) (*Database, error) {
 	// that were deserialized or rebuilt during recovery.
 	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
 		db.healthMonitor.Stop()
-		storageEngine.Close()
+		_ = storageEngine.Close()
+		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 

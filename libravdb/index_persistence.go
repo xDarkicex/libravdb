@@ -153,6 +153,62 @@ func (b *indexPersistenceBridge) RebuildIndex(collectionName string, config *sto
 	return nil
 }
 
+// CanApplyIndexDeltas keeps recovery incremental only for index families whose
+// restored/rebuilt base can accept online mutations without a training phase.
+func (b *indexPersistenceBridge) CanApplyIndexDeltas(_ string, config *storage.CollectionConfig) bool {
+	return config != nil && IndexType(config.IndexType) != IVFPQ
+}
+
+// ApplyIndexPut advances a recovered index by one committed WAL put. Replaced
+// ordinals are removed first, matching the normal update/upsert path.
+func (b *indexPersistenceBridge) ApplyIndexPut(
+	collectionName string,
+	entry *index.VectorEntry,
+	replace bool,
+	previousOrdinal uint32,
+	config *storage.CollectionConfig,
+) error {
+	idx, err := b.cachedRecoveryIndex(collectionName)
+	if err != nil {
+		return err
+	}
+	if replace {
+		if err := deleteIndexEntry(context.Background(), idx, entry.ID, previousOrdinal); err != nil {
+			return fmt.Errorf("delete replaced index entry %s/%s: %w", collectionName, entry.ID, err)
+		}
+	}
+	if err := idx.Insert(context.Background(), entryForIndex(DistanceMetric(config.Metric), entry)); err != nil {
+		return fmt.Errorf("insert recovered index entry %s/%s: %w", collectionName, entry.ID, err)
+	}
+	return nil
+}
+
+// ApplyIndexDelete advances a recovered index by one committed WAL delete.
+func (b *indexPersistenceBridge) ApplyIndexDelete(
+	collectionName, id string,
+	ordinal uint32,
+	_ *storage.CollectionConfig,
+) error {
+	idx, err := b.cachedRecoveryIndex(collectionName)
+	if err != nil {
+		return err
+	}
+	if err := deleteIndexEntry(context.Background(), idx, id, ordinal); err != nil {
+		return fmt.Errorf("delete recovered index entry %s/%s: %w", collectionName, id, err)
+	}
+	return nil
+}
+
+func (b *indexPersistenceBridge) cachedRecoveryIndex(collectionName string) (index.Index, error) {
+	b.mu.Lock()
+	idx := b.cache[collectionName]
+	b.mu.Unlock()
+	if idx == nil {
+		return nil, fmt.Errorf("recovery index %s is not initialized", collectionName)
+	}
+	return idx, nil
+}
+
 // DiscardIndex removes a checkpoint-restored index for a collection deleted by
 // post-checkpoint WAL replay.
 func (b *indexPersistenceBridge) DiscardIndex(collectionName string) {

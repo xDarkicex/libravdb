@@ -135,9 +135,9 @@ Implemented and validated:
 - The contiguous WAL transaction image is built in a reusable 64-byte-aligned,
   mmap-backed arena. Oversized transactions use an exact-size temporary mmap
   instead of a Go-heap fallback.
-- Recovery rebuilds a derived index whenever committed WAL replay touches its
-  collection after the checkpoint. This is deliberately conservative until
-  index-delta replay and persisted index-applied LSNs are implemented.
+- Recovery originally rebuilt a derived index whenever committed WAL replay
+  touched its collection after the checkpoint. The incremental recovery pass
+  below supersedes that behavior for providers implementing index deltas.
 - Unclaimed recovery-cache indexes are closed after collection loading,
   including physical shard indexes that the parent collection loader does not
   consume.
@@ -180,13 +180,23 @@ delayed writer from appearing behind an already-advanced watermark.
 
 The versioned index-block format persists this per-collection frontier. Recovery
 deserializes an index only when its frontier covers that collection's latest
-mutation without exceeding the authoritative checkpoint and the provider marks
-the persisted format safe to restore. Legacy blocks, lagging snapshots, and
-provider-rejected formats rebuild from records. HNSW currently remains on that
-conservative rebuild path until its off-heap deserializer is hardened
-independently. This is the correctness-first boundary for bounded delta replay:
-a later pass can apply committed record transactions after the persisted
-frontier without changing the on-disk contract.
+snapshot mutation without exceeding the authoritative checkpoint and the
+provider marks the persisted format safe to restore. Legacy, lagging, and
+provider-rejected images rebuild once from snapshot records.
+
+After that base is established, committed post-snapshot WAL transactions now
+advance the index directly in LSN order. Puts carry replacement state and the
+previous ordinal; deletes carry the exact ordinal; collection create/drop frames
+initialize or discard the recovery cache. Providers without the incremental
+contract, and index families that decline online recovery mutations, retain the
+full-rebuild fallback. IVF-PQ currently takes that path because an empty or
+untrained base cannot safely accept replayed inserts without retraining.
+
+HNSW deserialization remains quarantined: recovery rebuilds HNSW once at the
+selected snapshot boundary, then applies only the bounded WAL insert/update/delete
+deltas. It no longer rebuilds the entire final graph a second time merely because
+WAL replay touched the collection. `RecoveryStats` exposes base rebuild and index
+delta counts so this behavior is testable and observable.
 
 ## Bounded asynchronous HNSW indexing
 
