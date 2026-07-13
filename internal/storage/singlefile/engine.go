@@ -3889,6 +3889,10 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 // Iterate walks all live records.
 func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error {
+	if fn == nil {
+		return fmt.Errorf("iterate callback cannot be nil")
+	}
+
 	c.engine.mu.RLock()
 	if c.closed.Load() || c.engine.closed.Load() {
 		c.engine.mu.RUnlock()
@@ -3900,25 +3904,17 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 		return fmt.Errorf("collection %s not found", c.name)
 	}
 
-	// Collect live IDs under lock (fast — map key iteration only, no cloning).
-	// We release the lock before sorting/cloning so flushBatch is never starved
-	// by a multi-million-record Iterate.
-	ids := make([]string, 0, len(persisted.Records))
-	for id, record := range persisted.Records {
-		if record != nil && !record.Deleted {
-			ids = append(ids, id)
-		}
-	}
+	// Snapshot the ordinal frontier. Inserts committed after iteration begins
+	// receive ordinals at or beyond this boundary and are excluded.
+	ordinalLimit := persisted.NextOrdinal
 	c.engine.mu.RUnlock()
 
-	sort.Strings(ids)
-
-	// Process in chunks of 10K. Each chunk re-acquires RLock briefly to clone
-	// entries, then calls the user callback outside the lock. This bounds the
-	// worst-case lock hold to O(chunkSize) regardless of collection cardinality.
-	const chunkSize = 10000
-	for start := 0; start < len(ids); start += chunkSize {
-		end := min(start+chunkSize, len(ids))
+	// Process fixed ordinal windows. Each window re-acquires RLock only while
+	// resolving and cloning records, then invokes callbacks without holding it.
+	// Memory remains O(chunkSize), independent of collection cardinality.
+	const chunkSize uint32 = 1024
+	for start := uint32(0); start < ordinalLimit; {
+		end := start + min(chunkSize, ordinalLimit-start)
 
 		select {
 		case <-ctx.Done():
@@ -3926,7 +3922,7 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 		default:
 		}
 
-		chunk := make([]*index.VectorEntry, 0, end-start)
+		chunk := make([]*index.VectorEntry, 0, int(end-start))
 		c.engine.mu.RLock()
 		// Refetch persisted — a concurrent DeleteCollection may have replaced
 		// the pointer since the initial RLock acquisition above.
@@ -3935,9 +3931,14 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 			c.engine.mu.RUnlock()
 			return fmt.Errorf("collection %s was deleted during iteration", c.name)
 		}
-		for _, id := range ids[start:end] {
+		ordinalEnd := min(end, uint32(len(persisted.ordinalToID)))
+		for ordinal := start; ordinal < ordinalEnd; ordinal++ {
+			id := persisted.ordinalToID[ordinal]
+			if id == "" {
+				continue
+			}
 			record := persisted.Records[id]
-			if record == nil || record.Deleted {
+			if record == nil || record.Deleted || record.Ordinal != ordinal {
 				continue
 			}
 			entry := cloneEntry(record)
@@ -3947,10 +3948,14 @@ func (c *Collection) Iterate(ctx context.Context, fn func(*index.VectorEntry) er
 		c.engine.mu.RUnlock()
 
 		for _, entry := range chunk {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := fn(entry); err != nil {
 				return err
 			}
 		}
+		start = end
 	}
 	return nil
 }

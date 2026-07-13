@@ -97,6 +97,47 @@ func (c *Collection) Dimension() int {
 	return c.config.Dimension
 }
 
+// Config returns a defensive copy of the collection configuration. The
+// process-local Graph attachment is intentionally omitted from the copy.
+func (c *Collection) Config() CollectionConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.config == nil {
+		return CollectionConfig{}
+	}
+
+	config := *c.config
+	config.Graph = nil
+	config.IndexedFields = append([]string(nil), c.config.IndexedFields...)
+
+	if c.config.MetadataSchema != nil {
+		config.MetadataSchema = make(MetadataSchema, len(c.config.MetadataSchema))
+		for field, fieldType := range c.config.MetadataSchema {
+			config.MetadataSchema[field] = fieldType
+		}
+	}
+
+	if c.config.MemoryConfig != nil {
+		memoryConfig := *c.config.MemoryConfig
+		if c.config.MemoryConfig.PressureThresholds != nil {
+			memoryConfig.PressureThresholds = make(map[memory.MemoryPressureLevel]float64, len(c.config.MemoryConfig.PressureThresholds))
+			for level, threshold := range c.config.MemoryConfig.PressureThresholds {
+				memoryConfig.PressureThresholds[level] = threshold
+			}
+		}
+		config.MemoryConfig = &memoryConfig
+	}
+
+	if c.config.Quantization != nil {
+		quantization := *c.config.Quantization
+		quantization.Levels = append([]int(nil), c.config.Quantization.Levels...)
+		config.Quantization = &quantization
+	}
+
+	return config
+}
+
 // SetGraph attaches a Graph interface to an existing collection.
 func (c *Collection) SetGraph(g Graph) {
 	c.mu.Lock()
@@ -1706,6 +1747,10 @@ func (c *Collection) withCAS(ctx context.Context, fn func(tx Tx) error) error {
 
 // Iterate walks all persisted records in the collection.
 func (c *Collection) Iterate(ctx context.Context, fn func(Record) error) error {
+	if fn == nil {
+		return fmt.Errorf("iterate callback cannot be nil")
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 

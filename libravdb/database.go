@@ -427,6 +427,37 @@ func (db *Database) ListCollectionsWithContext(ctx context.Context) ([]string, e
 	return result, nil
 }
 
+// Iterate walks every persisted record in every collection. Records are
+// delivered one at a time and callback errors stop iteration immediately.
+func (db *Database) Iterate(ctx context.Context, fn func(collection string, record Record) error) error {
+	if fn == nil {
+		return fmt.Errorf("iterate callback cannot be nil")
+	}
+
+	names, err := db.ListCollectionsWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		collection, err := db.GetCollection(name)
+		if err != nil {
+			return fmt.Errorf("get collection %q during iteration: %w", name, err)
+		}
+		if err := collection.Iterate(ctx, func(record Record) error {
+			return fn(name, record)
+		}); err != nil {
+			return fmt.Errorf("iterate collection %q: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
 // DeleteCollection removes a collection and its persisted data.
 func (db *Database) DeleteCollection(ctx context.Context, name string) error {
 	db.mu.Lock()

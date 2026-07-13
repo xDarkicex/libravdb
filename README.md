@@ -26,6 +26,8 @@
 
 - [Overview](#-overview)
 - [Key Features](#-key-features)
+- [Measured Performance](#-measured-performance)
+- [Durability and Recovery](#-durability-and-recovery)
 - [Quick Start](#-quick-start)
 - [Usage Examples](#-usage-examples)
 - [Architecture](#-architecture)
@@ -95,6 +97,233 @@ LibraVDB now includes a Phase 1 write-admission layer intended to make local and
 - batch and streaming worker counts are clamped to collection write parallelism
 
 This improves safety under bursty or subagent-style write traffic, but it is not yet the full adaptive scheduler. If you expect very heavy write concurrency, keep batch and streaming concurrency conservative and prefer one coordinated writer path per collection.
+
+## 📊 Measured Performance
+
+These are local Apple M2 measurements with Go 1.25 and 768-dimensional
+`float32` vectors. HNSW construction numbers marked graph-ready preload vector
+storage outside the timed region so graph topology cost is not confused with
+the required owned-vector copy. Results are workload and hardware dependent;
+use the commands below on deployment hardware.
+
+### HNSW Construction And Search
+
+The primary scale fixture contains 50,000 deduplicated LongMemEval messages and
+100 held-out queries embedded with Nomic Embed Text v1.5 Q8 GGUF at 768
+dimensions. Exact brute-force squared-L2 top-10 results provide ground truth.
+Fixture SHA-256:
+`a176d920c50b0d8e635c522e1452b4f282c0c99b9b223089c66a9ae86bf4a243`.
+
+| Configuration | Graph-ready inserts/s | Recall@10, ef=200 | Higher-ef / repair outcome |
+|---|---:|---:|---|
+| `M=36`, serial | 628 | 1.000 | Exact at ef=200 and ef=300 |
+| `M=36`, four workers | 1,706-1,929 | 0.996-1.000 | Schedule-dependent; some misses persisted through ef=300 |
+| `M=24`, four workers | 2,602 | 0.998 | 0.999 from ef=216 through ef=300 |
+| `M=16`, four workers | 2,946-3,408 | 0.996-0.998 | Up to 0.999 at ef=300 across repeated builds |
+| `M=16`, serial | 1,122 | 0.999 | 1.000 at ef=300 |
+| `M=36`, four workers plus synchronous repair | 1,246 | 1.000 | Repaired 47,445 of 50,000 nodes |
+
+At `M=16` and `efSearch=200`, search measured approximately 0.33-0.39 ms
+p50 and 0.66-0.78 ms p99. The exact serial `M=36` control measured p50
+0.634 ms and p99 1.240 ms at ef=200.
+
+Concurrent topology quality is schedule-dependent. Increasing `efSearch`
+repairs shallow misses, but some concurrent builds retain topology misses
+through ef=300. Blanket repair restores exact recall but touches almost the
+entire graph and gives back most of the construction throughput.
+
+The separate 5k normalized-random fixture remains an adversarial isotropic
+topology test. On that fixture the ARM64 path produced 873.5 graph inserts/s at
+`M=36`, recall@10=1.000, and 0 B/op with 0 allocs/op in HNSW traversal. It is
+not presented as the production semantic workload.
+
+Run the checked-in 5k parameter and concurrency benchmarks:
+
+```bash
+go test ./internal/index/hnsw \
+  -run '^$' \
+  -bench 'BenchmarkHNSWNomic768(BuildParam|Concurrent)' \
+  -benchtime=1x \
+  -count=1 \
+  -benchmem
+```
+
+The 50k semantic benchmark needs the external fixture described in
+[`docs/research/semantic-scale-validation.md`](docs/research/semantic-scale-validation.md):
+
+```bash
+LIBRAVDB_SEMANTIC_FIXTURE=/tmp/nomic-longmemeval-50k-gguf-q8.semantic.f32 \
+go test ./internal/index/hnsw \
+  -run '^$' \
+  -bench '^BenchmarkHNSWSemanticScale$' \
+  -benchtime=1x \
+  -count=1 \
+  -v
+```
+
+### Durable WAL And Asynchronous HNSW
+
+The active WAL is the WAL inside `internal/storage/singlefile`, not the
+standalone graph-store WAL package. These measurements include the canonical
+768d vector write and synchronous durability acknowledgement, but exclude HNSW
+construction unless stated otherwise.
+
+| Workload | Measured result | WAL group occupancy |
+|---|---:|---:|
+| Durable, 8 pending writers | approximately 1.44k writes/s | 7.99 entries/transaction |
+| Durable, 32 pending writers | 5.44k-5.61k writes/s | 31.88-31.93 entries/transaction |
+| Durable 256-entry batches | approximately 49k vectors/s | 256 entries/transaction |
+| Async HNSW, retained 28-entry/5 ms policy | 4.00k-4.40k durable acknowledgements/s; 3.33k-3.61k graph-ready/s | 28.4-28.7 entries/transaction |
+
+Later off-heap WAL request and reusable descriptor work reduced the integrated
+async HNSW path to approximately 537-548 B/op and 5 allocations/op while
+retaining roughly 6.3k accepted writes/s when the bounded index queue has
+capacity. Accepted throughput is not graph-ready throughput: once the queue is
+full, backpressure forces the two rates to converge.
+
+Reproduce the WAL and integrated asynchronous-index measurements:
+
+```bash
+go test ./internal/storage/singlefile \
+  -run '^$' \
+  -bench '^BenchmarkWALInsertConcurrent$' \
+  -benchtime=3000x \
+  -count=3 \
+  -benchmem
+
+go test ./libravdb \
+  -run '^$' \
+  -bench '^BenchmarkCollectionAsyncHNSWInsert$' \
+  -benchtime=5000x \
+  -count=3 \
+  -benchmem
+```
+
+Restart benchmarks cover persisted-index loading and forced rebuild fallback:
+
+```bash
+go test ./libravdb \
+  -run '^$' \
+  -bench '^BenchmarkRestart.*(Persisted|Rebuild)$' \
+  -benchtime=1x \
+  -benchmem
+```
+
+Detailed methodology and rejected experiments are recorded in
+[`docs/research/semantic-scale-validation.md`](docs/research/semantic-scale-validation.md),
+[`docs/research/diskann-soa-candidate-queue-experiment.md`](docs/research/diskann-soa-candidate-queue-experiment.md),
+and [`docs/research/async-wal-indexing-plan.md`](docs/research/async-wal-indexing-plan.md).
+
+### Throughput Boundaries And The 20-30k Target
+
+LibraVDB reports three different write rates. They are not interchangeable:
+
+| Rate | Meaning |
+|---|---|
+| Admission rate | The bounded frontend reserved capacity for a write. This is internal flow-control progress, not a user acknowledgement. |
+| Durable acknowledgements/s | `Insert` returned after the canonical vector record survived the WAL synchronization barrier. The async benchmark reports this as `accepted_writes/s`; it is durable but may not be graph-visible yet. |
+| Graph-ready inserts/s | HNSW construction completed and the record is visible to ANN traversal. |
+
+The durable WAL is not the current 768d throughput ceiling. It has measured
+approximately 49k vectors/s for durable 256-record batches. The current
+single-graph ceiling is exact FP32 HNSW construction, which reaches roughly
+2.9k-3.4k graph-ready inserts/s on the four-worker 50k semantic fixture at
+`M=16`.
+
+Approximately 85% of sampled construction CPU is inside exact SIMD distance
+kernels. At 3.5k graph-ready inserts/s, reaching 20k requires a 5.7x total
+speedup and reaching 30k requires 8.6x. With 15% of time outside distance
+kernels, eliminating distance calculation entirely would still cap the current
+control flow near 23k/s. The 20-30k graph-ready target therefore requires less
+vector work and less per-insert orchestration; another isolated queue or heap
+optimization is insufficient.
+
+The planned path is deliberately separated from shipped benchmark claims:
+
+1. **Daemon-side durable microbatching:** coalesce approximately 128-256
+   records per `InsertBatch` call so gRPC ingestion can use the WAL's measured
+   durable batch capacity.
+2. **Exact-bounded int8 construction codes:** keep canonical FP32 vectors, use
+   compact int8 codes plus conservative distance-error intervals for candidate
+   expansion, and load FP32 only when candidate bounds overlap. This remains a
+   research target until fallback rate, topology, recall, persistence, and
+   cross-platform SIMD results pass the semantic benchmark.
+3. **Epoch-batched HNSW mutation:** evaluate a bounded batch against a stable
+   graph epoch, group backlinks by target, prune each affected neighborhood
+   once, and publish the completed adjacency changes. This attacks repeated
+   overflow pruning and random mutation traffic without changing the durable
+   record model.
+4. **Configurable independent shards:** construct separate HNSW graphs without
+   shared adjacency mutation, search shards concurrently, and merge top-k
+   results. Aggregate graph-ready throughput can scale with cores and memory
+   channels, at the cost of query fan-out that must remain inside the p99
+   latency budget.
+
+The quantized construction bound follows from the triangle inequality. For a
+vector `x`, reconstruction `x_hat`, and reconstruction error
+`epsilon_x = ||x - x_hat||`:
+
+```text
+abs(||q - x|| - ||q_hat - x_hat||) <= epsilon_q + epsilon_x
+
+lower = max(0, ||q_hat - x_hat|| - epsilon_q - epsilon_x)
+upper =        ||q_hat - x_hat|| + epsilon_q + epsilon_x
+```
+
+Non-overlapping intervals can be ordered without reading the 3,072-byte FP32
+payload. Overlapping intervals fall back to exact FP32 distance, preserving the
+existing construction decision. Int8 is the first target because it reduces
+vector bandwidth by 4x while retaining materially tighter bounds than binary
+Hamming codes.
+
+The release does **not** claim 20-30k graph-ready inserts/s today. It does claim
+that durable batched ingestion is already in that throughput class and records
+the concrete architectural work required to move graph readiness into the same
+class.
+
+## 🛡️ Durability And Recovery
+
+Synchronous WAL durability is the default public contract:
+
+- Transactions are framed with magic/version fields, monotonic LSNs, transaction
+  IDs, previous-LSN links, and Castagnoli CRC32 checksums.
+- A WAL group is appended, synced once with `File.Sync`, and only then published
+  to the live record map and acknowledged to writers.
+- A write or sync failure is returned to every affected writer; failed durable
+  records are not made visible.
+- Recovery streams committed transactions in LSN order, discards incomplete
+  transactions, and tolerates a truncated final WAL frame.
+- Dual metapages and checksummed snapshot/index chunks permit fallback from a
+  torn or corrupt newest checkpoint.
+- Index snapshots persist their exact applied LSN. HNSW and Flat recovery apply
+  bounded post-snapshot insert/update/delete deltas; IVF-PQ falls back to a full
+  rebuild when retraining is required.
+- Vacuum, migration swaps, backup creation, and file removal sync the containing
+  directory on POSIX. Windows replacements use `MOVEFILE_WRITE_THROUGH`.
+
+Do not use `cp` on a live `.libravdb` file. Use `Database.Backup` to create a
+point-in-time copy while writes continue:
+
+```go
+if err := db.Backup(ctx, "./backup.libravdb"); err != nil {
+    log.Fatal(err)
+}
+```
+
+Async HNSW indexing changes search visibility, not storage durability. A
+successful insert is durable before it is necessarily graph-visible. Use
+`IndexingStats` to observe the durable/applied LSN gap and `FlushIndex` when a
+caller requires a graph-readiness barrier:
+
+```go
+stats := collection.IndexingStats()
+fmt.Printf("durable=%d applied=%d lag=%d pending=%d\n",
+    stats.DurableLSN, stats.AppliedLSN, stats.LSNLag, stats.Pending)
+
+if err := collection.FlushIndex(ctx); err != nil {
+    log.Fatal(err)
+}
+```
 
 ## 🚀 Quick Start
 
@@ -460,6 +689,54 @@ go build ./...
 go test ./...
 ```
 
+### Cross-Compilation
+
+LibraVDB is a Go library, so applications compile it into their own binary.
+Set `GOOS` and `GOARCH` when building the consuming application; users do not
+need a separate LibraVDB runtime installed.
+
+```bash
+# Linux x86-64
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -o app-linux-amd64 ./cmd/app
+
+# Linux ARM64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -trimpath -o app-linux-arm64 ./cmd/app
+
+# macOS Apple Silicon
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+  go build -trimpath -o app-darwin-arm64 ./cmd/app
+
+# Windows x86-64
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+  go build -trimpath -o app-windows-amd64.exe ./cmd/app
+```
+
+Validated full-library build targets are Linux amd64, Linux arm64, macOS arm64,
+and Windows amd64. ARM64 uses the checked-in NEON kernels.
+AMD64 selects generated AVX2/FMA kernels at runtime when supported and retains
+the generic fallback for older CPUs.
+
+Generated amd64 assembly is committed to the repository, so library consumers
+do not need Avo. Contributors changing SIMD generation must regenerate and
+verify it:
+
+```bash
+go generate ./internal/util/simd
+git diff --exit-code -- \
+  internal/util/simd/distance_amd64.s \
+  internal/util/simd/stub_amd64.go
+```
+
+Cross-compile the package itself during development with:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./libravdb
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./libravdb
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./libravdb
+```
+
 ### Docker Support
 
 ```dockerfile
@@ -628,7 +905,94 @@ If you prefer to perform migrations manually or via script, use `Migrate`:
 err := libravdb.Migrate(ctx, "./data.libravdb")
 ```
 
-### Lifecycle And Export
+### Lifecycle, Streaming Export, And Import
+
+`Database.Iterate` exposes every persisted record without knowing whether the
+consumer writes a file, sends gRPC messages, pipes stdout, or forwards records
+to another database. The callback provides backpressure: LibraVDB does not
+advance until it returns.
+
+```go
+err := db.Iterate(ctx, func(collectionName string, record libravdb.Record) error {
+    // destination belongs to the application or daemon. It can encode, send,
+    // pipe, or write the record in any format.
+    return destination.WriteRecord(collectionName, record)
+})
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+Use `Collection.Iterate` when exporting only one collection. `Collection.Config`
+returns a defensive copy of the portable collection configuration; the
+process-local `Graph` attachment is intentionally omitted.
+
+```go
+config := collection.Config()
+
+err := collection.Iterate(ctx, func(record libravdb.Record) error {
+    return destination.WriteRecord(collectionName, record)
+})
+```
+
+Iteration is bounded internally and does not materialize all records. Record
+ordering is an implementation detail and must not be used as an export schema.
+For a logically consistent export while the live database is changing, create
+a point-in-time backup and iterate the backup:
+
+```go
+const snapshotPath = "./export-snapshot.libravdb"
+if err := db.Backup(ctx, snapshotPath); err != nil {
+    log.Fatal(err)
+}
+
+snapshot, err := libravdb.Open(libravdb.WithStoragePath(snapshotPath))
+if err != nil {
+    log.Fatal(err)
+}
+defer snapshot.Close()
+
+if err := snapshot.Iterate(ctx, destination.WriteRecord); err != nil {
+    log.Fatal(err)
+}
+```
+
+LibraVDB does not impose an archive or wire-format importer. A consumer decodes
+its own input and feeds records into the existing bounded batch API. Imports
+should normally target an empty collection; `InsertBatch` assigns new internal
+ordinals and record versions while rebuilding the selected index.
+
+```go
+const importBatchSize = 1000
+batch := make([]libravdb.VectorEntry, 0, importBatchSize)
+
+for source.Next() {
+    item := source.Record()
+    batch = append(batch, libravdb.VectorEntry{
+        ID:       item.ID,
+        Vector:   item.Vector,
+        Metadata: item.Metadata,
+    })
+
+    if len(batch) == importBatchSize {
+        if err := collection.InsertBatch(ctx, batch); err != nil {
+            log.Fatal(err)
+        }
+        batch = batch[:0]
+    }
+}
+if err := source.Err(); err != nil {
+    log.Fatal(err)
+}
+if len(batch) > 0 {
+    if err := collection.InsertBatch(ctx, batch); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+For an exact physical copy that preserves storage versions, ordinals, and
+checkpoint state, use `Backup` instead of logical export/import.
 
 ```go
 collections := db.ListCollections()
@@ -879,19 +1243,15 @@ go tool cover -html=coverage.out -o coverage.html
 
 ### Test Results
 
-Current test coverage and performance metrics:
+Performance results are reported with their dataset, dimensions, durability
+mode, recall, concurrency, and hardware in [Measured Performance](#-measured-performance).
+The project does not publish a context-free insert or QPS headline because WAL
+acknowledgement, graph readiness, vector ownership, recall target, and index
+configuration measure different work.
 
-```
-Package Coverage:
-- libravdb:     92.3%
-- internal/*:   88.7%
-- Overall:      89.5%
-
-Benchmark Results:
-- Insert:       150K ops/sec
-- Search:       12K qps (p95: 0.8ms)
-- Memory:       2.1GB for 1M vectors
-```
+CI runs unit, integration, race, graph, HNSW, and SIMD tests across the
+configured Linux amd64 and macOS arm64 matrix. The release validation described
+under Cross-Compilation additionally builds Linux arm64 and Windows amd64.
 
 ## 🤝 Contributing
 
