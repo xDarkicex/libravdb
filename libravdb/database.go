@@ -41,24 +41,44 @@ type Database struct {
 
 // Config holds database-wide configuration
 type Config struct {
-	Logger              Logger
-	StoragePath         string
-	MaxCollections      int
-	MaxConcurrentWrites int
-	MaxWriteQueueDepth  int
-	MetricsEnabled      bool
-	TracingEnabled      bool
+	Logger               Logger
+	StoragePath          string
+	MaxCollections       int
+	MaxConcurrentWrites  int
+	MaxWriteQueueDepth   int
+	AsyncIndexQueueDepth int
+	AsyncIndexWorkers    int
+	MetricsEnabled       bool
+	TracingEnabled       bool
+	Durability           DurabilityMode
+	maxWritesExplicit    bool
+	writeQueueExplicit   bool
 }
+
+// DurabilityMode controls when a successful write may be acknowledged.
+type DurabilityMode uint8
+
+const (
+	// DurabilitySynchronous acknowledges writes only after the WAL group reaches
+	// stable storage through file.Sync.
+	DurabilitySynchronous DurabilityMode = iota
+	// DurabilityUnsafeNoSync is an explicit benchmark-only mode. A successful
+	// write may still be lost after power failure or kernel crash.
+	DurabilityUnsafeNoSync
+)
 
 // Open opens a Database at the configured path, creating it if necessary.
 func Open(opts ...Option) (*Database, error) {
 	config := &Config{
-		StoragePath:         "./data",
-		MetricsEnabled:      true,
-		TracingEnabled:      false,
-		MaxCollections:      100,
-		MaxConcurrentWrites: defaultMaxConcurrentWrites(),
-		MaxWriteQueueDepth:  32,
+		StoragePath:          "./data",
+		MetricsEnabled:       true,
+		TracingEnabled:       false,
+		MaxCollections:       100,
+		MaxConcurrentWrites:  defaultMaxConcurrentWrites(),
+		MaxWriteQueueDepth:   32,
+		AsyncIndexQueueDepth: 0,
+		AsyncIndexWorkers:    min(4, runtime.GOMAXPROCS(0)),
+		Durability:           DurabilitySynchronous,
 	}
 
 	// Apply options
@@ -67,13 +87,26 @@ func Open(opts ...Option) (*Database, error) {
 			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
+	if config.AsyncIndexQueueDepth > 0 {
+		if !config.maxWritesExplicit {
+			config.MaxConcurrentWrites = 32
+		}
+		if !config.writeQueueExplicit {
+			config.MaxWriteQueueDepth = config.AsyncIndexQueueDepth
+		}
+	}
 
 	// Create the index persistence bridge so persisted indexes can be
 	// deserialized during recovery (avoiding full rebuild from records).
 	bridge := &indexPersistenceBridge{cache: make(map[string]index.Index)}
-	storageEngine, err := singlefile.New(config.StoragePath,
+	storageOptions := []singlefile.Option{
 		singlefile.WithIndexSnapshotProvider(bridge),
-	)
+		singlefile.WithWALSync(config.Durability == DurabilitySynchronous),
+	}
+	if config.AsyncIndexQueueDepth > 0 {
+		storageOptions = append(storageOptions, singlefile.WithWALGroupCommitTarget(min(28, config.MaxConcurrentWrites), 5*time.Millisecond))
+	}
+	storageEngine, err := singlefile.New(config.StoragePath, storageOptions...)
 
 	if err != nil {
 		if errors.Is(err, storage.ErrV1FormatMigrationRequired) {
@@ -81,9 +114,7 @@ func Open(opts ...Option) (*Database, error) {
 				return nil, fmt.Errorf("auto-migration failed: %w", err)
 			}
 			// Retry opening the newly migrated database
-			storageEngine, err = singlefile.New(config.StoragePath,
-				singlefile.WithIndexSnapshotProvider(bridge),
-			)
+			storageEngine, err = singlefile.New(config.StoragePath, storageOptions...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to open database after migration: %w", err)
 			}
@@ -180,6 +211,11 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		_ = collection.Close()
+		_ = db.storage.DeleteCollection(name)
+		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+	}
 
 	db.collections[name] = collection
 	return collection, nil
@@ -267,6 +303,11 @@ func (db *Database) createCollectionLocked(ctx context.Context, name string, opt
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		_ = collection.Close()
+		_ = db.storage.DeleteCollection(name)
+		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+	}
 	db.collections[name] = collection
 	return collection, nil
 }
@@ -645,6 +686,9 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 			for _, c := range loadedCollections {
 				c.Close()
 			}
+			if bridge != nil {
+				bridge.closeCachedIndexes()
+			}
 			return err
 		}
 
@@ -657,6 +701,9 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 		db.collections[name] = collection
 	}
 	db.mu.Unlock()
+	if bridge != nil {
+		bridge.closeCachedIndexes()
+	}
 
 	return nil
 }
@@ -696,6 +743,10 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
 		collection.db = db
+		if err := db.configureAsyncIndex(collection); err != nil {
+			_ = collection.Close()
+			return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+		}
 		return collection, nil
 	}
 
@@ -717,8 +768,24 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		_ = collection.Close()
+		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+	}
 
 	return collection, nil
+}
+
+func (db *Database) configureAsyncIndex(collection *Collection) error {
+	if db.config.AsyncIndexQueueDepth == 0 || collection == nil || collection.shards != nil || collection.config.IndexType != HNSW {
+		return nil
+	}
+	queue, err := newAsyncIndexQueue(collection, db.config.AsyncIndexQueueDepth, db.config.AsyncIndexWorkers)
+	if err != nil {
+		return err
+	}
+	collection.asyncIndex = queue
+	return nil
 }
 
 func (db *Database) newWriteController() *writeController {

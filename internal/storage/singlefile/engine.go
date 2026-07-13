@@ -60,6 +60,9 @@ const (
 	// reaches batchSize or after batchFlushInterval elapses.
 	batchSize          = 256                   // flush when buffer reaches this many vector entries
 	batchFlushInterval = 10 * time.Millisecond // flush periodically if buffer not full
+	// WAL transactions are serialized under Engine.mu, so their contiguous write
+	// image can reuse one mmap-backed arena without synchronization or GC scans.
+	walWriteArenaSize = 64 << 20
 )
 
 // groupCommitWindow is the short delay used to coalesce flushNow requests
@@ -233,48 +236,59 @@ type Engine struct {
 	indexProvider IndexSnapshotProvider
 	cancel        context.CancelFunc
 	file          *os.File
+	walWriteArena *memory.Arena
 	state         *persistedState
 	collections   map[string]*Collection
 	path          string
 	batchBuffer   struct {
-		mu       sync.Mutex
-		entries  []batchEntry
-		flusher  chan struct{}
-		flushNow []chan // accumulated entries awaiting flush
-		// signal to wake up flusher
-		error
+		mu                 sync.Mutex
+		entries            []batchEntry
+		flusher            chan struct{}
+		flushNow           []chan walFlushResult
 		flushSignalPending int32
 		pendingWaiters     int32
 	}
-	dirtyOps         int
-	compactionErrors uint64
-	lastTxID         uint64
-	fileID           uint64
-	dirtyBytes       uint64
-	metaEpoch        uint64
-	walTransactions  uint64
-	walBytes         uint64
-	batchFlushes     uint64
-	batchedEntries   uint64
-	checkpoints      uint64
-	replayedTxs      uint64
-	discardedTxs     uint64
-	lastLSN          uint64
-	activeMetaPage   uint64
-	mu               sync.RWMutex
-	status           atomic.Int32
-	closed           atomic.Bool
-	dirty            bool // completion channels for foreground flushes
+	dirtyOps            int
+	compactionErrors    uint64
+	lastTxID            uint64
+	fileID              uint64
+	dirtyBytes          uint64
+	metaEpoch           uint64
+	walTransactions     uint64
+	walBytes            uint64
+	batchFlushes        uint64
+	batchedEntries      uint64
+	checkpoints         uint64
+	replayedTxs         uint64
+	discardedTxs        uint64
+	lastLSN             uint64
+	activeMetaPage      uint64
+	mu                  sync.RWMutex
+	status              atomic.Int32
+	closed              atomic.Bool
+	walSync             bool
+	groupCommitTarget   int32
+	groupCommitMaxDelay time.Duration
+	walSyncFn           func(*os.File) error // test hook; nil uses (*os.File).Sync
+	dirty               bool                 // completion channels for foreground flushes
 }
 
 // batchEntry holds a buffered record pending WAL flush.
 type batchEntry struct {
 	collection string
 	entries    []*index.VectorEntry
+	firstLSN   uint64
+	commitLSN  uint64
+	walBytes   uint64
 	// encoded holds pre-encoded recordPut payloads, 1:1 with entries.
 	// When set, flushBatch passes these to putRecordsInlocked to avoid
 	// re-encoding under e.mu.Lock().
 	encoded []encodedPayload
+}
+
+type walFlushResult struct {
+	err error
+	lsn uint64
 }
 
 // startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
@@ -307,6 +321,33 @@ func WithIndexSnapshotProvider(provider IndexSnapshotProvider) Option {
 		if es, ok := provider.(interface{ SetEngine(storage.Engine) }); ok {
 			es.SetEngine(e)
 		}
+		return nil
+	}
+}
+
+// WithWALSync controls whether foreground WAL commits wait for file.Sync.
+// Production callers should keep this enabled. Disabling it is only suitable
+// for benchmarks that intentionally measure the non-durable upper bound.
+func WithWALSync(enabled bool) Option {
+	return func(e *Engine) error {
+		e.walSync = enabled
+		return nil
+	}
+}
+
+// WithWALGroupCommitTarget waits for up to maxDelay for target concurrent WAL
+// transactions before syncing. It is intended for asynchronous index admission,
+// where graph construction no longer needs to hold foreground writers open.
+func WithWALGroupCommitTarget(target int, maxDelay time.Duration) Option {
+	return func(e *Engine) error {
+		if target <= 0 {
+			return fmt.Errorf("WAL group commit target must be positive")
+		}
+		if maxDelay <= 0 {
+			return fmt.Errorf("WAL group commit maximum delay must be positive")
+		}
+		e.groupCommitTarget = int32(target)
+		e.groupCommitMaxDelay = maxDelay
 		return nil
 	}
 }
@@ -347,6 +388,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		file:        file,
 		state:       &persistedState{NextCollectionID: 1, Collections: make(map[string]*persistedCollection)},
 		collections: make(map[string]*Collection),
+		walSync:     true,
 	}
 	engine.ctx, engine.cancel = context.WithCancel(context.Background())
 
@@ -516,6 +558,7 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 	if err != nil {
 		return e.rebuildIndexesFromRecords()
 	}
+	handled := make(map[string]struct{}, len(entries))
 
 	// Per-collection validation and deserialization.
 	for _, entry := range entries {
@@ -528,6 +571,7 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
 			}
+			handled[entry.name] = struct{}{}
 			continue
 		}
 
@@ -536,6 +580,7 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
 			}
+			handled[entry.name] = struct{}{}
 			continue
 		}
 
@@ -544,6 +589,7 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
 			}
+			handled[entry.name] = struct{}{}
 			continue
 		}
 
@@ -551,7 +597,24 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
 			}
+			handled[entry.name] = struct{}{}
 			continue
+		}
+		handled[entry.name] = struct{}{}
+	}
+
+	// A valid index block may intentionally omit derived indexes that were
+	// behind durable records at checkpoint time. Rebuild every live collection
+	// absent from the block so recovery never exposes a partial index.
+	for name, collection := range e.state.Collections {
+		if collection.Deleted {
+			continue
+		}
+		if _, ok := handled[name]; ok {
+			continue
+		}
+		if err := e.rebuildCollectionIndexFromRecords(name, collection); err != nil {
+			return err
 		}
 	}
 
@@ -830,6 +893,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 	}
 	offset := int64(3 * pageSize)
 	pending := make(map[uint64][]walRecord)
+	touchedCollections := make(map[string]struct{})
 
 	for offset+16 <= stat.Size() {
 		headerBuf := make([]byte, 16)
@@ -877,7 +941,7 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 			pending[record.Header.TxID] = []walRecord{record}
 		case recordTypeTxCommit:
 			frames := append(pending[record.Header.TxID], record)
-			if err := e.applyCommittedFrames(frames); err != nil {
+			if err := e.applyCommittedFrames(frames, touchedCollections); err != nil {
 				return err
 			}
 			e.replayedTxs++
@@ -903,6 +967,20 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		offset += int64(16 + chunk.PayloadLen)
 	}
 	e.discardedTxs += uint64(len(pending))
+	if e.indexProvider != nil {
+		for name := range touchedCollections {
+			collection := e.state.Collections[name]
+			if collection == nil || collection.Deleted {
+				if discarder, ok := e.indexProvider.(interface{ DiscardIndex(string) }); ok {
+					discarder.DiscardIndex(name)
+				}
+				continue
+			}
+			if err := e.indexProvider.RebuildIndex(name, &collection.Config); err != nil {
+				return fmt.Errorf("rebuild replayed index %s: %w", name, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -930,7 +1008,7 @@ func decodeWALRecord(payload []byte) (walRecord, error) {
 	return walRecord{Header: header, Payload: body}, nil
 }
 
-func (e *Engine) applyCommittedFrames(frames []walRecord) error {
+func (e *Engine) applyCommittedFrames(frames []walRecord, touchedCollections map[string]struct{}) error {
 	for _, record := range frames {
 		switch record.Header.RecordType {
 		case recordTypeCollectionCreate:
@@ -939,12 +1017,14 @@ func (e *Engine) applyCommittedFrames(frames []walRecord) error {
 				return err
 			}
 			e.applyCreateCollection(payload.Name, payload.Config, record.Header.LSN)
+			touchedCollections[payload.Name] = struct{}{}
 		case recordTypeCollectionDelete:
 			payload, err := decodeCollectionDeletePayloadBinary(record.Payload)
 			if err != nil {
 				return err
 			}
 			e.applyDeleteCollection(payload.Name, record.Header.LSN)
+			touchedCollections[payload.Name] = struct{}{}
 		case recordTypeRecordPut:
 			payload, err := decodeRecordPutPayloadBinary(record.Payload)
 			if err != nil {
@@ -953,12 +1033,14 @@ func (e *Engine) applyCommittedFrames(frames []walRecord) error {
 			if err := e.applyRecordPut(payload, record.Header.LSN); err != nil {
 				return err
 			}
+			touchedCollections[payload.Collection] = struct{}{}
 		case recordTypeRecordDelete:
 			payload, err := decodeRecordDeletePayloadBinary(record.Payload)
 			if err != nil {
 				return err
 			}
 			e.applyRecordDelete(payload.Collection, payload.ID, record.Header.LSN)
+			touchedCollections[payload.Collection] = struct{}{}
 		}
 	}
 	return nil
@@ -2236,7 +2318,13 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 		totalSize += 16 + 40 + len(record.Payload)
 	}
 
-	buf := make([]byte, 0, totalSize)
+	buf, temporaryArena, err := e.allocateWALWriteBufferLocked(totalSize)
+	if err != nil {
+		return 0, err
+	}
+	if temporaryArena != nil {
+		defer temporaryArena.Free()
+	}
 	var written uint64
 	for _, record := range records {
 		// Reserve space in buf for chunk header + frame header.
@@ -2273,15 +2361,69 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	if _, err := e.file.Write(buf); err != nil {
 		return written, err
 	}
-	// BENCHMARK: fsync disabled to measure pure HNSW indexing upper bound.
-	// Re-enable for production durability.
-	// if err := e.file.Sync(); err != nil {
-	// 	return written, err
-	// }
 	e.walTransactions++
 	e.walBytes += written
 	_ = offset
 	return written, nil
+}
+
+func (e *Engine) syncWALLocked() error {
+	if !e.walSync {
+		return nil
+	}
+	var err error
+	if e.walSyncFn != nil {
+		err = e.walSyncFn(e.file)
+	} else {
+		err = e.file.Sync()
+	}
+	if err != nil {
+		return fmt.Errorf("sync WAL: %w", err)
+	}
+	return nil
+}
+
+// allocateWALWriteBufferLocked returns an off-heap buffer with exactly size
+// bytes of append capacity. Normal transactions reuse one mmap-backed arena;
+// unusually large transactions receive a temporary exact-size mapping rather
+// than falling back to the Go heap. Caller must hold e.mu.
+func (e *Engine) allocateWALWriteBufferLocked(size int) ([]byte, *memory.Arena, error) {
+	if size <= 0 {
+		return nil, nil, fmt.Errorf("invalid WAL write buffer size %d", size)
+	}
+
+	arena := e.walWriteArena
+	if size <= walWriteArenaSize {
+		if arena == nil {
+			var err error
+			arena, err = memory.NewArena(walWriteArenaSize, 64)
+			if err != nil {
+				return nil, nil, fmt.Errorf("allocate WAL write arena: %w", err)
+			}
+			e.walWriteArena = arena
+		} else {
+			arena.Reset()
+		}
+	} else {
+		var err error
+		arena, err = memory.NewArena(uint64(size), 64)
+		if err != nil {
+			return nil, nil, fmt.Errorf("allocate temporary WAL write arena (%d bytes): %w", size, err)
+		}
+	}
+
+	ptr, err := arena.Alloc(uint64(size))
+	if err != nil {
+		if arena != e.walWriteArena {
+			_ = arena.Free()
+		}
+		return nil, nil, fmt.Errorf("reserve WAL write buffer (%d bytes): %w", size, err)
+	}
+	buf := unsafe.Slice((*byte)(ptr), size)[:0:size]
+	if arena == e.walWriteArena {
+		return buf, nil, nil
+	}
+	return buf, arena, nil
 }
 
 func (e *Engine) nextLSNLocked() uint64 {
@@ -2349,6 +2491,9 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	if err != nil {
 		return err
 	}
+	if err := e.syncWALLocked(); err != nil {
+		return err
+	}
 	e.applyCreateCollection(name, config, opLSN)
 	e.collections[name] = &Collection{engine: e, name: name}
 	e.markDirtyLocked(written, 1)
@@ -2371,10 +2516,7 @@ func (e *Engine) batchFlusher() {
 		case <-ticker.C:
 			_ = e.flushBatch()
 		case <-e.batchBuffer.flusher:
-			delay := adaptiveGroupCommitWindow(atomic.LoadInt32(&e.batchBuffer.pendingWaiters))
-			if delay > 0 {
-				time.Sleep(delay)
-			}
+			e.waitForGroupCommit()
 			_ = e.flushBatch()
 		case <-timer.C:
 			_ = e.flushBatch()
@@ -2387,6 +2529,33 @@ func (e *Engine) batchFlusher() {
 			}
 		}
 		timer.Reset(batchFlushInterval)
+	}
+}
+
+func (e *Engine) waitForGroupCommit() {
+	target := e.groupCommitTarget
+	if target <= 0 {
+		delay := adaptiveGroupCommitWindow(atomic.LoadInt32(&e.batchBuffer.pendingWaiters))
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		return
+	}
+
+	deadline := time.Now().Add(e.groupCommitMaxDelay)
+	step := time.Duration(groupCommitStepWindow.Load())
+	if step <= 0 {
+		step = 100 * time.Microsecond
+	}
+	for atomic.LoadInt32(&e.batchBuffer.pendingWaiters) < target {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		if step > remaining {
+			step = remaining
+		}
+		time.Sleep(step)
 	}
 }
 
@@ -2449,17 +2618,18 @@ func (e *Engine) flushBatch() error {
 
 	// Signal all waiters with the result
 	var firstErr error
+	var groupLSN uint64
+	var durableLSN uint64
 	signalErr := func(err error) {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 		for _, done := range pendingFlushes {
-			done <- err
+			done <- walFlushResult{lsn: durableLSN, err: err}
 		}
 	}
 
 	if e.closed.Load() {
-		// Signal any waiting flushes with error
 		signalErr(fmt.Errorf("database is closed"))
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return fmt.Errorf("database is closed")
@@ -2487,22 +2657,46 @@ func (e *Engine) flushBatch() error {
 	}
 
 	// Write all entries to WAL - use pre-encoded payloads to minimise time under e.mu.
-	for i, batch := range merged {
-		if err := e.putRecordsInlocked(batch.collection, batch.entries, batch.encoded); err != nil {
-			// On error, re-queue only the failed suffix (merged[i:] onwards).
-			// Do NOT re-queue merged[:i] because they were already committed.
-			failedSuffix := merged[i:]
-			e.batchBuffer.mu.Lock()
-			e.batchBuffer.entries = append(failedSuffix, e.batchBuffer.entries...)
-			e.batchBuffer.mu.Unlock()
+	for i := range merged {
+		written, firstLSN, commitLSN, err := e.appendRecordsWALLocked(merged[i].collection, merged[i].entries, merged[i].encoded)
+		if err != nil {
+			// A write failure makes the on-disk prefix ambiguous. Do not retry
+			// automatically and risk duplicating a transaction; recovery will
+			// accept only complete framed commits.
 			signalErr(err)
 			atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
-			e.requestBatchFlush()
 			return err
 		}
+		merged[i].walBytes = written
+		merged[i].firstLSN = firstLSN
+		merged[i].commitLSN = commitLSN
+		if commitLSN > groupLSN {
+			groupLSN = commitLSN
+		}
+	}
+	if err := e.syncWALLocked(); err != nil {
+		signalErr(err)
+		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+		return err
+	}
+	durableLSN = groupLSN
+	for _, batch := range merged {
+		for i, entry := range batch.entries {
+			lsn := batch.firstLSN + uint64(i)
+			if err := e.applyRecordPutFields(batch.collection, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, lsn, true); err != nil {
+				signalErr(err)
+				atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+				return err
+			}
+		}
+		e.markDirtyLocked(batch.walBytes, len(batch.entries))
+	}
+	if err := e.maybeCheckpointLocked(); err != nil {
+		signalErr(err)
+		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+		return err
 	}
 
-	// Signal all waiting foreground flush completions with success
 	e.batchFlushes++
 	e.batchedEntries += uint64(batchedEntries)
 	signalErr(nil)
@@ -2517,12 +2711,13 @@ func (e *Engine) flushBatch() error {
 	return nil
 }
 
-// putRecordsInlocked writes records to WAL and applies them to memory.
-// Caller must hold e.mu. This is the internal batch-friendly variant.
-func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, encoded []encodedPayload) error {
+// appendRecordsWALLocked writes one record transaction without publishing it
+// to the in-memory state. The caller applies records only after the containing
+// flush group has reached the configured durability boundary.
+func (e *Engine) appendRecordsWALLocked(name string, entries []*index.VectorEntry, encoded []encodedPayload) (uint64, uint64, uint64, error) {
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
-		return fmt.Errorf("collection %s not found", name)
+		return 0, 0, 0, fmt.Errorf("collection %s not found", name)
 	}
 	maxOrdinal := -1
 	for _, entry := range entries {
@@ -2566,7 +2761,7 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, e
 				Metadata:   entry.Metadata,
 			})
 			if err != nil {
-				return err
+				return 0, 0, 0, err
 			}
 			frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
 		}
@@ -2576,23 +2771,14 @@ func (e *Engine) putRecordsInlocked(name string, entries []*index.VectorEntry, e
 	frames[len(frames)-1] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
-		return err
+		return written, 0, 0, err
 	}
-	for i, entry := range entries {
-		if err := e.applyRecordPutFields(name, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, frames[i+1].Header.LSN, true); err != nil {
-			return err
-		}
-	}
-	e.markDirtyLocked(written, len(entries))
-	if err := e.maybeCheckpointLocked(); err != nil {
-		return err
-	}
-	return nil
+	return written, frames[1].Header.LSN, frames[len(frames)-1].Header.LSN, nil
 }
 
-func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (bool, error) {
+func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (<-chan walFlushResult, error) {
 	if e.closed.Load() {
-		return false, fmt.Errorf("database is closed")
+		return nil, fmt.Errorf("database is closed")
 	}
 
 	// Pre-encode recordPut payloads before acquiring any locks.
@@ -2604,7 +2790,7 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 				for j := 0; j < i; j++ {
 					releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 				}
-				return false, ctx.Err()
+				return nil, ctx.Err()
 			default:
 			}
 		}
@@ -2619,7 +2805,7 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 			for j := 0; j < i; j++ {
 				releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 			}
-			return false, err
+			return nil, err
 		}
 		encoded[i] = payload
 	}
@@ -2631,18 +2817,21 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 		for j := 0; j < len(entries); j++ {
 			releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 		}
-		return false, fmt.Errorf("database is closed")
+		return nil, fmt.Errorf("database is closed")
 	}
 	bufferedEntries := 0
 	for _, batch := range e.batchBuffer.entries {
 		bufferedEntries += len(batch.entries)
 	}
 	shouldFlush := bufferedEntries+len(entries) >= batchSize
+	done := make(chan walFlushResult, 1)
 	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
 		collection: name,
 		entries:    entries,
 		encoded:    encoded,
 	})
+	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
+	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 	e.batchBuffer.mu.Unlock()
 
 	// Signal the flusher once for the current commit window and return immediately.
@@ -2651,31 +2840,19 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 	// If we've reached batch size, do a synchronous flush before returning.
 	// This ensures durability for this caller's data.
 	if shouldFlush {
-		return true, e.flushBatch()
+		_ = e.flushBatch()
 	}
 
-	return false, nil
+	return done, nil
 }
 
-// flushNow forces an immediate flush of the batch buffer and waits for completion.
-// This is used by single-record Insert to ensure immediate durability.
-// Respects context cancellation — returns ctx.Err() if the context is cancelled
-// before the flush completes.
-func (e *Engine) flushNow(ctx context.Context) error {
-	done := make(chan error, 1)
-	e.batchBuffer.mu.Lock()
-	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
-	e.batchBuffer.mu.Unlock()
-	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
-
-	e.requestBatchFlush()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func waitForWALFlush(ctx context.Context, done <-chan walFlushResult) (uint64, error) {
+	_ = ctx
+	// Once admitted to the WAL group, the transaction may commit even if the
+	// caller's context is canceled. Wait for the definitive durable result so
+	// callers never abandon follow-up index work for a committed record.
+	result := <-done
+	return result.lsn, result.err
 }
 
 func (e *Engine) deleteRecord(name, id string) error {
@@ -2709,6 +2886,9 @@ func (e *Engine) deleteRecord(name, id string) error {
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
+		return err
+	}
+	if err := e.syncWALLocked(); err != nil {
 		return err
 	}
 	e.applyRecordDelete(name, id, opLSN)
@@ -2839,6 +3019,9 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 	if err != nil {
 		return err
 	}
+	if err := e.syncWALLocked(); err != nil {
+		return err
+	}
 
 	for i, op := range ops {
 		recordLSN := frames[i+1].Header.LSN
@@ -2950,6 +3133,9 @@ func (e *Engine) DeleteCollection(name string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.syncWALLocked(); err != nil {
+		return err
+	}
 	e.applyDeleteCollection(name, opLSN)
 	if collectionObj := e.collections[name]; collectionObj != nil {
 		collectionObj.closed.Store(true)
@@ -2980,6 +3166,12 @@ func (e *Engine) Close() error {
 			collection.vectorSFL = nil
 			collection.vectorSlots = nil
 		}
+	}
+	if e.walWriteArena != nil {
+		if err := e.walWriteArena.Free(); err != nil {
+			return err
+		}
+		e.walWriteArena = nil
 	}
 	if e.dirty {
 		if err := e.file.Sync(); err != nil {
@@ -3098,36 +3290,40 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 // Insert persists a single vector entry.
 // It ensures immediate durability by forcing a flush before returning.
 func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error {
+	_, err := c.InsertDurable(ctx, entry)
+	return err
+}
+
+func (c *Collection) InsertDurable(ctx context.Context, entry *index.VectorEntry) (uint64, error) {
 	_ = ctx
 	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
-		return err
+		return 0, err
 	}
-	flushed, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
+	done, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if flushed {
-		return nil
-	}
-	return c.engine.flushNow(ctx)
+	return waitForWALFlush(ctx, done)
 }
 
 // InsertBatch persists multiple vector entries.
 // It uses buffered batching for better throughput, but ensures data is flushed
 // before returning so callers can immediately see the inserted data.
 func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEntry) error {
+	_, err := c.InsertBatchDurable(ctx, entries)
+	return err
+}
+
+func (c *Collection) InsertBatchDurable(ctx context.Context, entries []*index.VectorEntry) (uint64, error) {
 	_ = ctx
 	if err := c.assignOrdinals(entries); err != nil {
-		return err
+		return 0, err
 	}
-	flushed, err := c.engine.putRecords(ctx, c.name, entries)
+	done, err := c.engine.putRecords(ctx, c.name, entries)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if flushed {
-		return nil
-	}
-	return c.engine.flushNow(ctx)
+	return waitForWALFlush(ctx, done)
 }
 
 // Get returns a persisted entry by ID.

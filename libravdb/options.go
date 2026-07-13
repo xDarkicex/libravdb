@@ -39,6 +39,17 @@ func WithTracing(enabled bool) Option {
 	}
 }
 
+// WithDurability selects the database write durability contract.
+func WithDurability(mode DurabilityMode) Option {
+	return func(c *Config) error {
+		if mode != DurabilitySynchronous && mode != DurabilityUnsafeNoSync {
+			return fmt.Errorf("invalid durability mode %d", mode)
+		}
+		c.Durability = mode
+		return nil
+	}
+}
+
 // WithMaxCollections sets the maximum number of collections
 func WithMaxCollections(max int) Option {
 	return func(c *Config) error {
@@ -57,6 +68,7 @@ func WithMaxConcurrentWrites(max int) Option {
 			return fmt.Errorf("max concurrent writes must be positive")
 		}
 		c.MaxConcurrentWrites = max
+		c.maxWritesExplicit = true
 		return nil
 	}
 }
@@ -68,6 +80,24 @@ func WithMaxWriteQueueDepth(depth int) Option {
 			return fmt.Errorf("max write queue depth must be non-negative")
 		}
 		c.MaxWriteQueueDepth = depth
+		c.writeQueueExplicit = true
+		return nil
+	}
+}
+
+// WithAsyncIndexing decouples durable HNSW inserts from graph construction.
+// The bounded queue applies backpressure before WAL admission, and workers
+// index storage-owned vectors by ordinal without copying vector payloads.
+func WithAsyncIndexing(queueDepth, workers int) Option {
+	return func(c *Config) error {
+		if queueDepth < 32 {
+			return fmt.Errorf("asynchronous index queue depth must be at least 32")
+		}
+		if workers <= 0 {
+			return fmt.Errorf("asynchronous index worker count must be positive")
+		}
+		c.AsyncIndexQueueDepth = queueDepth
+		c.AsyncIndexWorkers = workers
 		return nil
 	}
 }

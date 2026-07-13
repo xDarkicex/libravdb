@@ -234,7 +234,7 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 		selectedVectors = make([][]float32, 0, maxM)
 	}
 
-	usePtrNEON := index.useHeuristicPtrNEON()
+	usePtrSIMD := index.useHeuristicPtrSIMD()
 	var selectedPtrBuf [128]unsafe.Pointer
 	selectedPtrs := selectedPtrBuf[:0]
 	if maxM > len(selectedPtrBuf) {
@@ -277,7 +277,7 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 			selectedVectors,
 			selectedPtrs,
 			candidate.Distance,
-			usePtrNEON,
+			usePtrSIMD,
 		)
 
 		if shouldSelect {
@@ -299,12 +299,12 @@ func (ns *NeighborSelector) selectWithSimpleHeuristicValues(
 	return candidates[:len(selected)]
 }
 
-func (h *Index) useHeuristicPtrNEON() bool {
-	return runtime.GOARCH == "arm64" &&
-		h.config != nil &&
+func (h *Index) useHeuristicPtrSIMD() bool {
+	return h.config != nil &&
 		h.config.Metric == util.L2Distance &&
 		h.quantizer == nil &&
-		h.provider == nil
+		h.provider == nil &&
+		simd.HasL2Batch8Ptr()
 }
 
 func (h *Index) rejectBySelectedHeuristic(
@@ -312,10 +312,10 @@ func (h *Index) rejectBySelectedHeuristic(
 	selectedVectors [][]float32,
 	selectedPtrs []unsafe.Pointer,
 	cutoff float32,
-	usePtrNEON bool,
+	usePtrSIMD bool,
 ) bool {
 	relaxedCutoff := h.relaxedHeuristicCutoff(cutoff)
-	if usePtrNEON && len(selectedPtrs) == len(selectedVectors) {
+	if usePtrSIMD && len(selectedPtrs) == len(selectedVectors) {
 		j := 0
 		for j+7 < len(selectedPtrs) {
 			p0 := selectedPtrs[j]
@@ -327,7 +327,14 @@ func (h *Index) rejectBySelectedHeuristic(
 			p6 := selectedPtrs[j+6]
 			p7 := selectedPtrs[j+7]
 			if p0 != nil && p1 != nil && p2 != nil && p3 != nil && p4 != nil && p5 != nil && p6 != nil && p7 != nil {
-				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(candidateVector, p0, p1, p2, p3, p4, p5, p6, p7)
+				if h.useHeuristicPredicate {
+					if simd.L2AnyLessThan8Ptr(candidateVector, p0, p1, p2, p3, p4, p5, p6, p7, relaxedCutoff) != 0 {
+						return true
+					}
+					j += 8
+					continue
+				}
+				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8Ptr(candidateVector, p0, p1, p2, p3, p4, p5, p6, p7)
 				if d0 < relaxedCutoff || d1 < relaxedCutoff || d2 < relaxedCutoff || d3 < relaxedCutoff ||
 					d4 < relaxedCutoff || d5 < relaxedCutoff || d6 < relaxedCutoff || d7 < relaxedCutoff {
 					return true
@@ -347,7 +354,7 @@ func (h *Index) rejectBySelectedHeuristic(
 			p2 := selectedPtrs[j+2]
 			p3 := selectedPtrs[j+3]
 			if p0 != nil && p1 != nil && p2 != nil && p3 != nil {
-				d0, d1, d2, d3 := simd.L2Distance4PtrNEON(candidateVector, p0, p1, p2, p3)
+				d0, d1, d2, d3 := simd.L2Distance4Ptr(candidateVector, p0, p1, p2, p3)
 				if d0 < relaxedCutoff || d1 < relaxedCutoff || d2 < relaxedCutoff || d3 < relaxedCutoff {
 					return true
 				}
@@ -793,7 +800,7 @@ func (h *Index) appendHeuristicCandidatesFromIDs(
 	candidates []util.Candidate,
 ) ([]uint32, []util.Candidate) {
 	trackLiveLinks := liveLinks != nil || cap(liveLinks) > 0
-	if h.useHeuristicPtrNEON() {
+	if h.useHeuristicPtrSIMD() {
 		var idBuf [8]uint32
 		var ptrBuf [8]unsafe.Pointer
 		for i := 0; i < len(ids); {
@@ -813,16 +820,10 @@ func (h *Index) appendHeuristicCandidatesFromIDs(
 				continue
 			}
 			if n == 8 {
-				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(
+				d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8Ptr(
 					queryVector,
-					ptrBuf[0],
-					ptrBuf[1],
-					ptrBuf[2],
-					ptrBuf[3],
-					ptrBuf[4],
-					ptrBuf[5],
-					ptrBuf[6],
-					ptrBuf[7],
+					ptrBuf[0], ptrBuf[1], ptrBuf[2], ptrBuf[3],
+					ptrBuf[4], ptrBuf[5], ptrBuf[6], ptrBuf[7],
 				)
 				if trackLiveLinks {
 					liveLinks = append(liveLinks, idBuf[0], idBuf[1], idBuf[2], idBuf[3], idBuf[4], idBuf[5], idBuf[6], idBuf[7])
@@ -841,7 +842,7 @@ func (h *Index) appendHeuristicCandidatesFromIDs(
 			}
 			j := 0
 			if n >= 4 {
-				d0, d1, d2, d3 := simd.L2Distance4PtrNEON(queryVector, ptrBuf[0], ptrBuf[1], ptrBuf[2], ptrBuf[3])
+				d0, d1, d2, d3 := simd.L2Distance4Ptr(queryVector, ptrBuf[0], ptrBuf[1], ptrBuf[2], ptrBuf[3])
 				if trackLiveLinks {
 					liveLinks = append(liveLinks, idBuf[0], idBuf[1], idBuf[2], idBuf[3])
 				}

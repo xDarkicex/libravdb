@@ -107,6 +107,15 @@ type Collection interface {
 	Close() error
 }
 
+// DurableCollection exposes the WAL commit LSN associated with a successful
+// storage mutation. Callers use this to track derived-index lag without making
+// the base Collection interface storage-engine-specific.
+type DurableCollection interface {
+	Collection
+	InsertDurable(ctx context.Context, entry *index.VectorEntry) (uint64, error)
+	InsertBatchDurable(ctx context.Context, entries []*index.VectorEntry) (uint64, error)
+}
+
 // OrdinalAssigner assigns stable internal ordinals to entries before indexing.
 type OrdinalAssigner interface {
 	AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error

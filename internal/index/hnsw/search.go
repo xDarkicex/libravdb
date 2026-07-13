@@ -22,6 +22,8 @@ type searchScratch struct {
 	visitedMarks  []uint32
 	maxHeapBuf    []util.Candidate
 	minHeapBuf    []util.Candidate
+	soaIDs        []uint32
+	soaDistances  []float32
 	pruneBuf      []util.Candidate
 	inFlightBuf   []uint32
 	prefetchedIDs []uint32
@@ -122,10 +124,14 @@ func (h *candidateMinHeap) PopCandidate() util.Candidate {
 	return result
 }
 
-// CandidateMode selects the candidate tracking data structure used during
-// search. "heap" is the current production default. "unsorted" and
-// "reservoir" remain available for targeted throughput/recall testing.
-var CandidateMode = "heap"
+type candidateMode uint32
+
+const (
+	candidateModeSOA candidateMode = iota
+	candidateModeHeap
+	candidateModeUnsorted
+	candidateModeReservoir
+)
 
 // unsortedTopK tracks the K closest candidates found so far using an
 // unsorted array with a cached worst-element index. For small K (ef ≤ 200),
@@ -652,16 +658,32 @@ func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *s
 
 func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef int) {
 	maxCap, minCap := searchHeapCaps(nodeCount, ef)
+	soaCap := min(max(ef, 1), max(nodeCount, 1))
+	inFlightCap := inFlightSnapshotLimit
+	mode := candidateMode(h.candidateMode.Load())
+	soaMode := mode == candidateModeSOA
+	if soaMode {
+		maxCap = soaCap // result materialization buffer
+		minCap = 0
+	}
+	// Construction unions the bounded traversal result with a snapshot of
+	// in-flight nodes. Reserve that union off-heap so concurrent insertion never
+	// grows the result slice on the Go heap.
+	maxCap += inFlightCap
 	prefetchCap := max(128, linkArrayCapacity(h.config.M, 0)*2)
 	candidateBytes := uint64(maxCap+minCap) * uint64(unsafe.Sizeof(util.Candidate{}))
+	if soaMode {
+		candidateBytes += uint64(soaCap) * uint64(unsafe.Sizeof(uint32(0))+unsafe.Sizeof(float32(0)))
+	}
 	prefetchBytes := uint64(prefetchCap) * uint64(
 		unsafe.Sizeof(uint32(0))+unsafe.Sizeof(unsafe.Pointer(nil))+unsafe.Sizeof([]float32(nil)),
 	)
+	inFlightBytes := uint64(inFlightCap) * uint64(unsafe.Sizeof(uint32(0)))
 	// Ensure the Arena is sized for visitedMarks, prefetch ID buffer, and the
 	// two candidate frontiers used by this search. ef may be much larger than
 	// the default headroom during quality sweeps and user-tuned high-recall
 	// searches, so fixed scratch sizing can panic under valid configurations.
-	needed := uint64(nodeCount*4) + prefetchBytes + candidateBytes + 64*1024 + 8*64
+	needed := uint64(nodeCount*4) + prefetchBytes + candidateBytes + inFlightBytes + 64*1024 + 8*64
 	if needed < 320*1024 {
 		needed = 320 * 1024
 	}
@@ -710,11 +732,35 @@ func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef i
 		panic("hnsw: arena maxHeapBuf: " + err.Error())
 	}
 	scratch.maxHeapBuf = maxHeap[:0]
-	minHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, minCap)
+	inFlightBuf, err := memory.ArenaSlice[uint32](scratch.arena, inFlightCap)
 	if err != nil {
-		panic("hnsw: arena minHeapBuf: " + err.Error())
+		panic("hnsw: arena inFlightBuf: " + err.Error())
 	}
-	scratch.minHeapBuf = minHeap[:0]
+	scratch.inFlightBuf = inFlightBuf[:0]
+	if minCap > 0 {
+		minHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, minCap)
+		if err != nil {
+			panic("hnsw: arena minHeapBuf: " + err.Error())
+		}
+		scratch.minHeapBuf = minHeap[:0]
+	} else {
+		scratch.minHeapBuf = nil
+	}
+	if soaMode {
+		soaIDs, err := memory.ArenaSlice[uint32](scratch.arena, soaCap)
+		if err != nil {
+			panic("hnsw: arena soaIDs: " + err.Error())
+		}
+		scratch.soaIDs = soaIDs[:soaCap]
+		soaDistances, err := memory.ArenaSlice[float32](scratch.arena, soaCap)
+		if err != nil {
+			panic("hnsw: arena soaDistances: " + err.Error())
+		}
+		scratch.soaDistances = soaDistances[:soaCap]
+	} else {
+		scratch.soaIDs = nil
+		scratch.soaDistances = nil
+	}
 
 }
 
@@ -975,16 +1021,18 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	visitMark := scratch.nextVisitMark()
 	scratch.maxHeapBuf = scratch.maxHeapBuf[:0]
 	scratch.minHeapBuf = scratch.minHeapBuf[:0]
-	candidateMode := CandidateMode
-	heapMode := candidateMode != "unsorted" && candidateMode != "reservoir"
-	reservoirMode := candidateMode == "reservoir"
+	mode := candidateMode(h.candidateMode.Load())
+	soaMode := mode == candidateModeSOA
+	heapMode := mode == candidateModeHeap
+	reservoirMode := mode == candidateModeReservoir
 	heapCandidates := candidateMaxHeap{items: scratch.maxHeapBuf}
 	unsortedCandidates := unsortedTopK{items: scratch.maxHeapBuf, maxSize: ef}
 	reservoirCandidates := reservoirTopK{items: scratch.maxHeapBuf, maxSize: ef}
 	w := &candidateMinHeap{items: scratch.minHeapBuf}
-	useRawNEONPtrL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && h.quantizer == nil && h.provider == nil
-	useNEONBatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && !useRawNEONPtrL2
-	useAVX2BatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "amd64" && cpu.X86.HasAVX2 && cpu.X86.HasFMA
+	soaCandidates := newSOACandidateQueue(scratch.soaIDs, scratch.soaDistances, min(ef, nodeCount))
+	useRawSIMDPtrL2 := h.config.Metric == util.L2Distance && h.quantizer == nil && h.provider == nil && simd.HasL2Batch8Ptr()
+	useNEONBatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "arm64" && !useRawSIMDPtrL2
+	useAVX2BatchL2 := h.config.Metric == util.L2Distance && runtime.GOARCH == "amd64" && !useRawSIMDPtrL2 && cpu.X86.HasAVX2 && cpu.X86.HasFMA
 	useSIMDBatchL2 := useNEONBatchL2 || useAVX2BatchL2
 	var done <-chan struct{}
 	if ctx != nil {
@@ -1006,6 +1054,8 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	candidate := util.Candidate{ID: entryID, Distance: distance}
 
 	switch {
+	case soaMode:
+		soaCandidates.Insert(candidate)
 	case heapMode:
 		heapCandidates.PushCandidate(candidate)
 	case reservoirMode:
@@ -1013,10 +1063,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	default:
 		unsortedCandidates.PushCandidate(candidate)
 	}
-	w.PushCandidate(candidate)
+	if !soaMode {
+		w.PushCandidate(candidate)
+	}
 	visited[entryID] = visitMark
 
-	for w.Len() > 0 {
+	for {
 		if done != nil {
 			select {
 			case <-done:
@@ -1025,10 +1077,24 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			}
 		}
 
-		current := w.PopCandidate()
+		var current util.Candidate
+		if soaMode {
+			var ok bool
+			current, ok = soaCandidates.PopClosestUnexpanded()
+			if !ok {
+				break
+			}
+		} else {
+			if w.Len() == 0 {
+				break
+			}
+			current = w.PopCandidate()
+		}
 
 		// Early termination condition - optimized for large datasets
-		if heapMode {
+		if soaMode {
+			// The bounded sorted beam owns both expansion state and results.
+		} else if heapMode {
 			if len(heapCandidates.items) >= ef && current.Distance > heapCandidates.items[0].Distance {
 				break
 			}
@@ -1061,14 +1127,17 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 					node := h.nodes.Get(neighborID)
 					if node != nil {
-						if useRawNEONPtrL2 {
+						if useRawSIMDPtrL2 {
 							ptr := node.VectorPtr
 							if ptr == nil {
 								continue
 							}
 							scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
 							scratch.prefetchPtrs = append(scratch.prefetchPtrs, ptr)
-							simd.PrefetchL1(ptr)
+							if n := len(scratch.prefetchPtrs); n&7 == 0 {
+								ptrs := (*[8]unsafe.Pointer)(unsafe.Pointer(&scratch.prefetchPtrs[n-8]))
+								simd.Prefetch8L1(ptrs)
+							}
 							continue
 						}
 						scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
@@ -1095,14 +1164,17 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 					node := h.nodes.Get(neighborID)
 					if node != nil {
-						if useRawNEONPtrL2 {
+						if useRawSIMDPtrL2 {
 							ptr := node.VectorPtr
 							if ptr == nil {
 								continue
 							}
 							scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
 							scratch.prefetchPtrs = append(scratch.prefetchPtrs, ptr)
-							simd.PrefetchL1(ptr)
+							if n := len(scratch.prefetchPtrs); n&7 == 0 {
+								ptrs := (*[8]unsafe.Pointer)(unsafe.Pointer(&scratch.prefetchPtrs[n-8]))
+								simd.Prefetch8L1(ptrs)
+							}
 							continue
 						}
 						scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
@@ -1119,10 +1191,13 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 					}
 				}
 			}
-			if useRawNEONPtrL2 {
+			if useRawSIMDPtrL2 {
+				for i := len(scratch.prefetchPtrs) &^ 7; i < len(scratch.prefetchPtrs); i++ {
+					simd.PrefetchL1(scratch.prefetchPtrs[i])
+				}
 				for i := 0; i < len(scratch.prefetchedIDs); {
 					if i+7 < len(scratch.prefetchedIDs) {
-						d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8PtrNEON(
+						d0, d1, d2, d3, d4, d5, d6, d7 := simd.L2Distance8Ptr(
 							query,
 							scratch.prefetchPtrs[i],
 							scratch.prefetchPtrs[i+1],
@@ -1134,7 +1209,10 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							scratch.prefetchPtrs[i+7],
 						)
 						batchIDs := scratch.prefetchedIDs[i : i+8]
-						if heapMode {
+						if soaMode {
+							admitBatch4SOA(&soaCandidates, batchIDs[:4], d0, d1, d2, d3)
+							admitBatch4SOA(&soaCandidates, batchIDs[4:], d4, d5, d6, d7)
+						} else if heapMode {
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs[:4], d0, d1, d2, d3)
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs[4:], d4, d5, d6, d7)
 						} else if reservoirMode {
@@ -1148,7 +1226,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						continue
 					}
 					if i+3 < len(scratch.prefetchedIDs) {
-						d0, d1, d2, d3 := simd.L2Distance4PtrNEON(
+						d0, d1, d2, d3 := simd.L2Distance4Ptr(
 							query,
 							scratch.prefetchPtrs[i],
 							scratch.prefetchPtrs[i+1],
@@ -1156,7 +1234,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							scratch.prefetchPtrs[i+3],
 						)
 						batchIDs := scratch.prefetchedIDs[i : i+4]
-						if heapMode {
+						if soaMode {
+							admitBatch4SOA(&soaCandidates, batchIDs, d0, d1, d2, d3)
+						} else if heapMode {
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs, d0, d1, d2, d3)
 						} else if reservoirMode {
 							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs, d0, d1, d2, d3)
@@ -1166,11 +1246,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						i += 4
 						continue
 					}
-
 					neighborID := scratch.prefetchedIDs[i]
 					vec := unsafe.Slice((*float32)(scratch.prefetchPtrs[i]), len(query))
 					neighborDistance := h.distance(query, vec)
-					if heapMode {
+					if soaMode {
+						soaCandidates.Insert(util.Candidate{ID: neighborID, Distance: neighborDistance})
+					} else if heapMode {
 						admitCandidateMaxHeap(&heapCandidates, w, ef, neighborID, neighborDistance)
 					} else if reservoirMode {
 						admitCandidateReservoir(&reservoirCandidates, w, neighborID, neighborDistance)
@@ -1196,7 +1277,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							d0, d1, d2, d3 = simd.L2Distance4AVX2(query, v0, v1, v2, v3)
 						}
 						batchIDs := scratch.prefetchedIDs[i : i+4]
-						if heapMode {
+						if soaMode {
+							admitBatch4SOA(&soaCandidates, batchIDs, d0, d1, d2, d3)
+						} else if heapMode {
 							admitBatch4MaxHeap(&heapCandidates, w, ef, batchIDs, d0, d1, d2, d3)
 						} else if reservoirMode {
 							admitBatch4Reservoir(&reservoirCandidates, w, batchIDs, d0, d1, d2, d3)
@@ -1228,7 +1311,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 					}
 				}
 
-				if heapMode {
+				if soaMode {
+					soaCandidates.Insert(util.Candidate{ID: neighborID, Distance: neighborDistance})
+				} else if heapMode {
 					admitCandidateMaxHeap(&heapCandidates, w, ef, neighborID, neighborDistance)
 				} else if reservoirMode {
 					admitCandidateReservoir(&reservoirCandidates, w, neighborID, neighborDistance)
@@ -1238,6 +1323,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 				i++
 			}
 		}
+	}
+	if soaMode {
+		return soaCandidates.AppendCandidates(scratch.maxHeapBuf[:0]), nil
 	}
 	if heapMode {
 		return heapCandidates.items, nil

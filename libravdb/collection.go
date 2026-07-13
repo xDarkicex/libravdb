@@ -35,12 +35,14 @@ type Collection struct {
 	name                   string
 	shards                 []shard
 	mutationStripes        [64]sync.Mutex
+	asyncMutation          sync.RWMutex
 	mu                     sync.RWMutex
 	closed                 bool
 	optimizationInProgress bool
 	graph                  Graph
 	insertHooks            []InsertHook
 	deleteHooks            []DeleteHook
+	asyncIndex             *asyncIndexQueue
 }
 
 // CollectionConfig holds collection-specific configuration
@@ -795,6 +797,20 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		} else if exists {
 			return fmt.Errorf("failed to insert into index: node with ID '%s' already exists", id)
 		}
+		asyncReserved := false
+		if c.asyncIndex != nil {
+			c.asyncMutation.RLock()
+			defer c.asyncMutation.RUnlock()
+			if err := c.asyncIndex.reserve(ctx, 1); err != nil {
+				return fmt.Errorf("failed to reserve asynchronous index capacity: %w", err)
+			}
+			asyncReserved = true
+			defer func() {
+				if asyncReserved {
+					c.asyncIndex.cancelReservation(1)
+				}
+			}()
+		}
 
 		if err := c.storage.AssignOrdinals(ctx, []*index.VectorEntry{storageEntry}); err != nil {
 			return err
@@ -825,6 +841,19 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 					return fmt.Errorf("failed to commit graph transaction: %w", err)
 				}
 			}
+		}
+
+		if c.asyncIndex != nil {
+			durableLSN, err := c.asyncIndex.storage.InsertDurable(ctx, storageEntry)
+			if err != nil {
+				return fmt.Errorf("failed to write to storage: %w", err)
+			}
+			c.asyncIndex.commitOne(storageEntry, durableLSN)
+			asyncReserved = false
+			if c.metrics != nil {
+				c.metrics.VectorInserts.Inc()
+			}
+			return nil
 		}
 
 		if err := c.storage.Insert(ctx, storageEntry); err != nil {
@@ -980,6 +1009,24 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		}
 	}
 
+	if c.asyncIndex != nil {
+		c.asyncMutation.RLock()
+		defer c.asyncMutation.RUnlock()
+		if err := c.asyncIndex.reserve(ctx, len(entries)); err != nil {
+			return fmt.Errorf("failed to reserve asynchronous index capacity: %w", err)
+		}
+		durableLSN, err := c.asyncIndex.storage.InsertBatchDurable(ctx, entries)
+		if err != nil {
+			c.asyncIndex.cancelReservation(len(entries))
+			return fmt.Errorf("failed to write batch to storage: %w", err)
+		}
+		c.asyncIndex.commit(entries, durableLSN)
+		if c.metrics != nil {
+			c.metrics.VectorInserts.Add(float64(len(entries)))
+		}
+		return nil
+	}
+
 	if err := storage.InsertBatch(ctx, entries); err != nil {
 		return fmt.Errorf("failed to write batch to storage: %w", err)
 	}
@@ -1112,6 +1159,11 @@ func (c *Collection) rollbackBatchIndex(ctx context.Context, ids []string) {
 
 // Update modifies an existing vector in the collection
 func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before update: %w", err)
+	}
+	defer unlockAsync()
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -1213,6 +1265,11 @@ func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, me
 		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 			len(vector), c.config.Dimension)
 	}
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before upsert: %w", err)
+	}
+	defer unlockAsync()
 
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
@@ -1434,6 +1491,11 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 
 // Delete removes a vector from the collection
 func (c *Collection) Delete(ctx context.Context, id string) error {
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before delete: %w", err)
+	}
+	defer unlockAsync()
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -2533,6 +2595,11 @@ func (c *Collection) Close() error {
 	}
 
 	var errors []error
+	if c.asyncIndex != nil {
+		if err := c.asyncIndex.close(); err != nil {
+			errors = append(errors, fmt.Errorf("asynchronous index close: %w", err))
+		}
+	}
 
 	// Stop memory manager if it exists
 	if c.memoryManager != nil {

@@ -37,7 +37,6 @@ func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
 func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Node, id string) error {
 	// Handle special case: deleting the only node
 	if h.size.Load() == 1 {
-		h.deleteStoredVector(node)
 		h.retireNodeStorage(nodeID, node)
 		h.globalState.Store(0)
 		if id != "" {
@@ -57,8 +56,6 @@ func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Nod
 	if err := h.handleEntryPointReplacement(nodeID, node); err != nil {
 		return fmt.Errorf("failed to handle entry point replacement: %w", err)
 	}
-
-	h.deleteStoredVector(node)
 
 	// Remove the node from data structures
 	h.removeNodeFromIndex(nodeID, id)
@@ -270,11 +267,9 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	distMat = distMat[:D*D]
 	for i := 0; i < D; i++ {
 		ni := validNeighbors[i]
-		nodeI := h.nodes.Get(ni)
 		for j := i + 1; j < D; j++ {
 			nj := validNeighbors[j]
-			nodeJ := h.nodes.Get(nj)
-			d, err := h.computeDistance(nil, nil, nodeI, nodeJ)
+			d, err := h.computePublishedNodeDistance(ni, nj)
 			if err != nil {
 				d = float32(math.Inf(1))
 			}
@@ -349,6 +344,36 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	}
 
 	return nil
+}
+
+func (h *Index) computePublishedNodeDistance(leftID, rightID uint32) (float32, error) {
+	left := h.nodes.Get(leftID)
+	right := h.nodes.Get(rightID)
+	if left == nil || right == nil || left == right {
+		return 0, fmt.Errorf("distance nodes are unavailable: %d, %d", leftID, rightID)
+	}
+
+	firstID, secondID := leftID, rightID
+	first, second := left, right
+	if firstID > secondID {
+		firstID, secondID = secondID, firstID
+		first, second = second, first
+	}
+	for !h.acquirePruneLock(first) {
+		runtime.Gosched()
+	}
+	for !h.acquirePruneLock(second) {
+		runtime.Gosched()
+	}
+	defer func() {
+		h.releasePruneLock(second)
+		h.releasePruneLock(first)
+	}()
+
+	if h.nodes.Get(firstID) != first || h.nodes.Get(secondID) != second {
+		return 0, fmt.Errorf("distance nodes retired during reconnect: %d, %d", leftID, rightID)
+	}
+	return h.computeDistance(nil, nil, left, right)
 }
 
 // hasConnection checks if two nodes are connected at a given level
@@ -472,6 +497,7 @@ func (h *Index) retireNodeStorage(nodeID uint32, node *Node) {
 	for !h.acquirePruneLock(node) {
 		runtime.Gosched()
 	}
+	h.deleteStoredVector(node)
 	h.freeNodeLinks(node)
 	node.CompressedVector = nil
 	node.setVector(nil)

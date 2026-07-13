@@ -3,6 +3,8 @@
 package main
 
 import (
+	"strconv"
+
 	"github.com/mmcloughlin/avo/build"
 	"github.com/mmcloughlin/avo/operand"
 	"github.com/mmcloughlin/avo/reg"
@@ -14,11 +16,28 @@ func main() {
 	genDotProduct()
 	genL2()
 	genL2x4()
+	genL2x4Ptr()
+	genL2x8Ptr()
+	genL2AnyLessThan8Ptr()
+	genPrefetch()
 	build.Generate()
+}
+
+func genPrefetch() {
+	build.TEXT("prefetch8L1AMD64", build.NOSPLIT, "func(ptrs *[8]*byte)")
+	build.Pragma("noescape")
+	ptrs := build.Load(build.Param("ptrs"), build.GP64())
+	for i := 0; i < 8; i++ {
+		ptr := build.GP64()
+		build.MOVQ(operand.Mem{Base: ptrs, Disp: i * 8}, ptr)
+		build.PREFETCHT0(operand.Mem{Base: ptr})
+	}
+	build.RET()
 }
 
 func genDotProduct() {
 	build.TEXT("DotProductAVX2", build.NOSPLIT, "func(a, b []float32) float32")
+	build.Pragma("noescape")
 	build.Doc("DotProductAVX2 computes the dot product of two float32 slices using AVX2, unrolled.")
 
 	aPtr := build.Load(build.Param("a").Base(), build.GP64())
@@ -99,6 +118,7 @@ func genDotProduct() {
 
 func genL2() {
 	build.TEXT("L2DistanceAVX2", build.NOSPLIT, "func(a, b []float32) float32")
+	build.Pragma("noescape")
 	build.Doc("L2DistanceAVX2 computes the L2 distance of two float32 slices using AVX2, unrolled.")
 
 	aPtr := build.Load(build.Param("a").Base(), build.GP64())
@@ -182,6 +202,7 @@ func genL2() {
 
 func genL2x4() {
 	build.TEXT("L2Distance4AVX2", build.NOSPLIT, "func(q, b0, b1, b2, b3 []float32) (d0, d1, d2, d3 float32)")
+	build.Pragma("noescape")
 	build.Doc("L2Distance4AVX2 computes four L2 distances against one query using AVX2.")
 
 	qPtr := build.Load(build.Param("q").Base(), build.GP64())
@@ -283,6 +304,136 @@ func genL2x4() {
 	build.Store(x1, build.ReturnIndex(1))
 	build.Store(x2, build.ReturnIndex(2))
 	build.Store(x3, build.ReturnIndex(3))
+	build.RET()
+}
+
+func loadL2PtrParameters(count int) (reg.Register, []reg.Register, reg.Register) {
+	qPtr := build.Load(build.Param("q").Base(), build.GP64())
+	n := build.Load(build.Param("q").Len(), build.GP64())
+	ptrs := make([]reg.Register, count)
+	for i := range ptrs {
+		ptrs[i] = build.Load(build.Param("b"+strconv.Itoa(i)), build.GP64())
+	}
+	return qPtr, ptrs, n
+}
+
+func emitL2PtrBody(prefix string, qPtr reg.Register, ptrs []reg.Register, n reg.Register) []reg.VecVirtual {
+	accs := make([]reg.VecVirtual, len(ptrs))
+	for i := range accs {
+		accs[i] = build.YMM()
+		build.VXORPS(accs[i], accs[i], accs[i])
+	}
+
+	build.Label(prefix + "_loop")
+	build.CMPQ(n, operand.Imm(8))
+	build.JL(operand.LabelRef(prefix + "_tail"))
+
+	qv := build.YMM()
+	tmp := build.YMM()
+	build.VMOVUPS(operand.Mem{Base: qPtr}, qv)
+	for i := range ptrs {
+		build.VMOVUPS(operand.Mem{Base: ptrs[i]}, tmp)
+		build.VSUBPS(qv, tmp, tmp)
+		build.VFMADD231PS(tmp, tmp, accs[i])
+		build.ADDQ(operand.Imm(32), ptrs[i])
+	}
+	build.ADDQ(operand.Imm(32), qPtr)
+	build.SUBQ(operand.Imm(8), n)
+	build.JMP(operand.LabelRef(prefix + "_loop"))
+
+	build.Label(prefix + "_tail")
+	return accs
+}
+
+func emitL2x8ScalarTail(prefix string, qPtr reg.Register, ptrs []reg.Register, n reg.Register, sums []reg.Register) {
+	build.Label(prefix + "_scalar_loop")
+	build.CMPQ(n, operand.Imm(0))
+	build.JE(operand.LabelRef(prefix + "_done"))
+
+	qs := build.XMM()
+	bs := build.XMM()
+	build.VMOVSS(operand.Mem{Base: qPtr}, qs)
+	for i := range ptrs {
+		build.VMOVSS(operand.Mem{Base: ptrs[i]}, bs)
+		build.VSUBSS(qs, bs, bs)
+		build.VMULSS(bs, bs, bs)
+		build.VADDSS(bs, sums[i], sums[i])
+		build.ADDQ(operand.Imm(4), ptrs[i])
+	}
+	build.ADDQ(operand.Imm(4), qPtr)
+	build.SUBQ(operand.Imm(1), n)
+	build.JMP(operand.LabelRef(prefix + "_scalar_loop"))
+
+	build.Label(prefix + "_done")
+}
+
+func genL2x8Ptr() {
+	build.TEXT("l2Distance8PtrAVX2", build.NOSPLIT, "func(q []float32, b0, b1, b2, b3, b4, b5, b6, b7 *byte) (d0, d1, d2, d3, d4, d5, d6, d7 float32)")
+	build.Pragma("noescape")
+	build.Doc("l2Distance8PtrAVX2 computes eight squared L2 distances in one query pass using AVX2.")
+
+	qPtr, ptrs, n := loadL2PtrParameters(8)
+	accs := emitL2PtrBody("l2x8ptr", qPtr, ptrs, n)
+	sums := make([]reg.Register, len(accs))
+	for i := range accs {
+		sums[i] = accs[i].AsX()
+		reduceYMM(accs[i], sums[i])
+	}
+	emitL2x8ScalarTail("l2x8ptr", qPtr, ptrs, n, sums)
+	for i := range sums {
+		build.Store(sums[i], build.ReturnIndex(i))
+	}
+	build.RET()
+}
+
+func genL2AnyLessThan8Ptr() {
+	build.TEXT("l2AnyLessThan8PtrAVX2", build.NOSPLIT, "func(q []float32, b0, b1, b2, b3, b4, b5, b6, b7 *byte, cutoff float32) uint32")
+	build.Pragma("noescape")
+	build.Doc("l2AnyLessThan8PtrAVX2 reports whether any squared L2 distance is below cutoff using AVX2.")
+
+	qPtr, ptrs, n := loadL2PtrParameters(8)
+	accs := emitL2PtrBody("l2x8any", qPtr, ptrs, n)
+	sums := make([]reg.Register, len(accs))
+	for i := range accs {
+		sums[i] = accs[i].AsX()
+		reduceYMM(accs[i], sums[i])
+	}
+	emitL2x8ScalarTail("l2x8any", qPtr, ptrs, n, sums)
+
+	cutoff := build.Load(build.Param("cutoff"), build.XMM())
+	for i := range sums {
+		next := "l2x8any_compare_next_" + strconv.Itoa(i)
+		build.VUCOMISS(cutoff, sums[i])
+		build.JP(operand.LabelRef(next))
+		build.JAE(operand.LabelRef(next))
+		result := build.GP32()
+		build.MOVL(operand.U32(1), result)
+		build.Store(result, build.ReturnIndex(0))
+		build.RET()
+		build.Label(next)
+	}
+	result := build.GP32()
+	build.MOVL(operand.U32(0), result)
+	build.Store(result, build.ReturnIndex(0))
+	build.RET()
+}
+
+func genL2x4Ptr() {
+	build.TEXT("l2Distance4PtrAVX2", build.NOSPLIT, "func(q []float32, b0, b1, b2, b3 *byte) (d0, d1, d2, d3 float32)")
+	build.Pragma("noescape")
+	build.Doc("l2Distance4PtrAVX2 computes four squared L2 distances in one query pass using AVX2.")
+
+	qPtr, ptrs, n := loadL2PtrParameters(4)
+	accs := emitL2PtrBody("l2x4ptrraw", qPtr, ptrs, n)
+	sums := make([]reg.Register, len(accs))
+	for i := range accs {
+		sums[i] = accs[i].AsX()
+		reduceYMM(accs[i], sums[i])
+	}
+	emitL2x8ScalarTail("l2x4ptrraw", qPtr, ptrs, n, sums)
+	for i := range sums {
+		build.Store(sums[i], build.ReturnIndex(i))
+	}
 	build.RET()
 }
 

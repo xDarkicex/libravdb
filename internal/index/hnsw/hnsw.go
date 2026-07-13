@@ -36,6 +36,7 @@ func hashID(id string) uint64 {
 }
 
 const inFlightRegistrySize = 65536 // Power of 2 for fast modulo
+const inFlightSnapshotLimit = 2048
 const defaultIDMapCapacity = 8192
 const defaultRepairQueueSize = 65536
 const defaultRepairBatchSize = 64
@@ -101,8 +102,9 @@ func (r *inFlightRegistry) GetSnapshot(buf []uint32) []uint32 {
 	end := r.idx.Load()
 	start := uint64(0)
 
-	// We only take up to 2048 most recent in-flight nodes to limit scan overhead
-	scanLimit := uint64(2048)
+	// Bound snapshot work so construction coordination cannot grow with the
+	// lifetime append position of the registry.
+	scanLimit := uint64(inFlightSnapshotLimit)
 	if end > scanLimit {
 		start = end - scanLimit
 	}
@@ -142,39 +144,41 @@ type VectorProvider interface {
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
-	searchScratchFree   atomic.Uint64
-	searchScratches     []searchScratch
-	provider            VectorProvider
-	quantizer           quant.Quantizer
-	rawVectorStore      RawVectorStore
-	idToIndex           *memory.TypedMap[Node]
-	globalState         atomic.Uint64 // Packs entryPoint ID (32 bits) and maxLevel (32 bits)
-	distance            util.DistanceFunc
-	vecMmap             *internalmemory.MemoryMap
-	config              *Config
-	pqMmap              *internalmemory.MemoryMap
-	link0SFL            *memory.ShardedFreeList
-	ordinalToID         *segmentedStringArray
-	linkSFL             *memory.ShardedFreeList
-	neighborSelector    *NeighborSelector
-	registryPool        *memory.Pool
-	scratchPool         *sync.Pool
-	nodeSFL             *memory.ShardedFreeList
-	inFlightNodes       *inFlightRegistry // registry for concurrent insertions
-	repairCh            chan uint32
-	repairStop          chan struct{}
-	repairDone          chan struct{}
-	mmapPath            string
-	trainingVectors     [][]float32
-	trainingCount       atomic.Int32
-	nodes               *segmentedNodeArray
-	size                atomic.Int32
-	mmapSize            int64
-	originalMemUsage    int64
-	nextOrdinal         atomic.Uint32
-	quantizationTrained atomic.Bool
-	repairOverflow      atomic.Bool
-	memoryMapped        bool
+	searchScratchFree     atomic.Uint64
+	searchScratches       []searchScratch
+	candidateMode         atomic.Uint32
+	provider              VectorProvider
+	quantizer             quant.Quantizer
+	rawVectorStore        RawVectorStore
+	idToIndex             *memory.TypedMap[Node]
+	globalState           atomic.Uint64 // Packs entryPoint ID (32 bits) and maxLevel (32 bits)
+	distance              util.DistanceFunc
+	vecMmap               *internalmemory.MemoryMap
+	config                *Config
+	pqMmap                *internalmemory.MemoryMap
+	link0SFL              *memory.ShardedFreeList
+	ordinalToID           *segmentedStringArray
+	linkSFL               *memory.ShardedFreeList
+	neighborSelector      *NeighborSelector
+	useHeuristicPredicate bool
+	registryPool          *memory.Pool
+	scratchPool           *sync.Pool
+	nodeSFL               *memory.ShardedFreeList
+	inFlightNodes         *inFlightRegistry // registry for concurrent insertions
+	repairCh              chan uint32
+	repairStop            chan struct{}
+	repairDone            chan struct{}
+	mmapPath              string
+	trainingVectors       [][]float32
+	trainingCount         atomic.Int32
+	nodes                 *segmentedNodeArray
+	size                  atomic.Int32
+	mmapSize              int64
+	originalMemUsage      int64
+	nextOrdinal           atomic.Uint32
+	quantizationTrained   atomic.Bool
+	repairOverflow        atomic.Bool
+	memoryMapped          bool
 }
 
 // Config holds HNSW configuration parameters
@@ -328,20 +332,21 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 
 	index := &Index{
-		config:           config,
-		nodes:            nodes,
-		neighborSelector: NewNeighborSelector(config.M, config.level0LinkMultiplier()),
-		distance:         distanceFunc,
-		provider:         config.Provider,
-		idToIndex:        idToIndexMap,
-		ordinalToID:      ordinalToID,
-		trainingVectors:  nil,
-		linkSFL:          linkSFL,
-		link0SFL:         link0SFL,
-		nodeSFL:          nodeSFL,
-		registryPool:     registryPool,
-		inFlightNodes:    inFlight,
-		scratchPool:      scratchPool,
+		config:                config,
+		nodes:                 nodes,
+		neighborSelector:      NewNeighborSelector(config.M, config.level0LinkMultiplier()),
+		useHeuristicPredicate: true,
+		distance:              distanceFunc,
+		provider:              config.Provider,
+		idToIndex:             idToIndexMap,
+		ordinalToID:           ordinalToID,
+		trainingVectors:       nil,
+		linkSFL:               linkSFL,
+		link0SFL:              link0SFL,
+		nodeSFL:               nodeSFL,
+		registryPool:          registryPool,
+		inFlightNodes:         inFlight,
+		scratchPool:           scratchPool,
 	}
 	if repairQueueSize := config.repairQueueSize(); repairQueueSize > 0 {
 		index.repairCh = make(chan uint32, repairQueueSize)
@@ -500,6 +505,9 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 		ordinal = h.nextOrdinal.Add(1) - 1
 	} else {
 		ordinal = entry.Ordinal
+	}
+	if ordinal >= maxNodeCapacity {
+		return nil, fmt.Errorf("node ordinal %d exceeds registry capacity %d", ordinal, maxNodeCapacity)
 	}
 	level := h.generateLevel(ordinal)
 	if int(ordinal) < h.nodes.Len() && h.nodes.Get(ordinal) != nil {
@@ -1537,6 +1545,9 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 		if err != nil {
 			return 0, err
 		}
+	}
+	if len(vec1) != h.config.Dimension || len(vec2) != h.config.Dimension {
+		return 0, fmt.Errorf("distance vector unavailable or malformed: got %d and %d dimensions, want %d", len(vec1), len(vec2), h.config.Dimension)
 	}
 
 	return h.distance(vec1, vec2), nil

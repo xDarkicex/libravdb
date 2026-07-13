@@ -32,6 +32,17 @@ func (b *indexPersistenceBridge) takeCachedIndex(name string) index.Index {
 	return idx
 }
 
+func (b *indexPersistenceBridge) closeCachedIndexes() {
+	b.mu.Lock()
+	for name, idx := range b.cache {
+		if idx != nil {
+			idx.Close()
+		}
+		delete(b.cache, name)
+	}
+	b.mu.Unlock()
+}
+
 // SerializeIndex returns serialized bytes for a collection's index.
 // Returns (nil, nil) for empty collections (no index to persist).
 // The engine skips nil entries in the index chunk; on recovery these
@@ -51,6 +62,12 @@ func (b *indexPersistenceBridge) SerializeIndex(collectionName string) ([]byte, 
 	}
 	col.mu.RLock()
 	defer col.mu.RUnlock()
+	if col.asyncIndex != nil {
+		// Records are authoritative while asynchronous construction is enabled.
+		// Omitting this collection forces an exact rebuild on recovery instead
+		// of persisting a graph behind the durable WAL frontier.
+		return nil, nil
+	}
 	idx := col.index
 	if idx == nil {
 		return nil, nil
@@ -111,9 +128,23 @@ func (b *indexPersistenceBridge) RebuildIndex(collectionName string, config *sto
 	}
 
 	b.mu.Lock()
+	if previous := b.cache[collectionName]; previous != nil {
+		previous.Close()
+	}
 	b.cache[collectionName] = idx
 	b.mu.Unlock()
 	return nil
+}
+
+// DiscardIndex removes a checkpoint-restored index for a collection deleted by
+// post-checkpoint WAL replay.
+func (b *indexPersistenceBridge) DiscardIndex(collectionName string) {
+	b.mu.Lock()
+	if previous := b.cache[collectionName]; previous != nil {
+		previous.Close()
+		delete(b.cache, collectionName)
+	}
+	b.mu.Unlock()
 }
 
 // IndexTypeVersion returns the index type code and format version.
@@ -146,6 +177,10 @@ func (b *indexPersistenceBridge) SnapshotVectors(ctx context.Context) error {
 	defer db.mu.RUnlock()
 	for name, col := range db.collections {
 		col.mu.RLock()
+		if col.asyncIndex != nil {
+			col.mu.RUnlock()
+			continue
+		}
 		idx := col.index
 		col.mu.RUnlock()
 		if idx == nil {

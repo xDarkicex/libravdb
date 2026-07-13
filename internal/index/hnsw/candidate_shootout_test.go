@@ -66,15 +66,18 @@ func TestCandidateStructureShootout(t *testing.T) {
 		groundTruth[qi] = top
 	}
 
-	modes := []string{"heap", "unsorted", "reservoir"}
+	modes := []struct {
+		name string
+		mode candidateMode
+	}{
+		{name: "heap", mode: candidateModeHeap},
+		{name: "unsorted", mode: candidateModeUnsorted},
+		{name: "reservoir", mode: candidateModeReservoir},
+		{name: "soa", mode: candidateModeSOA},
+	}
 
-	for _, mode := range modes {
-		t.Run(mode, func(t *testing.T) {
-			// Set the package-level candidate mode for this sub-test.
-			oldMode := CandidateMode
-			CandidateMode = mode
-			defer func() { CandidateMode = oldMode }()
-
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
 			cfg := &Config{
 				Dimension:      dim,
 				M:              M,
@@ -89,6 +92,7 @@ func TestCandidateStructureShootout(t *testing.T) {
 				t.Fatalf("NewHNSW: %v", err)
 			}
 			defer idx.Close()
+			idx.candidateMode.Store(uint32(tc.mode))
 
 			ctx := context.Background()
 
@@ -105,6 +109,12 @@ func TestCandidateStructureShootout(t *testing.T) {
 			}
 			insertDur := time.Since(start)
 			opsPerSec := float64(numVecs) / insertDur.Seconds()
+			totalLinks := 0
+			for i := 0; i < idx.nodes.Len(); i++ {
+				if node := idx.nodes.Get(uint32(i)); node != nil {
+					totalLinks += int(node.LinkCounts[0] + node.BacklinkCounts[0])
+				}
+			}
 
 			// Measure search recall.
 			var totalRecall float64
@@ -134,8 +144,8 @@ func TestCandidateStructureShootout(t *testing.T) {
 			}
 			avgRecall := totalRecall / float64(len(queries))
 
-			t.Logf("throughput=%.0f ops/s | avg_recall=%.4f | min_recall=%.4f",
-				opsPerSec, avgRecall, minRecall)
+			t.Logf("throughput=%.0f ops/s | avg_recall=%.4f | min_recall=%.4f | level0_links=%d",
+				opsPerSec, avgRecall, minRecall, totalLinks)
 		})
 	}
 }

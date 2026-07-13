@@ -3,16 +3,286 @@ package singlefile
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
+
+type recoveryIndexProvider struct {
+	mu           sync.Mutex
+	deserialized []string
+	rebuilt      []string
+}
+
+func (p *recoveryIndexProvider) SerializeIndex(string) ([]byte, error) {
+	return []byte("checkpoint-index"), nil
+}
+
+func (p *recoveryIndexProvider) DeserializeIndex(name string, _ []byte, _ *storage.CollectionConfig) error {
+	p.mu.Lock()
+	p.deserialized = append(p.deserialized, name)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *recoveryIndexProvider) RebuildIndex(name string, _ *storage.CollectionConfig) error {
+	p.mu.Lock()
+	p.rebuilt = append(p.rebuilt, name)
+	p.mu.Unlock()
+	return nil
+}
+
+func (*recoveryIndexProvider) IndexTypeVersion(string) (uint8, uint16) {
+	return 0, formatVersion
+}
+
+func (*recoveryIndexProvider) SnapshotVectors(context.Context) error { return nil }
+
+func TestWALWriteBufferUsesReusableOffHeapArena(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal_arena.libravdb")
+	engineIface, err := New(path, WithWALSync(false))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	engine.mu.Lock()
+	first, temporary, err := engine.allocateWALWriteBufferLocked(4096)
+	if err != nil {
+		engine.mu.Unlock()
+		t.Fatalf("allocate first buffer: %v", err)
+	}
+	if temporary != nil {
+		engine.mu.Unlock()
+		t.Fatal("normal WAL buffer unexpectedly used a temporary arena")
+	}
+	firstPtr := uintptr(unsafe.Pointer(unsafe.SliceData(first)))
+	if firstPtr&63 != 0 {
+		engine.mu.Unlock()
+		t.Fatalf("WAL buffer is not 64-byte aligned: %#x", firstPtr)
+	}
+
+	second, temporary, err := engine.allocateWALWriteBufferLocked(4096)
+	engine.mu.Unlock()
+	if err != nil {
+		t.Fatalf("allocate second buffer: %v", err)
+	}
+	if temporary != nil {
+		t.Fatal("normal WAL buffer unexpectedly used a temporary arena")
+	}
+	secondPtr := uintptr(unsafe.Pointer(unsafe.SliceData(second)))
+	if secondPtr != firstPtr {
+		t.Fatalf("WAL arena was not reused: first=%#x second=%#x", firstPtr, secondPtr)
+	}
+}
+
+func TestWALSyncDefaultsOnAndUnsafeModeIsExplicit(t *testing.T) {
+	defaultIface, err := New(filepath.Join(t.TempDir(), "default_sync.libravdb"))
+	if err != nil {
+		t.Fatalf("new default engine: %v", err)
+	}
+	defaultEngine := defaultIface.(*Engine)
+	if !defaultEngine.walSync {
+		t.Fatal("WAL sync must be enabled by default")
+	}
+	if err := defaultEngine.Close(); err != nil {
+		t.Fatalf("close default engine: %v", err)
+	}
+
+	unsafeIface, err := New(filepath.Join(t.TempDir(), "unsafe_sync.libravdb"), WithWALSync(false))
+	if err != nil {
+		t.Fatalf("new unsafe engine: %v", err)
+	}
+	unsafeEngine := unsafeIface.(*Engine)
+	if unsafeEngine.walSync {
+		t.Fatal("WithWALSync(false) did not disable sync")
+	}
+	if err := unsafeEngine.Close(); err != nil {
+		t.Fatalf("close unsafe engine: %v", err)
+	}
+}
+
+func TestGroupCommitSyncsOnceAndAcknowledgesAllWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "group_sync.libravdb")
+	engineIface, err := New(path, WithWALSync(false))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{Dimension: 3})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	engine.walSync = true
+	var syncCalls atomic.Uint64
+	engine.walSyncFn = func(*os.File) error {
+		syncCalls.Add(1)
+		return nil
+	}
+
+	origWindow := groupCommitWindow.Load()
+	groupCommitWindow.Store(int64(20 * time.Millisecond))
+	defer groupCommitWindow.Store(origWindow)
+
+	const writers = 32
+	start := make(chan struct{})
+	errCh := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errCh <- collection.Insert(context.Background(), &index.VectorEntry{
+				ID:     fmt.Sprintf("vector-%d", i),
+				Vector: []float32{float32(i), 1, 2},
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	calls := syncCalls.Load()
+	if calls == 0 {
+		t.Fatal("durable group did not invoke WAL sync")
+	}
+	if calls >= writers {
+		t.Fatalf("group commit issued %d syncs for %d writers", calls, writers)
+	}
+	if got := engine.WriteStats().BufferedVectorEntries; got != writers {
+		t.Fatalf("durable entries = %d, want %d", got, writers)
+	}
+}
+
+func TestGroupCommitReturnsSyncFailureToWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync_failure.libravdb")
+	engineIface, err := New(path, WithWALSync(false))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{Dimension: 3})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	syncFailure := errors.New("injected sync failure")
+	engine.walSync = true
+	engine.walSyncFn = func(*os.File) error { return syncFailure }
+
+	err = collection.Insert(context.Background(), &index.VectorEntry{
+		ID:     "vector",
+		Vector: []float32{1, 2, 3},
+	})
+	if !errors.Is(err, syncFailure) {
+		t.Fatalf("insert error = %v, want injected sync failure", err)
+	}
+	if exists, existsErr := collection.Exists(context.Background(), "vector"); existsErr != nil || exists {
+		t.Fatalf("failed durable insert became visible: exists=%v err=%v", exists, existsErr)
+	}
+
+	engine.walSyncFn = nil
+}
+
+func TestRecoveryRebuildsIndexTouchedAfterCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replay_index_lag.libravdb")
+	provider := &recoveryIndexProvider{}
+	engineIface, err := New(path, WithIndexSnapshotProvider(provider))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{
+		Dimension:      3,
+		IndexType:      0,
+		RawVectorStore: "memory",
+		RawStoreCap:    16,
+	})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(context.Background(), &index.VectorEntry{
+		ID: "checkpointed", Vector: []float32{1, 0, 0},
+	}); err != nil {
+		t.Fatalf("insert checkpointed record: %v", err)
+	}
+
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	if err := collection.Insert(context.Background(), &index.VectorEntry{
+		ID: "wal-only", Vector: []float32{0, 1, 0},
+	}); err != nil {
+		t.Fatalf("insert post-checkpoint record: %v", err)
+	}
+
+	// Simulate process loss: stop the flusher and close the descriptor without
+	// running Engine.Close, which would checkpoint the current state.
+	engine.cancel()
+	if engine.walWriteArena != nil {
+		_ = engine.walWriteArena.Free()
+		engine.walWriteArena = nil
+	}
+	for _, persisted := range engine.state.Collections {
+		if persisted.vectorSFL != nil {
+			persisted.vectorSFL.Free()
+			persisted.vectorSFL = nil
+		}
+	}
+	if err := engine.file.Close(); err != nil {
+		t.Fatalf("crash close: %v", err)
+	}
+
+	recoveryProvider := &recoveryIndexProvider{}
+	reopenedIface, err := New(path, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+
+	recoveryProvider.mu.Lock()
+	deserialized := append([]string(nil), recoveryProvider.deserialized...)
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	recoveryProvider.mu.Unlock()
+	if len(deserialized) != 1 || deserialized[0] != "vectors" {
+		t.Fatalf("deserialized indexes = %v, want [vectors]", deserialized)
+	}
+	if len(rebuilt) != 1 || rebuilt[0] != "vectors" {
+		t.Fatalf("rebuilt indexes = %v, want [vectors]", rebuilt)
+	}
+
+	recoveredCollection, err := reopened.GetCollection("vectors")
+	if err != nil {
+		t.Fatalf("get recovered collection: %v", err)
+	}
+	if exists, err := recoveredCollection.Exists(context.Background(), "wal-only"); err != nil || !exists {
+		t.Fatalf("post-checkpoint record recovery: exists=%v err=%v", exists, err)
+	}
+}
 
 func TestNewInitializesSingleFileDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.libravdb")
@@ -787,8 +1057,9 @@ func TestNewNoGoroutineLeakOnFailure(t *testing.T) {
 	}
 }
 
-// TestF: Verify flushBatch re-queues only the failed suffix, not the committed prefix
-func TestFlushBatchReQueuesOnlyFailedSuffix(t *testing.T) {
+// TestF: a failed flush does not publish an unsynced prefix or retry an
+// ambiguous on-disk transaction automatically.
+func TestFlushBatchFailureDoesNotPublishOrRequeue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "suffix_requeue.libravdb")
 
 	engineIface, err := New(path)
@@ -841,35 +1112,25 @@ func TestFlushBatchReQueuesOnlyFailedSuffix(t *testing.T) {
 		t.Fatalf("expected error when flushing bad collection, got nil")
 	}
 
-	// Verify the "good" entry was committed
+	// The valid prefix was appended but the group never crossed its sync
+	// boundary, so it must not be visible in the live state.
 	goodCol, err := engine.GetCollection("good")
 	if err != nil {
 		t.Fatalf("get good collection: %v", err)
 	}
 	got, err := goodCol.Get(context.Background(), "good_entry")
-	if err != nil {
-		t.Errorf("good entry should be committed but Get failed: %v", err)
-	}
-	if got == nil || got.ID != "good_entry" {
-		t.Errorf("good_entry not found in good collection")
+	if err == nil || got != nil {
+		t.Fatalf("unsynced prefix became visible: entry=%v err=%v", got, err)
 	}
 
-	// Verify the buffer contains ONLY the failed suffix (batch for "bad"), not the full list
+	// An append failure is ambiguous; automatic requeue could duplicate a
+	// transaction whose complete bytes reached the kernel.
 	engine.batchBuffer.mu.Lock()
 	remainingEntries := engine.batchBuffer.entries
 	engine.batchBuffer.mu.Unlock()
 
-	if len(remainingEntries) != 1 {
-		t.Fatalf("expected 1 remaining batch, got %d", len(remainingEntries))
-	}
-	if remainingEntries[0].collection != "bad" {
-		t.Errorf("expected remaining batch to be for 'bad' collection, got '%s'", remainingEntries[0].collection)
-	}
-	if len(remainingEntries[0].entries) != 1 {
-		t.Errorf("expected 1 entry in remaining batch, got %d", len(remainingEntries[0].entries))
-	}
-	if remainingEntries[0].entries[0].ID != "bad_entry" {
-		t.Errorf("expected remaining entry to be 'bad_entry', got '%s'", remainingEntries[0].entries[0].ID)
+	if len(remainingEntries) != 0 {
+		t.Fatalf("ambiguous failed group was requeued: %d batches", len(remainingEntries))
 	}
 }
 

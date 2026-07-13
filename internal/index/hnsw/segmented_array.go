@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	chunkSizeBits = 16
-	chunkSize     = 1 << chunkSizeBits // 65536
-	chunkMask     = chunkSize - 1
-	maxChunks     = 4096 // Supports up to 268,435,456 nodes
+	chunkSizeBits   = 16
+	chunkSize       = 1 << chunkSizeBits // 65536
+	chunkMask       = chunkSize - 1
+	maxChunks       = 4096 // Supports up to 268,435,456 nodes
+	maxNodeCapacity = maxChunks * chunkSize
 
 	segmentedPoolSize = 8 * 1024 * 1024 * 1024
 	segmentedSlabSize = 2 * 1024 * 1024
