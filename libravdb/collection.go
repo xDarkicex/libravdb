@@ -5,11 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/filter"
@@ -34,7 +33,7 @@ type Collection struct {
 	db                     *Database
 	name                   string
 	shards                 []shard
-	mutationStripes        [64]sync.Mutex
+	mutationState          atomic.Pointer[mutationStateTable]
 	asyncMutation          sync.RWMutex
 	mu                     sync.RWMutex
 	closed                 bool
@@ -103,46 +102,6 @@ func (c *Collection) SetGraph(g Graph) {
 	c.mu.Lock()
 	c.graph = g
 	c.mu.Unlock()
-}
-
-func (c *Collection) mutationStripe(id string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(id))
-	return &c.mutationStripes[h.Sum32()%uint32(len(c.mutationStripes))]
-}
-
-func (c *Collection) lockMutationIDs(ids []string) func() {
-	if len(ids) == 0 {
-		return func() {}
-	}
-
-	seen := make(map[int]struct{}, len(ids))
-	stripes := make([]int, 0, len(ids))
-	for _, id := range ids {
-		idx := int(fnv32a(id) % uint32(len(c.mutationStripes)))
-		if _, ok := seen[idx]; ok {
-			continue
-		}
-		seen[idx] = struct{}{}
-		stripes = append(stripes, idx)
-	}
-
-	sort.Ints(stripes)
-	for _, idx := range stripes {
-		c.mutationStripes[idx].Lock()
-	}
-
-	return func() {
-		for i := len(stripes) - 1; i >= 0; i-- {
-			c.mutationStripes[stripes[i]].Unlock()
-		}
-	}
-}
-
-func fnv32a(id string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(id))
-	return h.Sum32()
 }
 
 func trainingIndexState(idx index.Index) (trainableIndex, bool) {
@@ -788,8 +747,8 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 
 	// Non-sharded path: use single storage and index
 	if c.shards == nil {
-		unlock := c.lockMutationIDs([]string{id})
-		defer unlock()
+		mutation := c.lockMutationID(id)
+		defer mutation.unlock()
 		defer c.mu.RUnlock()
 
 		if exists, err := c.storage.Exists(ctx, id); err != nil {
@@ -990,14 +949,8 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 	c.mu.RUnlock()
 
 	// Non-sharded path (fallback - should not reach here for supported indexes)
-	unlock := c.lockMutationIDs(func() []string {
-		ids := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			ids = append(ids, entry.ID)
-		}
-		return ids
-	}())
-	defer unlock()
+	mutation := c.lockMutationEntries(entries)
+	defer mutation.unlock()
 	// Check existence against persisted storage
 	for _, entry := range entries {
 		exists, err := storage.Exists(ctx, entry.ID)
@@ -1190,8 +1143,8 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 
 	// Non-sharded path
 	if c.shards == nil {
-		unlock := c.lockMutationIDs([]string{id})
-		defer unlock()
+		mutation := c.lockMutationID(id)
+		defer mutation.unlock()
 		defer c.mu.RUnlock()
 		return c.updateNonSharded(ctx, id, vector, metadata)
 	}
@@ -1284,8 +1237,8 @@ func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, me
 	}
 
 	if c.shards == nil {
-		unlock := c.lockMutationIDs([]string{id})
-		defer unlock()
+		mutation := c.lockMutationID(id)
+		defer mutation.unlock()
 		defer c.mu.RUnlock()
 		return c.upsertNonSharded(ctx, id, vector, metadata)
 	}
@@ -1356,8 +1309,8 @@ func (c *Collection) upsertNonSharded(ctx context.Context, id string, vector []f
 }
 
 func (c *Collection) updateSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
-	unlock := c.lockMutationIDs([]string{id})
-	defer unlock()
+	mutation := c.lockMutationID(id)
+	defer mutation.unlock()
 
 	shard := c.getShard(id)
 	shard.mu.Lock()
@@ -1421,8 +1374,8 @@ func (c *Collection) updateSharded(ctx context.Context, id string, vector []floa
 }
 
 func (c *Collection) upsertSharded(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
-	unlock := c.lockMutationIDs([]string{id})
-	defer unlock()
+	mutation := c.lockMutationID(id)
+	defer mutation.unlock()
 
 	shard := c.getShard(id)
 	shard.mu.Lock()
@@ -1516,8 +1469,8 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 	// Non-sharded path
 	if c.shards == nil {
-		unlock := c.lockMutationIDs([]string{id})
-		defer unlock()
+		mutation := c.lockMutationID(id)
+		defer mutation.unlock()
 		defer c.mu.RUnlock()
 
 		entry, err := c.storage.Get(ctx, id)
@@ -1584,8 +1537,8 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 	// Sharded path: route to the correct shard for this ID
 	c.mu.RUnlock()
-	unlock := c.lockMutationIDs([]string{id})
-	defer unlock()
+	mutation := c.lockMutationID(id)
+	defer mutation.unlock()
 
 	shardIdx := shardForID(id)
 	shard := &c.shards[shardIdx]
@@ -2636,6 +2589,9 @@ func (c *Collection) Close() error {
 				errors = append(errors, err)
 			}
 		}
+	}
+	if mutationState := c.mutationState.Swap(nil); mutationState != nil {
+		mutationState.close()
 	}
 
 	c.closed = true

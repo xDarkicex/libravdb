@@ -245,3 +245,67 @@ The queue change improves index-worker delivery under the same machine load but
 does not remove the remaining allocations. Those are primarily ID formatting,
 single-ID mutation bookkeeping, WAL request/completion objects, and write
 admission coordination.
+
+## Lock-free WAL admission experiment
+
+A bounded MPSC sequence-counter ring was tested between concurrent writers and
+the existing single WAL file owner. Three reservation variants were measured:
+capacity CAS, increment/rollback reservation, and canonical one-XADD admission
+with per-slot sequence publication. All variants passed focused durability and
+race tests, and the final variant removed one allocation plus roughly 180-200
+bytes per unsafe write.
+
+It was rejected because it made the complete WAL path slower. On the same Apple
+M2, the existing short mutex admission path sustained approximately 3.9k-4.5k
+durable writes/s with 32 pending writers and 5.7k-5.8k unsafe writes/s with
+eight writers. The MPSC path sustained approximately 3.7k-4.1k durable writes/s
+and 5.4k-5.6k unsafe writes/s: a 4-10% unsafe regression and as much as a 15-20%
+durable regression in earlier variants.
+
+The current admission mutex is short and effectively uncontended; wrapping the
+same heap-backed request slices and completion channel in sequence counters only
+added atomic cache-line traffic. A future MPSC attempt must change the request
+representation itself (fixed/off-heap encoded requests and atomic completion),
+not merely place the existing request objects inside a lock-free ring.
+
+## Immutable adjacency CAS experiment
+
+The HNSW fixed adjacency arrays were replaced experimentally with immutable
+off-heap blocks carrying count and heuristic state in the same publication.
+Writers allocated and copied a replacement block, atomically CAS-published its
+pointer, and retired the prior generation through the existing Hyaline SMR.
+Search scratch slots entered both adjacency allocators' Hyaline domains for the
+duration of traversal. Append, overflow pruning, repair, deletion, persistence,
+and backlink paths were converted, and focused correctness and race tests
+passed.
+
+The design was rejected on throughput. On the 5k normalized 768d fixture at
+`M=16`, `efConstruction=200`, immutable publication sustained 956-968 inserts/s;
+the exact `f1b60dc` in-place checkpoint subsequently sustained 1,125 inserts/s
+on the same machine, a roughly 14-15% advantage despite thermal variance. The
+common in-place append is one ID store plus count publication; immutable
+publication adds an off-heap allocation, full adjacency copy, CAS, and
+retirement to every edge. The experiment was removed in full. Immutable CAS
+remains appropriate for rare large structural replacement, not for HNSW's
+per-edge insertion path.
+
+## Atomic per-key mutation state
+
+The 64 `sync.Mutex` mutation stripes and `lockMutationIDs` map/slice/sort/closure
+were replaced by a lazily allocated 4096-slot off-heap atomic state table. Each
+cache-line-isolated slot serializes one key hash; rare hash-slot collisions
+conservatively serialize unrelated keys but cannot admit conflicting writes.
+Single-key guards are stack values. Batch mutation uses try-all/release/retry,
+so overlapping batches cannot deadlock and require no sorted heap workspace.
+
+Paired Apple M2 runs of `BenchmarkCollectionAsyncHNSWInsert` at 5,000 writes:
+
+| Mutation coordination | Accepted writes/s | Graph-ready/s | Bytes/op | Allocs/op |
+|---|---:|---:|---:|---:|
+| `f1b60dc` mutex stripes | 3.73k-4.39k | 1.92k-2.28k | 1,195-1,212 | 12 |
+| Off-heap atomic state | 3.74k-4.54k | 2.02k-2.15k | 1,111-1,130 | 10 |
+
+The graph-ready spread remains dominated by HNSW scheduling, but accepted
+throughput is neutral-to-positive and the two-allocation reduction is stable.
+Focused collision, overlapping-batch, race, and zero-allocation guard tests
+pass, so the atomic state table is retained.
