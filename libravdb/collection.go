@@ -803,11 +803,11 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 		}
 
 		if c.asyncIndex != nil {
-			durableLSN, err := c.asyncIndex.storage.InsertDurable(ctx, storageEntry)
+			durable, err := c.asyncIndex.storage.InsertDurableRange(ctx, storageEntry)
 			if err != nil {
 				return fmt.Errorf("failed to write to storage: %w", err)
 			}
-			c.asyncIndex.commitOne(storageEntry, durableLSN)
+			c.asyncIndex.commitOne(storageEntry, durable)
 			asyncReserved = false
 			if c.metrics != nil {
 				c.metrics.VectorInserts.Inc()
@@ -968,12 +968,12 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		if err := c.asyncIndex.reserve(ctx, len(entries)); err != nil {
 			return fmt.Errorf("failed to reserve asynchronous index capacity: %w", err)
 		}
-		durableLSN, err := c.asyncIndex.storage.InsertBatchDurable(ctx, entries)
+		durable, err := c.asyncIndex.storage.InsertBatchDurableRange(ctx, entries)
 		if err != nil {
 			c.asyncIndex.cancelReservation(len(entries))
 			return fmt.Errorf("failed to write batch to storage: %w", err)
 		}
-		c.asyncIndex.commit(entries, durableLSN)
+		c.asyncIndex.commit(entries, durable)
 		if c.metrics != nil {
 			c.metrics.VectorInserts.Add(float64(len(entries)))
 		}

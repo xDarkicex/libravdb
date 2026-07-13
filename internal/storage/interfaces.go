@@ -116,6 +116,22 @@ type DurableCollection interface {
 	InsertBatchDurable(ctx context.Context, entries []*index.VectorEntry) (uint64, error)
 }
 
+// DurableRange identifies the operation and commit boundaries of one durable
+// WAL transaction. Derived indexes use FirstLSN-1 as the safe frontier while
+// any operation from the transaction remains unapplied.
+type DurableRange struct {
+	FirstLSN  uint64
+	CommitLSN uint64
+}
+
+// DurableRangeCollection exposes precise transaction boundaries for bounded
+// asynchronous derived-index tracking.
+type DurableRangeCollection interface {
+	DurableCollection
+	InsertDurableRange(ctx context.Context, entry *index.VectorEntry) (DurableRange, error)
+	InsertBatchDurableRange(ctx context.Context, entries []*index.VectorEntry) (DurableRange, error)
+}
+
 // OrdinalAssigner assigns stable internal ordinals to entries before indexing.
 type OrdinalAssigner interface {
 	AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error

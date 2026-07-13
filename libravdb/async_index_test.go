@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 )
@@ -33,8 +34,8 @@ func TestAsyncIndexQueueDurableLagAndDrain(t *testing.T) {
 	if collection.asyncIndex == nil {
 		t.Fatal("asynchronous index queue was not configured")
 	}
-	if got := unsafe.Sizeof(asyncIndexTask{}); got != 16 {
-		t.Fatalf("task size = %d, want 16", got)
+	if got := unsafe.Sizeof(asyncIndexTask{}); got != 24 {
+		t.Fatalf("task size = %d, want 24", got)
 	}
 	if got := unsafe.Sizeof(asyncIndexSlot{}); got != 64 {
 		t.Fatalf("slot size = %d, want 64", got)
@@ -42,6 +43,25 @@ func TestAsyncIndexQueueDurableLagAndDrain(t *testing.T) {
 	if ptr := uintptr(unsafe.Pointer(unsafe.SliceData(collection.asyncIndex.slots))); ptr&63 != 0 {
 		t.Fatalf("off-heap task ring is not 64-byte aligned: %#x", ptr)
 	}
+	statsDone := make(chan struct{})
+	statsErr := make(chan error, 1)
+	var statsWG sync.WaitGroup
+	statsWG.Add(1)
+	go func() {
+		defer statsWG.Done()
+		for {
+			select {
+			case <-statsDone:
+				return
+			default:
+				stats := collection.IndexingStats()
+				if stats.AppliedLSN > stats.DurableLSN {
+					statsErr <- fmt.Errorf("applied frontier exceeds durable frontier: %+v", stats)
+					return
+				}
+			}
+		}
+	}()
 
 	const total = 64
 	start := make(chan struct{})
@@ -59,6 +79,13 @@ func TestAsyncIndexQueueDurableLagAndDrain(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
+	close(statsDone)
+	statsWG.Wait()
+	select {
+	case err := <-statsErr:
+		t.Fatal(err)
+	default:
+	}
 	close(errCh)
 	for err := range errCh {
 		if err != nil {
@@ -84,6 +111,39 @@ func TestAsyncIndexQueueDurableLagAndDrain(t *testing.T) {
 	}
 	if got, err := collection.storage.Count(context.Background()); err != nil || got != total {
 		t.Fatalf("storage count = %d, err=%v, want %d", got, err, total)
+	}
+}
+
+func TestAsyncIndexPreciseAppliedFrontier(t *testing.T) {
+	q := &asyncIndexQueue{
+		slots:    make([]asyncIndexSlot, 4),
+		capacity: 4,
+	}
+	q.applied.Store(90)
+	q.durable.Store(110)
+	q.slots[0].task.firstLSN = 100
+	q.slots[0].task.commitLSN = 104
+	q.slots[1].task.firstLSN = 110
+	q.slots[1].task.commitLSN = 110
+	atomic.StoreUint64(&q.slots[0].active, 1)
+	atomic.StoreUint64(&q.slots[1].active, 1)
+
+	if got := q.preciseApplied(); got != 99 {
+		t.Fatalf("applied frontier with commit 100 pending = %d, want 99", got)
+	}
+	atomic.StoreUint64(&q.slots[0].active, 0)
+	if got := q.preciseApplied(); got != 109 {
+		t.Fatalf("applied frontier with commit 110 pending = %d, want 109", got)
+	}
+
+	q.reserved.Store(1)
+	atomic.StoreUint64(&q.slots[1].active, 0)
+	if got := q.preciseApplied(); got != 109 {
+		t.Fatalf("unknown reservation advanced frontier to %d, want 109", got)
+	}
+	q.reserved.Store(0)
+	if got := q.preciseApplied(); got != 110 {
+		t.Fatalf("fully applied frontier = %d, want 110", got)
 	}
 }
 
@@ -281,6 +341,16 @@ func TestAsyncIndexCloseAndRecoveryRebuild(t *testing.T) {
 		if err := collection.Insert(context.Background(), fmt.Sprintf("v-%03d", i), []float32{float32(i), 1, 0, 0}, nil); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
+	}
+	if err := collection.FlushIndex(context.Background()); err != nil {
+		t.Fatalf("flush before checkpoint: %v", err)
+	}
+	compactor, ok := db.storage.(interface{ Compact() error })
+	if !ok {
+		t.Fatal("single-file storage does not expose Compact")
+	}
+	if err := compactor.Compact(); err != nil {
+		t.Fatalf("compact async index checkpoint: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)

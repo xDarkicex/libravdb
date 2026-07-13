@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,13 +19,29 @@ import (
 )
 
 type recoveryIndexProvider struct {
-	mu           sync.Mutex
-	deserialized []string
-	rebuilt      []string
+	mu            sync.Mutex
+	deserialized  []string
+	rebuilt       []string
+	appliedByName map[string]uint64
+	appliedLag    uint64
+	rejectRestore bool
 }
 
 func (p *recoveryIndexProvider) SerializeIndex(string) ([]byte, error) {
 	return []byte("checkpoint-index"), nil
+}
+
+func (p *recoveryIndexProvider) SerializeIndexAt(name string, checkpointLSN uint64) ([]byte, uint64, error) {
+	if appliedLSN, ok := p.appliedByName[name]; ok {
+		return []byte("checkpoint-index"), appliedLSN, nil
+	}
+	appliedLSN := checkpointLSN
+	if p.appliedLag > appliedLSN {
+		appliedLSN = 0
+	} else {
+		appliedLSN -= p.appliedLag
+	}
+	return []byte("checkpoint-index"), appliedLSN, nil
 }
 
 func (p *recoveryIndexProvider) DeserializeIndex(name string, _ []byte, _ *storage.CollectionConfig) error {
@@ -43,6 +60,10 @@ func (p *recoveryIndexProvider) RebuildIndex(name string, _ *storage.CollectionC
 
 func (*recoveryIndexProvider) IndexTypeVersion(string) (uint8, uint16) {
 	return 0, formatVersion
+}
+
+func (p *recoveryIndexProvider) CanRestoreIndex(string, uint8, uint16) bool {
+	return !p.rejectRestore
 }
 
 func (*recoveryIndexProvider) SnapshotVectors(context.Context) error { return nil }
@@ -281,6 +302,199 @@ func TestRecoveryRebuildsIndexTouchedAfterCheckpoint(t *testing.T) {
 	}
 	if exists, err := recoveredCollection.Exists(context.Background(), "wal-only"); err != nil || !exists {
 		t.Fatalf("post-checkpoint record recovery: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestRecoveryRejectsLaggingIndexSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lagging_index_snapshot.libravdb")
+	provider := &recoveryIndexProvider{appliedLag: 2}
+	engineIface, err := New(path, WithIndexSnapshotProvider(provider))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{Dimension: 2, IndexType: 0})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(context.Background(), &index.VectorEntry{ID: "v", Vector: []float32{1, 0}}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	recoveryProvider := &recoveryIndexProvider{}
+	reopenedIface, err := New(path, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopenedIface.Close()
+
+	recoveryProvider.mu.Lock()
+	deserialized := append([]string(nil), recoveryProvider.deserialized...)
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	recoveryProvider.mu.Unlock()
+	if len(deserialized) != 0 {
+		t.Fatalf("lagging indexes deserialized = %v, want none", deserialized)
+	}
+	if len(rebuilt) != 1 || rebuilt[0] != "vectors" {
+		t.Fatalf("rebuilt indexes = %v, want [vectors]", rebuilt)
+	}
+}
+
+func TestRecoveryHonorsIndexRestorePolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index_restore_policy.libravdb")
+	provider := &recoveryIndexProvider{}
+	engineIface, err := New(path, WithIndexSnapshotProvider(provider))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("vectors", &storage.CollectionConfig{Dimension: 2, IndexType: 0})
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(context.Background(), &index.VectorEntry{ID: "v", Vector: []float32{1, 0}}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	recoveryProvider := &recoveryIndexProvider{rejectRestore: true}
+	reopened, err := New(path, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	recoveryProvider.mu.Lock()
+	deserialized := append([]string(nil), recoveryProvider.deserialized...)
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	recoveryProvider.mu.Unlock()
+	if len(deserialized) != 0 {
+		t.Fatalf("policy-rejected indexes deserialized = %v, want none", deserialized)
+	}
+	if len(rebuilt) != 1 || rebuilt[0] != "vectors" {
+		t.Fatalf("rebuilt indexes = %v, want [vectors]", rebuilt)
+	}
+}
+
+func TestRecoveryAcceptsCollectionFrontierBehindUnrelatedWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "collection_index_frontier.libravdb")
+	provider := &recoveryIndexProvider{appliedByName: make(map[string]uint64)}
+	engineIface, err := New(path, WithIndexSnapshotProvider(provider))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	for _, name := range []string{"stable", "moving"} {
+		collection, err := engine.CreateCollection(name, &storage.CollectionConfig{Dimension: 2, IndexType: 0})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		if err := collection.Insert(context.Background(), &index.VectorEntry{ID: name, Vector: []float32{1, 0}}); err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+		if name == "stable" {
+			engine.mu.RLock()
+			provider.appliedByName[name] = engine.state.Collections[name].UpdatedLSN
+			engine.mu.RUnlock()
+		}
+	}
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	meta, err := engine.readMetaPage(engine.activeMetaPage)
+	if err != nil {
+		t.Fatalf("read checkpoint meta: %v", err)
+	}
+	block, err := engine.readChunkAt(meta.IndexOffset)
+	if err != nil {
+		t.Fatalf("read checkpoint index block: %v", err)
+	}
+	checkpointEntries, err := decodeIndexBlock(block)
+	if err != nil {
+		t.Fatalf("decode checkpoint index block: %v", err)
+	}
+	if len(checkpointEntries) != 2 {
+		t.Fatalf("checkpoint index entries = %d, want 2", len(checkpointEntries))
+	}
+	var stableEntry *indexBlockEntry
+	for i := range checkpointEntries {
+		if checkpointEntries[i].name == "stable" {
+			stableEntry = &checkpointEntries[i]
+			break
+		}
+	}
+	if stableEntry == nil || stableEntry.appliedLSN >= meta.LastAppliedLSN || stableEntry.appliedLSN < engine.state.Collections["stable"].UpdatedLSN {
+		t.Fatalf("stable index frontier = %+v, updated=%d checkpoint=%d", stableEntry, engine.state.Collections["stable"].UpdatedLSN, meta.LastAppliedLSN)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	recoveryProvider := &recoveryIndexProvider{}
+	reopenedIface, err := New(path, WithIndexSnapshotProvider(recoveryProvider))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopenedIface.Close()
+	recoveryProvider.mu.Lock()
+	deserialized := append([]string(nil), recoveryProvider.deserialized...)
+	rebuilt := append([]string(nil), recoveryProvider.rebuilt...)
+	recoveryProvider.mu.Unlock()
+	sort.Strings(deserialized)
+	if fmt.Sprint(deserialized) != "[moving stable]" {
+		t.Fatalf("deserialized indexes = %v, rebuilt = %v, want [moving stable]", deserialized, rebuilt)
+	}
+	if len(rebuilt) != 0 {
+		t.Fatalf("unexpected rebuilt indexes: %v", rebuilt)
+	}
+}
+
+func TestGroupedWALReturnsPerTransactionCommitLSN(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transaction_commit_lsn.libravdb")
+	engineIface, err := New(path, WithWALSync(false))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+	for _, name := range []string{"a", "b"} {
+		if _, err := engine.CreateCollection(name, &storage.CollectionConfig{Dimension: 2}); err != nil {
+			t.Fatalf("create collection %s: %v", name, err)
+		}
+	}
+
+	engine.batchBuffer.flushMu.Lock()
+	requestA, err := engine.putRecord(context.Background(), "a", &index.VectorEntry{ID: "a", Vector: []float32{1, 0}})
+	if err != nil {
+		engine.batchBuffer.flushMu.Unlock()
+		t.Fatalf("admit a: %v", err)
+	}
+	requestB, err := engine.putRecord(context.Background(), "b", &index.VectorEntry{ID: "b", Vector: []float32{0, 1}})
+	engine.batchBuffer.flushMu.Unlock()
+	if err != nil {
+		t.Fatalf("admit b: %v", err)
+	}
+	if err := engine.flushBatch(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	durableA, err := engine.waitForWALFlush(context.Background(), requestA)
+	if err != nil {
+		t.Fatalf("wait a: %v", err)
+	}
+	durableB, err := engine.waitForWALFlush(context.Background(), requestB)
+	if err != nil {
+		t.Fatalf("wait b: %v", err)
+	}
+	if durableA.FirstLSN == 0 || durableA.CommitLSN >= durableB.CommitLSN {
+		t.Fatalf("transaction LSN ranges = (%+v, %+v), want distinct increasing ranges", durableA, durableB)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"unsafe"
+
+	"github.com/xDarkicex/libravdb/internal/storage"
 )
 
 func TestWALRequestRecordIsOneCacheLine(t *testing.T) {
@@ -21,10 +23,10 @@ func TestWALRequestPoolCompletionAndReuse(t *testing.T) {
 	defer pool.close()
 
 	first := pool.acquire(3)
-	pool.complete(first, 42, nil)
-	lsn, err := pool.waitFor(first)
-	if err != nil || lsn != 42 {
-		t.Fatalf("first completion = (%d, %v), want (42, nil)", lsn, err)
+	pool.complete(first, storage.DurableRange{FirstLSN: 40, CommitLSN: 42}, nil)
+	durable, err := pool.waitFor(first)
+	if err != nil || durable.FirstLSN != 40 || durable.CommitLSN != 42 {
+		t.Fatalf("first completion = (%+v, %v), want ({40 42}, nil)", durable, err)
 	}
 
 	second := pool.acquire(1)
@@ -34,10 +36,10 @@ func TestWALRequestPoolCompletionAndReuse(t *testing.T) {
 	if second.generation == first.generation {
 		t.Fatal("reused request slot retained its generation")
 	}
-	pool.complete(second, 84, nil)
-	lsn, err = pool.waitFor(second)
-	if err != nil || lsn != 84 {
-		t.Fatalf("second completion = (%d, %v), want (84, nil)", lsn, err)
+	pool.complete(second, storage.DurableRange{FirstLSN: 82, CommitLSN: 84}, nil)
+	durable, err = pool.waitFor(second)
+	if err != nil || durable.FirstLSN != 82 || durable.CommitLSN != 84 {
+		t.Fatalf("second completion = (%+v, %v), want ({82 84}, nil)", durable, err)
 	}
 }
 
@@ -50,7 +52,7 @@ func TestWALRequestPoolPreservesCompletionError(t *testing.T) {
 
 	want := errors.New("sync failed")
 	request := pool.acquire(1)
-	pool.complete(request, 0, want)
+	pool.complete(request, storage.DurableRange{}, want)
 	_, got := pool.waitFor(request)
 	if !errors.Is(got, want) {
 		t.Fatalf("completion error = %v, want %v", got, want)
@@ -77,18 +79,18 @@ func TestWALRequestPoolWakesGroupCompletion(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lsn, err := pool.waitFor(request)
+			durable, err := pool.waitFor(request)
 			if err != nil {
 				errs <- err
 				return
 			}
-			if lsn != 99 {
+			if durable.CommitLSN != 99 {
 				errs <- errors.New("wrong durable LSN")
 			}
 		}()
 	}
 	for _, request := range requests {
-		pool.complete(request, 99, nil)
+		pool.complete(request, storage.DurableRange{FirstLSN: 97, CommitLSN: 99}, nil)
 	}
 	wg.Wait()
 	close(errs)
@@ -106,7 +108,7 @@ func TestWALRequestPoolSteadyStateDoesNotAllocate(t *testing.T) {
 
 	allocations := testing.AllocsPerRun(1000, func() {
 		request := pool.acquire(1)
-		pool.complete(request, 1, nil)
+		pool.complete(request, storage.DurableRange{FirstLSN: 1, CommitLSN: 1}, nil)
 		_, _ = pool.waitFor(request)
 	})
 	if allocations != 0 {

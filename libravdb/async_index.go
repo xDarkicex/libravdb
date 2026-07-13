@@ -17,9 +17,9 @@ import (
 
 var errAsyncIndexerClosed = errors.New("asynchronous indexer is closed")
 
-// IndexingStats reports the durable-storage to derived-index gap. AppliedLSN
-// is conservative: it advances to DurableLSN whenever the bounded queue fully
-// drains, never ahead of work that may still be in flight.
+// IndexingStats reports the durable-storage to derived-index gap. AppliedLSN is
+// the exact contiguous transaction frontier: no known index mutation at or
+// below that LSN remains queued or in flight.
 type IndexingStats struct {
 	DurableLSN uint64
 	AppliedLSN uint64
@@ -31,9 +31,10 @@ type IndexingStats struct {
 }
 
 type asyncIndexTask struct {
-	durableLSN uint64
-	ordinal    uint32
-	_          uint32
+	firstLSN  uint64
+	commitLSN uint64
+	ordinal   uint32
+	_         uint32
 }
 
 // asyncIndexSlot is one cache line. Producers publish task data by advancing
@@ -41,8 +42,9 @@ type asyncIndexTask struct {
 // No Go pointer is stored in the off-heap slot.
 type asyncIndexSlot struct {
 	sequence uint64
+	active   uint64
 	task     asyncIndexTask
-	_        [40]byte
+	_        [24]byte
 }
 
 type asyncIndexFailure struct {
@@ -50,8 +52,9 @@ type asyncIndexFailure struct {
 }
 
 type asyncIndexStorage interface {
-	storage.DurableCollection
+	storage.DurableRangeCollection
 	GetByOrdinal(uint32) ([]float32, error)
+	DurableFrontier() uint64
 }
 
 type asyncIndexQueue struct {
@@ -63,6 +66,7 @@ type asyncIndexQueue struct {
 	capacity   uint64
 	workers    int
 	wg         sync.WaitGroup
+	applyGate  sync.RWMutex
 
 	enqueuePos  atomic.Uint64
 	_           [56]byte
@@ -78,6 +82,7 @@ type asyncIndexQueue struct {
 	reserved  atomic.Uint64
 	durable   atomic.Uint64
 	applied   atomic.Uint64
+	published atomic.Uint64
 	failure   atomic.Pointer[asyncIndexFailure]
 }
 
@@ -120,6 +125,9 @@ func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndex
 		capacity:   uint64(depth),
 		workers:    workers,
 	}
+	frontier := store.DurableFrontier()
+	q.durable.Store(frontier)
+	q.applied.Store(frontier)
 	q.accepting.Store(true)
 	q.wg.Add(workers)
 	for i := 0; i < workers; i++ {
@@ -170,32 +178,34 @@ func (q *asyncIndexQueue) cancelReservation(count int) {
 	q.advanceAppliedIfDrained()
 }
 
-func (q *asyncIndexQueue) commit(entries []*index.VectorEntry, durableLSN uint64) {
+func (q *asyncIndexQueue) commit(entries []*index.VectorEntry, durable storage.DurableRange) {
 	if len(entries) == 0 {
 		return
 	}
-	q.reserved.Add(^uint64(len(entries) - 1))
 	q.pending.Add(uint64(len(entries)))
-	atomicMax(&q.durable, durableLSN)
 	for _, entry := range entries {
-		q.enqueue(asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal})
+		q.enqueue(asyncIndexTask{firstLSN: durable.FirstLSN, commitLSN: durable.CommitLSN, ordinal: entry.Ordinal})
 	}
+	atomicMax(&q.durable, durable.CommitLSN)
+	q.published.Add(1)
+	q.reserved.Add(^uint64(len(entries) - 1))
 	q.signalWorkers(min(len(entries), q.workers))
 }
 
-func (q *asyncIndexQueue) commitOne(entry *index.VectorEntry, durableLSN uint64) {
-	q.reserved.Add(^uint64(0))
+func (q *asyncIndexQueue) commitOne(entry *index.VectorEntry, durable storage.DurableRange) {
 	q.pending.Add(1)
-	atomicMax(&q.durable, durableLSN)
-	q.enqueue(asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal})
+	q.enqueue(asyncIndexTask{firstLSN: durable.FirstLSN, commitLSN: durable.CommitLSN, ordinal: entry.Ordinal})
+	atomicMax(&q.durable, durable.CommitLSN)
+	q.published.Add(1)
+	q.reserved.Add(^uint64(0))
 	q.signalWorkers(1)
 }
 
 func (q *asyncIndexQueue) worker() {
 	defer q.wg.Done()
 	for {
-		if task, ok := q.pop(); ok {
-			q.apply(task)
+		if task, pos, ok := q.pop(); ok {
+			q.apply(task, pos)
 			continue
 		}
 		if q.closing.Load() && q.outstanding.Load() == 0 {
@@ -205,7 +215,7 @@ func (q *asyncIndexQueue) worker() {
 	}
 }
 
-func (q *asyncIndexQueue) pop() (asyncIndexTask, bool) {
+func (q *asyncIndexQueue) pop() (asyncIndexTask, uint64, bool) {
 	for {
 		pos := q.dequeuePos.Load()
 		slot := &q.slots[pos%q.capacity]
@@ -216,11 +226,9 @@ func (q *asyncIndexQueue) pop() (asyncIndexTask, bool) {
 			if !q.dequeuePos.CompareAndSwap(pos, pos+1) {
 				continue
 			}
-			task := slot.task
-			atomic.StoreUint64(&slot.sequence, pos+q.capacity)
-			return task, true
+			return slot.task, pos, true
 		case delta < 0:
-			return asyncIndexTask{}, false
+			return asyncIndexTask{}, 0, false
 		default:
 			runtime.Gosched()
 		}
@@ -235,25 +243,34 @@ func (q *asyncIndexQueue) enqueue(task asyncIndexTask) {
 		backoff.wait()
 	}
 	slot.task = task
+	atomic.StoreUint64(&slot.active, 1)
 	atomic.StoreUint64(&slot.sequence, pos+1)
 }
 
-func (q *asyncIndexQueue) apply(task asyncIndexTask) {
+func (q *asyncIndexQueue) apply(task asyncIndexTask, pos uint64) {
 	id, err := q.storage.GetIDByOrdinal(context.Background(), task.ordinal)
+	var vector []float32
 	if err == nil {
-		var vector []float32
 		vector, err = q.storage.GetByOrdinal(task.ordinal)
-		if err == nil {
-			entry := index.VectorEntry{ID: id, Vector: vector, Ordinal: task.ordinal}
-			err = q.collection.index.Insert(context.Background(), entryForIndex(q.collection.config.Metric, &entry))
-		}
-	}
-	if err != nil {
-		q.recordFailure(fmt.Errorf("apply durable LSN %d ordinal %d: %w", task.durableLSN, task.ordinal, err))
 	}
 
+	// Keep publication, active-state retirement, and slot reuse within the same
+	// read-side gate so a precise frontier scan cannot observe a recycled task.
+	q.applyGate.RLock()
+	if err == nil {
+		entry := index.VectorEntry{ID: id, Vector: vector, Ordinal: task.ordinal}
+		err = q.collection.index.Insert(context.Background(), entryForIndex(q.collection.config.Metric, &entry))
+	}
+	if err != nil {
+		q.recordFailure(fmt.Errorf("apply durable transaction %d ordinal %d: %w", task.commitLSN, task.ordinal, err))
+	}
+
+	slot := &q.slots[pos%q.capacity]
+	atomic.StoreUint64(&slot.active, 0)
+	atomic.StoreUint64(&slot.sequence, pos+q.capacity)
 	q.pending.Add(^uint64(0))
 	q.outstanding.Add(^uint64(0))
+	q.applyGate.RUnlock()
 	q.advanceAppliedIfDrained()
 }
 
@@ -299,8 +316,10 @@ func (q *asyncIndexQueue) close() error {
 }
 
 func (q *asyncIndexQueue) stats() IndexingStats {
+	applied := q.preciseApplied()
+	// Read durable after the frontier scan so a concurrently published WAL
+	// transaction cannot make AppliedLSN appear newer than a stale DurableLSN.
 	durable := q.durable.Load()
-	applied := q.applied.Load()
 	lag := uint64(0)
 	if durable > applied {
 		lag = durable - applied
@@ -313,6 +332,50 @@ func (q *asyncIndexQueue) stats() IndexingStats {
 		Reserved:   q.reserved.Load(),
 		Capacity:   int(q.capacity),
 		Failed:     q.failure.Load() != nil,
+	}
+}
+
+// preciseApplied returns the highest WAL frontier for which this index has no
+// known missing mutation. The short exclusive gate freezes worker publication
+// and slot reuse while the off-heap ring is inspected; producers may keep
+// admitting work, with reserved/published counters detecting an unstable scan.
+func (q *asyncIndexQueue) preciseApplied() uint64 {
+	q.applyGate.Lock()
+	defer q.applyGate.Unlock()
+	return q.preciseAppliedLocked()
+}
+
+func (q *asyncIndexQueue) preciseAppliedLocked() uint64 {
+	if q.failure.Load() != nil {
+		return q.applied.Load()
+	}
+	for {
+		if q.reserved.Load() != 0 {
+			return q.applied.Load()
+		}
+		version := q.published.Load()
+		durable := q.durable.Load()
+		minPending := uint64(0)
+		for i := range q.slots {
+			slot := &q.slots[i]
+			if atomic.LoadUint64(&slot.active) == 0 {
+				continue
+			}
+			lsn := slot.task.firstLSN
+			if lsn != 0 && (minPending == 0 || lsn < minPending) {
+				minPending = lsn
+			}
+		}
+		if q.reserved.Load() != 0 || q.published.Load() != version {
+			continue
+		}
+
+		candidate := durable
+		if minPending != 0 && minPending <= candidate {
+			candidate = minPending - 1
+		}
+		atomicMax(&q.applied, candidate)
+		return q.applied.Load()
 	}
 }
 

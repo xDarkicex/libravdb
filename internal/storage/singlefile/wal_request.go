@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync/atomic"
 
+	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/memory"
 )
 
@@ -19,11 +20,12 @@ const (
 )
 
 type walRequestRecord struct {
-	lsn        uint64
+	firstLSN   uint64
+	commitLSN  uint64
 	state      uint32
 	generation uint32
 	entryCount uint32
-	_          [44]byte
+	_          [36]byte
 }
 
 type walRequestHandle struct {
@@ -85,7 +87,8 @@ func (p *walRequestPool) acquire(entryCount int) walRequestHandle {
 				index := uint32(word*64 + bit)
 				record := &p.slots[index]
 				generation := atomic.AddUint32(&record.generation, 1)
-				atomic.StoreUint64(&record.lsn, 0)
+				atomic.StoreUint64(&record.firstLSN, 0)
+				atomic.StoreUint64(&record.commitLSN, 0)
 				atomic.StoreUint32(&record.entryCount, uint32(entryCount))
 				p.errors[index].Store(nil)
 				waiter := p.waiter(index)
@@ -113,7 +116,7 @@ func (p *walRequestPool) waiter(index uint32) *walRequestWaiter {
 	return p.waiters[index].Load()
 }
 
-func (p *walRequestPool) complete(handle walRequestHandle, lsn uint64, err error) {
+func (p *walRequestPool) complete(handle walRequestHandle, durable storage.DurableRange, err error) {
 	record := &p.slots[handle.index]
 	if atomic.LoadUint32(&record.generation) != handle.generation {
 		panic("singlefile: completing stale WAL request")
@@ -121,12 +124,13 @@ func (p *walRequestPool) complete(handle walRequestHandle, lsn uint64, err error
 	if err != nil {
 		p.errors[handle.index].Store(&walRequestError{err: err})
 	}
-	atomic.StoreUint64(&record.lsn, lsn)
+	atomic.StoreUint64(&record.firstLSN, durable.FirstLSN)
+	atomic.StoreUint64(&record.commitLSN, durable.CommitLSN)
 	atomic.StoreUint32(&record.state, walRequestComplete)
 	p.waiter(handle.index).ready <- struct{}{}
 }
 
-func (p *walRequestPool) waitFor(handle walRequestHandle) (uint64, error) {
+func (p *walRequestPool) waitFor(handle walRequestHandle) (storage.DurableRange, error) {
 	record := &p.slots[handle.index]
 	for atomic.LoadUint32(&record.generation) == handle.generation &&
 		atomic.LoadUint32(&record.state) != walRequestComplete {
@@ -134,16 +138,19 @@ func (p *walRequestPool) waitFor(handle walRequestHandle) (uint64, error) {
 	}
 
 	if atomic.LoadUint32(&record.generation) != handle.generation {
-		return 0, fmt.Errorf("stale WAL request completion")
+		return storage.DurableRange{}, fmt.Errorf("stale WAL request completion")
 	}
-	lsn := atomic.LoadUint64(&record.lsn)
+	durable := storage.DurableRange{
+		FirstLSN:  atomic.LoadUint64(&record.firstLSN),
+		CommitLSN: atomic.LoadUint64(&record.commitLSN),
+	}
 	var err error
 	if result := p.errors[handle.index].Swap(nil); result != nil {
 		err = result.err
 	}
 	p.release(handle)
 	runtime.Gosched()
-	return lsn, err
+	return durable, err
 }
 
 func (p *walRequestPool) cancel(handle walRequestHandle) {

@@ -48,31 +48,48 @@ func (b *indexPersistenceBridge) closeCachedIndexes() {
 // The engine skips nil entries in the index chunk; on recovery these
 // collections are rebuilt from Records.
 func (b *indexPersistenceBridge) SerializeIndex(collectionName string) ([]byte, error) {
+	indexBytes, _, err := b.SerializeIndexAt(collectionName, 0)
+	return indexBytes, err
+}
+
+// SerializeIndexAt captures an index together with the exact transaction
+// frontier represented by that image. Async HNSW workers are paused only for
+// the serialization window; WAL admission remains independent and bounded.
+func (b *indexPersistenceBridge) SerializeIndexAt(collectionName string, checkpointLSN uint64) ([]byte, uint64, error) {
 	b.mu.Lock()
 	db := b.db
 	b.mu.Unlock()
 	if db == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
 	db.mu.RLock()
 	col, ok := db.collections[collectionName]
 	db.mu.RUnlock()
 	if !ok || col == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
 	col.mu.RLock()
 	defer col.mu.RUnlock()
-	if col.asyncIndex != nil {
-		// Records are authoritative while asynchronous construction is enabled.
-		// Omitting this collection forces an exact rebuild on recovery instead
-		// of persisting a graph behind the durable WAL frontier.
-		return nil, nil
-	}
 	idx := col.index
 	if idx == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
-	return idx.SerializeToBytes()
+	if col.asyncIndex != nil {
+		q := col.asyncIndex
+		q.applyGate.Lock()
+		defer q.applyGate.Unlock()
+		if err := q.failureValue(); err != nil {
+			return nil, q.applied.Load(), err
+		}
+		appliedLSN := q.preciseAppliedLocked()
+		if appliedLSN > checkpointLSN {
+			appliedLSN = checkpointLSN
+		}
+		indexBytes, err := idx.SerializeToBytes()
+		return indexBytes, appliedLSN, err
+	}
+	indexBytes, err := idx.SerializeToBytes()
+	return indexBytes, checkpointLSN, err
 }
 
 // DeserializeIndex restores a collection's index from serialized bytes.
@@ -162,6 +179,12 @@ func (b *indexPersistenceBridge) IndexTypeVersion(collectionName string) (indexT
 		return 0, 1
 	}
 	return uint8(col.config.IndexType), 1
+}
+
+// CanRestoreIndex keeps HNSW recovery on the record-rebuild path until its
+// off-heap deserializer has independent lifetime and corruption validation.
+func (b *indexPersistenceBridge) CanRestoreIndex(_ string, indexType uint8, _ uint16) bool {
+	return IndexType(indexType) != HNSW
 }
 
 // SnapshotVectors copies node vectors from provider-backed indexes into local

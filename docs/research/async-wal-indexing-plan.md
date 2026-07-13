@@ -165,6 +165,29 @@ the group committer has enough pending work. The asynchronous index queue should
 provide that occupancy while remaining bounded and exposing its durable-LSN to
 index-applied-LSN lag.
 
+## Persisted index-applied frontier
+
+Index checkpoint entries now carry the exact contiguous WAL frontier represented
+by each derived index. Group-committed WAL requests receive their own transaction
+operation and commit boundaries rather than the group's maximum LSN, so separate
+collection transactions cannot falsely share an index boundary.
+
+Async workers leave their off-heap queue slot active until HNSW insertion is
+complete. Snapshot and statistics paths briefly stop index publication and scan
+those fixed slots to derive the contiguous frontier. Unknown WAL reservations
+keep the previous frontier until their commit LSN is published, preventing a
+delayed writer from appearing behind an already-advanced watermark.
+
+The versioned index-block format persists this per-collection frontier. Recovery
+deserializes an index only when its frontier covers that collection's latest
+mutation without exceeding the authoritative checkpoint and the provider marks
+the persisted format safe to restore. Legacy blocks, lagging snapshots, and
+provider-rejected formats rebuild from records. HNSW currently remains on that
+conservative rebuild path until its off-heap deserializer is hardened
+independently. This is the correctness-first boundary for bounded delta replay:
+a later pass can apply committed record transactions after the persisted
+frontier without changing the on-disk contract.
+
 ## Bounded asynchronous HNSW indexing
 
 Implemented as an opt-in database mode through `WithAsyncIndexing(depth,
@@ -180,7 +203,7 @@ the WAL group target is capped by the configured writer concurrency.
 
 The queue has these properties:
 
-- Each task is a fixed 16-byte `{durableLSN, ordinal}` record in a 64-byte-
+- Each task is a fixed 24-byte `{firstLSN, commitLSN, ordinal}` record in a 64-byte-
   aligned mmap arena. It does not retain IDs, metadata, or 768d vector payloads.
 - Workers resolve the canonical storage-owned vector and ID by ordinal, then
   run ordinary HNSW insertion.
@@ -190,15 +213,15 @@ The queue has these properties:
 - Once a transaction enters a WAL group, cancellation cannot abandon it before
   the definitive sync result. A durable record therefore always receives an
   index task.
-- `IndexingStats` exposes durable LSN, conservative applied LSN, LSN lag,
-  pending tasks, reservations, capacity, and failure state. The applied
-  watermark advances whenever the queue fully drains, so it never claims work
-  is indexed early.
+- `IndexingStats` exposes durable LSN, exact contiguous applied LSN, LSN lag,
+  pending tasks, reservations, capacity, and failure state. Queue slots remain
+  active through HNSW application, allowing the off-heap ring to identify the
+  lowest unfinished transaction without a heap map.
 - `FlushIndex(ctx)` is the explicit graph-readiness barrier. Search remains
   eventually consistent between durable acknowledgement and that barrier.
-- Async collections are omitted from index checkpoint chunks. Recovery rebuilds
-  every live collection absent from a valid chunk, preventing a checkpoint from
-  publishing a graph behind durable records.
+- Async collections persist their graph with the exact applied frontier. Recovery
+  rebuilds any absent, lagging, legacy, or provider-rejected index, preventing a
+  checkpoint from publishing a graph behind durable records.
 
 ### Group target sweep
 

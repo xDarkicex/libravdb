@@ -38,6 +38,8 @@ const (
 	chunkTypeSnapshot = uint16(1)
 	chunkTypeWAL      = uint16(2)
 	chunkTypeIndex    = uint16(3)
+	indexBlockMagic   = uint32(0x4C564449) // "LVDI"
+	indexBlockVersion = uint16(1)
 
 	recordTypeTxBegin          = uint16(1)
 	recordTypeTxCommit         = uint16(2)
@@ -231,13 +233,29 @@ type IndexSnapshotProvider interface {
 	SnapshotVectors(ctx context.Context) error
 }
 
+// CoordinatedIndexSnapshotProvider attaches a transaction-commit frontier to
+// each serialized derived index. Recovery only trusts an index whose frontier
+// covers that collection's latest durable mutation; lagging snapshots are
+// rebuilt until delta replay is available.
+type CoordinatedIndexSnapshotProvider interface {
+	SerializeIndexAt(collectionName string, checkpointLSN uint64) (indexBytes []byte, appliedLSN uint64, err error)
+}
+
+// IndexRestorePolicy lets a provider reject direct restoration of an otherwise
+// compatible persisted index. Rejected indexes are rebuilt from durable records.
+type IndexRestorePolicy interface {
+	CanRestoreIndex(collectionName string, indexType uint8, indexVersion uint16) bool
+}
+
 // indexBlockEntry is a single collection's serialized index within the index chunk.
 type indexBlockEntry struct {
 	name            string
 	payload         []byte
 	payloadChecksum uint32
+	appliedLSN      uint64
 	indexVersion    uint16
 	indexType       uint8
+	hasAppliedLSN   bool
 }
 
 // Engine is the single-file storage engine.
@@ -628,8 +646,30 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 			continue
 		}
 
+		// A derived index is directly recoverable when its transaction frontier
+		// covers this collection's latest mutation. Unrelated collections may
+		// advance the database checkpoint without invalidating this index.
+		// Legacy blocks and genuinely lagging snapshots rebuild until delta replay
+		// is available.
+		if !entry.hasAppliedLSN || entry.appliedLSN < collection.UpdatedLSN || entry.appliedLSN > chosen.LastAppliedLSN {
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			handled[entry.name] = struct{}{}
+			continue
+		}
+
 		// Validate index format version is supported.
-		if entry.indexVersion != formatVersion {
+		expectedType, expectedVersion := e.indexProvider.IndexTypeVersion(entry.name)
+		if entry.indexType != expectedType || entry.indexVersion != expectedVersion {
+			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
+				return err
+			}
+			handled[entry.name] = struct{}{}
+			continue
+		}
+		if policy, ok := e.indexProvider.(IndexRestorePolicy); ok &&
+			!policy.CanRestoreIndex(entry.name, entry.indexType, entry.indexVersion) {
 			if err := e.rebuildCollectionIndexFromRecords(entry.name, collection); err != nil {
 				return err
 			}
@@ -1388,21 +1428,26 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 }
 
 // encodeIndexBlock serializes all collection indexes into a single binary blob.
-// Format: collectionCount | repeated { nameLen, name, indexType, indexVersion, payloadLen, payload, payloadChecksum }
+// Format: magic, version, collectionCount | repeated
+// { nameLen, name, indexType, indexVersion, appliedLSN, payloadLen, payload, payloadChecksum }.
 func encodeIndexBlock(entries []indexBlockEntry) []byte {
-	size := 4 // collectionCount uint32
+	size := 12 // magic uint32 + version/reserved uint16 + collectionCount uint32
 	for _, e := range entries {
 		size += 2 + len(e.name)        // nameLen uint16 + name bytes
-		size += 1 + 2                  // indexType uint8 + indexVersion uint16
+		size += 1 + 2 + 8              // indexType uint8 + indexVersion uint16 + appliedLSN uint64
 		size += 4 + len(e.payload) + 4 // payloadLen uint32 + payload bytes + payloadChecksum uint32
 	}
 	buf := make([]byte, 0, size)
+	buf = binary.LittleEndian.AppendUint32(buf, indexBlockMagic)
+	buf = binary.LittleEndian.AppendUint16(buf, indexBlockVersion)
+	buf = binary.LittleEndian.AppendUint16(buf, 0)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
 	for _, e := range entries {
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.name)))
 		buf = append(buf, []byte(e.name)...)
 		buf = append(buf, e.indexType)
 		buf = binary.LittleEndian.AppendUint16(buf, e.indexVersion)
+		buf = binary.LittleEndian.AppendUint64(buf, e.appliedLSN)
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.payload)))
 		buf = append(buf, e.payload...)
 		buf = binary.LittleEndian.AppendUint32(buf, e.payloadChecksum)
@@ -1416,8 +1461,27 @@ func decodeIndexBlock(data []byte) ([]indexBlockEntry, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("index block too small")
 	}
+	versioned := binary.LittleEndian.Uint32(data) == indexBlockMagic
 	count := binary.LittleEndian.Uint32(data)
 	pos := 4
+	if versioned {
+		if len(data) < 12 {
+			return nil, fmt.Errorf("versioned index block too small")
+		}
+		version := binary.LittleEndian.Uint16(data[4:6])
+		if version != indexBlockVersion {
+			return nil, fmt.Errorf("unsupported index block version %d", version)
+		}
+		count = binary.LittleEndian.Uint32(data[8:12])
+		pos = 12
+	}
+	minEntrySize := 13 // empty name and payload in the legacy layout
+	if versioned {
+		minEntrySize += 8
+	}
+	if uint64(count) > uint64((len(data)-pos)/minEntrySize) {
+		return nil, fmt.Errorf("index block entry count %d exceeds payload capacity", count)
+	}
 	entries := make([]indexBlockEntry, 0, count)
 	for i := uint32(0); i < count; i++ {
 		if pos+2 > len(data) {
@@ -1430,13 +1494,23 @@ func decodeIndexBlock(data []byte) ([]indexBlockEntry, error) {
 		}
 		name := string(data[pos : pos+nameLen])
 		pos += nameLen
-		if pos+7 > len(data) {
+		headerSize := 7
+		if versioned {
+			headerSize += 8
+		}
+		if pos+headerSize > len(data) {
 			return nil, fmt.Errorf("truncated index block: entry %d (%s) header cut at offset %d", i, name, pos)
 		}
 		indexType := data[pos]
 		indexVersion := binary.LittleEndian.Uint16(data[pos+1:])
-		payloadLen := int(binary.LittleEndian.Uint32(data[pos+3:]))
-		pos += 7
+		pos += 3
+		var appliedLSN uint64
+		if versioned {
+			appliedLSN = binary.LittleEndian.Uint64(data[pos:])
+			pos += 8
+		}
+		payloadLen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
 		if pos+payloadLen+4 > len(data) {
 			return nil, fmt.Errorf("truncated index entry for collection %s", name)
 		}
@@ -1452,11 +1526,45 @@ func decodeIndexBlock(data []byte) ([]indexBlockEntry, error) {
 			name:            name,
 			indexType:       indexType,
 			indexVersion:    indexVersion,
+			appliedLSN:      appliedLSN,
+			hasAppliedLSN:   versioned,
 			payload:         payload,
 			payloadChecksum: payloadChecksum,
 		})
 	}
+	if pos != len(data) {
+		return nil, fmt.Errorf("index block has %d trailing bytes", len(data)-pos)
+	}
 	return entries, nil
+}
+
+func (e *Engine) serializeIndexEntry(name string, checkpointLSN uint64) (indexBlockEntry, bool, error) {
+	var (
+		indexBytes []byte
+		appliedLSN = checkpointLSN
+		err        error
+	)
+	if provider, ok := e.indexProvider.(CoordinatedIndexSnapshotProvider); ok {
+		indexBytes, appliedLSN, err = provider.SerializeIndexAt(name, checkpointLSN)
+	} else {
+		indexBytes, err = e.indexProvider.SerializeIndex(name)
+	}
+	if err != nil {
+		return indexBlockEntry{}, false, err
+	}
+	if indexBytes == nil {
+		return indexBlockEntry{}, false, nil
+	}
+	indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
+	return indexBlockEntry{
+		name:            name,
+		indexType:       indexType,
+		indexVersion:    indexVersion,
+		appliedLSN:      appliedLSN,
+		hasAppliedLSN:   true,
+		payload:         indexBytes,
+		payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
+	}, true, nil
 }
 
 func (e *Engine) checkpointLocked() error {
@@ -1484,21 +1592,14 @@ func (e *Engine) checkpointLocked() error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			entry, present, err := e.serializeIndexEntry(name, e.lastLSN)
 			if err != nil {
 				return fmt.Errorf("serialize index for %s: %w", name, err)
 			}
-			if indexBytes == nil {
+			if !present {
 				continue // empty collection (no index to persist); rebuilt from Records on recovery
 			}
-			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
-			entries = append(entries, indexBlockEntry{
-				name:            name,
-				indexType:       indexType,
-				indexVersion:    indexVersion,
-				payload:         indexBytes,
-				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
-			})
+			entries = append(entries, entry)
 		}
 		if len(entries) > 0 {
 			indexBlock = encodeIndexBlock(entries)
@@ -1690,21 +1791,14 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			entry, present, err := e.serializeIndexEntry(name, phase1LSN)
 			if err != nil {
 				return fmt.Errorf("vacuum serialize index %s: %w", name, err)
 			}
-			if indexBytes == nil {
+			if !present {
 				continue
 			}
-			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
-			entries = append(entries, indexBlockEntry{
-				name:            name,
-				indexType:       indexType,
-				indexVersion:    indexVersion,
-				payload:         indexBytes,
-				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
-			})
+			entries = append(entries, entry)
 		}
 		if len(entries) > 0 {
 			indexBlock = encodeIndexBlock(entries)
@@ -1950,21 +2044,14 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			entry, present, err := e.serializeIndexEntry(name, phase1LSN)
 			if err != nil {
 				return fmt.Errorf("backup serialize index %s: %w", name, err)
 			}
-			if indexBytes == nil {
+			if !present {
 				continue
 			}
-			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
-			entries = append(entries, indexBlockEntry{
-				name:            name,
-				indexType:       indexType,
-				indexVersion:    indexVersion,
-				payload:         indexBytes,
-				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
-			})
+			entries = append(entries, entry)
 		}
 		if len(entries) > 0 {
 			indexBlock = encodeIndexBlock(entries)
@@ -2183,21 +2270,14 @@ func (e *Engine) compactFileLocked() error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			indexBytes, err := e.indexProvider.SerializeIndex(name)
+			entry, present, err := e.serializeIndexEntry(name, e.lastLSN)
 			if err != nil {
 				return fmt.Errorf("compact: serialize index for %s: %w", name, err)
 			}
-			if indexBytes == nil {
+			if !present {
 				continue
 			}
-			indexType, indexVersion := e.indexProvider.IndexTypeVersion(name)
-			entries = append(entries, indexBlockEntry{
-				name:            name,
-				indexType:       indexType,
-				indexVersion:    indexVersion,
-				payload:         indexBytes,
-				payloadChecksum: crc32.Checksum(indexBytes, castagnoli),
-			})
+			entries = append(entries, entry)
 		}
 		if len(entries) > 0 {
 			indexBlock = encodeIndexBlock(entries)
@@ -2773,14 +2853,17 @@ func (e *Engine) flushBatch() error {
 
 	// Signal all waiters with the result
 	var firstErr error
-	var groupLSN uint64
-	var durableLSN uint64
 	signalErr := func(err error) {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		for _, request := range pendingFlushes {
-			e.walRequests.complete(request, durableLSN, err)
+		for i, request := range pendingFlushes {
+			var durable storage.DurableRange
+			if i < len(entries) {
+				durable.FirstLSN = entries[i].firstLSN
+				durable.CommitLSN = entries[i].commitLSN
+			}
+			e.walRequests.complete(request, durable, err)
 		}
 	}
 
@@ -2811,12 +2894,11 @@ func (e *Engine) flushBatch() error {
 			atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 			return err
 		}
-		entries[start].walBytes = written
-		entries[start].firstLSN = firstLSN
-		entries[start].commitLSN = commitLSN
-		if commitLSN > groupLSN {
-			groupLSN = commitLSN
+		for i := start; i < end; i++ {
+			entries[i].firstLSN = firstLSN
+			entries[i].commitLSN = commitLSN
 		}
+		entries[start].walBytes = written
 		start = end
 	}
 	if err := e.syncWALLocked(); err != nil {
@@ -2824,7 +2906,6 @@ func (e *Engine) flushBatch() error {
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return err
 	}
-	durableLSN = groupLSN
 	for start := 0; start < len(entries); {
 		end := start + 1
 		for end < len(entries) && entries[end].collection == entries[start].collection {
@@ -3045,7 +3126,7 @@ func (e *Engine) admitBatch(batch batchEntry, entryCount int) (walRequestHandle,
 	return request, nil
 }
 
-func (e *Engine) waitForWALFlush(ctx context.Context, request walRequestHandle) (uint64, error) {
+func (e *Engine) waitForWALFlush(ctx context.Context, request walRequestHandle) (storage.DurableRange, error) {
 	_ = ctx
 	// Once admitted to the WAL group, the transaction may commit even if the
 	// caller's context is canceled. Wait for the definitive durable result so
@@ -3499,13 +3580,18 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 }
 
 func (c *Collection) InsertDurable(ctx context.Context, entry *index.VectorEntry) (uint64, error) {
+	durable, err := c.InsertDurableRange(ctx, entry)
+	return durable.CommitLSN, err
+}
+
+func (c *Collection) InsertDurableRange(ctx context.Context, entry *index.VectorEntry) (storage.DurableRange, error) {
 	_ = ctx
 	if err := c.assignOrdinal(entry); err != nil {
-		return 0, err
+		return storage.DurableRange{}, err
 	}
 	request, err := c.engine.putRecord(ctx, c.name, entry)
 	if err != nil {
-		return 0, err
+		return storage.DurableRange{}, err
 	}
 	return c.engine.waitForWALFlush(ctx, request)
 }
@@ -3541,15 +3627,29 @@ func (c *Collection) InsertBatch(ctx context.Context, entries []*index.VectorEnt
 }
 
 func (c *Collection) InsertBatchDurable(ctx context.Context, entries []*index.VectorEntry) (uint64, error) {
+	durable, err := c.InsertBatchDurableRange(ctx, entries)
+	return durable.CommitLSN, err
+}
+
+func (c *Collection) InsertBatchDurableRange(ctx context.Context, entries []*index.VectorEntry) (storage.DurableRange, error) {
 	_ = ctx
 	if err := c.assignOrdinals(entries); err != nil {
-		return 0, err
+		return storage.DurableRange{}, err
 	}
 	request, err := c.engine.putRecords(ctx, c.name, entries)
 	if err != nil {
-		return 0, err
+		return storage.DurableRange{}, err
 	}
 	return c.engine.waitForWALFlush(ctx, request)
+}
+
+// DurableFrontier returns the latest transaction LSN represented by the
+// collection's recovered storage view. The async derived-index tracker starts
+// from this boundary after an index has been restored or rebuilt.
+func (c *Collection) DurableFrontier() uint64 {
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	return c.engine.lastLSN
 }
 
 // Get returns a persisted entry by ID.
