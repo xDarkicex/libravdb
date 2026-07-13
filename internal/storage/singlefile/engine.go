@@ -237,6 +237,7 @@ type Engine struct {
 	cancel        context.CancelFunc
 	file          *os.File
 	walWriteArena *memory.Arena
+	walRequests   *walRequestPool
 	state         *persistedState
 	collections   map[string]*Collection
 	path          string
@@ -244,7 +245,7 @@ type Engine struct {
 		mu                 sync.Mutex
 		entries            []batchEntry
 		flusher            chan struct{}
-		flushNow           []chan walFlushResult
+		flushNow           []walRequestHandle
 		flushSignalPending int32
 		pendingWaiters     int32
 	}
@@ -284,11 +285,6 @@ type batchEntry struct {
 	// When set, flushBatch passes these to putRecordsInlocked to avoid
 	// re-encoding under e.mu.Lock().
 	encoded []encodedPayload
-}
-
-type walFlushResult struct {
-	err error
-	lsn uint64
 }
 
 // startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
@@ -409,9 +405,15 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		file.Close()
 		return nil, fmt.Errorf("stat database file: %w", err)
 	}
+	engine.walRequests, err = newWALRequestPool()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("initialize WAL request pool: %w", err)
+	}
 
 	if stat.Size() == 0 {
 		if err := engine.initializeEmpty(); err != nil {
+			_ = engine.walRequests.close()
 			file.Close()
 			return nil, err
 		}
@@ -423,6 +425,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	}
 
 	if err := engine.openExisting(); err != nil {
+		_ = engine.walRequests.close()
 		file.Close()
 		return nil, err
 	}
@@ -2624,8 +2627,8 @@ func (e *Engine) flushBatch() error {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
-		for _, done := range pendingFlushes {
-			done <- walFlushResult{lsn: durableLSN, err: err}
+		for _, request := range pendingFlushes {
+			e.walRequests.complete(request, durableLSN, err)
 		}
 	}
 
@@ -2776,9 +2779,9 @@ func (e *Engine) appendRecordsWALLocked(name string, entries []*index.VectorEntr
 	return written, frames[1].Header.LSN, frames[len(frames)-1].Header.LSN, nil
 }
 
-func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (<-chan walFlushResult, error) {
+func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (walRequestHandle, error) {
 	if e.closed.Load() {
-		return nil, fmt.Errorf("database is closed")
+		return walRequestHandle{}, fmt.Errorf("database is closed")
 	}
 
 	// Pre-encode recordPut payloads before acquiring any locks.
@@ -2790,7 +2793,7 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 				for j := 0; j < i; j++ {
 					releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 				}
-				return nil, ctx.Err()
+				return walRequestHandle{}, ctx.Err()
 			default:
 			}
 		}
@@ -2805,10 +2808,11 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 			for j := 0; j < i; j++ {
 				releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 			}
-			return nil, err
+			return walRequestHandle{}, err
 		}
 		encoded[i] = payload
 	}
+	request := e.walRequests.acquire(len(entries))
 
 	// Add entries to batch buffer
 	e.batchBuffer.mu.Lock()
@@ -2817,20 +2821,20 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 		for j := 0; j < len(entries); j++ {
 			releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
 		}
-		return nil, fmt.Errorf("database is closed")
+		e.walRequests.cancel(request)
+		return walRequestHandle{}, fmt.Errorf("database is closed")
 	}
 	bufferedEntries := 0
 	for _, batch := range e.batchBuffer.entries {
 		bufferedEntries += len(batch.entries)
 	}
 	shouldFlush := bufferedEntries+len(entries) >= batchSize
-	done := make(chan walFlushResult, 1)
 	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
 		collection: name,
 		entries:    entries,
 		encoded:    encoded,
 	})
-	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, done)
+	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, request)
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 	e.batchBuffer.mu.Unlock()
 
@@ -2843,16 +2847,15 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 		_ = e.flushBatch()
 	}
 
-	return done, nil
+	return request, nil
 }
 
-func waitForWALFlush(ctx context.Context, done <-chan walFlushResult) (uint64, error) {
+func (e *Engine) waitForWALFlush(ctx context.Context, request walRequestHandle) (uint64, error) {
 	_ = ctx
 	// Once admitted to the WAL group, the transaction may commit even if the
 	// caller's context is canceled. Wait for the definitive durable result so
 	// callers never abandon follow-up index work for a committed record.
-	result := <-done
-	return result.lsn, result.err
+	return e.walRequests.waitFor(request)
 }
 
 func (e *Engine) deleteRecord(name, id string) error {
@@ -3173,6 +3176,12 @@ func (e *Engine) Close() error {
 		}
 		e.walWriteArena = nil
 	}
+	if e.walRequests != nil {
+		if err := e.walRequests.close(); err != nil {
+			return err
+		}
+		e.walRequests = nil
+	}
 	if e.dirty {
 		if err := e.file.Sync(); err != nil {
 			return err
@@ -3299,11 +3308,11 @@ func (c *Collection) InsertDurable(ctx context.Context, entry *index.VectorEntry
 	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
 		return 0, err
 	}
-	done, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
+	request, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
 	if err != nil {
 		return 0, err
 	}
-	return waitForWALFlush(ctx, done)
+	return c.engine.waitForWALFlush(ctx, request)
 }
 
 // InsertBatch persists multiple vector entries.
@@ -3319,11 +3328,11 @@ func (c *Collection) InsertBatchDurable(ctx context.Context, entries []*index.Ve
 	if err := c.assignOrdinals(entries); err != nil {
 		return 0, err
 	}
-	done, err := c.engine.putRecords(ctx, c.name, entries)
+	request, err := c.engine.putRecords(ctx, c.name, entries)
 	if err != nil {
 		return 0, err
 	}
-	return waitForWALFlush(ctx, done)
+	return c.engine.waitForWALFlush(ctx, request)
 }
 
 // Get returns a persisted entry by ID.

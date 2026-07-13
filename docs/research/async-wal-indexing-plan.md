@@ -309,3 +309,33 @@ The graph-ready spread remains dominated by HNSW scheduling, but accepted
 throughput is neutral-to-positive and the two-allocation reduction is stable.
 Focused collision, overlapping-batch, race, and zero-allocation guard tests
 pass, so the atomic state table is retained.
+
+## Off-heap WAL request completion
+
+The per-write buffered `chan walFlushResult` was replaced by a fixed 64-byte
+request record in a 4096-slot, 64-byte-aligned mmap arena. Foreground and file
+owner exchange an 8-byte `{slot, generation}` handle. Durable LSN, state, entry
+count, and generation are atomically published in the record; error boxes are
+allocated only when a WAL group fails.
+
+A first implementation used one shared condition variable. Standalone WAL was
+faster, but condition broadcast woke every foreground writer and reduced async
+HNSW graph-ready throughput to 1.38k-1.46k/s. It was rejected. The retained
+design lazily creates one reusable buffered parking channel per concurrently
+used request slot. The channel is a scheduling hint tied to the fixed record,
+not a per-write allocation; atomic state remains authoritative. One explicit
+`runtime.Gosched` after completion preserves CPU fairness for index workers.
+
+Paired Apple M2 WAL benchmark (`bfb0616` versus fixed requests, 3,000 writes):
+
+| Path | Checkpoint | Fixed request | Allocation change |
+|---|---:|---:|---:|
+| Durable, 32 writers | 234-239 us/op | 183-191 us/op | 7 to 5 allocs/op |
+| Unsafe, 8 writers | 166-177 us/op | 160-164 us/op | 9 to 7 allocs/op |
+| Durable group occupancy | 30.0-31.3 | 31.9 | none |
+
+At the integrated async HNSW layer, accepted throughput reaches 6.1k-6.4k/s
+with 31.5-31.9 entries/WAL transaction, while allocations fall from 10 to 8
+per insert and bytes fall from roughly 1,100 to 958-969. Repeated graph-ready
+results average within roughly 2-3% of the checkpoint despite expected
+concurrent-topology variance. The fixed request path is retained.
