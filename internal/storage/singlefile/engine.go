@@ -243,9 +243,12 @@ type Engine struct {
 	path          string
 	batchBuffer   struct {
 		mu                 sync.Mutex
+		flushMu            sync.Mutex
 		entries            []batchEntry
+		spareEntries       []batchEntry
 		flusher            chan struct{}
 		flushNow           []walRequestHandle
+		spareFlushNow      []walRequestHandle
 		flushSignalPending int32
 		pendingWaiters     int32
 	}
@@ -277,14 +280,40 @@ type Engine struct {
 // batchEntry holds a buffered record pending WAL flush.
 type batchEntry struct {
 	collection string
+	entry      *index.VectorEntry
 	entries    []*index.VectorEntry
 	firstLSN   uint64
 	commitLSN  uint64
 	walBytes   uint64
+	encodedOne encodedPayload
 	// encoded holds pre-encoded recordPut payloads, 1:1 with entries.
-	// When set, flushBatch passes these to putRecordsInlocked to avoid
+	// When set, flushBatch passes these to WAL framing to avoid
 	// re-encoding under e.mu.Lock().
 	encoded []encodedPayload
+}
+
+func (b *batchEntry) count() int {
+	if b.entry != nil {
+		return 1
+	}
+	return len(b.entries)
+}
+
+func (b *batchEntry) entryAt(i int) *index.VectorEntry {
+	if b.entry != nil {
+		return b.entry
+	}
+	return b.entries[i]
+}
+
+func (b *batchEntry) encodedAt(i int) encodedPayload {
+	if b.entry != nil {
+		return b.encodedOne
+	}
+	if i < len(b.encoded) {
+		return b.encoded[i]
+	}
+	return encodedPayload{}
 }
 
 // startBatchFlusher is a hook for testing. It starts the background flusher goroutine.
@@ -398,7 +427,10 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 
 	// Initialize WAL batch buffer channels (flusher goroutine started after init succeeds)
 	engine.batchBuffer.flusher = make(chan struct{})
-	engine.batchBuffer.entries = nil
+	engine.batchBuffer.entries = make([]batchEntry, 0, batchSize)
+	engine.batchBuffer.spareEntries = make([]batchEntry, 0, batchSize)
+	engine.batchBuffer.flushNow = make([]walRequestHandle, 0, batchSize)
+	engine.batchBuffer.spareFlushNow = make([]walRequestHandle, 0, batchSize)
 
 	stat, err = file.Stat()
 	if err != nil {
@@ -2303,14 +2335,7 @@ func (e *Engine) appendChunkHeaderPayloadLocked(kind uint16, headerPart, payload
 }
 
 func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
-	defer func() {
-		for i := range records {
-			if records[i].PayloadEncoder != nil {
-				releaseDetachedPayload(records[i].Payload, records[i].PayloadEncoder)
-				records[i].PayloadEncoder = nil
-			}
-		}
-	}()
+	defer releaseWALFramePayloads(records)
 	offset, err := e.file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, err
@@ -2368,6 +2393,15 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	e.walBytes += written
 	_ = offset
 	return written, nil
+}
+
+func releaseWALFramePayloads(records []walRecord) {
+	for i := range records {
+		if records[i].PayloadEncoder != nil {
+			releaseDetachedPayload(records[i].Payload, records[i].PayloadEncoder)
+			records[i].PayloadEncoder = nil
+		}
+	}
 }
 
 func (e *Engine) syncWALLocked() error {
@@ -2595,6 +2629,9 @@ func (e *Engine) requestBatchFlush() {
 // After flushing, it signals any waiting foreground flush completions.
 // Returns the first error encountered during flush, or nil on success.
 func (e *Engine) flushBatch() error {
+	e.batchBuffer.flushMu.Lock()
+	defer e.batchBuffer.flushMu.Unlock()
+
 	e.batchBuffer.mu.Lock()
 	if len(e.batchBuffer.entries) == 0 && len(e.batchBuffer.flushNow) == 0 {
 		e.batchBuffer.mu.Unlock()
@@ -2603,12 +2640,25 @@ func (e *Engine) flushBatch() error {
 	}
 	// Take ownership of the buffer and reset
 	entries := e.batchBuffer.entries
-	e.batchBuffer.entries = nil
+	e.batchBuffer.entries = e.batchBuffer.spareEntries[:0]
+	e.batchBuffer.spareEntries = nil
 	// Take ownership of pending flush completions
 	pendingFlushes := e.batchBuffer.flushNow
-	e.batchBuffer.flushNow = nil
+	e.batchBuffer.flushNow = e.batchBuffer.spareFlushNow[:0]
+	e.batchBuffer.spareFlushNow = nil
 	e.batchBuffer.mu.Unlock()
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, -int32(len(pendingFlushes)))
+	defer func() {
+		for i := range entries {
+			releaseBatchEntryPayloads(&entries[i])
+			entries[i] = batchEntry{}
+		}
+		clear(pendingFlushes)
+		e.batchBuffer.mu.Lock()
+		e.batchBuffer.spareEntries = entries[:0]
+		e.batchBuffer.spareFlushNow = pendingFlushes[:0]
+		e.batchBuffer.mu.Unlock()
+	}()
 
 	// Nothing to flush and no one waiting
 	if len(entries) == 0 && len(pendingFlushes) == 0 {
@@ -2638,30 +2688,19 @@ func (e *Engine) flushBatch() error {
 		return fmt.Errorf("database is closed")
 	}
 
-	// Merge contiguous runs for the same collection so one flush can cover more
-	// buffered work without changing the original ordering of distinct collections.
-	merged := make([]batchEntry, 0, len(entries))
-	for _, batch := range entries {
-		if len(merged) > 0 && merged[len(merged)-1].collection == batch.collection {
-			merged[len(merged)-1].entries = append(merged[len(merged)-1].entries, batch.entries...)
-			merged[len(merged)-1].encoded = append(merged[len(merged)-1].encoded, batch.encoded...)
-			continue
-		}
-		merged = append(merged, batchEntry{
-			collection: batch.collection,
-			entries:    batch.entries,
-			encoded:    batch.encoded,
-		})
-	}
-
 	batchedEntries := 0
-	for _, batch := range merged {
-		batchedEntries += len(batch.entries)
+	for i := range entries {
+		batchedEntries += entries[i].count()
 	}
 
-	// Write all entries to WAL - use pre-encoded payloads to minimise time under e.mu.
-	for i := range merged {
-		written, firstLSN, commitLSN, err := e.appendRecordsWALLocked(merged[i].collection, merged[i].entries, merged[i].encoded)
+	// Write contiguous collection runs directly. This preserves grouping without
+	// allocating merged descriptor and pointer slices for the common scalar path.
+	for start := 0; start < len(entries); {
+		end := start + 1
+		for end < len(entries) && entries[end].collection == entries[start].collection {
+			end++
+		}
+		written, firstLSN, commitLSN, err := e.appendBatchRunWALLocked(entries[start:end])
 		if err != nil {
 			// A write failure makes the on-disk prefix ambiguous. Do not retry
 			// automatically and risk duplicating a transaction; recovery will
@@ -2670,12 +2709,13 @@ func (e *Engine) flushBatch() error {
 			atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 			return err
 		}
-		merged[i].walBytes = written
-		merged[i].firstLSN = firstLSN
-		merged[i].commitLSN = commitLSN
+		entries[start].walBytes = written
+		entries[start].firstLSN = firstLSN
+		entries[start].commitLSN = commitLSN
 		if commitLSN > groupLSN {
 			groupLSN = commitLSN
 		}
+		start = end
 	}
 	if err := e.syncWALLocked(); err != nil {
 		signalErr(err)
@@ -2683,16 +2723,25 @@ func (e *Engine) flushBatch() error {
 		return err
 	}
 	durableLSN = groupLSN
-	for _, batch := range merged {
-		for i, entry := range batch.entries {
-			lsn := batch.firstLSN + uint64(i)
-			if err := e.applyRecordPutFields(batch.collection, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, lsn, true); err != nil {
-				signalErr(err)
-				atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
-				return err
+	for start := 0; start < len(entries); {
+		end := start + 1
+		for end < len(entries) && entries[end].collection == entries[start].collection {
+			end++
+		}
+		lsn := entries[start].firstLSN
+		for i := start; i < end; i++ {
+			for j := 0; j < entries[i].count(); j++ {
+				entry := entries[i].entryAt(j)
+				if err := e.applyRecordPutFields(entries[i].collection, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, lsn, true); err != nil {
+					signalErr(err)
+					atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+					return err
+				}
+				lsn++
 			}
 		}
-		e.markDirtyLocked(batch.walBytes, len(batch.entries))
+		e.markDirtyLocked(entries[start].walBytes, int(lsn-entries[start].firstLSN))
+		start = end
 	}
 	if err := e.maybeCheckpointLocked(); err != nil {
 		signalErr(err)
@@ -2714,69 +2763,89 @@ func (e *Engine) flushBatch() error {
 	return nil
 }
 
-// appendRecordsWALLocked writes one record transaction without publishing it
-// to the in-memory state. The caller applies records only after the containing
-// flush group has reached the configured durability boundary.
-func (e *Engine) appendRecordsWALLocked(name string, entries []*index.VectorEntry, encoded []encodedPayload) (uint64, uint64, uint64, error) {
-	collection := e.state.Collections[name]
-	if collection == nil || collection.Deleted {
-		return 0, 0, 0, fmt.Errorf("collection %s not found", name)
+func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, uint64, error) {
+	if len(batches) == 0 {
+		return 0, 0, 0, nil
 	}
+	collection := e.state.Collections[batches[0].collection]
+	if collection == nil || collection.Deleted {
+		return 0, 0, 0, fmt.Errorf("collection %s not found", batches[0].collection)
+	}
+
+	entryCount := 0
 	maxOrdinal := -1
-	for _, entry := range entries {
-		if entry != nil && int(entry.Ordinal) > maxOrdinal {
-			maxOrdinal = int(entry.Ordinal)
+	for i := range batches {
+		entryCount += batches[i].count()
+		for j := 0; j < batches[i].count(); j++ {
+			entry := batches[i].entryAt(j)
+			if entry != nil && int(entry.Ordinal) > maxOrdinal {
+				maxOrdinal = int(entry.Ordinal)
+			}
 		}
 	}
 	if maxOrdinal >= 0 {
 		ensureOrdinalCapacity(collection, maxOrdinal+1)
 	}
-	ensureRecordCapacity(collection, len(entries))
+	ensureRecordCapacity(collection, entryCount)
 
 	txID := e.nextTxIDLocked()
 	beginLSN := e.nextLSNLocked()
-	frames := make([]walRecord, len(entries)+2)
+	frames := make([]walRecord, entryCount+2)
 	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
-	prevLSN := frames[0].Header.LSN
-	for i, entry := range entries {
-		lsn := e.nextLSNLocked()
-		if i < len(encoded) && encoded[i].encoder != nil {
-			frames[i+1] = walRecord{
-				Header: walFrameHeader{
-					Magic:      chunkMagic,
-					Version:    formatVersion,
-					RecordType: recordTypeRecordPut,
-					LSN:        lsn,
-					TxID:       txID,
-					PrevLSN:    prevLSN,
-					PayloadLen: uint32(len(encoded[i].bytes)),
-					Checksum:   crc32.Checksum(encoded[i].bytes, castagnoli),
-				},
-				Payload:        encoded[i].bytes,
-				PayloadEncoder: encoded[i].encoder,
+	prevLSN := beginLSN
+	frameIndex := 1
+	for i := range batches {
+		for j := 0; j < batches[i].count(); j++ {
+			entry := batches[i].entryAt(j)
+			encoded := batches[i].encodedAt(j)
+			if encoded.encoder == nil {
+				var err error
+				encoded, err = encodeRecordPutPayloadBinary(recordPutPayload{
+					Collection: batches[i].collection,
+					ID:         entry.ID,
+					Ordinal:    entry.Ordinal,
+					Vector:     entry.Vector,
+					Metadata:   entry.Metadata,
+				})
+				if err != nil {
+					releaseWALFramePayloads(frames[:frameIndex])
+					return 0, 0, 0, err
+				}
 			}
-		} else {
-			payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
-				Collection: name,
-				ID:         entry.ID,
-				Ordinal:    entry.Ordinal,
-				Vector:     entry.Vector,
-				Metadata:   entry.Metadata,
-			})
-			if err != nil {
-				return 0, 0, 0, err
+			lsn := e.nextLSNLocked()
+			frames[frameIndex] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, encoded)
+			if batches[i].entry != nil {
+				batches[i].encodedOne = encodedPayload{}
+			} else if j < len(batches[i].encoded) {
+				batches[i].encoded[j] = encodedPayload{}
 			}
-			frames[i+1] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, payload)
+			prevLSN = lsn
+			frameIndex++
 		}
-		prevLSN = lsn
 	}
 	commitLSN := e.nextLSNLocked()
-	frames[len(frames)-1] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
+	frames[frameIndex] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
 	written, err := e.appendTransactionLocked(frames)
+	for i := range batches {
+		batches[i].encoded = nil
+	}
 	if err != nil {
 		return written, 0, 0, err
 	}
-	return written, frames[1].Header.LSN, frames[len(frames)-1].Header.LSN, nil
+	return written, frames[1].Header.LSN, commitLSN, nil
+}
+
+func releaseBatchEntryPayloads(batch *batchEntry) {
+	if batch.encodedOne.encoder != nil {
+		releaseDetachedPayload(batch.encodedOne.bytes, batch.encodedOne.encoder)
+		batch.encodedOne = encodedPayload{}
+	}
+	for i := range batch.encoded {
+		if batch.encoded[i].encoder != nil {
+			releaseDetachedPayload(batch.encoded[i].bytes, batch.encoded[i].encoder)
+			batch.encoded[i] = encodedPayload{}
+		}
+	}
 }
 
 func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (walRequestHandle, error) {
@@ -2812,28 +2881,52 @@ func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.V
 		}
 		encoded[i] = payload
 	}
-	request := e.walRequests.acquire(len(entries))
+	return e.admitBatch(batchEntry{collection: name, entries: entries, encoded: encoded}, len(entries))
+}
 
-	// Add entries to batch buffer
+func (e *Engine) putRecord(ctx context.Context, name string, entry *index.VectorEntry) (walRequestHandle, error) {
+	if e.closed.Load() {
+		return walRequestHandle{}, fmt.Errorf("database is closed")
+	}
+	select {
+	case <-ctx.Done():
+		return walRequestHandle{}, ctx.Err()
+	default:
+	}
+	encoded, err := encodeRecordPutPayloadBinary(recordPutPayload{
+		Collection: name,
+		ID:         entry.ID,
+		Ordinal:    entry.Ordinal,
+		Vector:     entry.Vector,
+		Metadata:   entry.Metadata,
+	})
+	if err != nil {
+		return walRequestHandle{}, err
+	}
+	return e.admitBatch(batchEntry{collection: name, entry: entry, encodedOne: encoded}, 1)
+}
+
+func (e *Engine) admitBatch(batch batchEntry, entryCount int) (walRequestHandle, error) {
+	request := e.walRequests.acquire(entryCount)
 	e.batchBuffer.mu.Lock()
 	if e.closed.Load() {
 		e.batchBuffer.mu.Unlock()
-		for j := 0; j < len(entries); j++ {
-			releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
+		if batch.entry != nil {
+			releaseDetachedPayload(batch.encodedOne.bytes, batch.encodedOne.encoder)
+		} else {
+			for j := range batch.encoded {
+				releaseDetachedPayload(batch.encoded[j].bytes, batch.encoded[j].encoder)
+			}
 		}
 		e.walRequests.cancel(request)
 		return walRequestHandle{}, fmt.Errorf("database is closed")
 	}
 	bufferedEntries := 0
-	for _, batch := range e.batchBuffer.entries {
-		bufferedEntries += len(batch.entries)
+	for i := range e.batchBuffer.entries {
+		bufferedEntries += e.batchBuffer.entries[i].count()
 	}
-	shouldFlush := bufferedEntries+len(entries) >= batchSize
-	e.batchBuffer.entries = append(e.batchBuffer.entries, batchEntry{
-		collection: name,
-		entries:    entries,
-		encoded:    encoded,
-	})
+	shouldFlush := bufferedEntries+entryCount >= batchSize
+	e.batchBuffer.entries = append(e.batchBuffer.entries, batch)
 	e.batchBuffer.flushNow = append(e.batchBuffer.flushNow, request)
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, 1)
 	e.batchBuffer.mu.Unlock()
@@ -3305,14 +3398,36 @@ func (c *Collection) Insert(ctx context.Context, entry *index.VectorEntry) error
 
 func (c *Collection) InsertDurable(ctx context.Context, entry *index.VectorEntry) (uint64, error) {
 	_ = ctx
-	if err := c.assignOrdinals([]*index.VectorEntry{entry}); err != nil {
+	if err := c.assignOrdinal(entry); err != nil {
 		return 0, err
 	}
-	request, err := c.engine.putRecords(ctx, c.name, []*index.VectorEntry{entry})
+	request, err := c.engine.putRecord(ctx, c.name, entry)
 	if err != nil {
 		return 0, err
 	}
 	return c.engine.waitForWALFlush(ctx, request)
+}
+
+func (c *Collection) assignOrdinal(entry *index.VectorEntry) error {
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed.Load() {
+		return fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return fmt.Errorf("collection %s not found", c.name)
+	}
+	if entry == nil {
+		return nil
+	}
+	if current := persisted.Records[entry.ID]; current != nil {
+		entry.Ordinal = current.Ordinal
+		return nil
+	}
+	n := persisted.reservedNextOrdinal.Add(1)
+	entry.Ordinal = n - 1
+	return nil
 }
 
 // InsertBatch persists multiple vector entries.

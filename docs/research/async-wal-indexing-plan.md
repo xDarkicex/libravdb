@@ -339,3 +339,34 @@ with 31.5-31.9 entries/WAL transaction, while allocations fall from 10 to 8
 per insert and bytes fall from roughly 1,100 to 958-969. Repeated graph-ready
 results average within roughly 2-3% of the checkpoint despite expected
 concurrent-topology variance. The fixed request path is retained.
+
+## Scalar WAL admission and reusable batch descriptors
+
+Single inserts previously entered the batch API through two temporary
+one-element slices: one for ordinal assignment and one for WAL admission. WAL
+flush also merged scalar batches by appending their pointers and encoded
+payload descriptors into new slices, then discarded the active batch and
+completion backing arrays after every group.
+
+The retained path gives `batchEntry` an inline scalar entry and encoded payload,
+frames contiguous collection runs directly, and swaps active/draining descriptor
+buffers. The drain owner clears references before returning both buffers for the
+next group. Vector and encoded payload bytes are never copied by the swap.
+Batch insertion retains its slice representation.
+
+Paired Apple M2 results with 32 durable writers and approximately 32 entries per
+WAL transaction:
+
+| Stage | WAL ns/op | WAL bytes/op | WAL allocs/op | Integrated bytes/op | Integrated allocs/op |
+|---|---:|---:|---:|---:|---:|
+| Fixed request checkpoint | 188k-218k | 961-976 | 5 | 960-970 | 8 |
+| Inline scalar/direct run | 188k-191k | 841-859 | 3 | 843-853 | 5 |
+| Reusable descriptor buffers | 182k-193k | 532-556 | 3 | 537-548 | 5 |
+
+Accepted async HNSW throughput remained around 6.3k writes/s and WAL occupancy
+remained 31.6-31.9 entries/transaction. Graph-ready throughput retained its
+existing scheduler/topology variance. The allocation count no longer exposes
+group-scoped descriptor allocation because benchmark reporting rounds per-op;
+the stable byte reduction and allocation profile confirm that backing-array
+growth was removed. MPSC admission remains deferred until another measured
+admission bottleneck appears.
