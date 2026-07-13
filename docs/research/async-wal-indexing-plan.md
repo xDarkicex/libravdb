@@ -216,3 +216,32 @@ The bounded queue absorbs the short durable/index rate difference, then forces
 foreground throughput to converge on graph construction once full. This is the
 intended contract: lower durable acknowledgement latency and near-32 WAL groups
 without hiding an unbounded graph backlog.
+
+## Lock-free async queue pass
+
+The original async queue used a mutex-protected ring plus capacity, worker,
+change, close, and failure channels. It was replaced by a bounded MPMC ring with:
+
+- one 64-byte off-heap slot per task;
+- a per-slot generation/sequence counter;
+- cache-line-separated atomic producer and consumer positions;
+- atomic outstanding reservations acquired before WAL admission;
+- atomic failure publication and durable/applied watermarks.
+
+The worker notification channel remains only as a parking hint. Queue
+correctness, capacity, enqueue, dequeue, backpressure, and flush observation do
+not depend on it. A pure polling version was rejected because idle/reserved WAL
+periods stole CPU from HNSW and produced severe throughput variance.
+
+Same-machine A/B (`067cf9e` mutex ring versus sequence-counter ring), Apple M2,
+768d, four index workers:
+
+| Queue | Durable acknowledgements/s | Graph-ready/s | Allocations |
+|---|---:|---:|---:|
+| Checkpoint mutex ring | 3.04k-3.70k | 1.74k-2.26k | 12/op |
+| Off-heap MPMC ring | 3.33k-3.75k | 2.61k-2.74k | 12/op |
+
+The queue change improves index-worker delivery under the same machine load but
+does not remove the remaining allocations. Those are primarily ID formatting,
+single-ID mutation bookkeeping, WAL request/completion objects, and write
+admission coordination.

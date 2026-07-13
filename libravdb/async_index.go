@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/index"
@@ -34,6 +36,19 @@ type asyncIndexTask struct {
 	_          uint32
 }
 
+// asyncIndexSlot is one cache line. Producers publish task data by advancing
+// sequence; consumers return the slot to its next ring generation the same way.
+// No Go pointer is stored in the off-heap slot.
+type asyncIndexSlot struct {
+	sequence uint64
+	task     asyncIndexTask
+	_        [40]byte
+}
+
+type asyncIndexFailure struct {
+	err error
+}
+
 type asyncIndexStorage interface {
 	storage.DurableCollection
 	GetByOrdinal(uint32) ([]float32, error)
@@ -43,31 +58,27 @@ type asyncIndexQueue struct {
 	collection *Collection
 	storage    asyncIndexStorage
 	arena      *offheap.Arena
-	tasks      []asyncIndexTask
-	tokens     chan struct{}
+	slots      []asyncIndexSlot
 	workReady  chan struct{}
-	changed    chan struct{}
-	stop       chan struct{}
-	closed     chan struct{}
-	failed     chan struct{}
+	capacity   uint64
+	workers    int
+	wg         sync.WaitGroup
 
-	mu       sync.Mutex
-	errMu    sync.Mutex
-	head     int
-	tail     int
-	count    int
-	workers  int
-	closeOne sync.Once
-	failOne  sync.Once
-	wg       sync.WaitGroup
+	enqueuePos  atomic.Uint64
+	_           [56]byte
+	dequeuePos  atomic.Uint64
+	_           [56]byte
+	outstanding atomic.Uint64
+	_           [56]byte
 
-	accepting  atomic.Bool
-	pending    atomic.Uint64
-	reserved   atomic.Uint64
-	durable    atomic.Uint64
-	applied    atomic.Uint64
-	failure    error
-	failedFlag atomic.Bool
+	accepting atomic.Bool
+	closing   atomic.Bool
+	closed    atomic.Bool
+	pending   atomic.Uint64
+	reserved  atomic.Uint64
+	durable   atomic.Uint64
+	applied   atomic.Uint64
+	failure   atomic.Pointer[asyncIndexFailure]
 }
 
 func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndexQueue, error) {
@@ -85,33 +96,29 @@ func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndex
 		return nil, fmt.Errorf("asynchronous index worker count must be positive")
 	}
 
-	taskBytes := uint64(unsafe.Sizeof(asyncIndexTask{})) * uint64(depth)
-	arena, err := offheap.NewArena(taskBytes, 64)
+	slotBytes := uint64(unsafe.Sizeof(asyncIndexSlot{})) * uint64(depth)
+	arena, err := offheap.NewArena(slotBytes, 64)
 	if err != nil {
 		return nil, fmt.Errorf("allocate asynchronous index queue: %w", err)
 	}
-	tasks, err := offheap.ArenaSlice[asyncIndexTask](arena, depth)
+	slots, err := offheap.ArenaSlice[asyncIndexSlot](arena, depth)
 	if err != nil {
 		_ = arena.Free()
-		return nil, fmt.Errorf("allocate asynchronous index task ring: %w", err)
+		return nil, fmt.Errorf("allocate asynchronous index slot ring: %w", err)
 	}
-	tasks = tasks[:depth]
+	slots = slots[:depth]
+	for i := range slots {
+		atomic.StoreUint64(&slots[i].sequence, uint64(i))
+	}
 
 	q := &asyncIndexQueue{
 		collection: collection,
 		storage:    store,
 		arena:      arena,
-		tasks:      tasks,
-		tokens:     make(chan struct{}, depth),
+		slots:      slots,
 		workReady:  make(chan struct{}, workers),
-		changed:    make(chan struct{}, 1),
-		stop:       make(chan struct{}),
-		closed:     make(chan struct{}),
-		failed:     make(chan struct{}),
+		capacity:   uint64(depth),
 		workers:    workers,
-	}
-	for i := 0; i < depth; i++ {
-		q.tokens <- struct{}{}
 	}
 	q.accepting.Store(true)
 	q.wg.Add(workers)
@@ -125,36 +132,33 @@ func (q *asyncIndexQueue) reserve(ctx context.Context, count int) error {
 	if count <= 0 {
 		return nil
 	}
-	if count > cap(q.tokens) {
-		return fmt.Errorf("asynchronous index batch of %d exceeds queue capacity %d", count, cap(q.tokens))
+	if uint64(count) > q.capacity {
+		return fmt.Errorf("asynchronous index batch of %d exceeds queue capacity %d", count, q.capacity)
 	}
 	if !q.accepting.Load() {
 		return q.currentError(errAsyncIndexerClosed)
 	}
 
-	acquired := 0
-	for acquired < count {
-		select {
-		case <-ctx.Done():
-			q.releaseTokens(acquired)
-			return ctx.Err()
-		case <-q.failed:
-			q.releaseTokens(acquired)
+	wanted := uint64(count)
+	var backoff lockFreeBackoff
+	for {
+		if !q.accepting.Load() {
 			return q.currentError(errAsyncIndexerClosed)
-		case <-q.closed:
-			q.releaseTokens(acquired)
-			return errAsyncIndexerClosed
-		case <-q.tokens:
-			acquired++
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		used := q.outstanding.Load()
+		if used <= q.capacity-wanted && q.outstanding.CompareAndSwap(used, used+wanted) {
+			q.reserved.Add(wanted)
+			if !q.accepting.Load() {
+				q.cancelReservation(count)
+				return q.currentError(errAsyncIndexerClosed)
+			}
+			return nil
+		}
+		backoff.wait()
 	}
-	if !q.accepting.Load() {
-		q.releaseTokens(acquired)
-		return q.currentError(errAsyncIndexerClosed)
-	}
-	q.reserved.Add(uint64(count))
-	q.signalChanged()
-	return nil
 }
 
 func (q *asyncIndexQueue) cancelReservation(count int) {
@@ -162,54 +166,29 @@ func (q *asyncIndexQueue) cancelReservation(count int) {
 		return
 	}
 	q.reserved.Add(^uint64(count - 1))
-	q.releaseTokens(count)
+	q.outstanding.Add(^uint64(count - 1))
 	q.advanceAppliedIfDrained()
-	q.signalChanged()
 }
 
 func (q *asyncIndexQueue) commit(entries []*index.VectorEntry, durableLSN uint64) {
 	if len(entries) == 0 {
 		return
 	}
-	q.mu.Lock()
-	for _, entry := range entries {
-		q.tasks[q.tail] = asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal}
-		q.tail++
-		if q.tail == len(q.tasks) {
-			q.tail = 0
-		}
-		q.count++
-	}
 	q.reserved.Add(^uint64(len(entries) - 1))
 	q.pending.Add(uint64(len(entries)))
 	atomicMax(&q.durable, durableLSN)
-	q.mu.Unlock()
-	for i := 0; i < min(len(entries), q.workers); i++ {
-		select {
-		case q.workReady <- struct{}{}:
-		default:
-		}
+	for _, entry := range entries {
+		q.enqueue(asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal})
 	}
-	q.signalChanged()
+	q.signalWorkers(min(len(entries), q.workers))
 }
 
 func (q *asyncIndexQueue) commitOne(entry *index.VectorEntry, durableLSN uint64) {
-	q.mu.Lock()
-	q.tasks[q.tail] = asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal}
-	q.tail++
-	if q.tail == len(q.tasks) {
-		q.tail = 0
-	}
-	q.count++
 	q.reserved.Add(^uint64(0))
 	q.pending.Add(1)
 	atomicMax(&q.durable, durableLSN)
-	q.mu.Unlock()
-	select {
-	case q.workReady <- struct{}{}:
-	default:
-	}
-	q.signalChanged()
+	q.enqueue(asyncIndexTask{durableLSN: durableLSN, ordinal: entry.Ordinal})
+	q.signalWorkers(1)
 }
 
 func (q *asyncIndexQueue) worker() {
@@ -219,27 +198,44 @@ func (q *asyncIndexQueue) worker() {
 			q.apply(task)
 			continue
 		}
-		select {
-		case <-q.workReady:
-		case <-q.stop:
+		if q.closing.Load() && q.outstanding.Load() == 0 {
 			return
 		}
+		<-q.workReady
 	}
 }
 
 func (q *asyncIndexQueue) pop() (asyncIndexTask, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.count == 0 {
-		return asyncIndexTask{}, false
+	for {
+		pos := q.dequeuePos.Load()
+		slot := &q.slots[pos%q.capacity]
+		sequence := atomic.LoadUint64(&slot.sequence)
+		delta := int64(sequence) - int64(pos+1)
+		switch {
+		case delta == 0:
+			if !q.dequeuePos.CompareAndSwap(pos, pos+1) {
+				continue
+			}
+			task := slot.task
+			atomic.StoreUint64(&slot.sequence, pos+q.capacity)
+			return task, true
+		case delta < 0:
+			return asyncIndexTask{}, false
+		default:
+			runtime.Gosched()
+		}
 	}
-	task := q.tasks[q.head]
-	q.head++
-	if q.head == len(q.tasks) {
-		q.head = 0
+}
+
+func (q *asyncIndexQueue) enqueue(task asyncIndexTask) {
+	pos := q.enqueuePos.Add(1) - 1
+	slot := &q.slots[pos%q.capacity]
+	var backoff lockFreeBackoff
+	for atomic.LoadUint64(&slot.sequence) != pos {
+		backoff.wait()
 	}
-	q.count--
-	return task, true
+	slot.task = task
+	atomic.StoreUint64(&slot.sequence, pos+1)
 }
 
 func (q *asyncIndexQueue) apply(task asyncIndexTask) {
@@ -257,37 +253,41 @@ func (q *asyncIndexQueue) apply(task asyncIndexTask) {
 	}
 
 	q.pending.Add(^uint64(0))
-	q.tokens <- struct{}{}
+	q.outstanding.Add(^uint64(0))
 	q.advanceAppliedIfDrained()
-	q.signalChanged()
 }
 
 func (q *asyncIndexQueue) flush(ctx context.Context) error {
+	var backoff lockFreeBackoff
 	for {
-		if q.pending.Load() == 0 && q.reserved.Load() == 0 {
+		if q.outstanding.Load() == 0 {
 			return q.failureValue()
 		}
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return ctx.Err()
-		case <-q.changed:
 		}
+		backoff.wait()
 	}
 }
 
 func (q *asyncIndexQueue) close() error {
-	q.closeOne.Do(func() {
+	owner := q.closing.CompareAndSwap(false, true)
+	if owner {
 		q.accepting.Store(false)
-		close(q.closed)
 		_ = q.flush(context.Background())
-		close(q.stop)
+		q.signalWorkers(q.workers)
 		q.wg.Wait()
-	})
+		q.closed.Store(true)
+	} else {
+		for !q.closed.Load() {
+			runtime.Gosched()
+		}
+	}
 	var err error
-	if q.arena != nil {
+	if owner && q.arena != nil {
 		err = q.arena.Free()
 		q.arena = nil
-		q.tasks = nil
+		q.slots = nil
 	}
 	if failure := q.failureValue(); failure != nil {
 		if err != nil {
@@ -311,8 +311,8 @@ func (q *asyncIndexQueue) stats() IndexingStats {
 		LSNLag:     lag,
 		Pending:    q.pending.Load(),
 		Reserved:   q.reserved.Load(),
-		Capacity:   cap(q.tokens),
-		Failed:     q.failedFlag.Load(),
+		Capacity:   int(q.capacity),
+		Failed:     q.failure.Load() != nil,
 	}
 }
 
@@ -320,20 +320,18 @@ func (q *asyncIndexQueue) recordFailure(err error) {
 	if err == nil {
 		return
 	}
-	q.failOne.Do(func() {
-		q.errMu.Lock()
-		q.failure = err
-		q.errMu.Unlock()
-		q.failedFlag.Store(true)
+	failure := &asyncIndexFailure{err: err}
+	if q.failure.CompareAndSwap(nil, failure) {
 		q.accepting.Store(false)
-		close(q.failed)
-	})
+	}
 }
 
 func (q *asyncIndexQueue) failureValue() error {
-	q.errMu.Lock()
-	defer q.errMu.Unlock()
-	return q.failure
+	failure := q.failure.Load()
+	if failure == nil {
+		return nil
+	}
+	return failure.err
 }
 
 func (q *asyncIndexQueue) currentError(fallback error) error {
@@ -343,23 +341,32 @@ func (q *asyncIndexQueue) currentError(fallback error) error {
 	return fallback
 }
 
-func (q *asyncIndexQueue) releaseTokens(count int) {
-	for i := 0; i < count; i++ {
-		q.tokens <- struct{}{}
-	}
-}
-
-func (q *asyncIndexQueue) signalChanged() {
-	select {
-	case q.changed <- struct{}{}:
-	default:
-	}
-}
-
 func (q *asyncIndexQueue) advanceAppliedIfDrained() {
-	if q.pending.Load() == 0 && q.reserved.Load() == 0 && !q.failedFlag.Load() {
+	if q.outstanding.Load() == 0 && q.failure.Load() == nil {
 		q.applied.Store(q.durable.Load())
 	}
+}
+
+func (q *asyncIndexQueue) signalWorkers(count int) {
+	for i := 0; i < count; i++ {
+		select {
+		case q.workReady <- struct{}{}:
+		default:
+			return
+		}
+	}
+}
+
+type lockFreeBackoff uint32
+
+func (b *lockFreeBackoff) wait() {
+	step := uint32(*b)
+	if step < 32 {
+		*b++
+		runtime.Gosched()
+		return
+	}
+	time.Sleep(25 * time.Microsecond)
 }
 
 func atomicMax(dst *atomic.Uint64, value uint64) {

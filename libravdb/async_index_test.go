@@ -36,7 +36,10 @@ func TestAsyncIndexQueueDurableLagAndDrain(t *testing.T) {
 	if got := unsafe.Sizeof(asyncIndexTask{}); got != 16 {
 		t.Fatalf("task size = %d, want 16", got)
 	}
-	if ptr := uintptr(unsafe.Pointer(unsafe.SliceData(collection.asyncIndex.tasks))); ptr&63 != 0 {
+	if got := unsafe.Sizeof(asyncIndexSlot{}); got != 64 {
+		t.Fatalf("slot size = %d, want 64", got)
+	}
+	if ptr := uintptr(unsafe.Pointer(unsafe.SliceData(collection.asyncIndex.slots))); ptr&63 != 0 {
 		t.Fatalf("off-heap task ring is not 64-byte aligned: %#x", ptr)
 	}
 
@@ -190,6 +193,67 @@ func TestAsyncIndexMutationBarrierDrainsBeforeUpdateAndDelete(t *testing.T) {
 	}
 	if got := collection.index.Size(); got != 0 {
 		t.Fatalf("index size after delete = %d, want 0", got)
+	}
+}
+
+func TestAsyncIndexLockFreeRingMultipleWraps(t *testing.T) {
+	db, err := Open(
+		WithStoragePath(testDBPath(t)),
+		WithAsyncIndexing(32, 4),
+		WithMaxConcurrentWrites(8),
+		WithMaxWriteQueueDepth(64),
+		WithDurability(DurabilityUnsafeNoSync),
+	)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	collection, err := db.CreateCollection(
+		context.Background(),
+		"wraps",
+		WithDimension(4),
+		WithMetric(L2Distance),
+		WithHNSW(4, 16, 16),
+	)
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	const total = 512
+	jobs := make(chan int, total)
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				err := collection.Insert(context.Background(), fmt.Sprintf("v-%04d", i), []float32{float32(i), 1, 0, 0}, nil)
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < total; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := collection.FlushIndex(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := collection.index.Size(); got != total {
+		t.Fatalf("index size after ring wraps = %d, want %d", got, total)
+	}
+	stats := collection.IndexingStats()
+	if stats.Pending != 0 || stats.Reserved != 0 || stats.LSNLag != 0 {
+		t.Fatalf("ring did not fully drain: %+v", stats)
 	}
 }
 
