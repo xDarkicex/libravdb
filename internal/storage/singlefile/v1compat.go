@@ -56,27 +56,17 @@ func OpenV1(path string) (*Engine, error) {
 	}
 
 	engine.fileID = header.FileID
-	meta1, err1 := engine.readMetaPage(1)
-	meta2, err2 := engine.readMetaPage(2)
-	if err1 != nil && err2 != nil {
-		engine.fail(fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2))
-		return nil, fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2)
+	chosen, err := engine.selectRecoveryCandidate()
+	if err != nil {
+		engine.fail(err)
+		return nil, err
 	}
-
-	chosen := chooseMeta(meta1, err1, meta2, err2)
-	engine.metaEpoch = chosen.MetaEpoch
-	engine.activeMetaPage = metaPageNumber(chosen)
-	engine.lastLSN = chosen.LastAppliedLSN
+	engine.metaEpoch = chosen.meta.MetaEpoch
+	engine.activeMetaPage = metaPageNumber(chosen.meta)
+	engine.lastLSN = chosen.meta.LastAppliedLSN
+	engine.state = chosen.state
 	engine.replayedTxs = 0
 	engine.discardedTxs = 0
-
-	// Phase 1: load snapshot
-	if chosen.SnapshotLength > 0 {
-		if err := engine.loadSnapshot(chosen.SnapshotOffset, chosen.SnapshotLength); err != nil {
-			engine.fail(fmt.Errorf("load snapshot: %w", err))
-			return nil, err
-		}
-	}
 
 	// SKIP loadIndexes entirely for v1compat!
 	// Phase 2: rebuild indexes from records
@@ -88,7 +78,7 @@ func OpenV1(path string) (*Engine, error) {
 
 	// Phase 3: replay WAL
 	engine.status.Store(int32(storage.StatusReplayingWAL))
-	if err := engine.replayWAL(chosen.LastAppliedLSN); err != nil {
+	if err := engine.replayWAL(chosen.meta.LastAppliedLSN); err != nil {
 		engine.fail(fmt.Errorf("replay WAL: %w", err))
 		return nil, err
 	}

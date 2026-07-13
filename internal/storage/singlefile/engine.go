@@ -123,6 +123,11 @@ type metaPage struct {
 	Checksum        uint32
 }
 
+type recoveryCandidate struct {
+	meta  *metaPage
+	state *persistedState
+}
+
 type chunkHeader struct {
 	Magic      uint32
 	Kind       uint16
@@ -535,37 +540,30 @@ func (e *Engine) openExisting() error {
 	}
 	e.fileID = header.FileID
 
-	meta1, err1 := e.readMetaPage(1)
-	meta2, err2 := e.readMetaPage(2)
-	if err1 != nil && err2 != nil {
-		e.fail(fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2))
-		return fmt.Errorf("failed to read any valid metapage: %v / %v", err1, err2)
+	chosen, err := e.selectRecoveryCandidate()
+	if err != nil {
+		e.fail(err)
+		return err
 	}
+	e.metaEpoch = chosen.meta.MetaEpoch
+	e.activeMetaPage = metaPageNumber(chosen.meta)
+	e.lastLSN = chosen.meta.LastAppliedLSN
+	e.state = chosen.state
 
-	chosen := chooseMeta(meta1, err1, meta2, err2)
-	e.metaEpoch = chosen.MetaEpoch
-	e.activeMetaPage = metaPageNumber(chosen)
-	e.lastLSN = chosen.LastAppliedLSN
-
-	// Phase 1: load snapshot
+	// Phase 1 was completed while selecting a complete recovery candidate. State
+	// is only published after the newest complete snapshot has been decoded.
 	e.status.Store(int32(storage.StatusRecoveringSnapshot))
-	if chosen.SnapshotLength > 0 {
-		if err := e.loadSnapshot(chosen.SnapshotOffset, chosen.SnapshotLength); err != nil {
-			e.fail(fmt.Errorf("load snapshot: %w", err))
-			return err
-		}
-	}
 
 	// Phase 2: load or rebuild indexes
 	e.status.Store(int32(storage.StatusRecoveringIndexes))
-	if err := e.loadIndexes(chosen); err != nil {
+	if err := e.loadIndexes(chosen.meta); err != nil {
 		e.fail(fmt.Errorf("load indexes: %w", err))
 		return err
 	}
 
 	// Phase 3: replay WAL
 	e.status.Store(int32(storage.StatusReplayingWAL))
-	if err := e.replayWAL(chosen.LastAppliedLSN); err != nil {
+	if err := e.replayWAL(chosen.meta.LastAppliedLSN); err != nil {
 		e.fail(fmt.Errorf("replay WAL: %w", err))
 		return err
 	}
@@ -698,13 +696,6 @@ func (e *Engine) rebuildCollectionIndexFromRecords(name string, collection *pers
 func (e *Engine) fail(err error) {
 	e.recoveryErr.Store(err)
 	e.status.Store(int32(storage.StatusFailed))
-}
-
-func chooseMeta(meta1 *metaPage, err1 error, meta2 *metaPage, err2 error) *metaPage {
-	if err1 == nil && (err2 != nil || meta1.MetaEpoch >= meta2.MetaEpoch) {
-		return meta1
-	}
-	return meta2
 }
 
 func metaPageNumber(meta *metaPage) uint64 {
@@ -884,23 +875,84 @@ func (e *Engine) readMetaPage(page uint64) (*metaPage, error) {
 	return meta, nil
 }
 
-func (e *Engine) loadSnapshot(offset, length uint64) error {
-	payload, err := e.readChunkAt(offset)
+func (e *Engine) selectRecoveryCandidate() (*recoveryCandidate, error) {
+	meta1, err1 := e.readMetaPage(1)
+	meta2, err2 := e.readMetaPage(2)
+	if err1 != nil && err2 != nil {
+		return nil, fmt.Errorf("failed to read any valid metapage: meta 1: %v; meta 2: %v", err1, err2)
+	}
+
+	ordered := [2]*metaPage{}
+	count := 0
+	if err1 == nil {
+		ordered[count] = meta1
+		count++
+	}
+	if err2 == nil {
+		ordered[count] = meta2
+		count++
+	}
+	if count == 2 && ordered[1].MetaEpoch > ordered[0].MetaEpoch {
+		ordered[0], ordered[1] = ordered[1], ordered[0]
+	}
+
+	var candidateErrors [2]error
+	for i := 0; i < count; i++ {
+		candidate, err := e.decodeRecoveryCandidate(ordered[i])
+		if err == nil {
+			return candidate, nil
+		}
+		candidateErrors[i] = err
+	}
+	if count == 1 {
+		return nil, fmt.Errorf("failed to read complete checkpoint from metapage %d: %w", ordered[0].PageNumber, candidateErrors[0])
+	}
+	return nil, fmt.Errorf(
+		"failed to read any complete checkpoint: metapage %d: %v; metapage %d: %v",
+		ordered[0].PageNumber,
+		candidateErrors[0],
+		ordered[1].PageNumber,
+		candidateErrors[1],
+	)
+}
+
+func (e *Engine) decodeRecoveryCandidate(meta *metaPage) (*recoveryCandidate, error) {
+	page := meta.PageNumber
+	state := &persistedState{
+		NextCollectionID: 1,
+		Collections:      make(map[string]*persistedCollection),
+	}
+	if meta.SnapshotLength == 0 {
+		if meta.SnapshotOffset != 0 {
+			return nil, fmt.Errorf("metapage %d has snapshot offset %d with zero length", page, meta.SnapshotOffset)
+		}
+		return &recoveryCandidate{meta: meta, state: state}, nil
+	}
+	if meta.SnapshotOffset < 3*pageSize {
+		return nil, fmt.Errorf("metapage %d snapshot offset %d overlaps fixed pages", page, meta.SnapshotOffset)
+	}
+	payload, err := e.readChunkAtKind(meta.SnapshotOffset, chunkTypeSnapshot)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("metapage %d snapshot: %w", page, err)
 	}
-	if uint64(len(payload)) != length {
-		return fmt.Errorf("snapshot length mismatch")
+	if uint64(len(payload)) != meta.SnapshotLength {
+		return nil, fmt.Errorf("metapage %d snapshot length %d does not match chunk length %d", page, meta.SnapshotLength, len(payload))
 	}
-	state, err := decodeStateBinary(payload)
+	state, err = decodeStateBinary(payload)
 	if err != nil {
-		return fmt.Errorf("decode snapshot: %w", err)
+		return nil, fmt.Errorf("metapage %d decode snapshot: %w", page, err)
 	}
-	e.state = state
-	return nil
+	return &recoveryCandidate{meta: meta, state: state}, nil
 }
 
 func (e *Engine) readChunkAt(offset uint64) ([]byte, error) {
+	return e.readChunkAtKind(offset, 0)
+}
+
+func (e *Engine) readChunkAtKind(offset uint64, expectedKind uint16) ([]byte, error) {
+	if offset > math.MaxInt64-16 {
+		return nil, fmt.Errorf("chunk offset %d exceeds file address range", offset)
+	}
 	headerBuf := make([]byte, 16)
 	if _, err := e.file.ReadAt(headerBuf, int64(offset)); err != nil {
 		return nil, err
@@ -909,8 +961,25 @@ func (e *Engine) readChunkAt(offset uint64) ([]byte, error) {
 	if header.Magic != chunkMagic {
 		return nil, fmt.Errorf("invalid chunk magic at offset %d", offset)
 	}
+	if expectedKind != 0 && header.Kind != expectedKind {
+		return nil, fmt.Errorf("chunk kind %d at offset %d, want %d", header.Kind, offset, expectedKind)
+	}
+	if header.Version == 0 || header.Version > formatVersion {
+		return nil, fmt.Errorf("unsupported chunk version %d at offset %d", header.Version, offset)
+	}
 	if header.PayloadLen > maxChunkSize {
 		return nil, fmt.Errorf("chunk size %d exceeds limit %d at offset %d", header.PayloadLen, maxChunkSize, offset)
+	}
+	chunkEnd := offset + 16 + uint64(header.PayloadLen)
+	if chunkEnd < offset {
+		return nil, fmt.Errorf("chunk at offset %d overflows file address range", offset)
+	}
+	stat, err := e.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() < 0 || chunkEnd > uint64(stat.Size()) {
+		return nil, fmt.Errorf("chunk at offset %d ends at %d beyond file size %d", offset, chunkEnd, stat.Size())
 	}
 	payload := make([]byte, header.PayloadLen)
 	if _, err := e.file.ReadAt(payload, int64(offset)+16); err != nil {
@@ -938,10 +1007,11 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		return err
 	}
 	offset := int64(3 * pageSize)
+	fileSize := stat.Size()
 	pending := make(map[uint64][]walRecord)
 	touchedCollections := make(map[string]struct{})
 
-	for offset+16 <= stat.Size() {
+	for fileSize >= 16 && offset >= 0 && offset <= fileSize-16 {
 		headerBuf := make([]byte, 16)
 		if _, err := e.file.ReadAt(headerBuf, offset); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -951,6 +1021,18 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		}
 		chunk := decodeChunkHeader(headerBuf)
 		if chunk.Magic != chunkMagic {
+			break
+		}
+		if chunk.PayloadLen > maxChunkSize {
+			if chunk.Kind != chunkTypeWAL {
+				break
+			}
+			return fmt.Errorf("chunk size %d exceeds limit %d during replay", chunk.PayloadLen, maxChunkSize)
+		}
+		chunkEnd := offset + 16 + int64(chunk.PayloadLen)
+		if chunkEnd < offset || chunkEnd > fileSize {
+			// A live copier or interrupted append may stop inside the final
+			// chunk. No complete commit frame exists beyond this boundary.
 			break
 		}
 
@@ -963,9 +1045,6 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 			continue
 		}
 
-		if chunk.PayloadLen > maxChunkSize {
-			return fmt.Errorf("chunk size %d exceeds limit %d during replay", chunk.PayloadLen, maxChunkSize)
-		}
 		payload := make([]byte, chunk.PayloadLen)
 		if _, err := e.file.ReadAt(payload, offset+16); err != nil {
 			return err

@@ -369,7 +369,7 @@ func TestMetapageFailoverOnCorruption(t *testing.T) {
 		file.Close()
 		t.Fatalf("read metapage: %v", err)
 	}
-	binary.LittleEndian.PutUint32(page[68:72], 0)
+	page[88] ^= 0xff // V2 metapage checksum.
 	if _, err := file.WriteAt(page, pageSize); err != nil {
 		file.Close()
 		t.Fatalf("corrupt metapage: %v", err)
@@ -389,6 +389,186 @@ func TestMetapageFailoverOnCorruption(t *testing.T) {
 	}
 	if len(names) != 1 || names[0] != "global" {
 		t.Fatalf("expected recovered collection, got %v", names)
+	}
+}
+
+func TestRecoveryFallsBackFromTruncatedNewestSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "live-source.libravdb")
+	copyPath := filepath.Join(dir, "live-copy.libravdb")
+
+	engineIface, err := New(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("records", &storage.CollectionConfig{Dimension: 2})
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	if err := collection.Insert(context.Background(), &index.VectorEntry{
+		ID: "before-checkpoint", Vector: []float32{1, 0},
+	}); err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+
+	if err := collection.Insert(context.Background(), &index.VectorEntry{
+		ID: "wal-after-older-checkpoint", Vector: []float32{0, 1},
+	}); err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+
+	meta1, err1 := engine.readMetaPage(1)
+	meta2, err2 := engine.readMetaPage(2)
+	if err1 != nil || err2 != nil {
+		engine.Close()
+		t.Fatalf("read source metapages: meta1=%v meta2=%v", err1, err2)
+	}
+	newest, older := meta1, meta2
+	if meta2.MetaEpoch > meta1.MetaEpoch {
+		newest, older = meta2, meta1
+	}
+	if newest.MetaEpoch <= older.MetaEpoch || newest.SnapshotLength < 2 {
+		engine.Close()
+		t.Fatalf("checkpoint epochs/length unsuitable for fallback test: newest=%d older=%d length=%d", newest.MetaEpoch, older.MetaEpoch, newest.SnapshotLength)
+	}
+
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(copyPath, contents, 0o600); err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	truncatedSize := int64(newest.SnapshotOffset + 16 + newest.SnapshotLength/2)
+	if err := os.Truncate(copyPath, truncatedSize); err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedIface, err := New(copyPath)
+	if err != nil {
+		t.Fatalf("open live copy with truncated newest snapshot: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+	if reopened.activeMetaPage != older.PageNumber {
+		t.Fatalf("selected metapage %d, want older complete page %d", reopened.activeMetaPage, older.PageNumber)
+	}
+
+	recovered, err := reopened.GetCollection("records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"before-checkpoint", "wal-after-older-checkpoint"} {
+		exists, err := recovered.Exists(context.Background(), id)
+		if err != nil || !exists {
+			t.Fatalf("recovered record %q: exists=%v err=%v", id, exists, err)
+		}
+	}
+}
+
+func TestRecoveryIgnoresTruncatedFinalWALFrame(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "wal-source.libravdb")
+	copyPath := filepath.Join(dir, "wal-copy.libravdb")
+
+	engineIface, err := New(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineIface.(*Engine)
+	collection, err := engine.CreateCollection("records", &storage.CollectionConfig{Dimension: 2})
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	engine.mu.Lock()
+	err = engine.checkpointLocked()
+	engine.mu.Unlock()
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+
+	for _, entry := range []*index.VectorEntry{
+		{ID: "committed-prefix", Vector: []float32{1, 0}},
+		{ID: "commit-cut-by-copy", Vector: []float32{0, 1}},
+	} {
+		if err := collection.Insert(context.Background(), entry); err != nil {
+			engine.Close()
+			t.Fatal(err)
+		}
+	}
+
+	contents, err := os.ReadFile(sourcePath)
+	if err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	lastWALOffset := -1
+	lastWALPayload := uint32(0)
+	for offset := 3 * pageSize; offset+16 <= len(contents); {
+		header := decodeChunkHeader(contents[offset : offset+16])
+		if header.Magic != chunkMagic || uint64(header.PayloadLen) > uint64(len(contents)-offset-16) {
+			break
+		}
+		if header.Kind == chunkTypeWAL {
+			lastWALOffset = offset
+			lastWALPayload = header.PayloadLen
+		}
+		offset += 16 + int(header.PayloadLen)
+	}
+	if lastWALOffset < 0 || lastWALPayload < 2 {
+		engine.Close()
+		t.Fatalf("could not locate final WAL frame: offset=%d payload=%d", lastWALOffset, lastWALPayload)
+	}
+	truncatedSize := lastWALOffset + 16 + int(lastWALPayload/2)
+	if err := os.WriteFile(copyPath, contents[:truncatedSize], 0o600); err != nil {
+		engine.Close()
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenedIface, err := New(copyPath)
+	if err != nil {
+		t.Fatalf("open copy ending inside final WAL frame: %v", err)
+	}
+	reopened := reopenedIface.(*Engine)
+	defer reopened.Close()
+	recovered, err := reopened.GetCollection("records")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := recovered.Exists(context.Background(), "committed-prefix"); err != nil || !exists {
+		t.Fatalf("complete transaction before torn tail was not recovered: exists=%v err=%v", exists, err)
+	}
+	if exists, err := recovered.Exists(context.Background(), "commit-cut-by-copy"); err != nil || exists {
+		t.Fatalf("transaction without complete copied commit became visible: exists=%v err=%v", exists, err)
 	}
 }
 
