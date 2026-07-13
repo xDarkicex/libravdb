@@ -20,6 +20,7 @@ import (
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/libravdb/internal/storage/fsdurability"
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
 )
@@ -48,6 +49,11 @@ const (
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+var (
+	replaceDatabaseFile = fsdurability.ReplaceFile
+	syncDatabaseParent  = fsdurability.SyncParent
+)
 
 const (
 	// Checkpoints are recovery accelerators, not the durability boundary.
@@ -448,6 +454,11 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 			_ = engine.walRequests.close()
 			file.Close()
 			return nil, err
+		}
+		if err := syncDatabaseParent(resolved); err != nil {
+			_ = engine.walRequests.close()
+			file.Close()
+			return nil, fmt.Errorf("sync new database directory entry: %w", err)
 		}
 		// Start background flusher only after successful initialization
 		startBatchFlusher(engine)
@@ -1781,7 +1792,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 	}
 
 	e.file = nil // Safety before rename
-	if err := os.Rename(tmpPath, e.path); err != nil {
+	if err := replaceDatabaseFile(tmpPath, e.path); err != nil {
 		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
 			e.status.Store(int32(storage.StatusFailed))
 			return fmt.Errorf("vacuum rename: %w; reopen: %w", err, ferr)
@@ -1799,6 +1810,9 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 	e.file = f
 	e.dirty = false
 	cleanup = false // Successfully swapped, defer won't remove it
+	if err := syncDatabaseParent(e.path); err != nil {
+		return fmt.Errorf("vacuum sync parent directory: %w", err)
+	}
 	return nil
 }
 
@@ -2019,6 +2033,9 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 	if err := destFile.Close(); err != nil {
 		return fmt.Errorf("backup close dest: %w", err)
 	}
+	if err := syncDatabaseParent(destPath); err != nil {
+		return fmt.Errorf("backup sync parent directory: %w", err)
+	}
 
 	cleanup = false
 	return nil
@@ -2040,6 +2057,9 @@ func (e *Engine) Drop(ctx context.Context) error {
 
 	if err := os.Remove(e.path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("drop remove: %w", err)
+	}
+	if err := syncDatabaseParent(e.path); err != nil {
+		return fmt.Errorf("drop sync parent directory: %w", err)
 	}
 
 	return nil
@@ -2241,7 +2261,7 @@ func (e *Engine) compactFileLocked() error {
 	}
 	e.file = nil
 
-	if err := os.Rename(tmpPath, e.path); err != nil {
+	if err := replaceDatabaseFile(tmpPath, e.path); err != nil {
 		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
 			e.status.Store(int32(storage.StatusFailed))
 			return fmt.Errorf("compact: rename: %w; reopen: %w", err, ferr)
@@ -2266,6 +2286,9 @@ func (e *Engine) compactFileLocked() error {
 	e.checkpoints++
 
 	ok = true
+	if err := syncDatabaseParent(e.path); err != nil {
+		return fmt.Errorf("compact: sync parent directory: %w", err)
+	}
 	return nil
 }
 

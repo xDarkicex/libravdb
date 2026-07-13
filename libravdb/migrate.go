@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/xDarkicex/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/storage/fsdurability"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
 
@@ -112,18 +113,25 @@ func Migrate(ctx context.Context, path string) error {
 	// 1. migrating → staged (mark ready)
 	// 2. path → backup (preserve original)
 	// 3. staged → path (activate)
-	if err := os.Rename(migratingPath, stagedPath); err != nil {
+	if err := replaceFileDurably(migratingPath, stagedPath); err != nil {
 		return fmt.Errorf("failed to stage migration: %w", err)
 	}
-	if err := os.Rename(path, backupPath); err != nil {
-		os.Rename(stagedPath, migratingPath)
+	if err := replaceFileDurably(path, backupPath); err != nil {
+		_ = replaceFileDurably(stagedPath, migratingPath)
 		return fmt.Errorf("failed to backup v1 database: %w", err)
 	}
-	if err := os.Rename(stagedPath, path); err != nil {
-		os.Rename(backupPath, path)
+	if err := replaceFileDurably(stagedPath, path); err != nil {
+		_ = replaceFileDurably(backupPath, path)
 		return fmt.Errorf("failed to activate migration: %w", err)
 	}
 	return nil
+}
+
+func replaceFileDurably(oldPath, newPath string) error {
+	if err := fsdurability.ReplaceFile(oldPath, newPath); err != nil {
+		return err
+	}
+	return fsdurability.SyncParent(newPath)
 }
 
 // recoverMigrate cleans up leftover files from a previous interrupted
@@ -141,7 +149,7 @@ func recoverMigrate(path string) {
 	if stagedExists && backupExists {
 		// Interrupted after backup was created but before staged→path
 		// activation completed. Finish the migration.
-		os.Rename(stagedPath, path)
+		_ = replaceFileDurably(stagedPath, path)
 		os.Remove(migratingPath)
 		return
 	}

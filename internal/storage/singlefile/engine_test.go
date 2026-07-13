@@ -1211,6 +1211,94 @@ func TestCompactEmptyEngine(t *testing.T) {
 	}
 }
 
+func TestNewSyncsParentDirectory(t *testing.T) {
+	originalSync := syncDatabaseParent
+	defer func() { syncDatabaseParent = originalSync }()
+
+	var calls int
+	syncDatabaseParent = func(string) error {
+		calls++
+		return nil
+	}
+
+	engineIface, err := New(filepath.Join(t.TempDir(), "new-publish.libravdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engineIface.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("parent directory sync calls = %d, want 1", calls)
+	}
+}
+
+func TestCompactParentSyncFailureKeepsEngineUsable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compact-sync-failure.libravdb")
+	engineIface, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineIface.(*Engine)
+
+	originalSync := syncDatabaseParent
+	defer func() { syncDatabaseParent = originalSync }()
+	syncFailure := errors.New("injected parent sync failure")
+	syncDatabaseParent = func(string) error { return syncFailure }
+	err = engine.Compact()
+	syncDatabaseParent = originalSync
+	if !errors.Is(err, syncFailure) {
+		engine.Close()
+		t.Fatalf("Compact() error = %v, want injected sync failure", err)
+	}
+	if engine.file == nil {
+		t.Fatal("engine file was left nil after completed rename and failed directory sync")
+	}
+	if engine.CompactionErrors() != 1 {
+		t.Fatalf("compaction errors = %d, want 1", engine.CompactionErrors())
+	}
+	if _, err := engine.CreateCollection("still-usable", &storage.CollectionConfig{Dimension: 2}); err != nil {
+		engine.Close()
+		t.Fatalf("engine unusable after directory sync failure: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(path)
+	if err != nil {
+		t.Fatalf("reopen after directory sync failure: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.GetCollection("still-usable"); err != nil {
+		t.Fatalf("post-failure write was not recoverable: %v", err)
+	}
+}
+
+func TestBackupParentSyncFailureRemovesDestination(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "backup-sync-source.libravdb")
+	destinationPath := filepath.Join(t.TempDir(), "backup-sync-destination.libravdb")
+	engineIface, err := New(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineIface.(*Engine)
+	defer engine.Close()
+
+	originalSync := syncDatabaseParent
+	defer func() { syncDatabaseParent = originalSync }()
+	syncFailure := errors.New("injected backup parent sync failure")
+	syncDatabaseParent = func(string) error { return syncFailure }
+	err = engine.Backup(context.Background(), destinationPath)
+	syncDatabaseParent = originalSync
+	if !errors.Is(err, syncFailure) {
+		t.Fatalf("Backup() error = %v, want injected sync failure", err)
+	}
+	if _, err := os.Stat(destinationPath); !os.IsNotExist(err) {
+		t.Fatalf("failed backup destination was retained: %v", err)
+	}
+}
+
 func TestCompactPreservesDataAndReducesFileSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "compact-data.libravdb")
 	engineIface, err := New(path)
