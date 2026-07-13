@@ -575,7 +575,9 @@ func (h *Index) readNodes(ctx context.Context, reader io.Reader) error {
 		h.nodes.Set(ordinal, node)
 		if nodeID != "" {
 			node := h.nodes.Get(ordinal)
-			h.idToIndex.Put(hashID(nodeID), node)
+			if err := h.idToIndex.PutString(nodeID, node); err != nil {
+				return fmt.Errorf("restore node ID %q: %w", nodeID, err)
+			}
 			h.ordinalToID.Set(ordinal, nodeID)
 		}
 

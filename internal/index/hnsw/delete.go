@@ -40,7 +40,7 @@ func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Nod
 		h.retireNodeStorage(nodeID, node)
 		h.globalState.Store(0)
 		if id != "" {
-			h.idToIndex.Delete(hashID(id))
+			h.idToIndex.DeleteString(id)
 		}
 		h.ordinalToID.Set(nodeID, "")
 		h.size.Store(0)
@@ -66,13 +66,13 @@ func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Nod
 
 // findNodeByID finds a node by its ID using O(1) map lookup
 func (h *Index) findNodeByID(id string) (uint32, *Node) {
-	if node, exists := h.idToIndex.Get(hashID(id)); exists {
+	if node, exists := h.idToIndex.GetString(id); exists {
 		// Wait! deleteNode requires an ordinal.
 		idx := node.Ordinal
 		if idx < uint32(h.nodes.Len()) && h.nodes.Get(idx) != nil {
 			return idx, h.nodes.Get(idx)
 		}
-		h.idToIndex.Delete(hashID(id))
+		h.idToIndex.DeleteString(id)
 	}
 	return ^uint32(0), nil
 }
@@ -472,7 +472,7 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 // removeNodeFromIndex removes a node from all index data structures
 func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
 	if id != "" {
-		h.idToIndex.Delete(hashID(id))
+		h.idToIndex.DeleteString(id)
 	}
 	h.ordinalToID.Set(nodeID, "")
 

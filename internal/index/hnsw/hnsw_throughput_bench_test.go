@@ -1349,7 +1349,7 @@ func benchmarkTruthSetsForExternalIDs(
 			if sourceOrdinal < 0 || sourceOrdinal >= len(ids) {
 				b.Fatalf("truth ordinal %d is outside ID table", sourceOrdinal)
 			}
-			node, ok := index.idToIndex.Get(hashID(ids[sourceOrdinal]))
+			node, ok := index.idToIndex.GetString(ids[sourceOrdinal])
 			if !ok || node == nil {
 				b.Fatalf("truth vector %q is missing from concurrent index", ids[sourceOrdinal])
 			}

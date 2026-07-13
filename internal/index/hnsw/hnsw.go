@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"hash/maphash"
 	"math"
 	"os"
 	"runtime"
@@ -22,22 +21,15 @@ import (
 	"github.com/xDarkicex/memory"
 )
 
-var idHasher maphash.Seed
-
-func init() {
-	idHasher = maphash.MakeSeed()
-}
-
-func hashID(id string) uint64 {
-	var h maphash.Hash
-	h.SetSeed(idHasher)
-	h.WriteString(id)
-	return h.Sum64()
-}
-
 const inFlightRegistrySize = 65536 // Power of 2 for fast modulo
 const inFlightSnapshotLimit = 2048
-const defaultIDMapCapacity = 8192
+const (
+	defaultIDMapCapacity = 8192
+	// ID keys remain stable for lock-free readers until the index closes. Keep
+	// a separate lifetime budget so table growth beyond the initial capacity
+	// does not prematurely exhaust copied-key storage.
+	defaultIDMapKeyBytes = 4 * 1024 * 1024
+)
 const defaultRepairQueueSize = 65536
 const defaultRepairBatchSize = 64
 
@@ -150,7 +142,7 @@ type Index struct {
 	provider              VectorProvider
 	quantizer             quant.Quantizer
 	rawVectorStore        RawVectorStore
-	idToIndex             *memory.TypedMap[Node]
+	idToIndex             *memory.TypedIDMap[Node]
 	globalState           atomic.Uint64 // Packs entryPoint ID (32 bits) and maxLevel (32 bits)
 	distance              util.DistanceFunc
 	vecMmap               *internalmemory.MemoryMap
@@ -207,6 +199,13 @@ func (c *Config) idMapCapacity() uint64 {
 		return uint64(c.IDMapCapacity)
 	}
 	return defaultIDMapCapacity
+}
+
+func (c *Config) idMapKeyBytes() uint64 {
+	if c.IDMapCapacity <= 0 {
+		return defaultIDMapKeyBytes
+	}
+	return uint64(c.IDMapCapacity) * 64
 }
 
 func (c *Config) level0LinkMultiplier() float64 {
@@ -300,7 +299,11 @@ func NewHNSW(config *Config) (*Index, error) {
 		},
 	}
 
-	idToIndexMap, err := memory.NewTypedMap[Node](memory.HashMapConfig{Capacity: config.idMapCapacity(), Alignment: 128})
+	idToIndexMap, err := memory.NewTypedIDMap[Node](memory.IDMapConfig{
+		Capacity:  config.idMapCapacity(),
+		KeyBytes:  config.idMapKeyBytes(),
+		Alignment: 128,
+	})
 	if err != nil {
 		linkSFL.Free()
 		link0SFL.Free()
@@ -309,6 +312,7 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 	registryPool, err := newSegmentedArrayPool()
 	if err != nil {
+		_ = idToIndexMap.Free()
 		linkSFL.Free()
 		link0SFL.Free()
 		nodeSFL.Free()
@@ -316,6 +320,7 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 	nodes, err := newSegmentedNodeArrayWithPool(registryPool)
 	if err != nil {
+		_ = idToIndexMap.Free()
 		registryPool.Free()
 		linkSFL.Free()
 		link0SFL.Free()
@@ -324,6 +329,7 @@ func NewHNSW(config *Config) (*Index, error) {
 	}
 	ordinalToID, err := newSegmentedStringArrayWithPool(registryPool)
 	if err != nil {
+		_ = idToIndexMap.Free()
 		registryPool.Free()
 		linkSFL.Free()
 		link0SFL.Free()
@@ -360,10 +366,12 @@ func NewHNSW(config *Config) (*Index, error) {
 	case RawVectorStoreSlabby:
 		store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
 		if err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("failed to create slabby raw vector store: %w", err)
 		}
 		index.rawVectorStore = store
 	default:
+		_ = index.Close()
 		return nil, fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
 	}
 
@@ -371,6 +379,7 @@ func NewHNSW(config *Config) (*Index, error) {
 	if config.Quantization != nil {
 		quantizer, err := quant.Create(config.Quantization)
 		if err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("failed to create quantizer: %w", err)
 		}
 		index.quantizer = quantizer
@@ -395,9 +404,11 @@ func NewHNSW(config *Config) (*Index, error) {
 	for _, allocator := range allocators {
 		slot, err := allocator.value.Allocate()
 		if err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("prewarm %s allocator: %w", allocator.name, err)
 		}
 		if err := allocator.value.Deallocate(slot); err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("return prewarmed %s slot: %w", allocator.name, err)
 		}
 	}
@@ -451,7 +462,7 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		// Rollback registration on failure (no locks needed, nodes handles concurrent nil sets safely)
 		h.nodes.Set(node.Ordinal, nil)
 		if entry.ID != "" {
-			h.idToIndex.Delete(hashID(entry.ID))
+			h.idToIndex.DeleteString(entry.ID)
 			h.ordinalToID.Set(node.Ordinal, "")
 		}
 		h.size.Add(-1)
@@ -473,11 +484,6 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 	}
 	if len(entry.Vector) != h.config.Dimension {
 		return nil, fmt.Errorf("vector dimension mismatch: expected %d, got %d", h.config.Dimension, len(entry.Vector))
-	}
-
-	var idHash uint64
-	if entry.ID != "" {
-		idHash = hashID(entry.ID)
 	}
 
 	// Handle quantization training collection
@@ -550,7 +556,17 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 	nodeID := node.Ordinal
 
 	if entry.ID != "" {
-		if _, inserted := h.idToIndex.PutIfAbsent(idHash, node); !inserted {
+		if _, inserted, err := h.idToIndex.PutStringIfAbsent(entry.ID, node); err != nil {
+			if h.rawVectorStore != nil && node.Slot != SentinelNodeID {
+				_ = h.rawVectorStore.Delete(VectorRef{
+					Kind:  VectorEncodingRaw,
+					Slot:  node.Slot,
+					Bytes: uint32(h.config.Dimension * 4),
+					Valid: true,
+				})
+			}
+			return nil, fmt.Errorf("register vector ID %s: %w", entry.ID, err)
+		} else if !inserted {
 			if h.rawVectorStore != nil && node.Slot != SentinelNodeID {
 				_ = h.rawVectorStore.Delete(VectorRef{
 					Kind:  VectorEncodingRaw,
@@ -1244,11 +1260,14 @@ func (h *Index) Close() error {
 		h.registryPool.Free()
 		h.registryPool = nil
 	}
+	if h.idToIndex != nil {
+		_ = h.idToIndex.Free()
+		h.idToIndex = nil
+	}
 
 	h.nodes = nil
 	h.size.Store(0)
 	h.nextOrdinal.Store(0)
-	h.idToIndex = nil
 	if h.rawVectorStore != nil {
 		_ = h.rawVectorStore.Close()
 	}
@@ -1307,6 +1326,9 @@ func (c *Config) validate() error {
 	}
 	if c.IDMapCapacity < 0 {
 		return fmt.Errorf("IDMapCapacity must be non-negative")
+	}
+	if c.IDMapCapacity > maxNodeCapacity {
+		return fmt.Errorf("IDMapCapacity must not exceed %d", maxNodeCapacity)
 	}
 	if c.PruneAlpha > 0 && c.PruneAlpha < 1 {
 		return fmt.Errorf("PruneAlpha must be >= 1 when set")

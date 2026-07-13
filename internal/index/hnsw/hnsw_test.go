@@ -7,18 +7,37 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 func TestAppendUniqueLinkPreventsDuplicates(t *testing.T) {
+	arena, err := memory.NewArena(4096, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer arena.Free()
+
+	const baseM = 8
+	capacity := linkArrayCapacity(baseM, 0)
+	data, err := arena.Alloc(uint64(capacity) * uint64(unsafe.Sizeof(uint32(0))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := unsafe.Slice((*uint32)(data), capacity)
+	for i := range links {
+		links[i] = SentinelNodeID
+	}
+	links[0], links[1] = 1, 2
+
 	node := &Node{}
-	links := []uint32{1, 2, SentinelNodeID, SentinelNodeID, SentinelNodeID, SentinelNodeID, SentinelNodeID, SentinelNodeID}
 	node.Links[0] = &links[0]
 	atomic.StoreUint32(&node.LinkCounts[0], 2)
 
-	idx := &Index{config: &Config{M: 8}}
-	if added := idx.appendUniqueLink(node, 8, 0, 2); added {
+	idx := &Index{config: &Config{M: baseM}}
+	if added := idx.appendUniqueLink(node, baseM, 0, 2); added {
 		t.Fatal("expected duplicate link append to be skipped")
 	}
 
@@ -26,12 +45,37 @@ func TestAppendUniqueLinkPreventsDuplicates(t *testing.T) {
 		t.Errorf("Expected 2 links, got %d", count)
 	}
 
-	if added := idx.appendUniqueLink(node, 8, 0, 3); !added {
+	if added := idx.appendUniqueLink(node, baseM, 0, 3); !added {
 		t.Fatal("expected unique link to be appended")
 	}
 
 	if count := len(idx.getNodeLinks(node, 0)); count != 3 {
 		t.Errorf("Expected 3 links after duplicate append, got %d", count)
+	}
+}
+
+func TestIDMapSizingSupportsGrowthBeyondInitialCapacity(t *testing.T) {
+	config := &Config{}
+	if got := config.idMapCapacity(); got != defaultIDMapCapacity {
+		t.Fatalf("default ID map capacity = %d, want %d", got, defaultIDMapCapacity)
+	}
+	if got := config.idMapKeyBytes(); got != defaultIDMapKeyBytes {
+		t.Fatalf("default ID key bytes = %d, want %d", got, defaultIDMapKeyBytes)
+	}
+
+	config.IDMapCapacity = 50_000
+	if got, want := config.idMapKeyBytes(), uint64(50_000*64); got != want {
+		t.Fatalf("configured ID key bytes = %d, want %d", got, want)
+	}
+
+	config.Dimension = 4
+	config.M = 4
+	config.EfConstruction = 8
+	config.EfSearch = 8
+	config.Metric = util.L2Distance
+	config.IDMapCapacity = maxNodeCapacity + 1
+	if err := config.validate(); err == nil {
+		t.Fatal("ID map capacity beyond the node registry limit was accepted")
 	}
 }
 

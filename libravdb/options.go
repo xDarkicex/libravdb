@@ -160,7 +160,7 @@ func WithRawVectorStoreSlabby(segmentCapacity int) CollectionOption {
 }
 
 // WithIDMapCapacity pre-sizes the HNSW external-ID map for the expected
-// collection cardinality. Larger values reduce hashmap resize churn and cold
+// collection cardinality. Larger values reduce ID-map resize churn and cold
 // mmap page faults during high-throughput inserts with user-provided IDs.
 func WithIDMapCapacity(capacity int) CollectionOption {
 	return func(c *CollectionConfig) error {

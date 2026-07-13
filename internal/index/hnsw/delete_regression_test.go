@@ -82,12 +82,12 @@ func TestDeleteRepairsAsymmetricIncomingLinksBeforePrune(t *testing.T) {
 		}
 	}
 
-	node0, _ := index.idToIndex.Get(hashID("vec_0"))
-	node1, _ := index.idToIndex.Get(hashID("vec_1"))
+	node0, _ := index.idToIndex.GetString("vec_0")
+	node1, _ := index.idToIndex.GetString("vec_1")
 	var staleLinks [7]uint32
 	staleLen := 0
 	for i := 1; i < 8; i++ {
-		nodeI, _ := index.idToIndex.Get(hashID(fmt.Sprintf("vec_%d", i)))
+		nodeI, _ := index.idToIndex.GetString(fmt.Sprintf("vec_%d", i))
 		staleLinks[staleLen] = nodeI.Ordinal
 		staleLen++
 	}
