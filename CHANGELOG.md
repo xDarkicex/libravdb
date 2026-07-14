@@ -1,6 +1,41 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+## [v1.3.0] / Go v1.3.0 — 2026-07-14
+
+This release focuses on high-throughput off-heap HNSW execution, durable asynchronous indexing, and recovery hardening. The scope below is based on the `v1.2.19..v1.3.0` source diff.
+
+### HNSW Performance and Memory
+
+- Added cross-platform amd64 and arm64 SIMD distance paths, including Avo-generated assembly, batched distance kernels, prefetch support, and architecture-specific implementations.
+- Reworked HNSW search and construction scratch around off-heap, zero-allocation hot paths with SoA candidate storage, batched admission, tighter beam behavior, and level-zero quality tuning.
+- Added semantic Nomic 768-dimensional benchmark coverage with graph-ready throughput, recall, and p50/p99 search-latency measurements.
+- Added shared epoch reclamation and bounded off-heap retire queues for nodes, links, and raw vectors, enabling safe concurrent delete, reinsert, and vector-slot reuse without retaining stale pointers.
+- Hardened provider-backed vector ownership, rollback cleanup, and the off-heap ordinal/ID registry.
+
+### Durable Async Indexing and WAL
+
+- Added bounded asynchronous HNSW indexing with a lock-free off-heap MPMC queue, durable/apply LSN tracking, lag metrics, bounded admission, and batched graph application.
+- Moved WAL completion/request descriptors off heap and reduced per-entry and batch descriptor allocations.
+- Added precise persisted index-applied frontiers and incremental index-delta replay from the persisted recovery frontier.
+- Hardened durable file publication, checkpoint recovery from live complete copies, and storage migration/replay error paths.
+
+### Quantization and Indexing
+
+- Added and documented scalar/FSQ quantization modes and their compatibility/error handling.
+- Improved Flat, HNSW, and IVF-PQ integration, filtering, persistence, and quantized search support.
+
+### API, Testing, and CI
+
+- Added bounded database iteration and expanded durable collection/range APIs used by asynchronous indexing.
+- Added coverage for HNSW quality and throughput, WAL durability, recovery, reclamation, SIMD parity, vector ownership, and concurrent operations.
+- Updated cross-platform CI and lint coverage for the new SIMD paths.
+- Removed obsolete competitive-features planning artifacts.
+
+### Reference Benchmarks
+
+On the 50k-vector, 768-dimensional Nomic semantic fixture, the documented reference runs reached 2,946–3,408 graph-ready inserts/s with M=16 and four workers, while M=36 reached 1,000 recall serially at 628 inserts/s. Durable async indexing sustained approximately 4,000–4,400 durable acknowledgements/s and 3,330–3,610 graph-ready inserts/s; large 256-entry WAL batches reached approximately 49k vectors/s. These figures are workload- and hardware-specific and are included as regression baselines, not universal guarantees.
+
 ## [v2.1.3] / Go v1.2.13 — 2026-06-30
 
 ### Collection API
