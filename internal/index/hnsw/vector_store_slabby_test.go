@@ -66,6 +66,29 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSlabbyRawVectorStoreReusesReleasedLogicalSlot(t *testing.T) {
+	store, err := NewSlabbyRawVectorStore(4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.Put([]float32{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.release(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Put([]float32{5, 6, 7, 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Slot != first.Slot {
+		t.Fatalf("released logical slot was not reused: got %d want %d", second.Slot, first.Slot)
+	}
+}
+
 func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 	config := &Config{
 		Dimension:      16,

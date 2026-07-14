@@ -95,6 +95,25 @@ func TestGlobalStateStoresZeroOrdinalZeroLevelEntryPoint(t *testing.T) {
 	}
 }
 
+func TestInitializeEntryPointCASDoesNotReplaceExistingEntry(t *testing.T) {
+	idx := &Index{nodes: newSegmentedNodeArray()}
+	defer idx.nodes.Close()
+	first := &Node{Ordinal: 0, Level: 0}
+	higher := &Node{Ordinal: 1, Level: 4}
+	idx.nodes.Set(first.Ordinal, first)
+	idx.nodes.Set(higher.Ordinal, higher)
+
+	if !idx.initializeEntryPointCAS(first) {
+		t.Fatal("first node did not initialize the entry point")
+	}
+	if idx.initializeEntryPointCAS(higher) {
+		t.Fatal("empty-state initialization replaced an existing entry point")
+	}
+	if got := idx.getEntryPoint(); got != first {
+		t.Fatalf("entry point = %p, want first node %p", got, first)
+	}
+}
+
 func TestGenerateLevelUsesExponentialDistribution(t *testing.T) {
 	config := &Config{
 		Dimension:      4,

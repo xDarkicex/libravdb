@@ -653,6 +653,9 @@ func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *s
 		}
 	}
 	h.prepareSearchScratch(scratch, nodeCount, ef)
+	if h.reclamation != nil {
+		h.reclamation.enter(scratch.slot)
+	}
 	return scratch
 }
 
@@ -780,6 +783,9 @@ func searchHeapCaps(nodeCount int, ef int) (int, int) {
 }
 
 func (h *Index) releaseSearchScratch(scratch *searchScratch) {
+	if h.reclamation != nil {
+		h.reclamation.leave(scratch.slot)
+	}
 	// Arena.Reset() rewinds the bump pointer, keeping the mmap'd region
 	// so the next acquireSearchScratch can reuse it without a new mmap.
 	scratch.arena.Reset()

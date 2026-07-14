@@ -9,6 +9,9 @@ import (
 
 // insertNode implements the optimized HNSW insertion algorithm
 func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searchVector []float32) error {
+	scratch := h.acquireSearchScratchWithEF(h.config.EfConstruction)
+	defer h.releaseSearchScratch(scratch)
+
 	// Handle the second node (simple connection to entry point)
 	if h.size.Load() == 1 {
 		entryID := h.findNodeID(h.getEntryPoint())
@@ -60,9 +63,6 @@ func (h *Index) insertNode(ctx context.Context, node *Node, nodeID uint32, searc
 	// Phase 2: From node.Level down to 0, search with efConstruction and connect.
 	// Keep one scratch context for the whole insertion so we can reuse the
 	// working-set buffers across levels.
-	scratch := h.acquireSearchScratchWithEF(h.config.EfConstruction)
-	defer h.releaseSearchScratch(scratch)
-
 	currentNode := h.pickEntryNodeValues(entryPoints)
 	startLevel := min(node.Level, maxLevel)
 	for level := startLevel; level >= 0; level-- {

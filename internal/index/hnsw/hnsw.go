@@ -170,6 +170,7 @@ type Index struct {
 	nextOrdinal           atomic.Uint32
 	quantizationTrained   atomic.Bool
 	repairOverflow        atomic.Bool
+	reclamation           *reclamationDomain
 	memoryMapped          bool
 }
 
@@ -336,6 +337,15 @@ func NewHNSW(config *Config) (*Index, error) {
 		nodeSFL.Free()
 		return nil, fmt.Errorf("failed to create off-heap ordinal registry: %w", err)
 	}
+	reclamation, err := newReclamationDomain(config.RawStoreCap)
+	if err != nil {
+		_ = idToIndexMap.Free()
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, err
+	}
 
 	index := &Index{
 		config:                config,
@@ -353,6 +363,7 @@ func NewHNSW(config *Config) (*Index, error) {
 		registryPool:          registryPool,
 		inFlightNodes:         inFlight,
 		scratchPool:           scratchPool,
+		reclamation:           reclamation,
 	}
 	if repairQueueSize := config.repairQueueSize(); repairQueueSize > 0 {
 		index.repairCh = make(chan uint32, repairQueueSize)
@@ -434,6 +445,9 @@ func NewHNSW(config *Config) (*Index, error) {
 }
 
 func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
 	// 1. Metadata Setup (Write Lock)
 	// 1. Lock-Free Metadata Allocation (slices protected by metaMu)
 	node, err := h.insertSingleMetadata(ctx, entry)
@@ -459,8 +473,10 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	}
 
 	if err != nil {
-		// Rollback registration on failure (no locks needed, nodes handles concurrent nil sets safely)
-		h.nodes.Set(node.Ordinal, nil)
+		// Unpublish before releasing owned vector and link storage. The node slot
+		// itself remains retired until epoch reclamation is available for readers
+		// that may already have captured its address.
+		h.retireNodeStorage(node.Ordinal, node)
 		if entry.ID != "" {
 			h.idToIndex.DeleteString(entry.ID)
 			h.ordinalToID.Set(node.Ordinal, "")
@@ -469,6 +485,9 @@ func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	} else {
 		// Update entry point atomically if necessary
 		h.updateEntryPointCAS(node)
+	}
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
 	}
 
 	return err
@@ -534,6 +553,7 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 	if h.rawVectorStore != nil {
 		ref, err := h.rawVectorStore.Put(entry.Vector)
 		if err != nil {
+			h.releaseUnpublishedNode(node)
 			return nil, fmt.Errorf("failed to store raw vector: %w", err)
 		}
 		node.Slot = ref.Slot
@@ -548,6 +568,7 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 	if h.quantizer != nil && h.quantizationTrained.Load() {
 		compressed, err := h.quantizer.Compress(entry.Vector)
 		if err != nil {
+			h.releaseUnpublishedNode(node)
 			return nil, fmt.Errorf("failed to compress vector: %w", err)
 		}
 		node.CompressedVector = compressed
@@ -557,24 +578,10 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 
 	if entry.ID != "" {
 		if _, inserted, err := h.idToIndex.PutStringIfAbsent(entry.ID, node); err != nil {
-			if h.rawVectorStore != nil && node.Slot != SentinelNodeID {
-				_ = h.rawVectorStore.Delete(VectorRef{
-					Kind:  VectorEncodingRaw,
-					Slot:  node.Slot,
-					Bytes: uint32(h.config.Dimension * 4),
-					Valid: true,
-				})
-			}
+			h.releaseUnpublishedNode(node)
 			return nil, fmt.Errorf("register vector ID %s: %w", entry.ID, err)
 		} else if !inserted {
-			if h.rawVectorStore != nil && node.Slot != SentinelNodeID {
-				_ = h.rawVectorStore.Delete(VectorRef{
-					Kind:  VectorEncodingRaw,
-					Slot:  node.Slot,
-					Bytes: uint32(h.config.Dimension * 4),
-					Valid: true,
-				})
-			}
+			h.releaseUnpublishedNode(node)
 			return nil, fmt.Errorf("vector with ID %s already exists", entry.ID)
 		}
 	}
@@ -587,12 +594,11 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 
 	// No entry point candidate list needed anymore, we fall back to O(N) scan.
 
-	// Try to become the first node
-	if h.getEntryPoint() == nil {
-		if h.updateEntryPointCAS(node) {
-			h.size.Add(1)
-			return nil, nil
-		}
+	// Only the node that changes the empty state from zero may skip graph
+	// insertion. A higher-level concurrent node must still connect normally.
+	if h.initializeEntryPointCAS(node) {
+		h.size.Add(1)
+		return nil, nil
 	}
 
 	h.size.Add(1)
@@ -922,6 +928,13 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 		return nil, fmt.Errorf("query dimension %d does not match index dimension %d",
 			len(query), h.config.Dimension)
 	}
+	qualityFloor := h.config.EfConstruction * 2
+	ef := max(h.config.EfSearch, k, qualityFloor)
+	if h.quantizer != nil {
+		ef = max(ef, min(int(h.size.Load()), h.config.EfConstruction*2))
+	}
+	scratch := h.acquireSearchScratchWithEF(ef)
+	defer h.releaseSearchScratch(scratch)
 
 	size := int(h.size.Load())
 	exactCutoff := max(h.config.EfConstruction*2, h.config.EfSearch, k)
@@ -950,14 +963,6 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	// produce unacceptable tail recall even when the graph topology is sound,
 	// so keep a degree/construction-aware floor while still honoring larger
 	// caller-specified beams.
-	qualityFloor := h.config.EfConstruction * 2
-	ef := max(h.config.EfSearch, k, qualityFloor)
-	if h.quantizer != nil {
-		ef = max(ef, min(int(h.size.Load()), h.config.EfConstruction*2))
-	}
-	scratch := h.acquireSearchScratchWithEF(ef)
-	defer h.releaseSearchScratch(scratch)
-
 	candidates, err := h.searchLevelValuesWithScratch(ctx, query, ep, ef, 0, true, scratch, queryState, filter)
 	if err != nil {
 		return nil, err
@@ -1134,6 +1139,8 @@ func (h *Index) Size() int {
 
 // MemoryUsage returns approximate memory usage in bytes
 func (h *Index) MemoryUsage() int64 {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	return h.calculateMemoryUsage()
 }
 
@@ -1224,6 +1231,9 @@ func (h *Index) Close() error {
 	h.stopRepairWorker()
 	h.setEntryPoint(nil)
 	h.searchScratchFree.Store(0)
+	if h.reclamation != nil {
+		h.reclamation.drain(h)
+	}
 	for i := range h.searchScratches {
 		if arena := h.searchScratches[i].arena; arena != nil {
 			_ = arena.Free()
@@ -1270,6 +1280,10 @@ func (h *Index) Close() error {
 	h.nextOrdinal.Store(0)
 	if h.rawVectorStore != nil {
 		_ = h.rawVectorStore.Close()
+	}
+	if h.reclamation != nil {
+		h.reclamation.close()
+		h.reclamation = nil
 	}
 	if h.quantizer != nil {
 		h.quantizer.Close()
@@ -1489,12 +1503,25 @@ func (h *Index) refreshNodeVectorViewsFromRawStore(slotByOrdinal bool) {
 // back into the provider. Must be called before SerializeToBytes when a
 // provider is set and the caller cannot re-enter the provider.
 func (h *Index) SnapshotVectorsFromProvider(ctx context.Context) error {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	if h.provider == nil {
 		return nil
 	}
 	if h.rawVectorStore == nil {
-		h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
+		switch h.config.RawVectorStore {
+		case "", RawVectorStoreMemory:
+			h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
+		case RawVectorStoreSlabby:
+			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
+			if err != nil {
+				return err
+			}
+			h.rawVectorStore = store
+		default:
+			return fmt.Errorf("unsupported raw vector store backend: %s", h.config.RawVectorStore)
+		}
 	}
 
 	for i := 0; i < h.nodes.Len(); i++ {
@@ -1576,11 +1603,29 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 }
 
 func (h *Index) Delete(ctx context.Context, id string) error {
-	return h.deleteNode(ctx, id)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	scratch := h.acquireSearchScratch()
+	err := h.deleteNode(ctx, id)
+	h.releaseSearchScratch(scratch)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	return err
 }
 
 func (h *Index) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
-	return h.deleteNodeByOrdinal(ctx, ordinal)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	scratch := h.acquireSearchScratch()
+	err := h.deleteNodeByOrdinal(ctx, ordinal)
+	h.releaseSearchScratch(scratch)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	return err
 }
 
 // MemoryMappable interface implementation
@@ -1594,12 +1639,13 @@ func (h *Index) CanMemoryMap() bool {
 
 // EstimateSize returns the estimated size in bytes if memory mapped
 func (h *Index) EstimateSize() int64 {
-
-	return h.calculateMemoryUsage()
+	return h.MemoryUsage()
 }
 
 // EnableMemoryMapping enables memory mapping for the index
 func (h *Index) EnableMemoryMapping(basePath string) error {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	if h.memoryMapped {
 		return fmt.Errorf("index is already memory mapped")
@@ -1727,6 +1773,8 @@ func (h *Index) MemoryMappedSize() int64 {
 
 // SaveToDisk persists the HNSW index to disk in binary format
 func (h *Index) SaveToDisk(ctx context.Context, path string) error {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	return h.saveToDiskImpl(ctx, path)
 }
 
@@ -1738,6 +1786,8 @@ func (h *Index) LoadFromDisk(ctx context.Context, path string) error {
 // SerializeToBytes serializes the index to an in-memory byte slice using the
 // same binary format as SaveToDisk.
 func (h *Index) SerializeToBytes() ([]byte, error) {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
@@ -1885,6 +1935,73 @@ func (h *Index) freeNodeLinks(node *Node) {
 		node.Backlinks[i] = nil
 		atomic.StoreUint32(&node.BacklinkCounts[i], 0)
 	}
+}
+
+func (h *Index) retireNodeLinksAt(node *Node, epoch uint64) {
+	if node == nil {
+		return
+	}
+	for level, ptr := range node.Links {
+		if ptr == nil || level == 0 && isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			continue
+		}
+		kind := retiredUpperLink
+		if level == 0 {
+			kind = retiredLevel0Link
+		}
+		base := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
+		h.retireAllocationAt(epoch, kind, base)
+	}
+	for level, ptr := range node.Backlinks {
+		if ptr == nil || level == 0 && isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			continue
+		}
+		kind := retiredUpperLink
+		if level == 0 {
+			kind = retiredLevel0Link
+		}
+		base := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
+		h.retireAllocationAt(epoch, kind, base)
+	}
+}
+
+// releaseUnpublishedNode returns allocations that were never made reachable
+// through the node registry. No epoch delay is required for these slots.
+func (h *Index) releaseUnpublishedNode(node *Node) {
+	if node == nil {
+		return
+	}
+	h.releaseUnpublishedVector(node)
+	h.freeNodeLinks(node)
+	node.CompressedVector = nil
+	node.setVector(nil)
+	if h.nodeSFL == nil {
+		return
+	}
+	base := unsafe.Pointer(uintptr(unsafe.Pointer(node)) - SFLMetadataOverhead)
+	slotSize := int(uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(h.config.M))
+	_ = h.nodeSFL.Deallocate(unsafe.Slice((*byte)(base), slotSize))
+}
+
+func (h *Index) releaseUnpublishedVector(node *Node) {
+	if node == nil || h.provider != nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
+		return
+	}
+	ref := VectorRef{
+		Kind:  VectorEncodingRaw,
+		Slot:  node.Slot,
+		Bytes: uint32(h.config.Dimension * 4),
+		Valid: true,
+	}
+	switch store := h.rawVectorStore.(type) {
+	case *InMemoryRawVectorStore:
+		_ = store.release(ref)
+	case *SlabbyRawVectorStore:
+		_ = store.release(ref)
+	default:
+		_ = h.rawVectorStore.Delete(ref)
+	}
+	node.setVector(nil)
 }
 
 func (h *Index) freeLinkArray(level int, ptr *uint32) {

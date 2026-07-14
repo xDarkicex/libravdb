@@ -39,6 +39,16 @@ func (h *Index) setEntryPoint(node *Node) {
 	h.globalState.Store(packGlobalState(node))
 }
 
+// initializeEntryPointCAS publishes node only when the graph is still empty.
+// Unlike updateEntryPointCAS, it never replaces an existing lower-level entry
+// point, so only the actual first node may skip graph insertion.
+func (h *Index) initializeEntryPointCAS(node *Node) bool {
+	if node == nil {
+		return false
+	}
+	return h.globalState.CompareAndSwap(0, packGlobalState(node))
+}
+
 // updateEntryPointCAS attempts to update the global entry point using CompareAndSwap.
 // It succeeds only if the node's level is strictly greater than the current max level.
 // If the global state is empty (0), it will also succeed to set the first entry point.

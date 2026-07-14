@@ -1,6 +1,7 @@
 package util
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -39,5 +40,24 @@ func TestCosineDistance_ZeroVectorUsesNormalizedDotContract(t *testing.T) {
 		if d != 1 {
 			t.Errorf("zero vector pair %v: want normalized-dot distance 1, got %v", pair, d)
 		}
+	}
+}
+
+func TestDistanceFunctionsRejectMismatchedDimensions(t *testing.T) {
+	metrics := []DistanceMetric{L2Distance, InnerProduct, CosineDistance}
+	for _, metric := range metrics {
+		metric := metric
+		t.Run(fmt.Sprint(metric), func(t *testing.T) {
+			distance, err := GetDistanceFunc(metric)
+			if err != nil {
+				t.Fatalf("GetDistanceFunc: %v", err)
+			}
+			defer func() {
+				if recover() == nil {
+					t.Fatal("mismatched dimensions did not panic")
+				}
+			}()
+			distance([]float32{1, 2, 3, 4}, []float32{1})
+		})
 	}
 }

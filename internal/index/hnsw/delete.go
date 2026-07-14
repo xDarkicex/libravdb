@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"slices"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
@@ -440,8 +441,8 @@ func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int
 
 // handleEntryPointReplacement handles the case where the deleted node is the entry point
 func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node) error {
-	// Only need to replace
-	if h.getEntryPoint() == nil {
+	entryPoint := h.getEntryPoint()
+	if entryPoint == nil || entryPoint.Ordinal != deletedID {
 		return nil
 	}
 
@@ -497,24 +498,37 @@ func (h *Index) retireNodeStorage(nodeID uint32, node *Node) {
 	for !h.acquirePruneLock(node) {
 		runtime.Gosched()
 	}
-	h.deleteStoredVector(node)
-	h.freeNodeLinks(node)
-	node.CompressedVector = nil
-	node.setVector(nil)
+	epoch := h.reclamation.nextRetireEpoch()
+	h.retireStoredVectorAt(node, epoch)
+	h.retireNodeLinksAt(node, epoch)
 	h.releasePruneLock(node)
+	base := unsafe.Pointer(uintptr(unsafe.Pointer(node)) - SFLMetadataOverhead)
+	h.retireAllocationAt(epoch, retiredNode, base)
 }
 
-func (h *Index) deleteStoredVector(node *Node) {
+func (h *Index) retireStoredVectorAt(node *Node, epoch uint64) {
 	if node == nil || h.provider != nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
 		return
 	}
-	_ = h.rawVectorStore.Delete(VectorRef{
+	ref := VectorRef{
 		Kind:  VectorEncodingRaw,
 		Slot:  node.Slot,
 		Bytes: uint32(h.config.Dimension * 4),
 		Valid: true,
-	})
-	node.setVector(nil)
+	}
+	switch store := h.rawVectorStore.(type) {
+	case *InMemoryRawVectorStore:
+		if ptr := store.detachPointer(ref); ptr != nil {
+			h.retireRawVectorAt(epoch, ptr, ref.Slot)
+		}
+		return
+	case *SlabbyRawVectorStore:
+		if ptr := store.detachPointer(ref); ptr != nil {
+			h.retireRawVectorAt(epoch, ptr, ref.Slot)
+		}
+		return
+	}
+	_ = h.rawVectorStore.Delete(ref)
 }
 
 func appendUniqueIDs(dst []uint32, ids ...uint32) []uint32 {

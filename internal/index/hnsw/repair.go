@@ -105,6 +105,7 @@ func (h *Index) FlushRepairs(limit int) int {
 			h.repairNode(nodeID)
 			processed++
 		default:
+			h.repairOverflow.Store(false)
 			remaining := 0
 			if limit > 0 {
 				remaining = limit - processed
@@ -112,7 +113,9 @@ func (h *Index) FlushRepairs(limit int) int {
 			scanned := h.scanDirtyRepairs(remaining)
 			processed += scanned
 			if scanned == 0 {
-				h.repairOverflow.Store(false)
+				if h.repairOverflow.Load() {
+					continue
+				}
 				return processed
 			}
 		}
@@ -124,6 +127,8 @@ func (h *Index) scanDirtyRepairs(limit int) int {
 	if h == nil || h.nodes == nil {
 		return 0
 	}
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	processed := 0
 	nodeCount := h.nodes.Len()
 	for i := 0; i < nodeCount; i++ {
@@ -147,6 +152,8 @@ func (h *Index) repairNode(nodeID uint32) {
 	if h == nil || h.nodes == nil || h.neighborSelector == nil || int(nodeID) >= h.nodes.Len() {
 		return
 	}
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	node := h.nodes.Get(nodeID)
 	if node == nil {
 		return

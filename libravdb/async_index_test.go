@@ -373,3 +373,46 @@ func TestAsyncIndexCloseAndRecoveryRebuild(t *testing.T) {
 		t.Fatalf("recovered index size = %d, want 20", got)
 	}
 }
+
+func TestSerializeIndexAtOmitsImageAheadOfCheckpoint(t *testing.T) {
+	db, err := Open(
+		WithStoragePath(testDBPath(t)),
+		WithAsyncIndexing(32, 1),
+		WithDurability(DurabilityUnsafeNoSync),
+	)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(
+		context.Background(),
+		"frontier",
+		WithDimension(4),
+		WithMetric(L2Distance),
+		WithHNSW(4, 16, 16),
+	)
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(context.Background(), "v-1", []float32{1, 0, 0, 0}, nil); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := collection.FlushIndex(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if applied := collection.IndexingStats().AppliedLSN; applied == 0 {
+		t.Fatal("expected a non-zero applied frontier")
+	}
+
+	image, applied, err := db.bridge.SerializeIndexAt("frontier", 0)
+	if err != nil {
+		t.Fatalf("SerializeIndexAt: %v", err)
+	}
+	if image != nil {
+		t.Fatalf("serialized an index ahead of the checkpoint: %d bytes", len(image))
+	}
+	if applied != 0 {
+		t.Fatalf("applied frontier = %d, want checkpoint frontier 0", applied)
+	}
+}

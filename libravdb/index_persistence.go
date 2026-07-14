@@ -83,7 +83,9 @@ func (b *indexPersistenceBridge) SerializeIndexAt(collectionName string, checkpo
 		}
 		appliedLSN := q.preciseAppliedLocked()
 		if appliedLSN > checkpointLSN {
-			appliedLSN = checkpointLSN
+			// The live index cannot be rewound to an older checkpoint frontier.
+			// Omit the image so recovery rebuilds from checkpoint records.
+			return nil, checkpointLSN, nil
 		}
 		indexBytes, err := idx.SerializeToBytes()
 		return indexBytes, appliedLSN, err

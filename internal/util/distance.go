@@ -29,20 +29,22 @@ func GetDistanceFunc(metric DistanceMetric) (DistanceFunc, error) {
 	switch metric {
 	case L2Distance:
 		if hasAVX2 {
-			return simd.L2DistanceAVX2, nil
+			return l2DistanceAVX2Checked, nil
 		}
 		if hasNEON {
-			return simd.L2DistanceNEON, nil
+			return l2DistanceNEONChecked, nil
 		}
 		return L2Distance_func, nil
 	case InnerProduct:
 		if hasAVX2 {
 			return func(a, b []float32) float32 {
+				checkVectorDimensions(a, b)
 				return -simd.DotProductAVX2(a, b) // Negative for max-heap behavior
 			}, nil
 		}
 		if hasNEON {
 			return func(a, b []float32) float32 {
+				checkVectorDimensions(a, b)
 				return -simd.DotProductNEON(a, b)
 			}, nil
 		}
@@ -50,6 +52,7 @@ func GetDistanceFunc(metric DistanceMetric) (DistanceFunc, error) {
 	case CosineDistance:
 		if hasAVX2 {
 			return func(a, b []float32) float32 {
+				checkVectorDimensions(a, b)
 				dist := 1.0 - simd.DotProductAVX2(a, b)
 				if dist < 0 {
 					return 0
@@ -59,6 +62,7 @@ func GetDistanceFunc(metric DistanceMetric) (DistanceFunc, error) {
 		}
 		if hasNEON {
 			return func(a, b []float32) float32 {
+				checkVectorDimensions(a, b)
 				dist := 1.0 - simd.DotProductNEON(a, b)
 				if dist < 0 {
 					return 0
@@ -72,11 +76,25 @@ func GetDistanceFunc(metric DistanceMetric) (DistanceFunc, error) {
 	}
 }
 
-// L2Distance_func calculates Euclidean distance
-func L2Distance_func(a, b []float32) float32 {
+func checkVectorDimensions(a, b []float32) {
 	if len(a) != len(b) {
 		panic("vector dimensions must match")
 	}
+}
+
+func l2DistanceAVX2Checked(a, b []float32) float32 {
+	checkVectorDimensions(a, b)
+	return simd.L2DistanceAVX2(a, b)
+}
+
+func l2DistanceNEONChecked(a, b []float32) float32 {
+	checkVectorDimensions(a, b)
+	return simd.L2DistanceNEON(a, b)
+}
+
+// L2Distance_func calculates Euclidean distance
+func L2Distance_func(a, b []float32) float32 {
+	checkVectorDimensions(a, b)
 
 	var sum float32
 	for i := range a {
@@ -88,9 +106,7 @@ func L2Distance_func(a, b []float32) float32 {
 
 // InnerProduct_func calculates inner product (dot product)
 func InnerProduct_func(a, b []float32) float32 {
-	if len(a) != len(b) {
-		panic("vector dimensions must match")
-	}
+	checkVectorDimensions(a, b)
 
 	var sum float32
 	for i := range a {
@@ -101,9 +117,7 @@ func InnerProduct_func(a, b []float32) float32 {
 
 // CosineDistance_func calculates cosine distance
 func CosineDistance_func(a, b []float32) float32 {
-	if len(a) != len(b) {
-		panic("vector dimensions must match")
-	}
+	checkVectorDimensions(a, b)
 
 	var dotProduct float32
 

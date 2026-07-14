@@ -19,6 +19,7 @@ const (
 type SlabbyRawVectorStore struct {
 	sfl             *memory.ShardedFreeList
 	metadataPool    *memory.Pool
+	recycler        *vectorRecycler
 	slots           rawSlotArray[byte]
 	dim             int
 	bytesPerVector  int
@@ -39,8 +40,13 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 	bytesPerVector := dim * 4
 	slotSize := uint64(bytesPerVector + userDataOffset)
 	slotSize = (slotSize + 7) &^ 7
+	poolSize := uint64(64 * 1024 * 1024)
+	if required := uint64(segmentCapacity) * slotSize; required > poolSize {
+		poolSize = (required + 2*1024*1024 - 1) &^ (2*1024*1024 - 1)
+	}
 
 	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  poolSize,
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 16,
@@ -56,6 +62,12 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		_ = sfl.Free()
 		return nil, fmt.Errorf("failed to create slabby metadata pool: %w", err)
 	}
+	recycler, err := newVectorRecycler(int(poolSize / slotSize))
+	if err != nil {
+		metadataPool.Free()
+		_ = sfl.Free()
+		return nil, fmt.Errorf("failed to create slabby logical slot recycler: %w", err)
+	}
 
 	store := &SlabbyRawVectorStore{
 		dim:             dim,
@@ -64,8 +76,10 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		segmentCapacity: segmentCapacity,
 		sfl:             sfl,
 		metadataPool:    metadataPool,
+		recycler:        recycler,
 	}
 	if err := store.slots.Init(metadataPool); err != nil {
+		recycler.close()
 		metadataPool.Free()
 		_ = sfl.Free()
 		return nil, fmt.Errorf("failed to initialize slabby slots: %w", err)
@@ -92,10 +106,14 @@ func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
 		return VectorRef{}, fmt.Errorf("failed to allocate vector slot: %w", err)
 	}
 
+	_, slotIndex, recycled := s.recycler.take()
+	if !recycled {
+		slotIndex = s.nextSlot.Add(1) - 1
+	}
 	writeVectorBytes(slot[userDataOffset:], vec)
-	slotIndex := s.nextSlot.Add(1) - 1
 	if err := s.slots.Store(slotIndex, &slot[0]); err != nil {
-		_ = s.sfl.Retire(slot)
+		_ = s.sfl.Deallocate(slot)
+		_ = s.recycler.put(nil, slotIndex)
 		return VectorRef{}, err
 	}
 	s.activeCount.Add(1)
@@ -121,22 +139,45 @@ func (s *SlabbyRawVectorStore) Get(ref VectorRef) ([]float32, error) {
 }
 
 func (s *SlabbyRawVectorStore) Delete(ref VectorRef) error {
+	s.detachPointer(ref)
+	return nil
+}
+
+func (s *SlabbyRawVectorStore) detachPointer(ref VectorRef) unsafe.Pointer {
 	if !ref.Valid || ref.Kind != VectorEncodingRaw {
 		return nil
 	}
 	for ptr := s.slots.Load(ref.Slot); ptr != nil; ptr = s.slots.Load(ref.Slot) {
 		if s.slots.CompareAndSwap(ref.Slot, ptr, nil) {
-			// Do not retire the slab here. Lock-free readers may already hold a
-			// slice view into this slot; safe reuse requires epoch reclamation.
 			s.activeCount.Add(-1)
-			break
+			return unsafe.Pointer(ptr)
 		}
 	}
 	return nil
 }
 
+func (s *SlabbyRawVectorStore) reclaimPointer(ptr unsafe.Pointer, logical uint32) error {
+	if s == nil || s.sfl == nil || ptr == nil {
+		return nil
+	}
+	if err := s.sfl.Deallocate(unsafe.Slice((*byte)(ptr), s.slotSize)); err != nil {
+		return err
+	}
+	if s.recycler == nil || !s.recycler.put(nil, logical) {
+		return fmt.Errorf("slabby logical slot recycler is full")
+	}
+	return nil
+}
+
+func (s *SlabbyRawVectorStore) release(ref VectorRef) error {
+	return s.reclaimPointer(s.detachPointer(ref), ref.Slot)
+}
+
 func (s *SlabbyRawVectorStore) Reset() error {
 	s.slots.Reset()
+	if s.recycler != nil {
+		s.recycler.reset()
+	}
 	if s.sfl != nil {
 		s.sfl.Reset()
 	}
@@ -153,6 +194,9 @@ func (s *SlabbyRawVectorStore) Reset() error {
 
 func (s *SlabbyRawVectorStore) Close() error {
 	s.slots.Detach()
+	if s.recycler != nil {
+		s.recycler.close()
+	}
 	var firstErr error
 	if s.sfl != nil {
 		firstErr = s.sfl.Free()
@@ -164,11 +208,10 @@ func (s *SlabbyRawVectorStore) Close() error {
 }
 
 func (s *SlabbyRawVectorStore) MemoryUsage() int64 {
-	if s == nil || s.sfl == nil {
+	if s == nil {
 		return 0
 	}
-	stats := s.sfl.Stats()
-	return int64(stats.Reserved)
+	return int64(s.activeCount.Load()) * int64(s.slotSize)
 }
 
 func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
@@ -189,6 +232,12 @@ func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
 		stats := s.metadataPool.Stats()
 		profile.ReservedMetaBytes = int64(stats.Reserved)
 		profile.ReservedBytes += int64(stats.Reserved)
+		profile.MemoryUsage = profile.ReservedBytes
+	}
+	if s.recycler != nil {
+		recyclerBytes := int64(len(s.recycler.slots)) * int64(unsafe.Sizeof(recycledVectorSlot{}))
+		profile.ReservedMetaBytes += recyclerBytes
+		profile.ReservedBytes += recyclerBytes
 		profile.MemoryUsage = profile.ReservedBytes
 	}
 	return profile

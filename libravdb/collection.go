@@ -1153,16 +1153,17 @@ func (c *Collection) rollbackBatchIndex(ctx context.Context, ids []string) {
 
 // Update modifies an existing vector in the collection
 func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
-	unlockAsync, err := c.lockAsyncMutation(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to flush asynchronous index before update: %w", err)
-	}
-	defer unlockAsync()
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
+
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before update: %w", err)
+	}
+	defer unlockAsync()
 
 	c.mu.RLock()
 	if c.closed {
@@ -1259,17 +1260,17 @@ func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, me
 		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 			len(vector), c.config.Dimension)
 	}
-	unlockAsync, err := c.lockAsyncMutation(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to flush asynchronous index before upsert: %w", err)
-	}
-	defer unlockAsync()
-
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
+
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before upsert: %w", err)
+	}
+	defer unlockAsync()
 
 	c.mu.RLock()
 	if c.closed {
@@ -1485,16 +1486,17 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 
 // Delete removes a vector from the collection
 func (c *Collection) Delete(ctx context.Context, id string) error {
-	unlockAsync, err := c.lockAsyncMutation(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to flush asynchronous index before delete: %w", err)
-	}
-	defer unlockAsync()
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
+
+	unlockAsync, err := c.lockAsyncMutation(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to flush asynchronous index before delete: %w", err)
+	}
+	defer unlockAsync()
 
 	c.mu.RLock()
 	if c.closed {

@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,5 +54,54 @@ func TestAutoMigrationV1ToV2(t *testing.T) {
 	}
 	if entry.Vector[0] != 1 || entry.Vector[1] != 2 || entry.Vector[2] != 3 {
 		t.Errorf("unexpected vector values: %v", entry.Vector)
+	}
+}
+
+func TestReplaceFileDurablyReportsRenameBeforeSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old")
+	newPath := filepath.Join(dir, "new")
+	if err := os.WriteFile(oldPath, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("sync failed")
+	renamed, err := replaceFileDurablyWith(oldPath, newPath, func(string) error { return syncErr })
+	if !renamed {
+		t.Fatal("rename completion was not reported")
+	}
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("error = %v, want sync failure", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("renamed file missing: %v", err)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old path still exists after rename: %v", err)
+	}
+}
+
+func TestRecoverMigrateActivatesStagedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "database.libravdb")
+	stagedPath := path + ".staged"
+	backupPath := path + ".v1.bak"
+	if err := os.WriteFile(stagedPath, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverMigrate(path); err != nil {
+		t.Fatalf("recoverMigrate: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read activated file: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("activated payload = %q, want new", data)
+	}
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Fatalf("staged path still exists: %v", err)
 	}
 }

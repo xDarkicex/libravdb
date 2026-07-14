@@ -435,6 +435,10 @@ func (ns *NeighborSelector) PruneConnections(
 	for !index.acquirePruneLock(node) {
 		runtime.Gosched()
 	}
+	if index.nodes.Get(nodeID) != node || level > node.Level || node.Links[level] == nil {
+		index.releasePruneLock(node)
+		return nil
+	}
 
 	originalLinks := index.getNodeLinks(node, level)
 

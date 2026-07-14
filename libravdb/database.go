@@ -95,6 +95,9 @@ func Open(opts ...Option) (*Database, error) {
 			config.MaxWriteQueueDepth = config.AsyncIndexQueueDepth
 		}
 	}
+	if err := recoverMigrate(config.StoragePath); err != nil {
+		return nil, fmt.Errorf("recover interrupted migration: %w", err)
+	}
 
 	// Create the index persistence bridge so persisted indexes can be
 	// deserialized during recovery (avoiding full rebuild from records).
@@ -217,9 +220,11 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 	}
 	collection.db = db
 	if err := db.configureAsyncIndex(collection); err != nil {
-		_ = collection.Close()
-		_ = db.storage.DeleteCollection(name)
-		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("failed to configure asynchronous index: %w", err),
+			collection.Close(),
+			db.storage.DeleteCollection(name),
+		)
 	}
 
 	db.collections[name] = collection
@@ -309,9 +314,11 @@ func (db *Database) createCollectionLocked(ctx context.Context, name string, opt
 	}
 	collection.db = db
 	if err := db.configureAsyncIndex(collection); err != nil {
-		_ = collection.Close()
-		_ = db.storage.DeleteCollection(name)
-		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("failed to configure asynchronous index: %w", err),
+			collection.Close(),
+			db.storage.DeleteCollection(name),
+		)
 	}
 	db.collections[name] = collection
 	return collection, nil
