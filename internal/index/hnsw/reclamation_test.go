@@ -157,22 +157,81 @@ func TestReclamationConcurrentSearchDeleteReinsert(t *testing.T) {
 		}(worker)
 	}
 
+	var mutationErr error
 	for i := 0; i < 256; i++ {
 		if err := index.Delete(context.Background(), "moving"); err != nil {
-			cancel()
-			t.Fatalf("delete %d: %v", i, err)
+			mutationErr = fmt.Errorf("delete %d: %w", i, err)
+			break
 		}
 		if err := index.Insert(context.Background(), &VectorEntry{ID: "moving", Vector: vectors[i%len(vectors)]}); err != nil {
-			cancel()
-			t.Fatalf("reinsert %d: %v", i, err)
+			mutationErr = fmt.Errorf("reinsert %d: %w", i, err)
+			break
 		}
 	}
 	cancel()
 	workers.Wait()
+	if mutationErr != nil {
+		t.Fatal(mutationErr)
+	}
 	select {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+type reclamationTestProvider struct{}
+
+func (reclamationTestProvider) GetByOrdinal(uint32) ([]float32, error) {
+	return nil, fmt.Errorf("provider lookup is not expected in this test")
+}
+
+func (reclamationTestProvider) Distance([]float32, uint32) (float32, error) {
+	return 0, fmt.Errorf("provider distance is not expected in this test")
+}
+
+func TestProviderModeReleasesOwnedRawVectorSlots(t *testing.T) {
+	for _, rawStore := range []string{RawVectorStoreMemory, RawVectorStoreSlabby} {
+		t.Run(rawStore, func(t *testing.T) {
+			index, err := NewHNSW(&Config{
+				Dimension:      16,
+				M:              8,
+				EfConstruction: 32,
+				EfSearch:       16,
+				ML:             1.0,
+				Metric:         util.L2Distance,
+				Provider:       reclamationTestProvider{},
+				RawVectorStore: rawStore,
+				RawStoreCap:    16,
+				RandomSeed:     42,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Close()
+
+			vector := make([]float32, 16)
+			if err := index.Insert(context.Background(), &VectorEntry{ID: "owned", Ordinal: 0, Vector: vector}); err != nil {
+				t.Fatal(err)
+			}
+			if active := index.rawVectorStore.Profile().VectorCount; active != 1 {
+				t.Fatalf("active raw vectors after insert = %d, want 1", active)
+			}
+
+			if err := index.Insert(context.Background(), &VectorEntry{ID: "owned", Ordinal: 1, Vector: vector}); err == nil {
+				t.Fatal("duplicate provider-backed insert succeeded")
+			}
+			if active := index.rawVectorStore.Profile().VectorCount; active != 1 {
+				t.Fatalf("active raw vectors after rollback = %d, want 1", active)
+			}
+
+			if err := index.Delete(context.Background(), "owned"); err != nil {
+				t.Fatal(err)
+			}
+			if active := index.rawVectorStore.Profile().VectorCount; active != 0 {
+				t.Fatalf("active raw vectors after delete = %d, want 0", active)
+			}
+		})
 	}
 }
 

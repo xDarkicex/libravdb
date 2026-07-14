@@ -507,7 +507,7 @@ func (h *Index) retireNodeStorage(nodeID uint32, node *Node) {
 }
 
 func (h *Index) retireStoredVectorAt(node *Node, epoch uint64) {
-	if node == nil || h.provider != nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
+	if node == nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
 		return
 	}
 	ref := VectorRef{

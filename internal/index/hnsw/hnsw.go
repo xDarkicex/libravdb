@@ -1984,7 +1984,7 @@ func (h *Index) releaseUnpublishedNode(node *Node) {
 }
 
 func (h *Index) releaseUnpublishedVector(node *Node) {
-	if node == nil || h.provider != nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
+	if node == nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
 		return
 	}
 	ref := VectorRef{
