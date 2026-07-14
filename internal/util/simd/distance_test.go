@@ -17,6 +17,7 @@ var distancePredicateBenchmarkSink uint32
 func BenchmarkL2Distance8PtrNEON(b *testing.B) {
 	if runtime.GOARCH != "arm64" {
 		b.Skipf("NEON pointer batch implementation only enabled for arm64")
+		return
 	}
 	for _, dimension := range []int{64, 256, 768} {
 		dimension := dimension
@@ -30,6 +31,7 @@ func BenchmarkL2Distance8PtrNEON(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			var sum float32
+			//nolint:staticcheck // The arm64 NEON call is an intentional panic stub when analyzed on amd64.
 			for i := 0; i < b.N; i++ {
 				d0, d1, d2, d3, d4, d5, d6, d7 := L2Distance8PtrNEON(
 					vectors[0],
@@ -52,6 +54,7 @@ func BenchmarkL2Distance8PtrNEON(b *testing.B) {
 func BenchmarkL2Distance8VsTwo4NEONInterleaved(b *testing.B) {
 	if runtime.GOARCH != "arm64" {
 		b.Skipf("NEON pointer batch implementation only enabled for arm64")
+		return
 	}
 	const dimension = 768
 	vectors := make([][]float32, 9)
@@ -70,8 +73,10 @@ func BenchmarkL2Distance8VsTwo4NEONInterleaved(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		//nolint:staticcheck // The arm64 NEON call is an intentional panic stub when analyzed on amd64.
 		for offset := 0; offset < 2; offset++ {
 			mode := (i + offset) & 1
+			//nolint:staticcheck // The value is consumed on arm64; amd64 analysis sees the following NEON panic stub.
 			start := time.Now()
 			if mode == 0 {
 				d0, d1, d2, d3, d4, d5, d6, d7 := L2Distance8PtrNEON(
@@ -100,6 +105,7 @@ func BenchmarkL2Distance8VsTwo4NEONInterleaved(b *testing.B) {
 func BenchmarkL2Distance8AlignedNEONInterleaved(b *testing.B) {
 	if runtime.GOARCH != "arm64" {
 		b.Skipf("NEON pointer batch implementation only enabled for arm64")
+		return
 	}
 	const dimension = 768
 	vectors := make([][]float32, 9)
@@ -117,8 +123,10 @@ func BenchmarkL2Distance8AlignedNEONInterleaved(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		//nolint:staticcheck // The arm64 NEON call is an intentional panic stub when analyzed on amd64.
 		for offset := 0; offset < 2; offset++ {
 			mode := (i + offset) & 1
+			//nolint:staticcheck // The value is consumed on arm64; amd64 analysis sees the following NEON panic stub.
 			start := time.Now()
 			if mode == 0 {
 				d0, d1, d2, d3, d4, d5, d6, d7 := L2Distance8PtrNEON(
@@ -148,6 +156,7 @@ func BenchmarkL2Distance8AlignedNEONInterleaved(b *testing.B) {
 func BenchmarkL2AnyLessThan8AlignedNEONInterleaved(b *testing.B) {
 	if runtime.GOARCH != "arm64" {
 		b.Skipf("NEON pointer batch implementation only enabled for arm64")
+		return
 	}
 	const dimension = 768
 	vectors := make([][]float32, 9)
@@ -184,8 +193,10 @@ func BenchmarkL2AnyLessThan8AlignedNEONInterleaved(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
+				//nolint:staticcheck // The arm64 NEON call is an intentional panic stub when analyzed on amd64.
 				for offset := 0; offset < 2; offset++ {
 					mode := (i + offset) & 1
+					//nolint:staticcheck // The value is consumed on arm64; amd64 analysis sees the following NEON panic stub.
 					start := time.Now()
 					if mode == 0 {
 						d0, d1, d2, d3, d4, d5, d6, d7 := L2Distance8AlignedPtrNEON(
