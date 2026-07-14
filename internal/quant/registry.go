@@ -144,4 +144,9 @@ func init() {
 	if err := Register(ScalarQuantization, sqFactory); err != nil {
 		panic(fmt.Sprintf("Failed to register ScalarQuantizer factory: %v", err))
 	}
+
+	fsqFactory := NewFSQQuantizerFactory()
+	if err := Register(FiniteScalarQuantization, fsqFactory); err != nil {
+		panic(fmt.Sprintf("Failed to register FSQQuantizer factory: %v", err))
+	}
 }

@@ -268,7 +268,7 @@ func (idx *Index) acquireIVFHeapSlot(k int) (*ivfHeapSlot, []ivfHeapElement) {
 				SlabSize:  1 * 1024 * 1024,
 				SlabCount: 16,
 				Prealloc:  true,
-			}, 64)
+			}, 64, 16)
 			if err != nil {
 				panic("ivfpq: failed to create query pool tier: " + err.Error())
 			}
@@ -332,7 +332,7 @@ func NewIVFPQ(config *Config) (*Index, error) {
 
 	scratchPool := &sync.Pool{
 		New: func() any {
-			a, _ := memory.NewArena(1024 * 1024)
+			a, _ := memory.NewArena(1024*1024, 64)
 			return a
 		},
 	}

@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/memory"
@@ -38,6 +39,17 @@ func WithTracing(enabled bool) Option {
 	}
 }
 
+// WithDurability selects the database write durability contract.
+func WithDurability(mode DurabilityMode) Option {
+	return func(c *Config) error {
+		if mode != DurabilitySynchronous && mode != DurabilityUnsafeNoSync {
+			return fmt.Errorf("invalid durability mode %d", mode)
+		}
+		c.Durability = mode
+		return nil
+	}
+}
+
 // WithMaxCollections sets the maximum number of collections
 func WithMaxCollections(max int) Option {
 	return func(c *Config) error {
@@ -56,6 +68,7 @@ func WithMaxConcurrentWrites(max int) Option {
 			return fmt.Errorf("max concurrent writes must be positive")
 		}
 		c.MaxConcurrentWrites = max
+		c.maxWritesExplicit = true
 		return nil
 	}
 }
@@ -67,6 +80,24 @@ func WithMaxWriteQueueDepth(depth int) Option {
 			return fmt.Errorf("max write queue depth must be non-negative")
 		}
 		c.MaxWriteQueueDepth = depth
+		c.writeQueueExplicit = true
+		return nil
+	}
+}
+
+// WithAsyncIndexing decouples durable HNSW inserts from graph construction.
+// The bounded queue applies backpressure before WAL admission, and workers
+// index storage-owned vectors by ordinal without copying vector payloads.
+func WithAsyncIndexing(queueDepth, workers int) Option {
+	return func(c *Config) error {
+		if queueDepth < 32 {
+			return fmt.Errorf("asynchronous index queue depth must be at least 32")
+		}
+		if workers <= 0 {
+			return fmt.Errorf("asynchronous index worker count must be positive")
+		}
+		c.AsyncIndexQueueDepth = queueDepth
+		c.AsyncIndexWorkers = workers
 		return nil
 	}
 }
@@ -103,6 +134,7 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 		c.M = m
 		c.EfConstruction = efConstruction
 		c.EfSearch = efSearch
+		c.ML = 1.0 / math.Log(float64(m))
 		return nil
 	}
 }
@@ -123,6 +155,19 @@ func WithRawVectorStoreSlabby(segmentCapacity int) CollectionOption {
 		}
 		c.RawVectorStore = "slabby"
 		c.RawStoreCap = segmentCapacity
+		return nil
+	}
+}
+
+// WithIDMapCapacity pre-sizes the HNSW external-ID map for the expected
+// collection cardinality. Larger values reduce ID-map resize churn and cold
+// mmap page faults during high-throughput inserts with user-provided IDs.
+func WithIDMapCapacity(capacity int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if capacity <= 0 {
+			return fmt.Errorf("ID map capacity must be positive")
+		}
+		c.IDMapCapacity = capacity
 		return nil
 	}
 }
@@ -202,6 +247,26 @@ func WithScalarQuantization(bits int, trainRatio float64) CollectionOption {
 		}
 		if err := config.Validate(); err != nil {
 			return fmt.Errorf("invalid scalar quantization config: %w", err)
+		}
+		c.Quantization = config
+		return nil
+	}
+}
+
+// WithFSQQuantization enables codebook-free Finite Scalar Quantization.
+// levels is optional; when omitted, a uniform 2^bits level count is used.
+func WithFSQQuantization(bits int, trainRatio float64, levels ...int) CollectionOption {
+	return func(c *CollectionConfig) error {
+		config := &quant.QuantizationConfig{
+			Type:       quant.FiniteScalarQuantization,
+			Bits:       bits,
+			TrainRatio: trainRatio,
+		}
+		if len(levels) > 0 {
+			config.Levels = append([]int(nil), levels...)
+		}
+		if err := config.Validate(); err != nil {
+			return fmt.Errorf("invalid FSQ config: %w", err)
 		}
 		c.Quantization = config
 		return nil

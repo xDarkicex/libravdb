@@ -37,6 +37,11 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
+      - name: Verify generated SIMD assembly
+        run: |
+          go generate ./internal/util/simd
+          git diff --exit-code -- internal/util/simd/distance_amd64.s internal/util/simd/stub_amd64.go
+
       - name: Build
         run: go build -v $(go list ./... | grep -v '/examples\|/benchmark\|/tests')
 

@@ -41,24 +41,44 @@ type Database struct {
 
 // Config holds database-wide configuration
 type Config struct {
-	Logger              Logger
-	StoragePath         string
-	MaxCollections      int
-	MaxConcurrentWrites int
-	MaxWriteQueueDepth  int
-	MetricsEnabled      bool
-	TracingEnabled      bool
+	Logger               Logger
+	StoragePath          string
+	MaxCollections       int
+	MaxConcurrentWrites  int
+	MaxWriteQueueDepth   int
+	AsyncIndexQueueDepth int
+	AsyncIndexWorkers    int
+	MetricsEnabled       bool
+	TracingEnabled       bool
+	Durability           DurabilityMode
+	maxWritesExplicit    bool
+	writeQueueExplicit   bool
 }
+
+// DurabilityMode controls when a successful write may be acknowledged.
+type DurabilityMode uint8
+
+const (
+	// DurabilitySynchronous acknowledges writes only after the WAL group reaches
+	// stable storage through file.Sync.
+	DurabilitySynchronous DurabilityMode = iota
+	// DurabilityUnsafeNoSync is an explicit benchmark-only mode. A successful
+	// write may still be lost after power failure or kernel crash.
+	DurabilityUnsafeNoSync
+)
 
 // Open opens a Database at the configured path, creating it if necessary.
 func Open(opts ...Option) (*Database, error) {
 	config := &Config{
-		StoragePath:         "./data",
-		MetricsEnabled:      true,
-		TracingEnabled:      false,
-		MaxCollections:      100,
-		MaxConcurrentWrites: defaultMaxConcurrentWrites(),
-		MaxWriteQueueDepth:  32,
+		StoragePath:          "./data",
+		MetricsEnabled:       true,
+		TracingEnabled:       false,
+		MaxCollections:       100,
+		MaxConcurrentWrites:  defaultMaxConcurrentWrites(),
+		MaxWriteQueueDepth:   32,
+		AsyncIndexQueueDepth: 0,
+		AsyncIndexWorkers:    min(4, runtime.GOMAXPROCS(0)),
+		Durability:           DurabilitySynchronous,
 	}
 
 	// Apply options
@@ -67,27 +87,44 @@ func Open(opts ...Option) (*Database, error) {
 			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
+	if config.AsyncIndexQueueDepth > 0 {
+		if !config.maxWritesExplicit {
+			config.MaxConcurrentWrites = 32
+		}
+		if !config.writeQueueExplicit {
+			config.MaxWriteQueueDepth = config.AsyncIndexQueueDepth
+		}
+	}
+	if err := recoverMigrate(config.StoragePath); err != nil {
+		return nil, fmt.Errorf("recover interrupted migration: %w", err)
+	}
 
 	// Create the index persistence bridge so persisted indexes can be
 	// deserialized during recovery (avoiding full rebuild from records).
 	bridge := &indexPersistenceBridge{cache: make(map[string]index.Index)}
-	storageEngine, err := singlefile.New(config.StoragePath,
+	storageOptions := []singlefile.Option{
 		singlefile.WithIndexSnapshotProvider(bridge),
-	)
+		singlefile.WithWALSync(config.Durability == DurabilitySynchronous),
+	}
+	if config.AsyncIndexQueueDepth > 0 {
+		storageOptions = append(storageOptions, singlefile.WithWALGroupCommitTarget(min(28, config.MaxConcurrentWrites), 5*time.Millisecond))
+	}
+	storageEngine, err := singlefile.New(config.StoragePath, storageOptions...)
 
 	if err != nil {
 		if errors.Is(err, storage.ErrV1FormatMigrationRequired) {
 			if err := Migrate(context.Background(), config.StoragePath); err != nil {
+				bridge.closeCachedIndexes()
 				return nil, fmt.Errorf("auto-migration failed: %w", err)
 			}
 			// Retry opening the newly migrated database
-			storageEngine, err = singlefile.New(config.StoragePath,
-				singlefile.WithIndexSnapshotProvider(bridge),
-			)
+			storageEngine, err = singlefile.New(config.StoragePath, storageOptions...)
 			if err != nil {
+				bridge.closeCachedIndexes()
 				return nil, fmt.Errorf("failed to open database after migration: %w", err)
 			}
 		} else {
+			bridge.closeCachedIndexes()
 			return nil, fmt.Errorf("failed to initialize storage engine: %w", err)
 		}
 	}
@@ -107,7 +144,7 @@ func Open(opts ...Option) (*Database, error) {
 		logger:      config.Logger,
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
-				arena, err := memory.NewArena(1024 * 1024)
+				arena, err := memory.NewArena(1024*1024, 64)
 				if err != nil {
 					panic(fmt.Sprintf("failed to allocate scratch arena: %v", err))
 				}
@@ -136,7 +173,8 @@ func Open(opts ...Option) (*Database, error) {
 		return HealthHealthy, nil
 	})
 	if err := db.healthMonitor.Start(context.Background()); err != nil {
-		storageEngine.Close()
+		_ = storageEngine.Close()
+		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to start health monitor: %w", err)
 	}
 
@@ -144,7 +182,8 @@ func Open(opts ...Option) (*Database, error) {
 	// that were deserialized or rebuilt during recovery.
 	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
 		db.healthMonitor.Stop()
-		storageEngine.Close()
+		_ = storageEngine.Close()
+		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 
@@ -180,6 +219,13 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("failed to configure asynchronous index: %w", err),
+			collection.Close(),
+			db.storage.DeleteCollection(name),
+		)
+	}
 
 	db.collections[name] = collection
 	return collection, nil
@@ -267,6 +313,13 @@ func (db *Database) createCollectionLocked(ctx context.Context, name string, opt
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("failed to configure asynchronous index: %w", err),
+			collection.Close(),
+			db.storage.DeleteCollection(name),
+		)
+	}
 	db.collections[name] = collection
 	return collection, nil
 }
@@ -379,6 +432,37 @@ func (db *Database) ListCollectionsWithContext(ctx context.Context) ([]string, e
 	}
 	sort.Strings(result)
 	return result, nil
+}
+
+// Iterate walks every persisted record in every collection. Records are
+// delivered one at a time and callback errors stop iteration immediately.
+func (db *Database) Iterate(ctx context.Context, fn func(collection string, record Record) error) error {
+	if fn == nil {
+		return fmt.Errorf("iterate callback cannot be nil")
+	}
+
+	names, err := db.ListCollectionsWithContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		collection, err := db.GetCollection(name)
+		if err != nil {
+			return fmt.Errorf("get collection %q during iteration: %w", name, err)
+		}
+		if err := collection.Iterate(ctx, func(record Record) error {
+			return fn(name, record)
+		}); err != nil {
+			return fmt.Errorf("iterate collection %q: %w", name, err)
+		}
+	}
+
+	return nil
 }
 
 // DeleteCollection removes a collection and its persisted data.
@@ -645,6 +729,9 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 			for _, c := range loadedCollections {
 				c.Close()
 			}
+			if bridge != nil {
+				bridge.closeCachedIndexes()
+			}
 			return err
 		}
 
@@ -657,6 +744,9 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 		db.collections[name] = collection
 	}
 	db.mu.Unlock()
+	if bridge != nil {
+		bridge.closeCachedIndexes()
+	}
 
 	return nil
 }
@@ -696,6 +786,10 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
 		collection.db = db
+		if err := db.configureAsyncIndex(collection); err != nil {
+			_ = collection.Close()
+			return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+		}
 		return collection, nil
 	}
 
@@ -717,8 +811,24 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
 	collection.db = db
+	if err := db.configureAsyncIndex(collection); err != nil {
+		_ = collection.Close()
+		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
+	}
 
 	return collection, nil
+}
+
+func (db *Database) configureAsyncIndex(collection *Collection) error {
+	if db.config.AsyncIndexQueueDepth == 0 || collection == nil || collection.shards != nil || collection.config.IndexType != HNSW {
+		return nil
+	}
+	queue, err := newAsyncIndexQueue(collection, db.config.AsyncIndexQueueDepth, db.config.AsyncIndexWorkers)
+	if err != nil {
+		return err
+	}
+	collection.asyncIndex = queue
+	return nil
 }
 
 func (db *Database) newWriteController() *writeController {

@@ -209,12 +209,15 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 	enc.WriteString(config.RawVectorStore)
 	enc.WriteUint32(uint32(config.RawStoreCap))
 	if config.Version >= 2 {
-		// Calculate size of optional fields (NClusters, NProbes)
-		optSize := uint32(4 + 4)
+		// Calculate size of optional fields (NClusters, NProbes, IDMapCapacity)
+		optSize := uint32(4 + 4 + 4)
 		enc.WriteUint32(optSize)
 	}
 	enc.WriteUint32(uint32(config.NClusters))
 	enc.WriteUint32(uint32(config.NProbes))
+	if config.Version >= 2 {
+		enc.WriteUint32(uint32(config.IDMapCapacity))
+	}
 	return nil
 }
 
@@ -333,6 +336,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 
 	var nClusters uint32
 	var nProbes uint32
+	var idMapCapacity uint32
 
 	if version >= 2 {
 		if dec.Off+4 <= len(dec.Data) {
@@ -340,8 +344,6 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 			if err != nil {
 				return storage.CollectionConfig{}, err
 			}
-			// Only read if we have exactly the optSize bytes remaining, or limit the read
-			// For now, we know the two fields take 8 bytes.
 			if optSize >= 4 && dec.Off+4 <= len(dec.Data) {
 				nClusters, err = dec.ReadUint32()
 				if err != nil {
@@ -354,9 +356,15 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 					return storage.CollectionConfig{}, err
 				}
 			}
+			if optSize >= 12 && dec.Off+4 <= len(dec.Data) {
+				idMapCapacity, err = dec.ReadUint32()
+				if err != nil {
+					return storage.CollectionConfig{}, err
+				}
+			}
 			// Skip any trailing unknown optional fields based on the length prefix
-			if optSize > 8 {
-				dec.Off += int(optSize) - 8
+			if optSize > 12 {
+				dec.Off += int(optSize) - 12
 			}
 		}
 	} else {
@@ -388,6 +396,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 		Version:        int(version),
 		RawVectorStore: rawVectorStore,
 		RawStoreCap:    int(rawStoreCap),
+		IDMapCapacity:  int(idMapCapacity),
 	}, nil
 }
 

@@ -134,6 +134,111 @@ func BenchmarkProductQuantizer_CompressionRatios(b *testing.B) {
 	}
 }
 
+func BenchmarkQuantizerTrain(b *testing.B) {
+	const dimension = 128
+	vectors := generateRandomVectors(5000, dimension)
+
+	benchmarks := []struct {
+		name   string
+		config *QuantizationConfig
+	}{
+		{
+			name: "PQ_8x8",
+			config: &QuantizationConfig{
+				Type:       ProductQuantization,
+				Codebooks:  8,
+				Bits:       8,
+				TrainRatio: 0.1,
+				CacheSize:  100,
+			},
+		},
+		{
+			name: "SQ_8",
+			config: &QuantizationConfig{
+				Type:       ScalarQuantization,
+				Bits:       8,
+				TrainRatio: 0.1,
+			},
+		},
+		{
+			name: "FSQ_6_levels",
+			config: &QuantizationConfig{
+				Type:       FiniteScalarQuantization,
+				Bits:       6,
+				TrainRatio: 0.1,
+				Levels:     []int{8, 8, 8, 6, 5},
+			},
+		},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				quantizer, err := Create(bm.config)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := quantizer.Train(context.Background(), vectors); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkQuantizerCompress(b *testing.B) {
+	const dimension = 128
+	vectors := generateRandomVectors(1000, dimension)
+	vector := generateRandomVector(dimension)
+
+	for _, bm := range trainedQuantizerBenchmarks(b, vectors) {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportMetric(float64(len(mustCompress(b, bm.quantizer, vector))), "bytes/code")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := bm.quantizer.Compress(vector); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkQuantizerDistanceToQuery(b *testing.B) {
+	const dimension = 128
+	vectors := generateRandomVectors(1000, dimension)
+	vector := generateRandomVector(dimension)
+	query := generateRandomVector(dimension)
+
+	for _, bm := range trainedQuantizerBenchmarks(b, vectors) {
+		compressed := mustCompress(b, bm.quantizer, vector)
+		state := bm.quantizer.PrepareQuery(query)
+		b.Run(bm.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := bm.quantizer.DistanceToQuery(compressed, query, state); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkQuantizerPrepareQuery(b *testing.B) {
+	const dimension = 128
+	vectors := generateRandomVectors(1000, dimension)
+	query := generateRandomVector(dimension)
+
+	for _, bm := range trainedQuantizerBenchmarks(b, vectors) {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = bm.quantizer.PrepareQuery(query)
+			}
+		})
+	}
+}
+
 // Helper function for benchmarks
 func setupTrainedQuantizerForBench(dimension, codebooks, bits int) *ProductQuantizer {
 	pq := NewProductQuantizer()
@@ -154,4 +259,67 @@ func setupTrainedQuantizerForBench(dimension, codebooks, bits int) *ProductQuant
 	}
 
 	return pq
+}
+
+type quantizerBenchmark struct {
+	name      string
+	quantizer Quantizer
+}
+
+func trainedQuantizerBenchmarks(b *testing.B, vectors [][]float32) []quantizerBenchmark {
+	b.Helper()
+	configs := []struct {
+		name   string
+		config *QuantizationConfig
+	}{
+		{
+			name: "PQ_8x8",
+			config: &QuantizationConfig{
+				Type:       ProductQuantization,
+				Codebooks:  8,
+				Bits:       8,
+				TrainRatio: 0.1,
+				CacheSize:  100,
+			},
+		},
+		{
+			name: "SQ_8",
+			config: &QuantizationConfig{
+				Type:       ScalarQuantization,
+				Bits:       8,
+				TrainRatio: 0.1,
+			},
+		},
+		{
+			name: "FSQ_6_levels",
+			config: &QuantizationConfig{
+				Type:       FiniteScalarQuantization,
+				Bits:       6,
+				TrainRatio: 0.1,
+				Levels:     []int{8, 8, 8, 6, 5},
+			},
+		},
+	}
+
+	benchmarks := make([]quantizerBenchmark, 0, len(configs))
+	for _, cfg := range configs {
+		quantizer, err := Create(cfg.config)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := quantizer.Train(context.Background(), vectors); err != nil {
+			b.Fatal(err)
+		}
+		benchmarks = append(benchmarks, quantizerBenchmark{name: cfg.name, quantizer: quantizer})
+	}
+	return benchmarks
+}
+
+func mustCompress(b *testing.B, quantizer Quantizer, vector []float32) []byte {
+	b.Helper()
+	compressed, err := quantizer.Compress(vector)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return compressed
 }

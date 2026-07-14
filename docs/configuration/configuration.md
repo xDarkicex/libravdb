@@ -148,6 +148,8 @@ libravdb.WithCachePolicy(libravdb.FIFOCache)
 
 ### Quantization Configuration
 
+See [Quantization Modes for Production](quantization-modes.md) for the production tradeoffs between raw vectors, Product Quantization, Scalar Quantization, and FSQ.
+
 #### Product Quantization
 
 ```go
@@ -177,6 +179,21 @@ collection, err := db.CreateCollection(ctx, "sq_collection",
     ),
 )
 ```
+
+#### Finite Scalar Quantization
+
+```go
+collection, err := db.CreateCollection(ctx, "fsq_collection",
+    libravdb.WithDimension(768),
+    libravdb.WithFSQQuantization(
+        6,    // bits used when explicit levels are omitted
+        0.1,  // training ratio
+        8, 8, 8, 6, 5, // optional repeating FSQ level cycle
+    ),
+)
+```
+
+FSQ is codebook-free and avoids PQ's k-means/codebook training path. Use it for write-heavy or frequently rebuilt collections, while keeping raw vectors enabled for exact final reranking.
 
 #### Custom Quantization
 

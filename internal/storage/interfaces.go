@@ -24,6 +24,7 @@ type CollectionConfig struct {
 	ML             float64
 	Version        int
 	RawStoreCap    int
+	IDMapCapacity  int
 }
 
 // Engine defines the storage engine interface
@@ -104,6 +105,31 @@ type Collection interface {
 	Count(ctx context.Context) (int, error)
 	NextOrdinal(ctx context.Context) (uint32, error)
 	Close() error
+}
+
+// DurableCollection exposes the WAL commit LSN associated with a successful
+// storage mutation. Callers use this to track derived-index lag without making
+// the base Collection interface storage-engine-specific.
+type DurableCollection interface {
+	Collection
+	InsertDurable(ctx context.Context, entry *index.VectorEntry) (uint64, error)
+	InsertBatchDurable(ctx context.Context, entries []*index.VectorEntry) (uint64, error)
+}
+
+// DurableRange identifies the operation and commit boundaries of one durable
+// WAL transaction. Derived indexes use FirstLSN-1 as the safe frontier while
+// any operation from the transaction remains unapplied.
+type DurableRange struct {
+	FirstLSN  uint64
+	CommitLSN uint64
+}
+
+// DurableRangeCollection exposes precise transaction boundaries for bounded
+// asynchronous derived-index tracking.
+type DurableRangeCollection interface {
+	DurableCollection
+	InsertDurableRange(ctx context.Context, entry *index.VectorEntry) (DurableRange, error)
+	InsertBatchDurableRange(ctx context.Context, entries []*index.VectorEntry) (DurableRange, error)
 }
 
 // OrdinalAssigner assigns stable internal ordinals to entries before indexing.

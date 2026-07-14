@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
+	"math"
 	"os"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
 	"unsafe"
 
 	internalmemory "github.com/xDarkicex/libravdb/internal/memory"
@@ -17,6 +20,95 @@ import (
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
 )
+
+const inFlightRegistrySize = 65536 // Power of 2 for fast modulo
+const inFlightSnapshotLimit = 2048
+const (
+	defaultIDMapCapacity = 8192
+	// ID keys remain stable for lock-free readers until the index closes. Keep
+	// a separate lifetime budget so table growth beyond the initial capacity
+	// does not prematurely exhaust copied-key storage.
+	defaultIDMapKeyBytes = 4 * 1024 * 1024
+)
+const defaultRepairQueueSize = 65536
+const defaultRepairBatchSize = 64
+
+type inFlightRegistry struct {
+	idx    atomic.Uint64
+	active atomic.Int32
+	nodes  []uint32
+}
+
+func newInFlightRegistry(arena *memory.Arena) *inFlightRegistry {
+	var slice []uint32
+	if arena != nil {
+		slice, _ = memory.ArenaSlice[uint32](arena, inFlightRegistrySize)
+	}
+	if slice == nil {
+		// Fallback to on-heap if arena allocation fails during initialization
+		slice = make([]uint32, inFlightRegistrySize)
+	} else {
+		slice = slice[:inFlightRegistrySize]
+	}
+
+	// Initialize with Sentinels
+	for i := range slice {
+		slice[i] = SentinelNodeID
+	}
+
+	return &inFlightRegistry{
+		nodes: slice,
+	}
+}
+
+func (r *inFlightRegistry) Add(id uint32) {
+	if r == nil || r.nodes == nil {
+		return
+	}
+	r.active.Add(1)
+	i := r.idx.Add(1) - 1
+	atomic.StoreUint32(&r.nodes[i&(inFlightRegistrySize-1)], id)
+}
+
+func (r *inFlightRegistry) Remove(id uint32) {
+	// Ring buffer implicitly removes items by overwriting them.
+	// The InFlight flag on the Node struct is cleared instead.
+	if r == nil || r.nodes == nil {
+		return
+	}
+	r.active.Add(-1)
+}
+
+func (r *inFlightRegistry) Active() int32 {
+	if r == nil || r.nodes == nil {
+		return 0
+	}
+	return r.active.Load()
+}
+
+func (r *inFlightRegistry) GetSnapshot(buf []uint32) []uint32 {
+	if r == nil || r.nodes == nil {
+		return buf
+	}
+	buf = buf[:0]
+	end := r.idx.Load()
+	start := uint64(0)
+
+	// Bound snapshot work so construction coordination cannot grow with the
+	// lifetime append position of the registry.
+	scanLimit := uint64(inFlightSnapshotLimit)
+	if end > scanLimit {
+		start = end - scanLimit
+	}
+
+	for i := start; i < end; i++ {
+		id := atomic.LoadUint32(&r.nodes[i&(inFlightRegistrySize-1)])
+		if id != SentinelNodeID {
+			buf = append(buf, id)
+		}
+	}
+	return buf
+}
 
 // VectorEntry represents a vector entry for HNSW indexing
 type VectorEntry struct {
@@ -44,49 +136,104 @@ type VectorProvider interface {
 
 // Index implements the HNSW algorithm for approximate nearest neighbor search
 type Index struct {
-	searchScratchPool    sync.Pool
-	provider             VectorProvider
-	quantizer            quant.Quantizer
-	rawVectorStore       RawVectorStore
-	idToIndex            map[string]uint32
-	entryPoint           *Node
-	distance             util.DistanceFunc
-	vecMmap              *internalmemory.MemoryMap
-	config               *Config
-	pqMmap               *internalmemory.MemoryMap
-	link0SFL             *memory.ShardedFreeList
-	ordinalToID          map[uint32]string
-	linkSFL              *memory.ShardedFreeList
-	neighborSelector     *NeighborSelector
-	levelGenerator       *rand.Rand
-	scratchPool          *sync.Pool
-	mmapPath             string
-	entryPointCandidates []uint32
-	trainingVectors      [][]float32
-	nodes                []*Node
-	size                 int
-	mmapSize             int64
-	maxLevel             int
-	originalMemUsage     int64
-	mu                   sync.RWMutex
-	nextOrdinal          uint32
-	quantizationTrained  bool
-	memoryMapped         bool
+	searchScratchFree     atomic.Uint64
+	searchScratches       []searchScratch
+	candidateMode         atomic.Uint32
+	provider              VectorProvider
+	quantizer             quant.Quantizer
+	rawVectorStore        RawVectorStore
+	idToIndex             *memory.TypedIDMap[Node]
+	globalState           atomic.Uint64 // Packs entryPoint ID (32 bits) and maxLevel (32 bits)
+	distance              util.DistanceFunc
+	vecMmap               *internalmemory.MemoryMap
+	config                *Config
+	pqMmap                *internalmemory.MemoryMap
+	link0SFL              *memory.ShardedFreeList
+	ordinalToID           *segmentedStringArray
+	linkSFL               *memory.ShardedFreeList
+	neighborSelector      *NeighborSelector
+	useHeuristicPredicate bool
+	registryPool          *memory.Pool
+	scratchPool           *sync.Pool
+	nodeSFL               *memory.ShardedFreeList
+	inFlightNodes         *inFlightRegistry // registry for concurrent insertions
+	repairCh              chan uint32
+	repairStop            chan struct{}
+	repairDone            chan struct{}
+	mmapPath              string
+	trainingVectors       [][]float32
+	trainingCount         atomic.Int32
+	nodes                 *segmentedNodeArray
+	size                  atomic.Int32
+	mmapSize              int64
+	originalMemUsage      int64
+	nextOrdinal           atomic.Uint32
+	quantizationTrained   atomic.Bool
+	repairOverflow        atomic.Bool
+	reclamation           *reclamationDomain
+	memoryMapped          bool
 }
 
 // Config holds HNSW configuration parameters
 type Config struct {
-	Provider       VectorProvider
-	Quantization   *quant.QuantizationConfig
-	RawVectorStore string
-	Dimension      int
-	M              int
-	EfConstruction int
-	EfSearch       int
-	ML             float64
-	Metric         util.DistanceMetric
-	RandomSeed     int64
-	RawStoreCap    int
+	Provider             VectorProvider
+	Quantization         *quant.QuantizationConfig
+	RawVectorStore       string
+	Dimension            int
+	M                    int
+	EfConstruction       int
+	EfSearch             int
+	ML                   float64
+	Metric               util.DistanceMetric
+	PruneAlpha           float32
+	Level0LinkMultiplier float64
+	RepairEnabled        bool
+	RepairQueueSize      int
+	RepairBatchSize      int
+	RandomSeed           int64
+	RawStoreCap          int
+	IDMapCapacity        int
+}
+
+func (c *Config) idMapCapacity() uint64 {
+	if c.IDMapCapacity > 0 {
+		return uint64(c.IDMapCapacity)
+	}
+	return defaultIDMapCapacity
+}
+
+func (c *Config) idMapKeyBytes() uint64 {
+	if c.IDMapCapacity <= 0 {
+		return defaultIDMapKeyBytes
+	}
+	return uint64(c.IDMapCapacity) * 64
+}
+
+func (c *Config) level0LinkMultiplier() float64 {
+	if c == nil || c.Level0LinkMultiplier <= 0 {
+		return level0LinkMultiplier
+	}
+	return c.Level0LinkMultiplier
+}
+
+func (c *Config) repairQueueSize() int {
+	if c == nil {
+		return 0
+	}
+	if c.RepairQueueSize > 0 {
+		return c.RepairQueueSize
+	}
+	if c.RepairEnabled {
+		return defaultRepairQueueSize
+	}
+	return 0
+}
+
+func (c *Config) repairBatchSize() int {
+	if c == nil || c.RepairBatchSize <= 0 {
+		return defaultRepairBatchSize
+	}
+	return c.RepairBatchSize
 }
 
 // NewHNSW creates a new HNSW index
@@ -110,7 +257,7 @@ func NewHNSW(config *Config) (*Index, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create linkSFL: %w", err)
 	}
@@ -125,48 +272,117 @@ func NewHNSW(config *Config) (*Index, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
-	}, 64)
+	}, 64, 64)
 	if err != nil {
 		linkSFL.Free()
 		return nil, fmt.Errorf("failed to create link0SFL: %w", err)
 	}
 
+	nodeSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  512 * 1024 * 1024,
+		SlotSize:  uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(config.M),
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 8,
+		Prealloc:  false,
+	}, 64, 64)
+	if err != nil {
+		linkSFL.Free()
+		link0SFL.Free()
+		return nil, fmt.Errorf("failed to create nodeSFL: %w", err)
+	}
+
+	inFlight := newInFlightRegistry(nil)
+
 	scratchPool := &sync.Pool{
 		New: func() any {
-			a, _ := memory.NewArena(1024 * 1024)
+			a, _ := memory.NewArena(1024*1024, 64)
 			return a
 		},
 	}
 
-	index := &Index{
-		config:               config,
-		nodes:                make([]*Node, 0),
-		levelGenerator:       rand.New(rand.NewSource(config.RandomSeed)),
-		distance:             distanceFunc,
-		provider:             config.Provider,
-		idToIndex:            make(map[string]uint32),
-		ordinalToID:          make(map[uint32]string),
-		entryPointCandidates: make([]uint32, 0),
-		trainingVectors:      make([][]float32, 0),
-		quantizationTrained:  false,
-		nextOrdinal:          0,
-		linkSFL:              linkSFL,
-		link0SFL:             link0SFL,
-		scratchPool:          scratchPool,
+	idToIndexMap, err := memory.NewTypedIDMap[Node](memory.IDMapConfig{
+		Capacity:  config.idMapCapacity(),
+		KeyBytes:  config.idMapKeyBytes(),
+		Alignment: 128,
+	})
+	if err != nil {
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create idToIndex map: %w", err)
 	}
-	index.searchScratchPool.New = func() interface{} {
-		return &searchScratch{}
+	registryPool, err := newSegmentedArrayPool()
+	if err != nil {
+		_ = idToIndexMap.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap registry pool: %w", err)
+	}
+	nodes, err := newSegmentedNodeArrayWithPool(registryPool)
+	if err != nil {
+		_ = idToIndexMap.Free()
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap node registry: %w", err)
+	}
+	ordinalToID, err := newSegmentedStringArrayWithPool(registryPool)
+	if err != nil {
+		_ = idToIndexMap.Free()
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, fmt.Errorf("failed to create off-heap ordinal registry: %w", err)
+	}
+	reclamation, err := newReclamationDomain(config.RawStoreCap)
+	if err != nil {
+		_ = idToIndexMap.Free()
+		registryPool.Free()
+		linkSFL.Free()
+		link0SFL.Free()
+		nodeSFL.Free()
+		return nil, err
+	}
+
+	index := &Index{
+		config:                config,
+		nodes:                 nodes,
+		neighborSelector:      NewNeighborSelector(config.M, config.level0LinkMultiplier()),
+		useHeuristicPredicate: true,
+		distance:              distanceFunc,
+		provider:              config.Provider,
+		idToIndex:             idToIndexMap,
+		ordinalToID:           ordinalToID,
+		trainingVectors:       nil,
+		linkSFL:               linkSFL,
+		link0SFL:              link0SFL,
+		nodeSFL:               nodeSFL,
+		registryPool:          registryPool,
+		inFlightNodes:         inFlight,
+		scratchPool:           scratchPool,
+		reclamation:           reclamation,
+	}
+	if repairQueueSize := config.repairQueueSize(); repairQueueSize > 0 {
+		index.repairCh = make(chan uint32, repairQueueSize)
+		if config.RepairEnabled {
+			index.startRepairWorker()
+		}
 	}
 	switch config.RawVectorStore {
 	case "", RawVectorStoreMemory:
-		index.rawVectorStore = NewInMemoryRawVectorStore(config.Dimension)
+		index.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(config.Dimension, config.RawStoreCap)
 	case RawVectorStoreSlabby:
 		store, err := NewSlabbyRawVectorStore(config.Dimension, config.RawStoreCap)
 		if err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("failed to create slabby raw vector store: %w", err)
 		}
 		index.rawVectorStore = store
 	default:
+		_ = index.Close()
 		return nil, fmt.Errorf("unsupported raw vector store backend: %s", config.RawVectorStore)
 	}
 
@@ -174,144 +390,224 @@ func NewHNSW(config *Config) (*Index, error) {
 	if config.Quantization != nil {
 		quantizer, err := quant.Create(config.Quantization)
 		if err != nil {
+			_ = index.Close()
 			return nil, fmt.Errorf("failed to create quantizer: %w", err)
 		}
 		index.quantizer = quantizer
+	}
+
+	// Pre-allocate training vectors array if quantization is enabled
+	if config.Quantization != nil {
+		index.trainingVectors = make([][]float32, index.getTrainingThreshold())
+	}
+
+	// Force allocator growth and initialize the reusable search contexts before
+	// the index is published. Inserts and searches must not pay first-use mmap
+	// wrappers or scratch allocation on their latency-critical paths.
+	allocators := [...]struct {
+		name  string
+		value *memory.ShardedFreeList
+	}{
+		{name: "node", value: index.nodeSFL},
+		{name: "link", value: index.linkSFL},
+		{name: "link0", value: index.link0SFL},
+	}
+	for _, allocator := range allocators {
+		slot, err := allocator.value.Allocate()
+		if err != nil {
+			_ = index.Close()
+			return nil, fmt.Errorf("prewarm %s allocator: %w", allocator.name, err)
+		}
+		if err := allocator.value.Deallocate(slot); err != nil {
+			_ = index.Close()
+			return nil, fmt.Errorf("return prewarmed %s slot: %w", allocator.name, err)
+		}
+	}
+	scratchCount := min(64, max(32, runtime.GOMAXPROCS(0)*4))
+	index.searchScratches = make([]searchScratch, scratchCount)
+	scratchNodeCapacity := config.RawStoreCap
+	if scratchNodeCapacity <= 0 {
+		scratchNodeCapacity = int(config.idMapCapacity())
+	}
+	scratchEF := max(config.EfConstruction*2, config.EfSearch)
+	for i := range index.searchScratches {
+		scratch := &index.searchScratches[i]
+		scratch.slot = uint8(i)
+		index.prepareSearchScratch(scratch, scratchNodeCapacity, scratchEF)
+	}
+	if scratchCount == 64 {
+		index.searchScratchFree.Store(^uint64(0))
+	} else {
+		index.searchScratchFree.Store((uint64(1) << scratchCount) - 1)
 	}
 
 	return index, nil
 }
 
 func (h *Index) Insert(ctx context.Context, entry *VectorEntry) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	// 1. Metadata Setup (Write Lock)
+	// 1. Lock-Free Metadata Allocation (slices protected by metaMu)
+	node, err := h.insertSingleMetadata(ctx, entry)
+	if err != nil {
+		return err
+	}
+	// If first node, it returns nil, nil
+	if node == nil {
+		return nil
+	}
+	if h.inFlightNodes != nil {
+		atomic.StoreUint32(&node.InFlight, 1)
+		h.inFlightNodes.Add(uint32(node.Ordinal))
+	}
 
-	return h.insertSingle(ctx, entry)
+	// 2. Lock-Free Graph Traversal & Mutually Unaware Edge Construction
+	err = h.insertNode(ctx, node, node.Ordinal, entry.Vector)
+
+	// 3. Remove from in-flight registry
+	if h.inFlightNodes != nil {
+		atomic.StoreUint32(&node.InFlight, 0)
+		h.inFlightNodes.Remove(uint32(node.Ordinal))
+	}
+
+	if err != nil {
+		// Unpublish before releasing owned vector and link storage. The node slot
+		// itself remains retired until epoch reclamation is available for readers
+		// that may already have captured its address.
+		h.retireNodeStorage(node.Ordinal, node)
+		if entry.ID != "" {
+			h.idToIndex.DeleteString(entry.ID)
+			h.ordinalToID.Set(node.Ordinal, "")
+		}
+		h.size.Add(-1)
+	} else {
+		// Update entry point atomically if necessary
+		h.updateEntryPointCAS(node)
+	}
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+
+	return err
 }
 
-// insertSingle handles single vector insertion (must be called with lock held)
-func (h *Index) insertSingle(ctx context.Context, entry *VectorEntry) error {
+// insertSingleMetadata handles single vector metadata initialization
+func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*Node, error) {
 	if entry == nil {
-		return fmt.Errorf("entry cannot be nil")
+		return nil, fmt.Errorf("entry cannot be nil")
 	}
 	if len(entry.Vector) == 0 {
-		return fmt.Errorf("vector cannot be empty")
+		return nil, fmt.Errorf("vector cannot be empty")
 	}
 	if len(entry.Vector) != h.config.Dimension {
-		return fmt.Errorf("vector dimension mismatch: expected %d, got %d", h.config.Dimension, len(entry.Vector))
-	}
-
-	if entry.ID != "" {
-		if _, exists := h.idToIndex[entry.ID]; exists {
-			return fmt.Errorf("node with ID '%s' already exists", entry.ID)
-		}
+		return nil, fmt.Errorf("vector dimension mismatch: expected %d, got %d", h.config.Dimension, len(entry.Vector))
 	}
 
 	// Handle quantization training collection
-	if h.quantizer != nil && !h.quantizationTrained {
-		// Collect vectors for training
+	if h.quantizer != nil && !h.quantizationTrained.Load() {
+		// Collect vectors for training lock-free
 		vectorCopy := make([]float32, len(entry.Vector))
 		copy(vectorCopy, entry.Vector)
-		h.trainingVectors = append(h.trainingVectors, vectorCopy)
 
-		// Train quantizer when we have enough training data
-		if len(h.trainingVectors) >= h.getTrainingThreshold() {
-			if err := h.trainQuantizer(ctx); err != nil {
-				return fmt.Errorf("failed to train quantizer: %w", err)
+		threshold := h.getTrainingThreshold()
+		count := h.trainingCount.Add(1)
+		if int(count) <= threshold {
+			h.trainingVectors[count-1] = vectorCopy
+			if int(count) == threshold {
+				if err := h.trainQuantizer(ctx); err != nil {
+					return nil, fmt.Errorf("failed to train quantizer: %w", err)
+				}
+				h.quantizationTrained.Store(true)
 			}
 		}
 	}
 
 	// Create new node with optimized memory allocation
-	level := h.generateLevel()
-	ordinal := entry.Ordinal
+	var ordinal uint32
 	if h.provider == nil {
-		ordinal = h.nextOrdinal
+		ordinal = h.nextOrdinal.Add(1) - 1
+	} else {
+		ordinal = entry.Ordinal
 	}
-	if int(ordinal) < len(h.nodes) && h.nodes[ordinal] != nil {
-		return fmt.Errorf("node with ordinal %d already exists", ordinal)
+	if ordinal >= maxNodeCapacity {
+		return nil, fmt.Errorf("node ordinal %d exceeds registry capacity %d", ordinal, maxNodeCapacity)
 	}
-	node := &Node{
+	level := h.generateLevel(ordinal)
+	if int(ordinal) < h.nodes.Len() && h.nodes.Get(ordinal) != nil {
+		return nil, fmt.Errorf("node with ordinal %d already exists", ordinal)
+	}
+	nodeSlot, err := h.nodeSFL.Allocate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate node from SFL: %w", err)
+	}
+	node := (*Node)(unsafe.Pointer(&nodeSlot[SFLMetadataOverhead]))
+	*node = Node{
 		Ordinal: ordinal,
 		Level:   level,
-		Links:   h.newNodeLinks(level, h.config.M),
+		Slot:    SentinelNodeID,
 	}
+	h.initNodeArrays(node, level, h.config.M)
 
-	// Handle vector storage (quantized or original)
-	if h.quantizer != nil && h.quantizationTrained {
-		// Compress the vector
-		compressed, err := h.quantizer.Compress(entry.Vector)
-		if err != nil {
-			return fmt.Errorf("failed to compress vector: %w", err)
-		}
-		node.CompressedVector = compressed
-	} else if h.rawVectorStore != nil {
+	if h.rawVectorStore != nil {
 		ref, err := h.rawVectorStore.Put(entry.Vector)
 		if err != nil {
-			return fmt.Errorf("failed to store raw vector: %w", err)
+			h.releaseUnpublishedNode(node)
+			return nil, fmt.Errorf("failed to store raw vector: %w", err)
 		}
 		node.Slot = ref.Slot
+		if vec, err := h.rawVectorStore.Get(ref); err == nil {
+			node.setVector(vec)
+		}
+	}
+
+	// Handle vector compression when quantization is active. Keep the raw
+	// off-heap vector reference as well so final candidate reranking can use
+	// exact distances instead of returning approximate PQ/SQ order.
+	if h.quantizer != nil && h.quantizationTrained.Load() {
+		compressed, err := h.quantizer.Compress(entry.Vector)
+		if err != nil {
+			h.releaseUnpublishedNode(node)
+			return nil, fmt.Errorf("failed to compress vector: %w", err)
+		}
+		node.CompressedVector = compressed
 	}
 
 	nodeID := node.Ordinal
-	if int(nodeID) >= len(h.nodes) {
-		h.ensureNodeCapacity(int(nodeID) + 1)
-	}
-	h.nodes[nodeID] = node
-	if h.provider == nil {
-		h.nextOrdinal++
-	}
 
 	if entry.ID != "" {
-		h.idToIndex[entry.ID] = nodeID
-		h.ordinalToID[nodeID] = entry.ID
-	}
-
-	// Add to entry point candidates if level is high enough
-	// Using level >= 2 as threshold for entry point candidates
-	if level >= 2 {
-		h.entryPointCandidates = append(h.entryPointCandidates, nodeID)
-	}
-
-	// If this is the first node, set it as entry point
-	if h.entryPoint == nil {
-		h.entryPoint = node
-		h.maxLevel = level
-		h.size++
-		return nil
-	}
-
-	// Delegate to insertion logic in insert.go
-	if err := h.insertNode(ctx, node, nodeID, entry.Vector); err != nil {
-		h.nodes[nodeID] = nil
-		if entry.ID != "" {
-			delete(h.idToIndex, entry.ID)
-			delete(h.ordinalToID, nodeID)
+		if _, inserted, err := h.idToIndex.PutStringIfAbsent(entry.ID, node); err != nil {
+			h.releaseUnpublishedNode(node)
+			return nil, fmt.Errorf("register vector ID %s: %w", entry.ID, err)
+		} else if !inserted {
+			h.releaseUnpublishedNode(node)
+			return nil, fmt.Errorf("vector with ID %s already exists", entry.ID)
 		}
-
-		if level >= 2 && len(h.entryPointCandidates) > 0 {
-			lastIdx := len(h.entryPointCandidates) - 1
-			if h.entryPointCandidates[lastIdx] == nodeID {
-				h.entryPointCandidates = h.entryPointCandidates[:lastIdx]
-			}
-		}
-
-		return fmt.Errorf("failed to insert node: %w", err)
 	}
 
-	h.size++
+	h.nodes.Set(nodeID, node)
 
-	// Update entry point if necessary
-	if level > h.maxLevel {
-		h.entryPoint = node
-		h.maxLevel = level
+	if entry.ID != "" {
+		h.ordinalToID.Set(nodeID, entry.ID)
 	}
 
-	return nil
+	// No entry point candidate list needed anymore, we fall back to O(N) scan.
+
+	// Only the node that changes the empty state from zero may skip graph
+	// insertion. A higher-level concurrent node must still connect normally.
+	if h.initializeEntryPointCAS(node) {
+		h.size.Add(1)
+		return nil, nil
+	}
+
+	h.size.Add(1)
+	return node, nil
 }
 
-func (h *Index) newNodeLinks(level int, baseM int) [][]uint32 {
-	links := make([][]uint32, level+1)
+const SentinelNodeID uint32 = 0xFFFFFFFF
+
+func (h *Index) newNodeArrays(level int, baseM int) (links, backlinks [MaxLevel]*uint32) {
 	for i := 0; i <= level; i++ {
 		capacity := levelMaxLinks(baseM, i)
 		slack := capacity / 4
@@ -320,21 +616,104 @@ func (h *Index) newNodeLinks(level int, baseM int) [][]uint32 {
 		}
 		maxCapacity := capacity + slack
 
-		var slot []byte
+		// Allocate Links
+		var slotL, slotB []byte
 		var err error
 		if i == 0 {
-			slot, err = h.link0SFL.Allocate()
+			slotL, err = h.link0SFL.Allocate()
+			if err == nil {
+				slotB, err = h.link0SFL.Allocate()
+			}
 		} else {
-			slot, err = h.linkSFL.Allocate()
+			slotL, err = h.linkSFL.Allocate()
+			if err == nil {
+				slotB, err = h.linkSFL.Allocate()
+			}
 		}
 		if err != nil {
-			panic(fmt.Sprintf("hnsw: failed to allocate links: %v", err))
+			panic(fmt.Sprintf("hnsw: failed to allocate links/backlinks: %v", err))
 		}
-		ptr := unsafe.Pointer(&slot[SFLMetadataOverhead])
-		// Slice up to maxCapacity, but start with len 0
-		links[i] = unsafe.Slice((*uint32)(ptr), maxCapacity)[:0]
+
+		ptrL := (*uint32)(unsafe.Pointer(&slotL[SFLMetadataOverhead]))
+		ptrB := (*uint32)(unsafe.Pointer(&slotB[SFLMetadataOverhead]))
+
+		// Initialize with SentinelNodeID
+		sliceL := unsafe.Slice(ptrL, maxCapacity)
+		sliceB := unsafe.Slice(ptrB, maxCapacity)
+		for j := 0; j < maxCapacity; j++ {
+			sliceL[j] = SentinelNodeID
+			sliceB[j] = SentinelNodeID
+		}
+
+		links[i] = ptrL
+		backlinks[i] = ptrB
 	}
-	return links
+	return links, backlinks
+}
+
+func inlineNodeLinkOffset() uintptr {
+	const align = uintptr(8)
+	size := uintptr(unsafe.Sizeof(Node{}))
+	return (size + align - 1) &^ (align - 1)
+}
+
+func inlineNodeSlotPayloadSize(baseM int) uint64 {
+	linkCap := uintptr(linkArrayCapacity(baseM, 0))
+	return uint64(inlineNodeLinkOffset() + linkCap*4*2)
+}
+
+func (h *Index) initNodeArrays(node *Node, level int, baseM int) {
+	if node == nil {
+		return
+	}
+	h.initInlineLevel0Arrays(node, baseM)
+	for i := 1; i <= level; i++ {
+		slotL, err := h.linkSFL.Allocate()
+		if err != nil {
+			panic(fmt.Sprintf("hnsw: failed to allocate upper links: %v", err))
+		}
+		slotB, err := h.linkSFL.Allocate()
+		if err != nil {
+			panic(fmt.Sprintf("hnsw: failed to allocate upper backlinks: %v", err))
+		}
+		ptrL := (*uint32)(unsafe.Pointer(&slotL[SFLMetadataOverhead]))
+		ptrB := (*uint32)(unsafe.Pointer(&slotB[SFLMetadataOverhead]))
+		maxCapacity := linkArrayCapacity(baseM, i)
+		sliceL := unsafe.Slice(ptrL, maxCapacity)
+		sliceB := unsafe.Slice(ptrB, maxCapacity)
+		for j := 0; j < maxCapacity; j++ {
+			sliceL[j] = SentinelNodeID
+			sliceB[j] = SentinelNodeID
+		}
+		node.Links[i] = ptrL
+		node.Backlinks[i] = ptrB
+	}
+}
+
+func (h *Index) initInlineLevel0Arrays(node *Node, baseM int) {
+	linkCap := linkArrayCapacity(baseM, 0)
+	base := uintptr(unsafe.Pointer(node)) + inlineNodeLinkOffset()
+	links := (*uint32)(unsafe.Pointer(base))
+	backlinks := (*uint32)(unsafe.Pointer(base + uintptr(linkCap*4)))
+	linkSlice := unsafe.Slice(links, linkCap)
+	backlinkSlice := unsafe.Slice(backlinks, linkCap)
+	for i := 0; i < linkCap; i++ {
+		linkSlice[i] = SentinelNodeID
+		backlinkSlice[i] = SentinelNodeID
+	}
+	node.Links[0] = links
+	node.Backlinks[0] = backlinks
+}
+
+func isInlineLevel0LinkPtr(node *Node, baseM int, ptr *uint32) bool {
+	if node == nil || ptr == nil {
+		return false
+	}
+	linkCap := linkArrayCapacity(baseM, 0)
+	base := uintptr(unsafe.Pointer(node)) + inlineNodeLinkOffset()
+	links := (*uint32)(unsafe.Pointer(base))
+	backlinks := (*uint32)(unsafe.Pointer(base + uintptr(linkCap*4)))
+	return ptr == links || ptr == backlinks
 }
 
 func initialNodeLinkCapacity(baseM int, level int) int {
@@ -343,6 +722,101 @@ func initialNodeLinkCapacity(baseM int, level int) int {
 		return maxLinks + max(8, maxLinks/2)
 	}
 	return maxLinks
+}
+
+func linkArrayCapacity(baseM int, level int) int {
+	capacity := levelMaxLinks(baseM, level)
+	slack := capacity / 4
+	if slack < 4 {
+		slack = 4
+	}
+	return capacity + slack
+}
+
+func getArraySliceWithCount(ptr *uint32, baseM int, level int, count uint32) []uint32 {
+	if ptr == nil {
+		return nil
+	}
+	maxCapacity := linkArrayCapacity(baseM, level)
+	n := int(count)
+	if n > maxCapacity {
+		n = maxCapacity
+	}
+	return unsafe.Slice(ptr, maxCapacity)[:n]
+}
+
+func (h *Index) getNodeLinks(node *Node, level int) []uint32 {
+	if node == nil || level < 0 || level >= MaxLevel || level > node.Level {
+		return nil
+	}
+	return getArraySliceWithCount(node.Links[level], h.config.M, level, atomic.LoadUint32(&node.LinkCounts[level]))
+}
+
+func (h *Index) getNodeBacklinks(node *Node, level int) []uint32 {
+	if node == nil || level < 0 || level >= MaxLevel || level > node.Level {
+		return nil
+	}
+	return getArraySliceWithCount(node.Backlinks[level], h.config.M, level, atomic.LoadUint32(&node.BacklinkCounts[level]))
+}
+
+func (h *Index) appendWithSpinlock(node *Node, ptr *uint32, newID uint32, baseM int, level int) bool {
+	if node == nil || ptr == nil {
+		return false
+	}
+
+	// Acquire spinlock to protect against concurrent PruneConnections
+	for !h.acquirePruneLock(node) {
+		runtime.Gosched()
+	}
+	defer h.releasePruneLock(node)
+
+	maxCapacity := linkArrayCapacity(baseM, level)
+	countPtr := node.linkCountPtr(ptr, level)
+	if countPtr == nil {
+		return false
+	}
+	slice := unsafe.Slice(ptr, maxCapacity)
+	count := int(atomic.LoadUint32(countPtr))
+	if count > maxCapacity {
+		count = maxCapacity
+	}
+
+	for i := 0; i < count; i++ {
+		val := atomic.LoadUint32(&slice[i])
+		if val == newID {
+			return false // Already exists
+		}
+	}
+	if count >= maxCapacity {
+		return false
+	}
+	atomic.StoreUint32(&slice[count], newID)
+	atomic.StoreUint32(countPtr, uint32(count+1))
+	if ptr == node.Links[level] {
+		atomic.StoreUint32(&node.LinkHeuristic[level], 0)
+	}
+	return true
+}
+
+func (node *Node) linkCountPtr(ptr *uint32, level int) *uint32 {
+	if node == nil || level < 0 || level >= MaxLevel {
+		return nil
+	}
+	if ptr == node.Links[level] {
+		return &node.LinkCounts[level]
+	}
+	if ptr == node.Backlinks[level] {
+		return &node.BacklinkCounts[level]
+	}
+	return nil
+}
+
+func (h *Index) acquirePruneLock(node *Node) bool {
+	return atomic.CompareAndSwapUint32(&node.PruneLock, 0, 1)
+}
+
+func (h *Index) releasePruneLock(node *Node) {
+	atomic.StoreUint32(&node.PruneLock, 0)
 }
 
 // BatchInsert provides optimized batch insertion for better performance with large datasets
@@ -357,52 +831,87 @@ func (h *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
 
 // batchInsertOptimized handles large batch insertions with memory optimization
 func (h *Index) batchInsertOptimized(ctx context.Context, entries []*VectorEntry) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Pre-allocate space for nodes to avoid repeated slice growth
-	expectedSize := len(h.nodes) + len(entries)
-	if h.provider != nil {
-		for _, entry := range entries {
-			if entry != nil && int(entry.Ordinal)+1 > expectedSize {
-				expectedSize = int(entry.Ordinal) + 1
+	workers := min(runtime.GOMAXPROCS(0), len(entries))
+	if workers <= 1 || len(entries) < 8 {
+		for i, entry := range entries {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if err := h.Insert(ctx, entry); err != nil {
+				return fmt.Errorf("failed to insert entry at index %d: %w", i, err)
 			}
 		}
-	}
-	if expectedSize > len(h.nodes) {
-		h.ensureNodeCapacity(expectedSize)
+		return nil
 	}
 
-	// Process entries in chunks to manage memory usage
-	chunkSize := 100 // Process 100 entries at a time
-	for i := 0; i < len(entries); i += chunkSize {
-		end := min(i+chunkSize, len(entries))
-		chunk := entries[i:end]
+	jobs := make(chan int, workers*2)
+	errCh := make(chan error, 1)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
 
-		// Check context cancellation
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if stop.Load() {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					stop.Store(true)
+					select {
+					case errCh <- ctx.Err():
+					default:
+					}
+					return
+				default:
+				}
+				if err := h.Insert(ctx, entries[idx]); err != nil {
+					stop.Store(true)
+					select {
+					case errCh <- fmt.Errorf("failed to insert entry at index %d: %w", idx, err):
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+sendLoop:
+	for i := range entries {
+		if stop.Load() {
+			break
+		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// Process chunk
-		for _, entry := range chunk {
-			if err := h.insertSingle(ctx, entry); err != nil {
-				return fmt.Errorf("failed to insert entry %s in batch: %w", entry.ID, err)
+			stop.Store(true)
+			select {
+			case errCh <- ctx.Err():
+			default:
 			}
+			break sendLoop
+		case jobs <- i:
 		}
 	}
+	close(jobs)
+	wg.Wait()
 
-	return nil
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
 }
 
 // Search performs a KNN search using the HNSW algorithm.
 func (h *Index) Search(ctx context.Context, query []float32, k int, filter interface {
 	Test(idx uint64) bool
 }) ([]*SearchResult, error) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 
 	if k <= 0 {
 		return nil, fmt.Errorf("k must be positive, got %d: %w", k, util.ErrInvalidK)
@@ -411,13 +920,26 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 		return nil, fmt.Errorf("k %d exceeds maximum allowed search result limit of 4096", k)
 	}
 
-	if h.size == 0 {
+	if h.size.Load() == 0 {
 		return nil, fmt.Errorf("%w", util.ErrEmptyIndex)
 	}
 
 	if len(query) != h.config.Dimension {
 		return nil, fmt.Errorf("query dimension %d does not match index dimension %d",
 			len(query), h.config.Dimension)
+	}
+	qualityFloor := h.config.EfConstruction * 2
+	ef := max(h.config.EfSearch, k, qualityFloor)
+	if h.quantizer != nil {
+		ef = max(ef, min(int(h.size.Load()), h.config.EfConstruction*2))
+	}
+	scratch := h.acquireSearchScratchWithEF(ef)
+	defer h.releaseSearchScratch(scratch)
+
+	size := int(h.size.Load())
+	exactCutoff := max(h.config.EfConstruction*2, h.config.EfSearch, k)
+	if size <= exactCutoff {
+		return h.searchExact(ctx, query, k, filter)
 	}
 
 	var queryState any
@@ -426,23 +948,26 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	}
 
 	// Phase 1: Search from top level to level 1
-	ep := h.entryPoint
-	for level := h.maxLevel; level > 0; level-- {
-		candidate, err := h.greedySearchLevel(ctx, query, ep, level, queryState)
+	ep := h.getEntryPoint()
+	for level := h.getMaxLevel(); level > 0; level-- {
+		candidate, ok, err := h.greedySearchLevelValue(ctx, query, ep, level, queryState)
 		if err != nil {
 			return nil, err
 		}
-		if candidate != nil {
-			ep = h.nodes[candidate.ID]
+		if ok {
+			ep = h.nodes.Get(candidate.ID)
 		}
 	}
 
-	// Phase 2: Search level 0 with ef
-	ef := max(h.config.EfSearch, k)
-	candidates, err := h.searchLevel(ctx, query, ep, ef, 0, queryState, filter)
+	// Phase 2: Search level 0 with ef. Extremely small efSearch values can
+	// produce unacceptable tail recall even when the graph topology is sound,
+	// so keep a degree/construction-aware floor while still honoring larger
+	// caller-specified beams.
+	candidates, err := h.searchLevelValuesWithScratch(ctx, query, ep, ef, 0, true, scratch, queryState, filter)
 	if err != nil {
 		return nil, err
 	}
+	h.rerankSearchCandidateValues(query, candidates)
 
 	// Convert to results and limit to k
 	results := make([]*SearchResult, 0, min(k, len(candidates)))
@@ -451,7 +976,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 			break
 		}
 
-		node := h.nodes[candidate.ID]
+		node := h.nodes.Get(candidate.ID)
 		if node == nil {
 			continue
 		}
@@ -465,7 +990,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 
 		results = append(results, &SearchResult{
 			Ordinal: node.Ordinal,
-			ID:      h.ordinalToID[node.Ordinal],
+			ID:      strings.Clone(h.ordinalToID.Get(node.Ordinal)),
 			Score:   candidate.Distance,
 			Vector:  resultVector,
 		})
@@ -485,23 +1010,141 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	return results, nil
 }
 
+func (h *Index) searchExact(ctx context.Context, query []float32, k int, filter interface {
+	Test(idx uint64) bool
+}) ([]*SearchResult, error) {
+	type exactCandidate struct {
+		id       uint32
+		distance float32
+	}
+
+	candidates := make([]exactCandidate, 0, min(k, int(h.size.Load())))
+	for i := 0; i < h.nodes.Len(); i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
+		if filter != nil && !filter.Test(uint64(node.Ordinal)) {
+			continue
+		}
+
+		vec := node.Vector
+		if vec == nil {
+			if stored, err := h.getNodeVector(node); err == nil {
+				vec = stored
+			}
+		}
+		var distance float32
+		if vec != nil {
+			distance = h.distance(query, vec)
+		} else {
+			var err error
+			distance, err = h.computeDistanceOptimized(query, node, nil)
+			if err != nil {
+				continue
+			}
+		}
+		candidates = append(candidates, exactCandidate{id: node.Ordinal, distance: distance})
+	}
+
+	if len(candidates) == 0 {
+		return []*SearchResult{}, nil
+	}
+
+	slices.SortFunc(candidates, func(a, b exactCandidate) int {
+		if a.distance < b.distance {
+			return -1
+		}
+		if a.distance > b.distance {
+			return 1
+		}
+		if a.id < b.id {
+			return -1
+		}
+		if a.id > b.id {
+			return 1
+		}
+		return 0
+	})
+
+	if k > len(candidates) {
+		k = len(candidates)
+	}
+	results := make([]*SearchResult, 0, k)
+	for _, candidate := range candidates[:k] {
+		node := h.nodes.Get(candidate.id)
+		if node == nil {
+			continue
+		}
+		var resultVector []float32
+		if h.provider == nil {
+			resultVector, _ = h.getNodeVector(node)
+		}
+		results = append(results, &SearchResult{
+			Ordinal: node.Ordinal,
+			ID:      strings.Clone(h.ordinalToID.Get(node.Ordinal)),
+			Score:   candidate.distance,
+			Vector:  resultVector,
+		})
+	}
+	return results, nil
+}
+
+func (h *Index) rerankSearchCandidates(query []float32, candidates []*util.Candidate) {
+	if h.quantizer == nil || len(candidates) == 0 {
+		return
+	}
+	for _, candidate := range candidates {
+		node := h.nodes.Get(candidate.ID)
+		if node == nil {
+			continue
+		}
+		vec, err := h.getNodeVector(node)
+		if err != nil || vec == nil {
+			continue
+		}
+		candidate.Distance = h.distance(query, vec)
+	}
+	slices.SortFunc(candidates, compareCandidatePtrs)
+}
+
+func (h *Index) rerankSearchCandidateValues(query []float32, candidates []util.Candidate) {
+	if h.quantizer == nil || len(candidates) == 0 {
+		return
+	}
+	for i := range candidates {
+		node := h.nodes.Get(candidates[i].ID)
+		if node == nil {
+			continue
+		}
+		vec, err := h.getNodeVector(node)
+		if err != nil || vec == nil {
+			continue
+		}
+		candidates[i].Distance = h.distance(query, vec)
+	}
+	slices.SortFunc(candidates, compareCandidateValues)
+}
+
 // Size returns the number of vectors in the index
 func (h *Index) Size() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.size
+	return int(h.size.Load())
 }
 
 // MemoryUsage returns approximate memory usage in bytes
 func (h *Index) MemoryUsage() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	return h.calculateMemoryUsage()
 }
 
 func (h *Index) RawVectorStoreProfile() map[string]any {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 
 	if h.rawVectorStore == nil {
 		return nil
@@ -530,9 +1173,8 @@ func (h *Index) calculateMemoryUsage() int64 {
 		var usage int64
 
 		// Count only essential in-memory structures
-		usage += int64(len(h.nodes) * 8)                // Pointer overhead
-		usage += int64(len(h.idToIndex) * 16)           // Map overhead
-		usage += int64(len(h.entryPointCandidates) * 4) // uint32 slice
+		usage += int64(h.nodes.Len() * 8) // Pointer overhead
+		// Note: idToIndex map was removed in favor of SegmentedArray
 
 		// Add quantizer memory usage if present
 		if h.quantizer != nil {
@@ -543,7 +1185,11 @@ func (h *Index) calculateMemoryUsage() int64 {
 	}
 
 	var usage int64
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
 		if node == nil {
 			continue
 		}
@@ -553,7 +1199,8 @@ func (h *Index) calculateMemoryUsage() int64 {
 		}
 
 		// Links
-		for _, links := range node.Links {
+		for i := 0; i < len(node.Links); i++ {
+			links := h.getNodeLinks(node, i)
 			usage += int64(len(links) * 4) // 4 bytes per uint32
 		}
 
@@ -581,10 +1228,25 @@ func (h *Index) calculateMemoryUsage() int64 {
 
 // Close shuts down the index
 func (h *Index) Close() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.stopRepairWorker()
+	h.setEntryPoint(nil)
+	h.searchScratchFree.Store(0)
+	if h.reclamation != nil {
+		h.reclamation.drain(h)
+	}
+	for i := range h.searchScratches {
+		if arena := h.searchScratches[i].arena; arena != nil {
+			_ = arena.Free()
+			h.searchScratches[i].arena = nil
+		}
+	}
+	h.searchScratches = nil
 
 	// Free off-heap link storage.
+	if h.nodeSFL != nil {
+		h.nodeSFL.Free()
+		h.nodeSFL = nil
+	}
 	if h.linkSFL != nil {
 		h.linkSFL.Free()
 		h.linkSFL = nil
@@ -594,15 +1256,34 @@ func (h *Index) Close() error {
 		h.link0SFL = nil
 	}
 
-	// Clear all data structures
+	// Clear all data structures. Registry directories and chunks are off-heap
+	// and share registryPool, so detach them before unmapping the pool.
+	if h.nodes != nil {
+		_ = h.nodes.Close()
+		h.nodes = nil
+	}
+	if h.ordinalToID != nil {
+		_ = h.ordinalToID.Close()
+		h.ordinalToID = nil
+	}
+	if h.registryPool != nil {
+		h.registryPool.Free()
+		h.registryPool = nil
+	}
+	if h.idToIndex != nil {
+		_ = h.idToIndex.Free()
+		h.idToIndex = nil
+	}
+
 	h.nodes = nil
-	h.entryPoint = nil
-	h.size = 0
-	h.nextOrdinal = 0
-	h.idToIndex = make(map[string]uint32)
-	h.ordinalToID = make(map[uint32]string)
+	h.size.Store(0)
+	h.nextOrdinal.Store(0)
 	if h.rawVectorStore != nil {
 		_ = h.rawVectorStore.Close()
+	}
+	if h.reclamation != nil {
+		h.reclamation.close()
+		h.reclamation = nil
 	}
 	if h.quantizer != nil {
 		h.quantizer.Close()
@@ -611,11 +1292,20 @@ func (h *Index) Close() error {
 	return nil
 }
 
-// generateLevel returns a random level for a new node
-func (h *Index) generateLevel() int {
-	level := 0
-	for h.levelGenerator.Float64() < h.config.ML && level < 16 { // Cap at 16 levels
-		level++
+// generateLevel derives an independent uniform sample from the stable ordinal.
+// This avoids a shared PRNG and synchronization on parallel inserts.
+func (h *Index) generateLevel(ordinal uint32) int {
+	z := uint64(ordinal) + uint64(h.config.RandomSeed) + 0x9e3779b97f4a7c15
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	z ^= z >> 31
+	u := (float64(z>>11) + 1) / (float64(uint64(1)<<53) + 1)
+	level := int(-math.Log(u) * h.config.ML)
+	if level >= MaxLevel {
+		return MaxLevel - 1
+	}
+	if level < 0 {
+		return 0
 	}
 	return level
 }
@@ -625,37 +1315,10 @@ func (h *Index) findNodeID(target *Node) uint32 {
 	if target == nil {
 		return ^uint32(0)
 	}
-	if int(target.Ordinal) >= len(h.nodes) || h.nodes[target.Ordinal] != target {
+	if int(target.Ordinal) >= h.nodes.Len() || h.nodes.Get(target.Ordinal) != target {
 		return ^uint32(0)
 	}
 	return target.Ordinal
-}
-
-func (h *Index) ensureNodeCapacity(minSize int) {
-	if minSize <= len(h.nodes) {
-		return
-	}
-	grown := make([]*Node, minSize, nextNodeCapacity(cap(h.nodes), minSize))
-	copy(grown, h.nodes)
-	h.nodes = grown
-}
-
-func nextNodeCapacity(currentCap, minSize int) int {
-	if minSize <= currentCap {
-		return currentCap
-	}
-	newSize := currentCap
-	if newSize < 16 {
-		newSize = 16
-	}
-	for newSize < minSize {
-		if newSize < 1024 {
-			newSize *= 2
-		} else {
-			newSize += newSize / 2
-		}
-	}
-	return newSize
 }
 
 // validate checks if the configuration is valid
@@ -674,6 +1337,24 @@ func (c *Config) validate() error {
 	}
 	if c.ML <= 0 {
 		return fmt.Errorf("ML must be positive")
+	}
+	if c.IDMapCapacity < 0 {
+		return fmt.Errorf("IDMapCapacity must be non-negative")
+	}
+	if c.IDMapCapacity > maxNodeCapacity {
+		return fmt.Errorf("IDMapCapacity must not exceed %d", maxNodeCapacity)
+	}
+	if c.PruneAlpha > 0 && c.PruneAlpha < 1 {
+		return fmt.Errorf("PruneAlpha must be >= 1 when set")
+	}
+	if c.Level0LinkMultiplier > 0 && c.Level0LinkMultiplier < 1 {
+		return fmt.Errorf("Level0LinkMultiplier must be >= 1 when set")
+	}
+	if c.RepairQueueSize < 0 {
+		return fmt.Errorf("RepairQueueSize must be non-negative")
+	}
+	if c.RepairBatchSize < 0 {
+		return fmt.Errorf("RepairBatchSize must be non-negative")
 	}
 
 	// Validate quantization config if present
@@ -728,7 +1409,7 @@ func (h *Index) trainQuantizer(ctx context.Context) error {
 		return fmt.Errorf("quantizer training failed: %w", err)
 	}
 
-	h.quantizationTrained = true
+	h.quantizationTrained.Store(true)
 
 	// Clear training vectors to free memory
 	h.trainingVectors = nil
@@ -741,24 +1422,22 @@ func (h *Index) getNodeVector(node *Node) ([]float32, error) {
 	if node == nil {
 		return nil, fmt.Errorf("node is nil")
 	}
-	if node.CompressedVector != nil && h.quantizer != nil {
-		return h.quantizer.Decompress(node.CompressedVector)
+	if node.Vector != nil {
+		return node.Vector, nil
 	}
 	if h.provider != nil {
 		if vec, err := h.provider.GetByOrdinal(node.Ordinal); err == nil && vec != nil {
 			return vec, nil
 		}
 	}
-	if h.rawVectorStore != nil {
-		ref := VectorRef{
-			Kind:  VectorEncodingRaw,
-			Slot:  node.Slot,
-			Bytes: uint32(h.config.Dimension * 4),
-			Valid: true,
-		}
+	if ref, ok := h.rawVectorRef(node); ok {
 		return h.rawVectorStore.Get(ref)
 	}
-	return nil, fmt.Errorf("vector unavailable for ordinal %d", node.Ordinal)
+	if node.CompressedVector != nil && h.quantizer != nil {
+		return h.quantizer.Decompress(node.CompressedVector)
+	}
+	return nil, fmt.Errorf("vector unavailable for ordinal %d (compressed: %v, provider: %v, rawStore: %v)",
+		node.Ordinal, node.CompressedVector != nil, h.provider != nil, h.rawVectorStore != nil)
 }
 
 // getNodeVectorLocal retrieves a node's vector from local storage only.
@@ -769,22 +1448,54 @@ func (h *Index) getNodeVectorLocal(node *Node) ([]float32, error) {
 	if node == nil {
 		return nil, fmt.Errorf("node is nil")
 	}
-	if node.CompressedVector != nil && h.quantizer != nil {
-		return h.quantizer.Decompress(node.CompressedVector)
+	if node.Vector != nil {
+		return node.Vector, nil
 	}
-	if h.rawVectorStore != nil {
-		ref := VectorRef{
-			Kind:  VectorEncodingRaw,
-			Slot:  node.Slot,
-			Bytes: uint32(h.config.Dimension * 4),
-			Valid: true,
-		}
+	if ref, ok := h.rawVectorRef(node); ok {
 		vec, err := h.rawVectorStore.Get(ref)
 		if err == nil && vec != nil {
 			return vec, nil
 		}
 	}
+	if node.CompressedVector != nil && h.quantizer != nil {
+		return h.quantizer.Decompress(node.CompressedVector)
+	}
 	return nil, fmt.Errorf("vector for ordinal %d not in local storage", node.Ordinal)
+}
+
+func (h *Index) rawVectorRef(node *Node) (VectorRef, bool) {
+	if h.rawVectorStore == nil || node == nil || node.Slot == SentinelNodeID {
+		return VectorRef{}, false
+	}
+	return VectorRef{
+		Kind:  VectorEncodingRaw,
+		Slot:  node.Slot,
+		Bytes: uint32(h.config.Dimension * 4),
+		Valid: true,
+	}, true
+}
+
+func (h *Index) refreshNodeVectorViewsFromRawStore(slotByOrdinal bool) {
+	if h.rawVectorStore == nil {
+		return
+	}
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
+		if slotByOrdinal {
+			node.Slot = node.Ordinal
+		}
+		node.setVector(nil)
+		ref, ok := h.rawVectorRef(node)
+		if !ok {
+			continue
+		}
+		if vec, err := h.rawVectorStore.Get(ref); err == nil {
+			node.setVector(vec)
+		}
+	}
 }
 
 // SnapshotVectorsFromProvider copies all node vectors from the provider into
@@ -792,36 +1503,52 @@ func (h *Index) getNodeVectorLocal(node *Node) ([]float32, error) {
 // back into the provider. Must be called before SerializeToBytes when a
 // provider is set and the caller cannot re-enter the provider.
 func (h *Index) SnapshotVectorsFromProvider(ctx context.Context) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	if h.provider == nil {
 		return nil
 	}
 	if h.rawVectorStore == nil {
-		h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+		switch h.config.RawVectorStore {
+		case "", RawVectorStoreMemory:
+			h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
+		case RawVectorStoreSlabby:
+			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
+			if err != nil {
+				return err
+			}
+			h.rawVectorStore = store
+		default:
+			return fmt.Errorf("unsupported raw vector store backend: %s", h.config.RawVectorStore)
+		}
 	}
 
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
 		if node == nil || node.CompressedVector != nil {
 			continue
 		}
-		// Check if already present in rawVectorStore.
-		ref := VectorRef{
-			Kind:  VectorEncodingRaw,
-			Slot:  node.Ordinal,
-			Bytes: uint32(h.config.Dimension * 4),
-			Valid: true,
-		}
-		if vec, err := h.rawVectorStore.Get(ref); err == nil && vec != nil {
-			continue
+		if ref, ok := h.rawVectorRef(node); ok {
+			if vec, err := h.rawVectorStore.Get(ref); err == nil && vec != nil {
+				node.setVector(vec)
+				continue
+			}
 		}
 		vec, err := h.provider.GetByOrdinal(node.Ordinal)
 		if err != nil || vec == nil {
 			return fmt.Errorf("snapshot vector ordinal %d: %w", node.Ordinal, err)
 		}
-		if _, err := h.rawVectorStore.Put(vec); err != nil {
+		ref, err := h.rawVectorStore.Put(vec)
+		if err != nil {
 			return fmt.Errorf("snapshot store ordinal %d: %w", node.Ordinal, err)
+		}
+		node.Slot = ref.Slot
+		if stored, err := h.rawVectorStore.Get(ref); err == nil {
+			node.setVector(stored)
 		}
 		select {
 		case <-ctx.Done():
@@ -838,12 +1565,20 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 	if node1 != nil && node2 != nil &&
 		node1.CompressedVector != nil && node2.CompressedVector != nil &&
 		h.quantizer != nil {
-		return h.quantizer.Distance(node1.CompressedVector, node2.CompressedVector)
+		distance, err := h.quantizer.Distance(node1.CompressedVector, node2.CompressedVector)
+		if err != nil {
+			return 0, err
+		}
+		return h.normalizeQuantizedDistance(distance), nil
 	}
 
 	// If one is a query vector and the other is quantized
 	if node2 != nil && node2.CompressedVector != nil && h.quantizer != nil {
-		return h.quantizer.DistanceToQuery(node2.CompressedVector, vec1, nil)
+		distance, err := h.quantizer.DistanceToQuery(node2.CompressedVector, vec1, nil)
+		if err != nil {
+			return 0, err
+		}
+		return h.normalizeQuantizedDistance(distance), nil
 	}
 
 	if vec1 == nil && node1 != nil {
@@ -860,47 +1595,63 @@ func (h *Index) computeDistance(vec1, vec2 []float32, node1, node2 *Node) (float
 			return 0, err
 		}
 	}
+	if len(vec1) != h.config.Dimension || len(vec2) != h.config.Dimension {
+		return 0, fmt.Errorf("distance vector unavailable or malformed: got %d and %d dimensions, want %d", len(vec1), len(vec2), h.config.Dimension)
+	}
 
 	return h.distance(vec1, vec2), nil
 }
 
 func (h *Index) Delete(ctx context.Context, id string) error {
-	return h.deleteNode(ctx, id)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	scratch := h.acquireSearchScratch()
+	err := h.deleteNode(ctx, id)
+	h.releaseSearchScratch(scratch)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	return err
 }
 
 func (h *Index) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
-	return h.deleteNodeByOrdinal(ctx, ordinal)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	scratch := h.acquireSearchScratch()
+	err := h.deleteNodeByOrdinal(ctx, ordinal)
+	h.releaseSearchScratch(scratch)
+	if h.reclamation != nil {
+		h.reclamation.tryReclaim(h)
+	}
+	return err
 }
 
 // MemoryMappable interface implementation
 
 // CanMemoryMap returns true if the index can be memory mapped
 func (h *Index) CanMemoryMap() bool {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 
 	// Can memory map if we have nodes and are not already mapped
-	return h.size > 0 && !h.memoryMapped
+	return int(h.size.Load()) > 0 && !h.memoryMapped
 }
 
 // EstimateSize returns the estimated size in bytes if memory mapped
 func (h *Index) EstimateSize() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	return h.calculateMemoryUsage()
+	return h.MemoryUsage()
 }
 
 // EnableMemoryMapping enables memory mapping for the index
 func (h *Index) EnableMemoryMapping(basePath string) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	if h.memoryMapped {
 		return fmt.Errorf("index is already memory mapped")
 	}
 
-	if h.size == 0 {
+	if h.size.Load() == 0 {
 		return fmt.Errorf("cannot memory map empty index")
 	}
 
@@ -933,8 +1684,15 @@ func (h *Index) EnableMemoryMapping(basePath string) error {
 			return fmt.Errorf("failed to create memory-mapped raw vector store: %w", err)
 		}
 		h.vecMmap = mmapStore.mmap
-		_ = h.rawVectorStore.Reset()
+		oldStore := h.rawVectorStore
+		for i := 0; i < h.nodes.Len(); i++ {
+			if node := h.nodes.Get(uint32(i)); node != nil {
+				node.setVector(nil)
+			}
+		}
+		_ = oldStore.Reset()
 		h.rawVectorStore = mmapStore
+		h.refreshNodeVectorViewsFromRawStore(true)
 	} else if h.quantizer != nil {
 		pqMmapPath := fmt.Sprintf("%s/hnsw_pq_%p.mmap", basePath, h)
 		pqMmap, err := h.createMmapCompressedVectorStore(pqMmapPath)
@@ -952,8 +1710,6 @@ func (h *Index) EnableMemoryMapping(basePath string) error {
 
 // DisableMemoryMapping disables memory mapping and loads data back to RAM
 func (h *Index) DisableMemoryMapping() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if !h.memoryMapped {
 		return fmt.Errorf("index is not memory mapped")
@@ -1003,15 +1759,11 @@ func (h *Index) DisableMemoryMapping() error {
 
 // IsMemoryMapped returns true if currently using memory mapping
 func (h *Index) IsMemoryMapped() bool {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 	return h.memoryMapped
 }
 
 // MemoryMappedSize returns the size of memory-mapped data
 func (h *Index) MemoryMappedSize() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 
 	if h.memoryMapped {
 		return h.mmapSize
@@ -1021,6 +1773,8 @@ func (h *Index) MemoryMappedSize() int64 {
 
 // SaveToDisk persists the HNSW index to disk in binary format
 func (h *Index) SaveToDisk(ctx context.Context, path string) error {
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 	return h.saveToDiskImpl(ctx, path)
 }
 
@@ -1032,8 +1786,8 @@ func (h *Index) LoadFromDisk(ctx context.Context, path string) error {
 // SerializeToBytes serializes the index to an in-memory byte slice using the
 // same binary format as SaveToDisk.
 func (h *Index) SerializeToBytes() ([]byte, error) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	scratch := h.acquireSearchScratch()
+	defer h.releaseSearchScratch(scratch)
 
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
@@ -1074,7 +1828,7 @@ func (h *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	if h.rawVectorStore == nil {
 		switch h.config.RawVectorStore {
 		case "", RawVectorStoreMemory:
-			h.rawVectorStore = NewInMemoryRawVectorStore(h.config.Dimension)
+			h.rawVectorStore = NewInMemoryRawVectorStoreWithCapacity(h.config.Dimension, h.config.RawStoreCap)
 		case RawVectorStoreSlabby:
 			store, err := NewSlabbyRawVectorStore(h.config.Dimension, h.config.RawStoreCap)
 			if err != nil {
@@ -1101,18 +1855,16 @@ func (h *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 
 // GetPersistenceMetadata returns metadata about the current index state
 func (h *Index) GetPersistenceMetadata() *HNSWPersistenceMetadata {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 
-	if h.size == 0 {
+	if h.size.Load() == 0 {
 		return nil // No metadata for empty index
 	}
 
 	return &HNSWPersistenceMetadata{
 		Version:       FormatVersion,
-		NodeCount:     h.size,
+		NodeCount:     int(h.size.Load()),
 		Dimension:     h.config.Dimension,
-		MaxLevel:      h.maxLevel,
+		MaxLevel:      h.getMaxLevel(),
 		CreatedAt:     time.Now(),
 		ChecksumCRC32: h.calculateCRC32(),
 		FileSize:      h.estimateFileSize(),
@@ -1128,7 +1880,11 @@ func (h *Index) estimateFileSize() int64 {
 	size += 64
 
 	// Nodes
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
 		if node != nil {
 			vectorBytes := int64(0)
 			switch {
@@ -1142,10 +1898,18 @@ func (h *Index) estimateFileSize() int64 {
 	}
 
 	// Links
-	for _, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
+		if node == nil {
+			continue
+		}
 		if node != nil {
-			for _, connections := range node.Links {
-				size += int64(len(connections) * 4) // 4 bytes per uint32
+			for i := 0; i < len(node.Links); i++ {
+				connections := h.getNodeLinks(node, i)
+				if len(connections) > 0 {
+					// Memory for the array of links
+					size += int64(len(connections) * 4) // 4 bytes per uint32
+				}
 			}
 		}
 	}
@@ -1154,53 +1918,114 @@ func (h *Index) estimateFileSize() int64 {
 }
 
 func (h *Index) freeNodeLinks(node *Node) {
-	if node == nil || node.Links == nil {
+	if node == nil {
 		return
 	}
-	for i, links := range node.Links {
-		h.freeLinkSliceIfSFL(i, links)
+	for i, ptr := range node.Links {
+		if i != 0 || !isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			h.freeLinkArray(i, ptr)
+		}
+		node.Links[i] = nil
+		atomic.StoreUint32(&node.LinkCounts[i], 0)
+	}
+	for i, ptr := range node.Backlinks {
+		if i != 0 || !isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			h.freeLinkArray(i, ptr)
+		}
+		node.Backlinks[i] = nil
+		atomic.StoreUint32(&node.BacklinkCounts[i], 0)
 	}
 }
 
-// freeLinkSliceIfSFL checks if a slice came from the SFL allocator and deallocates it.
-// It uses capacity to detect SFL vs heap slices.
-func (h *Index) freeLinkSliceIfSFL(level int, links []uint32) {
-	if len(links) == 0 && cap(links) == 0 {
+func (h *Index) retireNodeLinksAt(node *Node, epoch uint64) {
+	if node == nil {
 		return
 	}
+	for level, ptr := range node.Links {
+		if ptr == nil || level == 0 && isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			continue
+		}
+		kind := retiredUpperLink
+		if level == 0 {
+			kind = retiredLevel0Link
+		}
+		base := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
+		h.retireAllocationAt(epoch, kind, base)
+	}
+	for level, ptr := range node.Backlinks {
+		if ptr == nil || level == 0 && isInlineLevel0LinkPtr(node, h.config.M, ptr) {
+			continue
+		}
+		kind := retiredUpperLink
+		if level == 0 {
+			kind = retiredLevel0Link
+		}
+		base := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
+		h.retireAllocationAt(epoch, kind, base)
+	}
+}
 
-	ptr := unsafe.Pointer(unsafe.SliceData(links))
+// releaseUnpublishedNode returns allocations that were never made reachable
+// through the node registry. No epoch delay is required for these slots.
+func (h *Index) releaseUnpublishedNode(node *Node) {
+	if node == nil {
+		return
+	}
+	h.releaseUnpublishedVector(node)
+	h.freeNodeLinks(node)
+	node.CompressedVector = nil
+	node.setVector(nil)
+	if h.nodeSFL == nil {
+		return
+	}
+	base := unsafe.Pointer(uintptr(unsafe.Pointer(node)) - SFLMetadataOverhead)
+	slotSize := int(uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(h.config.M))
+	_ = h.nodeSFL.Deallocate(unsafe.Slice((*byte)(base), slotSize))
+}
+
+func (h *Index) releaseUnpublishedVector(node *Node) {
+	if node == nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
+		return
+	}
+	ref := VectorRef{
+		Kind:  VectorEncodingRaw,
+		Slot:  node.Slot,
+		Bytes: uint32(h.config.Dimension * 4),
+		Valid: true,
+	}
+	switch store := h.rawVectorStore.(type) {
+	case *InMemoryRawVectorStore:
+		_ = store.release(ref)
+	case *SlabbyRawVectorStore:
+		_ = store.release(ref)
+	default:
+		_ = h.rawVectorStore.Delete(ref)
+	}
+	node.setVector(nil)
+}
+
+func (h *Index) freeLinkArray(level int, ptr *uint32) {
 	if ptr == nil {
 		return
 	}
 
-	slack := h.config.M / 4
+	capacity := levelMaxLinks(h.config.M, level)
+	slack := capacity / 4
 	if slack < 4 {
 		slack = 4
 	}
-	slack0 := (h.config.M * 2) / 4
-	if slack0 < 4 {
-		slack0 = 4
-	}
+	expectedCap := capacity + slack
 
-	expectedCap := h.config.M + slack
+	basePtr := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
 	if level == 0 {
-		expectedCap = h.config.M*2 + slack0
-	}
-
-	// Only deallocate if it was originally an SFL slice
-	if cap(links) == expectedCap {
-		basePtr := unsafe.Pointer(uintptr(ptr) - SFLMetadataOverhead)
-		if level == 0 {
-			if h.link0SFL != nil {
-				slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead+expectedCap*4))
-				_ = h.link0SFL.Deallocate(slot)
-			}
-		} else {
-			if h.linkSFL != nil {
-				slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead+expectedCap*4))
-				_ = h.linkSFL.Deallocate(slot)
-			}
+		if h.link0SFL != nil {
+			slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead)+expectedCap*4)
+			_ = h.link0SFL.Deallocate(slot)
+		}
+	} else {
+		if h.linkSFL != nil {
+			slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead)+expectedCap*4)
+			_ = h.linkSFL.Deallocate(slot)
 		}
 	}
 }

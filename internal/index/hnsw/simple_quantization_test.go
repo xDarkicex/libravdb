@@ -67,12 +67,16 @@ func TestSimpleQuantizationIntegration(t *testing.T) {
 		}
 
 		// Quantization should not be trained yet
-		if index.quantizationTrained {
+		if index.quantizationTrained.Load() {
 			t.Error("Quantization should not be trained with insufficient data")
 		}
 
 		// All nodes should have original vectors (not quantized)
-		for _, node := range index.nodes {
+		for i := 0; i < index.nodes.Len(); i++ {
+			node := index.nodes.Get(uint32(i))
+			if node == nil {
+				continue
+			}
 			if node.CompressedVector != nil {
 				t.Error("Nodes should not be quantized before training")
 			}
@@ -126,20 +130,24 @@ func TestSimpleQuantizationIntegration(t *testing.T) {
 			}
 
 			// Check if training happened
-			if i >= threshold && index.quantizationTrained {
+			if i >= threshold && index.quantizationTrained.Load() {
 				t.Logf("Training triggered after %d vectors", i+1)
 				break
 			}
 		}
 
 		// Quantization should be trained now
-		if !index.quantizationTrained {
+		if !index.quantizationTrained.Load() {
 			t.Error("Quantization should be trained after inserting enough vectors")
 		}
 
 		// Some nodes should be quantized (those inserted after training)
 		quantizedCount := 0
-		for _, node := range index.nodes {
+		for i := 0; i < index.nodes.Len(); i++ {
+			node := index.nodes.Get(uint32(i))
+			if node == nil {
+				continue
+			}
 			if node.CompressedVector != nil {
 				quantizedCount++
 			}
@@ -149,7 +157,7 @@ func TestSimpleQuantizationIntegration(t *testing.T) {
 			t.Error("Some nodes should be quantized after training")
 		}
 
-		t.Logf("Quantized nodes: %d out of %d", quantizedCount, len(index.nodes))
+		t.Logf("Quantized nodes: %d out of %d", quantizedCount, index.nodes.Len())
 	})
 
 	t.Run("Search with Mixed Nodes", func(t *testing.T) {
@@ -269,7 +277,7 @@ func TestQuantizationConfiguration(t *testing.T) {
 		}
 
 		// Training should be false
-		if index.quantizationTrained {
+		if index.quantizationTrained.Load() {
 			t.Error("Quantization trained should be false when no quantization config")
 		}
 	})

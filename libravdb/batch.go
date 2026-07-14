@@ -397,7 +397,7 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	arena, err := memory.NewArena(1024 * 1024)
+	arena, err := memory.NewArena(1024*1024, 64)
 	if err != nil {
 		return nil, fmt.Errorf("arena create: %w", err)
 	}

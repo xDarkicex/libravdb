@@ -32,30 +32,66 @@ func (b *indexPersistenceBridge) takeCachedIndex(name string) index.Index {
 	return idx
 }
 
+func (b *indexPersistenceBridge) closeCachedIndexes() {
+	b.mu.Lock()
+	for name, idx := range b.cache {
+		if idx != nil {
+			idx.Close()
+		}
+		delete(b.cache, name)
+	}
+	b.mu.Unlock()
+}
+
 // SerializeIndex returns serialized bytes for a collection's index.
 // Returns (nil, nil) for empty collections (no index to persist).
 // The engine skips nil entries in the index chunk; on recovery these
 // collections are rebuilt from Records.
 func (b *indexPersistenceBridge) SerializeIndex(collectionName string) ([]byte, error) {
+	indexBytes, _, err := b.SerializeIndexAt(collectionName, 0)
+	return indexBytes, err
+}
+
+// SerializeIndexAt captures an index together with the exact transaction
+// frontier represented by that image. Async HNSW workers are paused only for
+// the serialization window; WAL admission remains independent and bounded.
+func (b *indexPersistenceBridge) SerializeIndexAt(collectionName string, checkpointLSN uint64) ([]byte, uint64, error) {
 	b.mu.Lock()
 	db := b.db
 	b.mu.Unlock()
 	if db == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
 	db.mu.RLock()
 	col, ok := db.collections[collectionName]
 	db.mu.RUnlock()
 	if !ok || col == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
 	col.mu.RLock()
 	defer col.mu.RUnlock()
 	idx := col.index
 	if idx == nil {
-		return nil, nil
+		return nil, checkpointLSN, nil
 	}
-	return idx.SerializeToBytes()
+	if col.asyncIndex != nil {
+		q := col.asyncIndex
+		q.applyGate.Lock()
+		defer q.applyGate.Unlock()
+		if err := q.failureValue(); err != nil {
+			return nil, q.applied.Load(), err
+		}
+		appliedLSN := q.preciseAppliedLocked()
+		if appliedLSN > checkpointLSN {
+			// The live index cannot be rewound to an older checkpoint frontier.
+			// Omit the image so recovery rebuilds from checkpoint records.
+			return nil, checkpointLSN, nil
+		}
+		indexBytes, err := idx.SerializeToBytes()
+		return indexBytes, appliedLSN, err
+	}
+	indexBytes, err := idx.SerializeToBytes()
+	return indexBytes, checkpointLSN, err
 }
 
 // DeserializeIndex restores a collection's index from serialized bytes.
@@ -99,20 +135,91 @@ func (b *indexPersistenceBridge) RebuildIndex(collectionName string, config *sto
 	}
 
 	if len(entries) > 0 {
-		if err := prepareIndexForEntries(context.Background(), idx, entries); err != nil {
+		metric := DistanceMetric(config.Metric)
+		if err := prepareIndexForEntries(context.Background(), idx, metric, entries); err != nil {
 			idx.Close()
 			return fmt.Errorf("rebuild: prepare entries for %s: %w", collectionName, err)
 		}
-		if err := insertEntriesIntoIndex(context.Background(), idx, entries); err != nil {
+		if err := insertEntriesIntoIndex(context.Background(), idx, metric, entries); err != nil {
 			idx.Close()
 			return fmt.Errorf("rebuild: insert entries for %s: %w", collectionName, err)
 		}
 	}
 
 	b.mu.Lock()
+	if previous := b.cache[collectionName]; previous != nil {
+		previous.Close()
+	}
 	b.cache[collectionName] = idx
 	b.mu.Unlock()
 	return nil
+}
+
+// CanApplyIndexDeltas keeps recovery incremental only for index families whose
+// restored/rebuilt base can accept online mutations without a training phase.
+func (b *indexPersistenceBridge) CanApplyIndexDeltas(_ string, config *storage.CollectionConfig) bool {
+	return config != nil && IndexType(config.IndexType) != IVFPQ
+}
+
+// ApplyIndexPut advances a recovered index by one committed WAL put. Replaced
+// ordinals are removed first, matching the normal update/upsert path.
+func (b *indexPersistenceBridge) ApplyIndexPut(
+	collectionName string,
+	entry *index.VectorEntry,
+	replace bool,
+	previousOrdinal uint32,
+	config *storage.CollectionConfig,
+) error {
+	idx, err := b.cachedRecoveryIndex(collectionName)
+	if err != nil {
+		return err
+	}
+	if replace {
+		if err := deleteIndexEntry(context.Background(), idx, entry.ID, previousOrdinal); err != nil {
+			return fmt.Errorf("delete replaced index entry %s/%s: %w", collectionName, entry.ID, err)
+		}
+	}
+	if err := idx.Insert(context.Background(), entryForIndex(DistanceMetric(config.Metric), entry)); err != nil {
+		return fmt.Errorf("insert recovered index entry %s/%s: %w", collectionName, entry.ID, err)
+	}
+	return nil
+}
+
+// ApplyIndexDelete advances a recovered index by one committed WAL delete.
+func (b *indexPersistenceBridge) ApplyIndexDelete(
+	collectionName, id string,
+	ordinal uint32,
+	_ *storage.CollectionConfig,
+) error {
+	idx, err := b.cachedRecoveryIndex(collectionName)
+	if err != nil {
+		return err
+	}
+	if err := deleteIndexEntry(context.Background(), idx, id, ordinal); err != nil {
+		return fmt.Errorf("delete recovered index entry %s/%s: %w", collectionName, id, err)
+	}
+	return nil
+}
+
+func (b *indexPersistenceBridge) cachedRecoveryIndex(collectionName string) (index.Index, error) {
+	b.mu.Lock()
+	idx := b.cache[collectionName]
+	b.mu.Unlock()
+	if idx == nil {
+		return nil, fmt.Errorf("recovery index %s is not initialized", collectionName)
+	}
+	return idx, nil
+}
+
+// DiscardIndex removes a checkpoint-restored index for a collection deleted by
+// post-checkpoint WAL replay.
+func (b *indexPersistenceBridge) DiscardIndex(collectionName string) {
+	b.mu.Lock()
+	if previous := b.cache[collectionName]; previous != nil {
+		previous.Close()
+		delete(b.cache, collectionName)
+	}
+	b.mu.Unlock()
 }
 
 // IndexTypeVersion returns the index type code and format version.
@@ -132,6 +239,12 @@ func (b *indexPersistenceBridge) IndexTypeVersion(collectionName string) (indexT
 	return uint8(col.config.IndexType), 1
 }
 
+// CanRestoreIndex keeps HNSW recovery on the record-rebuild path until its
+// off-heap deserializer has independent lifetime and corruption validation.
+func (b *indexPersistenceBridge) CanRestoreIndex(_ string, indexType uint8, _ uint16) bool {
+	return IndexType(indexType) != HNSW
+}
+
 // SnapshotVectors copies node vectors from provider-backed indexes into local
 // storage so that subsequent SerializeIndex calls do not re-enter the provider.
 func (b *indexPersistenceBridge) SnapshotVectors(ctx context.Context) error {
@@ -145,6 +258,10 @@ func (b *indexPersistenceBridge) SnapshotVectors(ctx context.Context) error {
 	defer db.mu.RUnlock()
 	for name, col := range db.collections {
 		col.mu.RLock()
+		if col.asyncIndex != nil {
+			col.mu.RUnlock()
+			continue
+		}
 		idx := col.index
 		col.mu.RUnlock()
 		if idx == nil {
@@ -178,6 +295,7 @@ func (b *indexPersistenceBridge) createIndexFromEngineConfig(config *storage.Col
 		NProbes:        config.NProbes,
 		RawVectorStore: config.RawVectorStore,
 		RawStoreCap:    config.RawStoreCap,
+		IDMapCapacity:  config.IDMapCapacity,
 	}
 	return createIndexForCollection(libraConfig, nil)
 }

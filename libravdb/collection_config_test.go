@@ -1,6 +1,7 @@
 package libravdb
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -372,6 +373,58 @@ func TestCollectionOptionsValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWithHNSWUpdatesLevelMultiplierFromM(t *testing.T) {
+	config := &CollectionConfig{
+		Dimension:      128,
+		Metric:         CosineDistance,
+		IndexType:      HNSW,
+		M:              32,
+		EfConstruction: 200,
+		EfSearch:       50,
+		ML:             1.0,
+		BatchConfig:    DefaultBatchConfig(),
+	}
+
+	if err := WithHNSW(16, 100, 64)(config); err != nil {
+		t.Fatalf("WithHNSW: %v", err)
+	}
+	want := 1.0 / math.Log(16)
+	if math.Abs(config.ML-want) > 1e-12 {
+		t.Fatalf("ML got %.12f want %.12f", config.ML, want)
+	}
+}
+
+func TestWithFSQQuantization(t *testing.T) {
+	config := &CollectionConfig{
+		Dimension:      128,
+		Metric:         CosineDistance,
+		IndexType:      HNSW,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       64,
+		BatchConfig:    DefaultBatchConfig(),
+	}
+
+	if err := WithFSQQuantization(6, 0.25, 8, 8, 8, 6, 5)(config); err != nil {
+		t.Fatalf("WithFSQQuantization: %v", err)
+	}
+	if config.Quantization == nil {
+		t.Fatal("expected quantization config")
+	}
+	if got := config.Quantization.Type.String(); got != "fsq" {
+		t.Fatalf("quantization type got %s want fsq", got)
+	}
+	wantLevels := []int{8, 8, 8, 6, 5}
+	if len(config.Quantization.Levels) != len(wantLevels) {
+		t.Fatalf("levels got %v", config.Quantization.Levels)
+	}
+	for i, want := range wantLevels {
+		if config.Quantization.Levels[i] != want {
+			t.Fatalf("levels got %v", config.Quantization.Levels)
+		}
 	}
 }
 

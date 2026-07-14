@@ -16,7 +16,7 @@ func newReverseIndex(cfg GraphConfig) (*ReverseIndex, error) {
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 32,
 		Prealloc:  false,
-	}, cfg.PageShards)
+	}, 64, cfg.PageShards)
 	if err != nil {
 		return nil, err
 	}

@@ -3,20 +3,110 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
 
+func BenchmarkCollectionAsyncHNSWInsert(b *testing.B) {
+	ctx := context.Background()
+	db, err := Open(
+		WithStoragePath(testDBPathBench(b)),
+		WithDurability(DurabilitySynchronous),
+		WithAsyncIndexing(4096, 4),
+		WithMaxConcurrentWrites(32),
+		WithMaxWriteQueueDepth(4096),
+	)
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	collection, err := db.CreateCollection(
+		ctx,
+		"async_hnsw",
+		WithDimension(768),
+		WithMetric(L2Distance),
+		WithHNSW(16, 100, 200),
+		WithIDMapCapacity(max(b.N+16, 4096)),
+	)
+	if err != nil {
+		b.Fatalf("create collection: %v", err)
+	}
+
+	const fixtureCount = 256
+	vectors := make([][]float32, fixtureCount)
+	for i := range vectors {
+		vectors[i] = benchVector(768, i+1)
+	}
+	var before storage.WriteStats
+	if provider, ok := db.storage.(storage.WriteStatsProvider); ok {
+		before = provider.WriteStats()
+	}
+
+	var nextID atomic.Uint64
+	b.SetParallelism(4)
+	b.SetBytes(768 * 4)
+	b.ReportAllocs()
+	b.ResetTimer()
+	acceptedStart := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := nextID.Add(1)
+			if err := collection.Insert(ctx, strconv.FormatUint(id, 10), vectors[id%fixtureCount], nil); err != nil {
+				b.Errorf("insert: %v", err)
+				return
+			}
+		}
+	})
+	acceptedElapsed := time.Since(acceptedStart)
+	statsAtAck := collection.IndexingStats()
+	b.StopTimer()
+	if err := collection.FlushIndex(ctx); err != nil {
+		b.Fatalf("flush index: %v", err)
+	}
+	graphReadyElapsed := time.Since(acceptedStart)
+
+	if acceptedElapsed > 0 {
+		b.ReportMetric(float64(b.N)/acceptedElapsed.Seconds(), "accepted_writes/s")
+	}
+	if graphReadyElapsed > 0 {
+		b.ReportMetric(float64(b.N)/graphReadyElapsed.Seconds(), "graph_ready/s")
+	}
+	stats := collection.IndexingStats()
+	b.ReportMetric(float64(stats.LSNLag), "lsn_lag")
+	b.ReportMetric(float64(statsAtAck.Pending), "pending_at_ack")
+	b.ReportMetric(float64(statsAtAck.LSNLag), "lsn_lag_at_ack")
+	if provider, ok := db.storage.(storage.WriteStatsProvider); ok {
+		after := provider.WriteStats()
+		transactions := after.WALTransactions - before.WALTransactions
+		entries := after.BufferedVectorEntries - before.BufferedVectorEntries
+		if transactions > 0 {
+			b.ReportMetric(float64(entries)/float64(transactions), "entries/wal_tx")
+		}
+	}
+}
+
 func BenchmarkCollectionInsert(b *testing.B) {
-	benchmarkCollectionInsert(b, false)
+	benchmarkCollectionInsert(b, false, DurabilitySynchronous)
+}
+
+func BenchmarkCollectionInsertUnsafeNoSync(b *testing.B) {
+	benchmarkCollectionInsert(b, false, DurabilityUnsafeNoSync)
 }
 
 func BenchmarkCollectionInsertSteadyState(b *testing.B) {
-	benchmarkCollectionInsertSteadyStateBatch(b)
+	benchmarkCollectionInsertSteadyStateBatch(b, DurabilitySynchronous)
 }
 
-func benchmarkCollectionInsert(b *testing.B, logDelta bool) {
+func BenchmarkCollectionInsertSteadyStateUnsafeNoSync(b *testing.B) {
+	benchmarkCollectionInsertSteadyStateBatch(b, DurabilityUnsafeNoSync)
+}
+
+func benchmarkCollectionInsert(b *testing.B, logDelta bool, durability DurabilityMode) {
 	benchmarks := []struct {
 		name string
 		opts []CollectionOption
@@ -38,7 +128,7 @@ func benchmarkCollectionInsert(b *testing.B, logDelta bool) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			ctx := context.Background()
-			db, err := Open(WithStoragePath(testDBPathBench(b)))
+			db, err := Open(WithStoragePath(testDBPathBench(b)), WithDurability(durability))
 			if err != nil {
 				b.Fatalf("new db: %v", err)
 			}
@@ -99,7 +189,7 @@ func benchmarkCollectionInsert(b *testing.B, logDelta bool) {
 	}
 }
 
-func benchmarkCollectionInsertSteadyStateBatch(b *testing.B) {
+func benchmarkCollectionInsertSteadyStateBatch(b *testing.B, durability DurabilityMode) {
 	const batchSize = 256
 
 	benchmarks := []struct {
@@ -119,7 +209,7 @@ func benchmarkCollectionInsertSteadyStateBatch(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			ctx := context.Background()
-			db, err := Open(WithStoragePath(testDBPathBench(b)))
+			db, err := Open(WithStoragePath(testDBPathBench(b)), WithDurability(durability))
 			if err != nil {
 				b.Fatalf("new db: %v", err)
 			}

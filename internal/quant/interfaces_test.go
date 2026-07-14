@@ -11,6 +11,7 @@ func TestQuantizationType_String(t *testing.T) {
 	}{
 		{expected: "product", qType: ProductQuantization},
 		{expected: "scalar", qType: ScalarQuantization},
+		{expected: "fsq", qType: FiniteScalarQuantization},
 		{expected: "unknown", qType: QuantizationType(999)},
 	}
 
@@ -48,6 +49,26 @@ func TestQuantizationConfig_Validate(t *testing.T) {
 				TrainRatio: 0.1,
 			},
 			wantErr: false,
+		},
+		{
+			name: "valid FSQ config",
+			config: &QuantizationConfig{
+				Type:       FiniteScalarQuantization,
+				Bits:       6,
+				TrainRatio: 0.1,
+				Levels:     []int{8, 8, 8, 6, 5},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid FSQ level",
+			config: &QuantizationConfig{
+				Type:       FiniteScalarQuantization,
+				Bits:       6,
+				TrainRatio: 0.1,
+				Levels:     []int{8, 1},
+			},
+			wantErr: true,
 		},
 		{
 			name: "invalid bits - too low",
@@ -149,6 +170,15 @@ func TestDefaultConfig(t *testing.T) {
 			qType: ScalarQuantization,
 			want: &QuantizationConfig{
 				Type:       ScalarQuantization,
+				Bits:       8,
+				TrainRatio: 0.1,
+			},
+		},
+		{
+			name:  "FSQ default",
+			qType: FiniteScalarQuantization,
+			want: &QuantizationConfig{
+				Type:       FiniteScalarQuantization,
 				Bits:       8,
 				TrainRatio: 0.1,
 			},

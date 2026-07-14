@@ -2,10 +2,12 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/xDarkicex/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/storage/fsdurability"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
 
@@ -65,6 +67,7 @@ func Migrate(ctx context.Context, path string) error {
 				c.Version = config.Version
 				c.RawVectorStore = config.RawVectorStore
 				c.RawStoreCap = config.RawStoreCap
+				c.IDMapCapacity = config.IDMapCapacity
 				return nil
 			})
 			if err != nil {
@@ -103,7 +106,6 @@ func Migrate(ctx context.Context, path string) error {
 		}
 	}
 
-
 	if err := v2DB.Close(); err != nil {
 		return fmt.Errorf("failed to close v2 database: %w", err)
 	}
@@ -112,25 +114,44 @@ func Migrate(ctx context.Context, path string) error {
 	// 1. migrating → staged (mark ready)
 	// 2. path → backup (preserve original)
 	// 3. staged → path (activate)
-	if err := os.Rename(migratingPath, stagedPath); err != nil {
-		return fmt.Errorf("failed to stage migration: %w", err)
+	if renamed, err := replaceFileDurably(migratingPath, stagedPath); err != nil {
+		var rollbackErr error
+		if renamed {
+			_, rollbackErr = replaceFileDurably(stagedPath, migratingPath)
+		}
+		return errors.Join(fmt.Errorf("failed to stage migration: %w", err), rollbackErr)
 	}
-	if err := os.Rename(path, backupPath); err != nil {
-		os.Rename(stagedPath, migratingPath)
-		return fmt.Errorf("failed to backup v1 database: %w", err)
+	if renamed, err := replaceFileDurably(path, backupPath); err != nil {
+		var restoreErr error
+		if renamed {
+			_, restoreErr = replaceFileDurably(backupPath, path)
+		}
+		_, unstageErr := replaceFileDurably(stagedPath, migratingPath)
+		return errors.Join(fmt.Errorf("failed to backup v1 database: %w", err), restoreErr, unstageErr)
 	}
-	if err := os.Rename(stagedPath, path); err != nil {
-		os.Rename(backupPath, path)
-		return fmt.Errorf("failed to activate migration: %w", err)
+	if _, err := replaceFileDurably(stagedPath, path); err != nil {
+		_, restoreErr := replaceFileDurably(backupPath, path)
+		return errors.Join(fmt.Errorf("failed to activate migration: %w", err), restoreErr)
 	}
 	return nil
+}
+
+func replaceFileDurably(oldPath, newPath string) (bool, error) {
+	return replaceFileDurablyWith(oldPath, newPath, fsdurability.SyncParent)
+}
+
+func replaceFileDurablyWith(oldPath, newPath string, syncParent func(string) error) (bool, error) {
+	if err := fsdurability.ReplaceFile(oldPath, newPath); err != nil {
+		return false, err
+	}
+	return true, syncParent(newPath)
 }
 
 // recoverMigrate cleans up leftover files from a previous interrupted
 // migration. If the swap was interrupted after backup but before activation
 // (staged + backup both exist), it finishes the activation by renaming
 // staged → path. Otherwise it just removes stale temp files.
-func recoverMigrate(path string) {
+func recoverMigrate(path string) error {
 	stagedPath := path + ".staged"
 	backupPath := path + ".v1.bak"
 	migratingPath := path + ".migrating"
@@ -141,12 +162,21 @@ func recoverMigrate(path string) {
 	if stagedExists && backupExists {
 		// Interrupted after backup was created but before staged→path
 		// activation completed. Finish the migration.
-		os.Rename(stagedPath, path)
-		os.Remove(migratingPath)
-		return
+		if _, err := replaceFileDurably(stagedPath, path); err != nil {
+			return fmt.Errorf("activate staged migration: %w", err)
+		}
+		if err := os.Remove(migratingPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale migration file: %w", err)
+		}
+		return nil
 	}
-	os.Remove(stagedPath)
-	os.Remove(migratingPath)
+	if err := os.Remove(stagedPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale staged file: %w", err)
+	}
+	if err := os.Remove(migratingPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale migration file: %w", err)
+	}
+	return nil
 }
 
 func fileExists(path string) bool {

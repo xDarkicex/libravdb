@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
 	"slices"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
@@ -12,42 +15,36 @@ import (
 
 // deleteNode removes a vector from the HNSW index (internal implementation)
 func (h *Index) deleteNode(ctx context.Context, id string) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.size == 0 {
+	if h.size.Load() == 0 {
 		return fmt.Errorf("cannot delete from empty index")
 	}
 	nodeID, node := h.findNodeByID(id)
 	if nodeID == ^uint32(0) {
 		return fmt.Errorf("node with ID '%s': %w", id, util.ErrNotFound)
 	}
-	return h.deleteNodeLocked(ctx, nodeID, node, id)
+	return h.deleteNodeInternal(ctx, nodeID, node, id)
 }
 
 func (h *Index) deleteNodeByOrdinal(ctx context.Context, ordinal uint32) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.size == 0 {
+	if h.size.Load() == 0 {
 		return fmt.Errorf("cannot delete from empty index")
 	}
-	if ordinal >= uint32(len(h.nodes)) || h.nodes[ordinal] == nil {
+	if ordinal >= uint32(h.nodes.Len()) || h.nodes.Get(ordinal) == nil {
 		return fmt.Errorf("node with ordinal %d: %w", ordinal, util.ErrNotFound)
 	}
-	return h.deleteNodeLocked(ctx, ordinal, h.nodes[ordinal], h.ordinalToID[ordinal])
+	return h.deleteNodeInternal(ctx, ordinal, h.nodes.Get(ordinal), h.ordinalToID.Get(ordinal))
 }
 
-func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node, id string) error {
+func (h *Index) deleteNodeInternal(ctx context.Context, nodeID uint32, node *Node, id string) error {
 	// Handle special case: deleting the only node
-	if h.size == 1 {
-		h.deleteStoredVector(node)
-		h.freeNodeLinks(node) // release off-heap SFL link slots
-		h.nodes = h.nodes[:0]
-		h.entryPoint = nil
-		h.maxLevel = 0
-		h.size = 0
-		delete(h.idToIndex, id)
-		delete(h.ordinalToID, nodeID)
-		h.entryPointCandidates = h.entryPointCandidates[:0]
+	if h.size.Load() == 1 {
+		h.retireNodeStorage(nodeID, node)
+		h.globalState.Store(0)
+		if id != "" {
+			h.idToIndex.DeleteString(id)
+		}
+		h.ordinalToID.Set(nodeID, "")
+		h.size.Store(0)
 		return nil
 	}
 
@@ -61,22 +58,22 @@ func (h *Index) deleteNodeLocked(ctx context.Context, nodeID uint32, node *Node,
 		return fmt.Errorf("failed to handle entry point replacement: %w", err)
 	}
 
-	h.deleteStoredVector(node)
-
 	// Remove the node from data structures
 	h.removeNodeFromIndex(nodeID, id)
 
-	h.size--
+	h.size.Add(-1)
 	return nil
 }
 
 // findNodeByID finds a node by its ID using O(1) map lookup
 func (h *Index) findNodeByID(id string) (uint32, *Node) {
-	if idx, exists := h.idToIndex[id]; exists {
-		if idx < uint32(len(h.nodes)) && h.nodes[idx] != nil {
-			return idx, h.nodes[idx]
+	if node, exists := h.idToIndex.GetString(id); exists {
+		// Wait! deleteNode requires an ordinal.
+		idx := node.Ordinal
+		if idx < uint32(h.nodes.Len()) && h.nodes.Get(idx) != nil {
+			return idx, h.nodes.Get(idx)
 		}
-		delete(h.idToIndex, id)
+		h.idToIndex.DeleteString(id)
 	}
 	return ^uint32(0), nil
 }
@@ -86,8 +83,9 @@ func (h *Index) removeAllConnections(ctx context.Context, targetID uint32, targe
 	// For each level where the target node exists
 	for level := 0; level <= targetNode.Level; level++ {
 		// Get all neighbors of the target node at this level
-		neighbors := make([]uint32, len(targetNode.Links[level]))
-		copy(neighbors, targetNode.Links[level])
+		targetLinks := h.getNodeLinks(targetNode, level)
+		neighbors := make([]uint32, len(targetLinks))
+		copy(neighbors, targetLinks)
 
 		// Remove target from every node that still references it. This repairs
 		// older asymmetric graph state where incoming edges may exist without a
@@ -105,72 +103,120 @@ func (h *Index) removeAllConnections(ctx context.Context, targetID uint32, targe
 
 func (h *Index) removeIncomingConnections(targetID uint32, level int) []uint32 {
 	affected := make([]uint32, 0)
-	targetNode := h.nodes[targetID]
-	if targetNode == nil || level >= len(targetNode.Backlinks) {
+	targetNode := h.nodes.Get(targetID)
+	if targetNode == nil || level >= (targetNode.Level+1) {
 		return affected
 	}
 
-	for _, incomingID := range targetNode.Backlinks[level] {
-		if incomingID >= uint32(len(h.nodes)) {
+	targetBacklinks := h.getNodeBacklinks(targetNode, level)
+	for _, incomingID := range targetBacklinks {
+		if incomingID >= uint32(h.nodes.Len()) {
 			continue
 		}
-		node := h.nodes[incomingID]
-		if node == nil || level >= len(node.Links) {
+		node := h.nodes.Get(incomingID)
+		if node == nil || level >= (node.Level+1) {
 			continue
 		}
 
-		links := node.Links[level]
-		newLinks := links[:0]
-		removed := false
-		for _, linkID := range links {
+		for !h.acquirePruneLock(node) {
+			runtime.Gosched()
+		}
+
+		links := h.getNodeLinks(node, level)
+		lastIdx := len(links) - 1
+		if lastIdx < 0 {
+			h.releasePruneLock(node)
+			continue
+		}
+
+		for i, linkID := range links {
 			if linkID == targetID {
-				removed = true
-				continue
+				lastVal := links[lastIdx]
+				atomic.StoreUint32(&links[i], lastVal)
+				atomic.StoreUint32(&links[lastIdx], SentinelNodeID)
+				atomic.StoreUint32(&node.LinkCounts[level], uint32(lastIdx))
+				affected = append(affected, incomingID)
+				break
 			}
-			newLinks = append(newLinks, linkID)
 		}
-		if removed {
-			node.Links[level] = newLinks
-			affected = append(affected, incomingID)
-		}
+
+		h.releasePruneLock(node)
 	}
-	// We do not need to clear targetNode.Backlinks[level] because targetNode is being deleted anyway.
 	return affected
 }
 
-// removeConnection removes a specific connection between two nodes at a given level
+// removeConnection removes a specific connection between two nodes at a given level,
+// using sorted lock acquisition to strictly prevent circular deadlocks.
 func (h *Index) removeConnection(fromID, toID uint32, level int) {
-	fromNode := h.nodes[fromID]
-	if fromNode == nil || level >= len(fromNode.Links) {
+	fromNode := h.nodes.Get(fromID)
+	toNode := h.nodes.Get(toID)
+
+	if fromNode == nil || toNode == nil {
+		return
+	}
+	if level >= (fromNode.Level+1) && level >= (toNode.Level+1) {
 		return
 	}
 
-	// Find and remove the connection efficiently
-	links := fromNode.Links[level]
-	removed := false
-	for i, linkID := range links {
-		if linkID == toID {
-			// Remove by swapping with last element and truncating
-			links[i] = links[len(links)-1]
-			fromNode.Links[level] = links[:len(links)-1]
-			removed = true
-			break
-		}
+	// Sorted Lock Acquisition to prevent deadlocks
+	var first, second *Node
+	if fromID < toID {
+		first, second = fromNode, toNode
+	} else if fromID > toID {
+		first, second = toNode, fromNode
+	} else {
+		// Cannot remove connection to self in a meaningful way
+		return
 	}
 
-	if removed {
-		toNode := h.nodes[toID]
-		if toNode != nil && level < len(toNode.Backlinks) {
-			backlinks := toNode.Backlinks[level]
-			for i, blID := range backlinks {
-				if blID == fromID {
-					backlinks[i] = backlinks[len(backlinks)-1]
-					toNode.Backlinks[level] = backlinks[:len(backlinks)-1]
-					break
-				}
+	for !h.acquirePruneLock(first) {
+		runtime.Gosched()
+	}
+	for !h.acquirePruneLock(second) {
+		runtime.Gosched()
+	}
+
+	defer func() {
+		h.releasePruneLock(second)
+		h.releasePruneLock(first)
+	}()
+
+	// Remove from links (forward direction)
+	if level < (fromNode.Level + 1) {
+		links := h.getNodeLinks(fromNode, level)
+		lastIdx := len(links) - 1
+		for i, linkID := range links {
+			if linkID == toID {
+				lastVal := links[lastIdx]
+				atomic.StoreUint32(&links[i], lastVal)
+				atomic.StoreUint32(&links[lastIdx], SentinelNodeID)
+				atomic.StoreUint32(&fromNode.LinkCounts[level], uint32(lastIdx))
+				break
 			}
 		}
 	}
+
+	// Remove from backlinks (reverse direction)
+	if level < (toNode.Level + 1) {
+		backlinks := h.getNodeBacklinks(toNode, level)
+		lastIdx := len(backlinks) - 1
+		for i, id := range backlinks {
+			if id == fromID {
+				lastVal := backlinks[lastIdx]
+				atomic.StoreUint32(&backlinks[i], lastVal)
+				atomic.StoreUint32(&backlinks[lastIdx], SentinelNodeID)
+				atomic.StoreUint32(&toNode.BacklinkCounts[level], uint32(lastIdx))
+				break
+			}
+		}
+	}
+}
+
+// deleteBacklink is now integrated into removeConnection,
+// keeping it as a no-op just in case it's called elsewhere,
+// though it shouldn't be needed if bidirectional removal is always synchronized.
+func (h *Index) deleteBacklink(fromID, toID uint32, level int) {
+	// Handled by removeConnection directly now to avoid deadlocks.
 }
 
 // reconnectNeighborsOptimized attempts to reconnect neighbors with precomputed distances
@@ -203,7 +249,7 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 		return fmt.Errorf("arena allocate validNeighbors: %w", err)
 	}
 	for _, neighborID := range neighbors {
-		if neighborID < uint32(len(h.nodes)) && h.nodes[neighborID] != nil {
+		if neighborID < uint32(h.nodes.Len()) && h.nodes.Get(neighborID) != nil {
 			validNeighbors = append(validNeighbors, neighborID)
 		}
 	}
@@ -222,11 +268,9 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	distMat = distMat[:D*D]
 	for i := 0; i < D; i++ {
 		ni := validNeighbors[i]
-		nodeI := h.nodes[ni]
 		for j := i + 1; j < D; j++ {
 			nj := validNeighbors[j]
-			nodeJ := h.nodes[nj]
-			d, err := h.computeDistance(nil, nil, nodeI, nodeJ)
+			d, err := h.computePublishedNodeDistance(ni, nj)
 			if err != nil {
 				d = float32(math.Inf(1))
 			}
@@ -243,12 +287,12 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 		default:
 		}
 
-		neighborNode := h.nodes[neighborID]
-		if neighborNode == nil || level >= len(neighborNode.Links) {
+		neighborNode := h.nodes.Get(neighborID)
+		if neighborNode == nil || level >= (neighborNode.Level+1) {
 			continue
 		}
 
-		currentConnections := len(neighborNode.Links[level])
+		currentConnections := len(h.getNodeLinks(neighborNode, level))
 
 		minConnections := maxM / 2
 		if minConnections < 1 {
@@ -264,7 +308,7 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 		candidatesSlice, _ := memory.ArenaSlice[*util.Candidate](arena, len(validNeighbors))
 		candidates := candidatesSlice[:0]
 		for nj, otherID := range validNeighbors {
-			if ni == nj || h.nodes[otherID] == nil {
+			if ni == nj || h.nodes.Get(otherID) == nil {
 				continue
 			}
 
@@ -303,18 +347,49 @@ func (h *Index) reconnectNeighborsOptimized(ctx context.Context, neighbors []uin
 	return nil
 }
 
+func (h *Index) computePublishedNodeDistance(leftID, rightID uint32) (float32, error) {
+	left := h.nodes.Get(leftID)
+	right := h.nodes.Get(rightID)
+	if left == nil || right == nil || left == right {
+		return 0, fmt.Errorf("distance nodes are unavailable: %d, %d", leftID, rightID)
+	}
+
+	firstID, secondID := leftID, rightID
+	first, second := left, right
+	if firstID > secondID {
+		firstID, secondID = secondID, firstID
+		first, second = second, first
+	}
+	for !h.acquirePruneLock(first) {
+		runtime.Gosched()
+	}
+	for !h.acquirePruneLock(second) {
+		runtime.Gosched()
+	}
+	defer func() {
+		h.releasePruneLock(second)
+		h.releasePruneLock(first)
+	}()
+
+	if h.nodes.Get(firstID) != first || h.nodes.Get(secondID) != second {
+		return 0, fmt.Errorf("distance nodes retired during reconnect: %d, %d", leftID, rightID)
+	}
+	return h.computeDistance(nil, nil, left, right)
+}
+
 // hasConnection checks if two nodes are connected at a given level
 func (h *Index) hasConnection(nodeID1, nodeID2 uint32, level int) bool {
-	if nodeID1 >= uint32(len(h.nodes)) || nodeID2 >= uint32(len(h.nodes)) {
+	if nodeID1 >= uint32(h.nodes.Len()) || nodeID2 >= uint32(h.nodes.Len()) {
 		return false
 	}
 
-	node1 := h.nodes[nodeID1]
-	if node1 == nil || level >= len(node1.Links) {
+	node1 := h.nodes.Get(nodeID1)
+	if node1 == nil || level >= (node1.Level+1) {
 		return false
 	}
 
-	for _, linkID := range node1.Links[level] {
+	links := h.getNodeLinks(node1, level)
+	for _, linkID := range links {
 		if linkID == nodeID2 {
 			return true
 		}
@@ -344,21 +419,21 @@ func (h *Index) selectBestCandidatesByDistance(candidates []*util.Candidate, num
 
 // createBidirectionalConnection creates a bidirectional connection between two nodes
 func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int) {
-	node1 := h.nodes[nodeID1]
-	node2 := h.nodes[nodeID2]
+	node1 := h.nodes.Get(nodeID1)
+	node2 := h.nodes.Get(nodeID2)
 
-	if node1 != nil && level < len(node1.Links) {
+	if node1 != nil && level < (node1.Level+1) {
 		if h.appendUniqueLink(node1, levelMaxLinks(h.config.M, level), level, nodeID2) {
-			if node2 != nil && level < len(node2.Backlinks) {
-				node2.Backlinks[level] = append(node2.Backlinks[level], nodeID1)
+			if node2 != nil && level < (node2.Level+1) {
+				h.appendWithSpinlock(node2, node2.Backlinks[level], nodeID1, h.config.M, level)
 			}
 		}
 	}
 
-	if node2 != nil && level < len(node2.Links) {
+	if node2 != nil && level < (node2.Level+1) {
 		if h.appendUniqueLink(node2, levelMaxLinks(h.config.M, level), level, nodeID1) {
-			if node1 != nil && level < len(node1.Backlinks) {
-				node1.Backlinks[level] = append(node1.Backlinks[level], nodeID2)
+			if node1 != nil && level < (node1.Level+1) {
+				h.appendWithSpinlock(node1, node1.Backlinks[level], nodeID2, h.config.M, level)
 			}
 		}
 	}
@@ -366,34 +441,23 @@ func (h *Index) createBidirectionalConnection(nodeID1, nodeID2 uint32, level int
 
 // handleEntryPointReplacement handles the case where the deleted node is the entry point
 func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node) error {
-	// Only need to replace if the deleted node is the entry point
-	if h.entryPoint != deletedNode {
-		// Remove from entry point candidates if present
-		h.removeFromEntryPointCandidates(deletedID)
+	entryPoint := h.getEntryPoint()
+	if entryPoint == nil || entryPoint.Ordinal != deletedID {
 		return nil
 	}
 
-	// Try to find replacement from entry point candidates first
-	newEntryPoint := h.findBestEntryPointCandidate(deletedID)
-	if newEntryPoint != nil {
-		h.entryPoint = newEntryPoint
-		h.maxLevel = newEntryPoint.Level
-		return nil
-	}
-
-	// Fallback: scan all nodes for highest level
+	// Fallback to scan all nodes for highest level
 	var fallbackEntryPoint *Node
-	var fallbackOrdinal uint32
 	newMaxLevel := -1
 
-	for i, node := range h.nodes {
+	for i := 0; i < h.nodes.Len(); i++ {
+		node := h.nodes.Get(uint32(i))
 		if node == nil || uint32(i) == deletedID {
 			continue
 		}
 		if node.Level > newMaxLevel {
 			newMaxLevel = node.Level
 			fallbackEntryPoint = node
-			fallbackOrdinal = uint32(i)
 		}
 	}
 
@@ -401,73 +465,70 @@ func (h *Index) handleEntryPointReplacement(deletedID uint32, deletedNode *Node)
 		return fmt.Errorf("could not find replacement entry point")
 	}
 
-	h.entryPoint = fallbackEntryPoint
-	h.maxLevel = newMaxLevel
-
-	// Add the fallback to the candidate list. The list is maintained
-	// incrementally during Insert/Delete; a full O(N) rebuild is unnecessary.
-	h.entryPointCandidates = append(h.entryPointCandidates, fallbackOrdinal)
-
+	h.setEntryPoint(fallbackEntryPoint)
+	// maxLevel is handled atomically
 	return nil
-}
-
-// findBestEntryPointCandidate finds the best entry point from candidates list
-func (h *Index) findBestEntryPointCandidate(excludeID uint32) *Node {
-	var bestNode *Node
-	bestLevel := -1
-
-	for _, candidateID := range h.entryPointCandidates {
-		if candidateID == excludeID || candidateID >= uint32(len(h.nodes)) {
-			continue
-		}
-
-		node := h.nodes[candidateID]
-		if node != nil && node.Level > bestLevel {
-			bestLevel = node.Level
-			bestNode = node
-		}
-	}
-
-	return bestNode
-}
-
-// removeFromEntryPointCandidates removes a node from the entry point candidates list
-func (h *Index) removeFromEntryPointCandidates(nodeID uint32) {
-	for i, candidateID := range h.entryPointCandidates {
-		if candidateID == nodeID {
-			// Remove by swapping with last element
-			h.entryPointCandidates[i] = h.entryPointCandidates[len(h.entryPointCandidates)-1]
-			h.entryPointCandidates = h.entryPointCandidates[:len(h.entryPointCandidates)-1]
-			break
-		}
-	}
 }
 
 // removeNodeFromIndex removes a node from all index data structures
 func (h *Index) removeNodeFromIndex(nodeID uint32, id string) {
-	delete(h.idToIndex, id)
-	delete(h.ordinalToID, nodeID)
+	if id != "" {
+		h.idToIndex.DeleteString(id)
+	}
+	h.ordinalToID.Set(nodeID, "")
 
-	h.removeFromEntryPointCandidates(nodeID)
-
-	if nodeID < uint32(len(h.nodes)) {
-		h.freeNodeLinks(h.nodes[nodeID])
-		h.nodes[nodeID].Links = nil
-		h.nodes[nodeID].CompressedVector = nil
-		h.nodes[nodeID] = nil
+	if nodeID < uint32(h.nodes.Len()) {
+		node := h.nodes.Get(nodeID)
+		if node == nil {
+			return
+		}
+		h.retireNodeStorage(nodeID, node)
 	}
 }
 
-func (h *Index) deleteStoredVector(node *Node) {
-	if node == nil || h.provider != nil || h.rawVectorStore == nil {
+// retireNodeStorage removes a node from the registry before reclaiming any of
+// its off-heap link storage. Writers that captured the old pointer serialize
+// on PruneLock and revalidate the registry after acquiring it.
+func (h *Index) retireNodeStorage(nodeID uint32, node *Node) {
+	if node == nil {
 		return
 	}
-	_ = h.rawVectorStore.Delete(VectorRef{
+
+	h.nodes.Set(nodeID, nil)
+	for !h.acquirePruneLock(node) {
+		runtime.Gosched()
+	}
+	epoch := h.reclamation.nextRetireEpoch()
+	h.retireStoredVectorAt(node, epoch)
+	h.retireNodeLinksAt(node, epoch)
+	h.releasePruneLock(node)
+	base := unsafe.Pointer(uintptr(unsafe.Pointer(node)) - SFLMetadataOverhead)
+	h.retireAllocationAt(epoch, retiredNode, base)
+}
+
+func (h *Index) retireStoredVectorAt(node *Node, epoch uint64) {
+	if node == nil || h.rawVectorStore == nil || node.Slot == SentinelNodeID {
+		return
+	}
+	ref := VectorRef{
 		Kind:  VectorEncodingRaw,
 		Slot:  node.Slot,
 		Bytes: uint32(h.config.Dimension * 4),
 		Valid: true,
-	})
+	}
+	switch store := h.rawVectorStore.(type) {
+	case *InMemoryRawVectorStore:
+		if ptr := store.detachPointer(ref); ptr != nil {
+			h.retireRawVectorAt(epoch, ptr, ref.Slot)
+		}
+		return
+	case *SlabbyRawVectorStore:
+		if ptr := store.detachPointer(ref); ptr != nil {
+			h.retireRawVectorAt(epoch, ptr, ref.Slot)
+		}
+		return
+	}
+	_ = h.rawVectorStore.Delete(ref)
 }
 
 func appendUniqueIDs(dst []uint32, ids ...uint32) []uint32 {

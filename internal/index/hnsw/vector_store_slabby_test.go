@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -36,6 +37,9 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get vector %d failed: %v", i, err)
 		}
+		if uintptr(unsafe.Pointer(&got[0]))%64 != 0 {
+			t.Fatalf("vector %d is not 64-byte aligned", i)
+		}
 		for j := range vec {
 			if got[j] != vec[j] {
 				t.Fatalf("vector %d mismatch at dim %d: got %f want %f", i, j, got[j], vec[j])
@@ -57,8 +61,31 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 	if err := store.Reset(); err != nil {
 		t.Fatalf("reset failed: %v", err)
 	}
-	if store.sfl != nil && store.sfl.Stats().Allocated != 0 || len(store.slots) != 0 {
+	if store.sfl != nil && store.sfl.Stats().Allocated != 0 || store.activeCount.Load() != 0 || store.nextSlot.Load() != 0 {
 		t.Fatalf("expected reset to clear slabby store")
+	}
+}
+
+func TestSlabbyRawVectorStoreReusesReleasedLogicalSlot(t *testing.T) {
+	store, err := NewSlabbyRawVectorStore(4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.Put([]float32{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.release(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Put([]float32{5, 6, 7, 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Slot != first.Slot {
+		t.Fatalf("released logical slot was not reused: got %d want %d", second.Slot, first.Slot)
 	}
 }
 
@@ -115,7 +142,7 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		t.Fatalf("load failed: %v", err)
 	}
 
-	if _, err := loaded.getNodeVector(loaded.nodes[0]); err != nil {
+	if _, err := loaded.getNodeVector(loaded.nodes.Get(0)); err != nil {
 		t.Fatalf("failed to access loaded slabby-backed node vector: %v", err)
 	}
 
@@ -124,6 +151,10 @@ func TestHNSWSlabbyRawVectorStoreSaveLoad(t *testing.T) {
 		t.Fatalf("post-load search failed: %v", err)
 	}
 	if len(loadedResults) == 0 || loadedResults[0].ID != "vec_0" {
-		t.Fatalf("expected vec_0 as nearest result after load, got %#v", loadedResults)
+		var ids []string
+		for _, r := range loadedResults {
+			ids = append(ids, r.ID)
+		}
+		t.Fatalf("expected vec_0 as nearest result after load, got %v", ids)
 	}
 }
