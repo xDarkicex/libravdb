@@ -30,13 +30,17 @@ type reclamationReaderSlot struct {
 	_     [56]byte
 }
 
+type retiredAllocation struct {
+	epoch   uint64
+	ptr     uintptr
+	kind    retiredAllocationKind
+	logical uint32
+}
+
 type retiredAllocationSlot struct {
 	sequence atomic.Uint64
-	epoch    uint64
-	ptr      uintptr
-	kind     retiredAllocationKind
-	logical  uint32
-	_        [32]byte
+	retiredAllocation
+	_ [32]byte
 }
 
 type reclamationDomain struct {
@@ -136,7 +140,7 @@ func (h *Index) retireAllocationWithLogicalAt(epoch uint64, kind retiredAllocati
 	if h == nil || h.reclamation == nil || ptr == nil {
 		return
 	}
-	record := retiredAllocationSlot{
+	record := retiredAllocation{
 		epoch:   epoch,
 		ptr:     uintptr(ptr),
 		kind:    kind,
@@ -148,7 +152,7 @@ func (h *Index) retireAllocationWithLogicalAt(epoch uint64, kind retiredAllocati
 	}
 }
 
-func (d *reclamationDomain) enqueue(record retiredAllocationSlot) bool {
+func (d *reclamationDomain) enqueue(record retiredAllocation) bool {
 	for {
 		pos := d.enqueuePos.Load()
 		slot := &d.retired[pos&d.queueMask]
@@ -196,7 +200,7 @@ func (d *reclamationDomain) tryReclaim(index *Index) int {
 		if slot.sequence.Load() != pos+1 || !d.safe(slot.epoch) {
 			return reclaimed
 		}
-		record := retiredAllocationSlot{
+		record := retiredAllocation{
 			epoch:   slot.epoch,
 			ptr:     slot.ptr,
 			kind:    slot.kind,
@@ -233,7 +237,7 @@ func (d *reclamationDomain) close() {
 	d.retired = nil
 }
 
-func (h *Index) reclaimAllocation(record retiredAllocationSlot) {
+func (h *Index) reclaimAllocation(record retiredAllocation) {
 	ptr := unsafe.Pointer(record.ptr)
 	switch record.kind {
 	case retiredNode:

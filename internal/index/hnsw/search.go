@@ -1153,7 +1153,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						// computeDistanceOptimized in the scoring pass.
 						vec := node.Vector
 						scratch.prefetchVecs = append(scratch.prefetchVecs, vec)
-						if vec != nil && len(vec) > 0 {
+						if len(vec) > 0 {
 							if useNEONBatchL2 {
 								simd.PrefetchL1(unsafe.Pointer(&vec[0]))
 							} else {
@@ -1187,7 +1187,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 						vec := node.Vector
 						scratch.prefetchVecs = append(scratch.prefetchVecs, vec)
-						if vec != nil && len(vec) > 0 {
+						if len(vec) > 0 {
 							if useNEONBatchL2 {
 								simd.PrefetchL1(unsafe.Pointer(&vec[0]))
 							} else {

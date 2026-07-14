@@ -53,6 +53,9 @@ type asyncIndexFailure struct {
 
 type asyncIndexStorage interface {
 	storage.DurableRangeCollection
+	InsertDurableRange(context.Context, *index.VectorEntry) (storage.DurableRange, error)
+	InsertBatchDurableRange(context.Context, []*index.VectorEntry) (storage.DurableRange, error)
+	GetIDByOrdinal(context.Context, uint32) (string, error)
 	GetByOrdinal(uint32) ([]float32, error)
 	DurableFrontier() uint64
 }
