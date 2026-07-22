@@ -494,7 +494,27 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 	state.applyPreparedOrdinals(preparedOps)
 
-	newIndexes, err := state.buildIndexes(ctx, names, db.logger)
+	preparedDeltas, deltaCollections, err := state.prepareIndexDeltas(ctx, names)
+	if err != nil {
+		return err
+	}
+	committedDeltas := false
+	defer func() {
+		if committedDeltas {
+			return
+		}
+		for _, prepared := range preparedDeltas {
+			_ = prepared.Abort()
+		}
+	}()
+
+	rebuildNames := make([]string, 0, len(names))
+	for _, name := range names {
+		if !deltaCollections[name] {
+			rebuildNames = append(rebuildNames, name)
+		}
+	}
+	newIndexes, err := state.buildIndexes(ctx, rebuildNames, db.logger)
 	if err != nil {
 		closeIndexes(newIndexes)
 		return err
@@ -515,8 +535,18 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	if hasCAS && db.metrics != nil {
 		db.metrics.CASSuccesses.Inc()
 	}
-
 	for _, name := range names {
+		prepared := preparedDeltas[name]
+		if prepared == nil {
+			continue
+		}
+		if err := prepared.Commit(); err != nil {
+			return fmt.Errorf("publish prepared index delta for %s: %w", name, err)
+		}
+	}
+	committedDeltas = true
+
+	for _, name := range rebuildNames {
 		collection := collections[name]
 		oldIndex := collection.index
 		collection.index = newIndexes[name]
@@ -525,6 +555,54 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 
 	return nil
+}
+
+// prepareIndexDeltas builds unpublished generation candidates for indexes that
+// support copy-on-write transaction publication. It deliberately inspects only
+// touched IDs; Flat never receives the historical collection as a batch.
+func (s *txCommitState) prepareIndexDeltas(ctx context.Context, names []string) (map[string]index.PreparedMutation, map[string]bool, error) {
+	prepared := make(map[string]index.PreparedMutation, len(names))
+	deltaCollections := make(map[string]bool, len(names))
+	for _, name := range names {
+		state := s.collections[name]
+		if state == nil {
+			continue
+		}
+		deltaIndex, ok := state.collection.index.(index.DeltaIndex)
+		if !ok {
+			continue
+		}
+		deltaCollections[name] = true
+		ids := make([]string, 0, len(state.touched))
+		for id := range state.touched {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		puts := make([]*index.VectorEntry, 0, len(ids))
+		deletes := make([]string, 0, len(ids))
+		for _, id := range ids {
+			after := state.working[id]
+			before := state.base[id]
+			switch {
+			case after != nil:
+				puts = append(puts, entryForIndex(state.collection.config.Metric, after))
+			case before != nil:
+				deletes = append(deletes, id)
+			}
+		}
+		if len(puts) == 0 && len(deletes) == 0 {
+			continue
+		}
+		candidate, err := deltaIndex.PrepareMutations(ctx, puts, deletes)
+		if err != nil {
+			for _, existing := range prepared {
+				_ = existing.Abort()
+			}
+			return nil, nil, fmt.Errorf("prepare index delta for %s: %w", name, err)
+		}
+		prepared[name] = candidate
+	}
+	return prepared, deltaCollections, nil
 }
 
 func (db *Database) txCollections(ops []txMutation) (map[string]*Collection, []string, error) {

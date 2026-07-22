@@ -61,15 +61,16 @@ type PersistenceMetadata struct {
 
 // Index implements a flat (brute-force) vector index
 type Index struct {
-	quantizer   quant.Quantizer
-	config      *Config
-	idToIndex   map[string]int
-	vectorSFL   *memory.ShardedFreeList
-	scratchPool *sync.Pool
-	vectors     []*VectorEntry
-	mu          sync.RWMutex
-	queryTiers  [4]poolTier
+	quantizer  quant.Quantizer
+	config     *Config
+	idToIndex  map[string]int
+	vectorSFL  *memory.ShardedFreeList
+	vectors    []*VectorEntry
+	mu         sync.RWMutex
+	queryTiers [4]poolTier
 }
+
+const vectorDataOffset = 48
 
 // NewFlat creates a new flat index
 func NewFlat(config *Config) (*Index, error) {
@@ -79,7 +80,7 @@ func NewFlat(config *Config) (*Index, error) {
 
 	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  256 * 1024 * 1024,
-		SlotSize:  uint64(48 + config.Dimension*4),
+		SlotSize:  uint64(vectorDataOffset + config.Dimension*4),
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -93,15 +94,6 @@ func NewFlat(config *Config) (*Index, error) {
 		vectors:   make([]*VectorEntry, 0),
 		idToIndex: make(map[string]int),
 		vectorSFL: sfl,
-		scratchPool: &sync.Pool{
-			New: func() any {
-				a, err := memory.NewArena(1024*1024, 64)
-				if err != nil {
-					return nil
-				}
-				return a
-			},
-		},
 		queryTiers: [4]poolTier{
 			{maxK: 16},
 			{maxK: 128},
@@ -165,12 +157,12 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 		if err != nil {
 			// Rollback allocated slots on error
 			for j := 0; j < i; j++ {
-				idx.deallocateVector(newEntries[j].Vector)
+				idx.releaseVector(newEntries[j].Vector)
 			}
 			return err
 		}
 
-		vecPtr := unsafe.Pointer(&slot[48])
+		vecPtr := unsafe.Pointer(&slot[vectorDataOffset])
 		offHeapVec := unsafe.Slice((*float32)(vecPtr), idx.config.Dimension)
 		copy(offHeapVec, entry.Vector)
 
@@ -194,7 +186,7 @@ func (idx *Index) BatchInsert(ctx context.Context, entries []*VectorEntry) error
 
 	for _, newEntry := range newEntries {
 		if existingIndex, exists := idx.idToIndex[newEntry.ID]; exists {
-			idx.deallocateVector(idx.vectors[existingIndex].Vector)
+			idx.releaseVector(idx.vectors[existingIndex].Vector)
 			idx.vectors[existingIndex] = newEntry
 		} else {
 			idx.idToIndex[newEntry.ID] = len(idx.vectors)
@@ -212,7 +204,7 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	if err != nil {
 		return err
 	}
-	vecPtr := unsafe.Pointer(&slot[48])
+	vecPtr := unsafe.Pointer(&slot[vectorDataOffset])
 	offHeapVec := unsafe.Slice((*float32)(vecPtr), idx.config.Dimension)
 	copy(offHeapVec, entry.Vector)
 
@@ -226,7 +218,7 @@ func (idx *Index) insertLocked(entry *VectorEntry) error {
 	}
 
 	if existingIndex, exists := idx.idToIndex[entry.ID]; exists {
-		idx.deallocateVector(idx.vectors[existingIndex].Vector)
+		idx.releaseVector(idx.vectors[existingIndex].Vector)
 		idx.vectors[existingIndex] = newEntry
 		return nil
 	}
@@ -363,20 +355,6 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 
 	limit := k
 
-	// Acquire an arena for search-scoped scratch, released on return.
-	arena := idx.scratchPool.Get().(*memory.Arena)
-	if arena == nil {
-		a, err := memory.NewArena(1024*1024, 64)
-		if err != nil {
-			return nil, fmt.Errorf("arena allocate for search: %w", err)
-		}
-		arena = a
-	}
-	defer func() {
-		arena.Reset()
-		idx.scratchPool.Put(arena)
-	}()
-
 	// Acquire off-heap buffer for the heap. Gracefully degrades to arena
 	// allocation if k exceeds the largest tier or the SFL pool is exhausted.
 	var heapBuf []heapElement
@@ -385,7 +363,11 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 		defer hs.free()
 		heapBuf = buf
 	} else {
-		var err error
+		arena, err := memory.NewArena(1024*1024, 64)
+		if err != nil {
+			return nil, fmt.Errorf("arena allocate heap buf: %w", err)
+		}
+		defer arena.Free()
 		heapBuf, err = memory.ArenaSlice[heapElement](arena, k)
 		if err != nil {
 			return nil, fmt.Errorf("arena allocate heap buf: %w", err)
@@ -459,7 +441,7 @@ func (idx *Index) Delete(ctx context.Context, id string) error {
 	}
 
 	// Deallocate the off-heap vector before dropping the reference
-	idx.deallocateVector(idx.vectors[index].Vector)
+	idx.releaseVector(idx.vectors[index].Vector)
 
 	// Remove from vectors slice
 	idx.vectors = append(idx.vectors[:index], idx.vectors[index+1:]...)
@@ -509,14 +491,18 @@ func (idx *Index) Close() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	entries := idx.vectors
 	idx.vectors = nil
 	idx.idToIndex = nil
 	if idx.quantizer != nil {
 		idx.quantizer.Close()
 		idx.quantizer = nil
 	}
+	for _, entry := range entries {
+		idx.releaseVector(entry.Vector)
+	}
 	if idx.vectorSFL != nil {
-		idx.vectorSFL.Free()
+		_ = idx.vectorSFL.Free()
 		idx.vectorSFL = nil
 	}
 
@@ -730,7 +716,7 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 		if err != nil {
 			return err
 		}
-		vecPtr := unsafe.Pointer(&slot[48])
+		vecPtr := unsafe.Pointer(&slot[vectorDataOffset])
 		offHeapVec := unsafe.Slice((*float32)(vecPtr), idx.config.Dimension)
 		copy(offHeapVec, entry.Vector)
 		entry.Vector = offHeapVec
@@ -743,6 +729,9 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	for _, entry := range idx.vectors {
+		idx.releaseVector(entry.Vector)
+	}
 	idx.config = cfg
 	idx.vectors = vectors
 	idx.idToIndex = newIDToIndex
@@ -843,10 +832,10 @@ func deepCloneValue(v interface{}) interface{} {
 	}
 }
 
-// deallocateVector returns the off-heap slice back to the ShardedFreeList.
-func (idx *Index) deallocateVector(v []float32) {
+// releaseVector returns an off-heap vector slot to the index pool.
+func (idx *Index) releaseVector(v []float32) {
 	ptr := unsafe.Pointer(unsafe.SliceData(v))
-	basePtr := unsafe.Pointer(uintptr(ptr) - 48)
-	slot := unsafe.Slice((*byte)(basePtr), int(48+idx.config.Dimension*4))
+	basePtr := unsafe.Add(ptr, -vectorDataOffset)
+	slot := unsafe.Slice((*byte)(basePtr), int(vectorDataOffset+idx.config.Dimension*4))
 	_ = idx.vectorSFL.Deallocate(slot)
 }

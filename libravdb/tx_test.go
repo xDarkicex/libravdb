@@ -45,6 +45,53 @@ func TestCASSuccessIncrementsVersion(t *testing.T) {
 	}
 }
 
+func TestFlatTransactionPublishesDeltaWithoutRebuild(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	collection, err := db.CreateCollection(ctx, "flat_tx_delta", WithDimension(2), WithFlat())
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	if err := collection.Insert(ctx, "old", []float32{1, 0}, nil); err != nil {
+		t.Fatalf("seed old: %v", err)
+	}
+	if err := collection.Insert(ctx, "keep", []float32{0, 1}, nil); err != nil {
+		t.Fatalf("seed keep: %v", err)
+	}
+	before := collection.index
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Delete(ctx, "flat_tx_delta", "old"); err != nil {
+		t.Fatalf("stage delete: %v", err)
+	}
+	if err := tx.Insert(ctx, "flat_tx_delta", "new", []float32{2, 0}, nil); err != nil {
+		t.Fatalf("stage insert: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if collection.index != before {
+		t.Fatal("Flat transaction rebuilt the index instead of publishing its delta")
+	}
+	results, err := collection.Search(ctx, []float32{1, 0}, 3)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	seen := make(map[string]bool, len(results.Results))
+	for _, result := range results.Results {
+		seen[result.ID] = true
+	}
+	if seen["old"] || !seen["new"] || !seen["keep"] {
+		t.Fatalf("unexpected visible IDs after Flat delta: %#v", seen)
+	}
+}
+
 func TestTxListByMetadataReadsStagedView(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(WithStoragePath(testDBPath(t)))

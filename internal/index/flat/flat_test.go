@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/xDarkicex/libravdb/internal/util"
-	"github.com/xDarkicex/memory"
 )
 
 func TestNewFlat(t *testing.T) {
@@ -645,11 +644,9 @@ func TestSearchArenaBacked(t *testing.T) {
 		}
 	}
 
-	// Verify the arena pool exists and returns a valid arena.
-	arena := idx.scratchPool.Get().(*memory.Arena)
-	if arena == nil {
-		t.Fatal("scratchPool returned nil arena")
+	// Ordinary searches must use the off-heap tier allocator, not a Go heap
+	// sync.Pool of arenas. k=5 fits tier zero (maxK=16).
+	if idx.queryTiers[0].pool == nil {
+		t.Fatal("search did not initialize the off-heap heap tier")
 	}
-	arena.Reset()
-	idx.scratchPool.Put(arena)
 }

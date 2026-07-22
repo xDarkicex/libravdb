@@ -2,6 +2,10 @@ package index
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"os"
 	"time"
 
 	"unsafe"
@@ -10,6 +14,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
 	"github.com/xDarkicex/libravdb/internal/index/ivfpq"
 	"github.com/xDarkicex/libravdb/internal/quant"
+	"github.com/xDarkicex/libravdb/internal/record"
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/memory"
 )
@@ -37,6 +42,20 @@ type Index interface {
 	SerializeToBytes() ([]byte, error)
 	DeserializeFromBytes(ctx context.Context, data []byte) error
 	GetPersistenceMetadata() *PersistenceMetadata
+}
+
+// PreparedMutation is a fully materialized index delta. Commit must not
+// allocate or search; it only publishes state after the storage transaction
+// is durable. Abort releases an unpublished candidate generation.
+type PreparedMutation interface {
+	Commit() error
+	Abort() error
+}
+
+// DeltaIndex is implemented by indexes whose transaction path can publish a
+// copy-on-write delta instead of rebuilding every record in the collection.
+type DeltaIndex interface {
+	PrepareMutations(ctx context.Context, puts []*VectorEntry, deletes []string) (PreparedMutation, error)
 }
 
 // VectorEntry represents a vector entry (avoid circular imports)
@@ -509,63 +528,152 @@ func NewIVFPQ(config *IVFPQConfig) (Index, error) {
 
 // flatWrapper wraps the Flat index to adapt between interface types
 type flatWrapper struct {
-	index *flat.Index
-	sfl   *memory.ShardedFreeList
+	core *flat.Core
 }
 
-// Insert adapts the interface VectorEntry to Flat VectorEntry
-func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
-	flatEntry := &flat.VectorEntry{
-		ID:       entry.ID,
-		Vector:   entry.Vector,
-		Metadata: entry.Metadata,
-		Version:  entry.Version,
+const flatCoreFormatVersion uint32 = 2
+
+func newFlatWrapper(core *flat.Core) (*flatWrapper, error) {
+	if core == nil {
+		return nil, fmt.Errorf("flat core is nil")
 	}
-	return w.index.Insert(ctx, flatEntry)
+	return &flatWrapper{core: core}, nil
 }
 
-// BatchInsert provides batch insertion for Flat (fallback to individual inserts for now)
-func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	flatEntries := make([]*flat.VectorEntry, len(entries))
-	slots := make([][]byte, len(entries))
-	for i, entry := range entries {
-		slot, err := w.sfl.Allocate()
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = w.sfl.Deallocate(slots[j])
-			}
-			return err
+func flatDeltaBytes(entries []*VectorEntry) uint64 {
+	bytes := uint64(16 << 10)
+	for _, entry := range entries {
+		if entry == nil {
+			continue
 		}
-		slots[i] = slot
-		flatEntry := (*flat.VectorEntry)(unsafe.Pointer(&slot[48]))
-		flatEntry.ID = entry.ID
-		flatEntry.Vector = entry.Vector
-		flatEntry.Metadata = entry.Metadata
-		flatEntry.Version = entry.Version
-		flatEntries[i] = flatEntry
+		bytes += uint64(len(entry.ID)) + uint64(len(entry.Vector))*4 + 256
 	}
-	err := w.index.BatchInsert(ctx, flatEntries)
-	for _, slot := range slots {
-		_ = w.sfl.Deallocate(slot)
+	return bytes
+}
+
+// Insert publishes one immutable off-heap generation. Metadata remains owned
+// by the authoritative storage layer and is hydrated at the public boundary;
+// Flat therefore never retains a Go metadata map.
+func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
+	return w.BatchInsert(ctx, []*VectorEntry{entry})
+}
+
+// BatchInsert stages all writes in one bounded delta and publishes exactly one
+// new generation. The core copies every retained byte into its arena before
+// publication, so caller-owned slices and maps cannot leak into the index.
+func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	prepared, err := w.PrepareMutations(ctx, entries, nil)
+	if err != nil {
+		return err
+	}
+	defer prepared.Abort()
+	return prepared.Commit()
+}
+
+type flatPreparedMutation struct{ prepared *flat.PreparedDelta }
+
+func (p *flatPreparedMutation) Commit() error {
+	if p == nil || p.prepared == nil {
+		return fmt.Errorf("flat prepared mutation is closed")
+	}
+	err := p.prepared.Commit()
+	if err == nil {
+		p.prepared = nil
 	}
 	return err
 }
 
-// Search adapts the search results from Flat to interface types
-func (w *flatWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
-	flatResults, err := w.index.Search(ctx, query, k, filter)
+func (p *flatPreparedMutation) Abort() error {
+	if p == nil || p.prepared == nil {
+		return nil
+	}
+	err := p.prepared.Abort()
+	p.prepared = nil
+	return err
+}
+
+// PrepareMutations stages one transaction-owned delta against the current
+// immutable generation. It does not publish anything; callers commit it only
+// after the matching storage/WAL transaction succeeds.
+func (w *flatWrapper) PrepareMutations(ctx context.Context, entries []*VectorEntry, deletes []string) (PreparedMutation, error) {
+	if len(entries) == 0 && len(deletes) == 0 {
+		return nil, fmt.Errorf("flat mutation is empty")
+	}
+	delta, err := w.core.NewDelta(flatDeltaBytes(entries)+uint64(len(deletes))*128, uint32(len(entries)+len(deletes)), uint64(len(entries))*128+uint64(len(deletes))*128+4096)
 	if err != nil {
 		return nil, err
 	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = delta.Close()
+		}
+	}()
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if entry == nil || entry.ID == "" {
+			return nil, fmt.Errorf("flat entry ID cannot be empty")
+		}
+		if len(entry.Vector) != w.core.Config().Dimension {
+			return nil, fmt.Errorf("vector dimension %d does not match index dimension %d", len(entry.Vector), w.core.Config().Dimension)
+		}
+		id := record.BorrowBytes([]byte(entry.ID))
+		before, found := w.core.CurrentRecord(id)
+		if !found {
+			before = record.RecordRef{}
+		}
+		_, _, err = delta.StagePut(record.MutationUpsert, before, record.RecordBuilder{
+			ID:      id,
+			Vector:  record.BorrowVector(entry.Vector),
+			Version: entry.Version,
+			Ordinal: entry.Ordinal,
+		}, 0, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, id := range deletes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if id == "" {
+			return nil, fmt.Errorf("flat entry ID cannot be empty")
+		}
+		key := record.BorrowBytes([]byte(id))
+		before, found := w.core.CurrentRecord(key)
+		if !found {
+			continue
+		}
+		if _, _, err := delta.StageDelete(before, key, 0, false); err != nil {
+			return nil, err
+		}
+	}
+	candidate, err := w.core.PrepareDelta(delta)
+	if err != nil {
+		return nil, err
+	}
+	prepared = true
+	return &flatPreparedMutation{prepared: candidate}, nil
+}
 
-	results := make([]*SearchResult, len(flatResults))
-	for i, r := range flatResults {
+// Search adapts the search results from Flat to interface types
+func (w *flatWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
+	set, err := w.core.SearchBorrowed(ctx, record.BorrowVector(query), k, filter)
+	if err != nil {
+		return nil, err
+	}
+	defer set.Close()
+
+	results := make([]*SearchResult, set.Len())
+	for i := 0; i < set.Len(); i++ {
+		ref, score := set.At(i)
 		results[i] = &SearchResult{
-			ID:       r.ID,
-			Score:    r.Score,
-			Vector:   r.Vector,
-			Metadata: r.Metadata,
-			Version:  r.Version,
+			ID:      string(ref.ID().Bytes()),
+			Score:   score,
+			Version: ref.Version(),
+			Ordinal: ref.Ordinal(),
 		}
 	}
 	return results, nil
@@ -573,64 +681,207 @@ func (w *flatWrapper) Search(ctx context.Context, query []float32, k int, filter
 
 // Delete delegates to the wrapped index
 func (w *flatWrapper) Delete(ctx context.Context, id string) error {
-	return w.index.Delete(ctx, id)
+	prepared, err := w.PrepareMutations(ctx, nil, []string{id})
+	if err != nil {
+		return err
+	}
+	defer prepared.Abort()
+	return prepared.Commit()
 }
 
 // Size delegates to the wrapped index
 func (w *flatWrapper) Size() int {
-	return w.index.Size()
+	return w.core.Size()
 }
 
 // MemoryUsage delegates to the wrapped index
 func (w *flatWrapper) MemoryUsage() int64 {
-	return w.index.MemoryUsage()
+	return w.core.MemoryUsage()
 }
 
 // Close delegates to the wrapped index
 func (w *flatWrapper) Close() error {
-	if w.sfl != nil {
-		_ = w.sfl.Free()
-	}
-	return w.index.Close()
+	return w.core.Close()
 }
 
-// SaveToDisk delegates persistence to the wrapped index
+// SaveToDisk writes a generation snapshot atomically. Metadata is persisted by
+// the storage engine, which is its authoritative owner; Flat snapshots retain
+// only the routing fields needed to restore vector search.
 func (w *flatWrapper) SaveToDisk(ctx context.Context, path string) error {
-	return w.index.SaveToDisk(ctx, path)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	data, err := w.SerializeToBytes()
+	if err != nil {
+		return err
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
 }
 
-// LoadFromDisk delegates loading to the wrapped index
 func (w *flatWrapper) LoadFromDisk(ctx context.Context, path string) error {
-	return w.index.LoadFromDisk(ctx, path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return w.DeserializeFromBytes(ctx, data)
 }
 
-// SerializeToBytes delegates to the wrapped Flat index
 func (w *flatWrapper) SerializeToBytes() ([]byte, error) {
-	return w.index.SerializeToBytes()
+	config := w.core.Config()
+	enc := &util.BinaryEncoder{}
+	enc.WriteUint32(uint32(config.Dimension))
+	enc.WriteUint32(uint32(config.Metric))
+	hasQuantization := config.Quantization != nil
+	enc.WriteBool(hasQuantization)
+	if hasQuantization {
+		enc.WriteUint32(uint32(config.Quantization.Type))
+		enc.WriteUint32(uint32(config.Quantization.Codebooks))
+		enc.WriteUint32(uint32(config.Quantization.Bits))
+		enc.WriteFloat64(config.Quantization.TrainRatio)
+		enc.WriteUint32(uint32(config.Quantization.CacheSize))
+	}
+	enc.WriteUint32(uint32(w.core.Size()))
+	if err := w.core.VisitVisible(func(ref record.RecordRef) error {
+		enc.WriteString(string(ref.ID().Bytes()))
+		enc.WriteUint32(ref.Ordinal())
+		enc.WriteUint64(ref.Version())
+		enc.WriteVector(ref.Vector().Float32s())
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	body := enc.DetachBytes()
+	result := make([]byte, 16+len(body))
+	copy(result[:8], flat.FlatMagicBytes)
+	binary.LittleEndian.PutUint32(result[8:12], flatCoreFormatVersion)
+	binary.LittleEndian.PutUint32(result[12:16], crc32.ChecksumIEEE(body))
+	copy(result[16:], body)
+	return result, nil
 }
 
-// DeserializeFromBytes delegates to the wrapped Flat index
 func (w *flatWrapper) DeserializeFromBytes(ctx context.Context, data []byte) error {
-	return w.index.DeserializeFromBytes(ctx, data)
+	if len(data) < 16 || string(data[:8]) != string(flat.FlatMagicBytes) {
+		return fmt.Errorf("invalid flat core snapshot")
+	}
+	if binary.LittleEndian.Uint32(data[8:12]) != flatCoreFormatVersion {
+		return fmt.Errorf("unsupported flat core snapshot version %d", binary.LittleEndian.Uint32(data[8:12]))
+	}
+	body := data[16:]
+	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(data[12:16]) {
+		return fmt.Errorf("flat core snapshot checksum mismatch")
+	}
+	dec := &util.BinaryDecoder{Data: body}
+	dimension, err := dec.ReadUint32()
+	if err != nil {
+		return err
+	}
+	metric, err := dec.ReadUint32()
+	if err != nil {
+		return err
+	}
+	hasQuantization, err := dec.ReadBool()
+	if err != nil {
+		return err
+	}
+	config := &flat.Config{Dimension: int(dimension), Metric: util.DistanceMetric(metric)}
+	if hasQuantization {
+		kind, err := dec.ReadUint32()
+		if err != nil {
+			return err
+		}
+		codebooks, err := dec.ReadUint32()
+		if err != nil {
+			return err
+		}
+		bits, err := dec.ReadUint32()
+		if err != nil {
+			return err
+		}
+		ratio, err := dec.ReadFloat64()
+		if err != nil {
+			return err
+		}
+		cacheSize, err := dec.ReadUint32()
+		if err != nil {
+			return err
+		}
+		config.Quantization = &quant.QuantizationConfig{Type: quant.QuantizationType(kind), Codebooks: int(codebooks), Bits: int(bits), TrainRatio: ratio, CacheSize: int(cacheSize)}
+	}
+	count, err := dec.ReadUint32()
+	if err != nil {
+		return err
+	}
+	core, err := flat.NewCore(config)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		delta, err := core.NewDelta(uint64(len(body))+16<<10, count, uint64(len(body))+4096)
+		if err != nil {
+			_ = core.Close()
+			return err
+		}
+		for i := uint32(0); i < count; i++ {
+			if err := ctx.Err(); err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+			id, err := dec.ReadString()
+			if err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+			ordinal, err := dec.ReadUint32()
+			if err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+			version, err := dec.ReadUint64()
+			if err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+			vector, err := dec.ReadVector()
+			if err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+			if _, _, err := delta.StagePut(record.MutationInsert, record.RecordRef{}, record.RecordBuilder{ID: record.BorrowBytes([]byte(id)), Vector: record.BorrowVector(vector), Ordinal: ordinal, Version: version}, 0, false); err != nil {
+				_ = delta.Close()
+				_ = core.Close()
+				return err
+			}
+		}
+		if err := core.CommitDelta(delta); err != nil {
+			_ = core.Close()
+			return err
+		}
+	}
+	previous := w.core
+	w.core = core
+	return previous.Close()
 }
 
 // GetPersistenceMetadata delegates to the wrapped index
 func (w *flatWrapper) GetPersistenceMetadata() *PersistenceMetadata {
-	flatMeta := w.index.GetPersistenceMetadata()
-	if flatMeta == nil {
-		return nil
-	}
-
-	// Convert from Flat metadata to interface metadata
 	return &PersistenceMetadata{
-		Version:       flatMeta.Version,
-		NodeCount:     flatMeta.NodeCount,
-		Dimension:     flatMeta.Dimension,
-		MaxLevel:      flatMeta.MaxLevel,
-		IndexType:     "Flat",
-		CreatedAt:     flatMeta.CreatedAt,
-		ChecksumCRC32: flatMeta.ChecksumCRC32,
-		FileSize:      flatMeta.FileSize,
+		Version:   flatCoreFormatVersion,
+		NodeCount: w.core.Size(),
+		Dimension: w.core.Config().Dimension,
+		IndexType: "Flat",
 	}
 }
 
@@ -643,25 +894,10 @@ func NewFlat(config *FlatConfig) (Index, error) {
 		Quantization: config.Quantization,
 	}
 
-	flatIndex, err := flat.NewFlat(flatConfig)
+	flatIndex, err := flat.NewCore(flatConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	slotSize := 48 + uint64(unsafe.Sizeof(flat.VectorEntry{}))
-	slotSize = (slotSize + 7) &^ 7
-	if slotSize < 32 {
-		slotSize = 32
-	}
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		SlotSize:  slotSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 4,
-	}, 64, 16)
-	if err != nil {
-		flatIndex.Close()
-		return nil, err
-	}
-
-	return &flatWrapper{index: flatIndex, sfl: sfl}, nil
+	return newFlatWrapper(flatIndex)
 }
