@@ -1360,7 +1360,15 @@ func (c *persistedCollection) initVectorSFL() error {
 	// Slot must hold the vector data plus the SFL internal metadata prefix.
 	slotSize := uint64(sflMetadataOverhead + c.Config.Dimension*4)
 	slotSize = (slotSize + 7) &^ 7 // 8-byte alignment
+	poolSize := uint64(64 * 1024 * 1024 * 1024) // 64GB default
+	if c.Config.RawStoreCap > 0 {
+		if required := uint64(c.Config.RawStoreCap) * slotSize; required > poolSize {
+			poolSize = (required + 2*1024*1024 - 1) &^ (2*1024*1024 - 1)
+		}
+	}
+
 	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  poolSize,
 		SlotSize:  slotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 16,

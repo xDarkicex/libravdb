@@ -8,9 +8,11 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
+	"github.com/xDarkicex/memory"
 )
 
 var (
@@ -477,11 +479,12 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 		locked = append(locked, collection)
 	}
 
-	state, err := buildTransactionState(ctx, collections, names)
+	state, err := buildTransactionState(ctx, collections, names, ops)
 	if err != nil {
 		return err
 	}
-	if err := state.apply(ops); err != nil {
+	defer state.close()
+	if err := state.apply(ctx, ops); err != nil {
 		return err
 	}
 	if err := state.validateCAS(); err != nil {
@@ -573,6 +576,32 @@ func (s *txCommitState) prepareIndexDeltas(ctx context.Context, names []string) 
 			continue
 		}
 		deltaCollections[name] = true
+		if state.flat != nil {
+			state.flat.sortEntries()
+			puts := make([]*index.VectorEntry, 0, len(state.flat.entries))
+			deletes := make([]string, 0, len(state.flat.entries))
+			for i := range state.flat.entries {
+				entry := &state.flat.entries[i]
+				switch {
+				case entry.current != nil:
+					puts = append(puts, entryForIndex(state.collection.config.Metric, entry.current))
+				case entry.base != nil:
+					deletes = append(deletes, entry.id)
+				}
+			}
+			if len(puts) == 0 && len(deletes) == 0 {
+				continue
+			}
+			candidate, err := deltaIndex.PrepareMutations(ctx, puts, deletes)
+			if err != nil {
+				for _, existing := range prepared {
+					_ = existing.Abort()
+				}
+				return nil, nil, fmt.Errorf("prepare index delta for %s: %w", name, err)
+			}
+			prepared[name] = candidate
+			continue
+		}
 		ids := make([]string, 0, len(state.touched))
 		for id := range state.touched {
 			ids = append(ids, id)
@@ -636,22 +665,235 @@ type txCollectionState struct {
 	touched    map[string]struct{}
 	expected   map[string]uint64
 	casTouched map[string]struct{}
+	flat       *flatTxCollectionState
 }
 
 type txCommitState struct {
 	collections map[string]*txCollectionState
 }
 
-func buildTransactionState(ctx context.Context, collections map[string]*Collection, names []string) (*txCommitState, error) {
+// flatTxSlot is deliberately pointer-free because it is allocated in a
+// transaction-local mmap arena and indexed by memory.IDMap. The entry payload
+// remains in flatTxCollectionState.entries so Go keeps vectors and metadata
+// reachable while the storage transaction is prepared and committed.
+type flatTxSlot struct {
+	row uint32
+}
+
+// flatTxEntry is a bounded touched-record overlay. base is immutable and
+// current evolves as staged operations for the same ID are applied in order.
+// Unlike the historical base/working maps, its cardinality is the number of
+// transaction IDs, never the collection size.
+type flatTxEntry struct {
+	base               *index.VectorEntry
+	current            *index.VectorEntry
+	id                 string
+	slot               *flatTxSlot
+	expectedVersion    uint64
+	hasExpectedVersion bool
+}
+
+type flatTxCollectionState struct {
+	lookup  *memory.TypedIDMap[flatTxSlot]
+	arena   *memory.Arena
+	slots   []flatTxSlot
+	entries []flatTxEntry
+}
+
+func newFlatTxCollectionState(ops []txMutation, collection string) (*flatTxCollectionState, error) {
+	var count, keyBytes uint64
+	for _, op := range ops {
+		if op.collection != collection {
+			continue
+		}
+		count++
+		keyBytes += uint64(len(op.id))
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("%w: empty flat transaction state for %s", ErrTxValidation, collection)
+	}
+	if keyBytes < 4096 {
+		keyBytes = 4096
+	}
+	slotBytes := count * uint64(unsafe.Sizeof(flatTxSlot{}))
+	if slotBytes < 4096 {
+		slotBytes = 4096
+	}
+	arena, err := memory.NewArena(slotBytes, 64)
+	if err != nil {
+		return nil, fmt.Errorf("flat transaction arena: %w", err)
+	}
+	slots, err := memory.ArenaSlice[flatTxSlot](arena, int(count))
+	if err != nil {
+		_ = arena.Free()
+		return nil, fmt.Errorf("flat transaction slots: %w", err)
+	}
+	lookup, err := memory.NewTypedIDMap[flatTxSlot](memory.IDMapConfig{
+		Capacity:  count,
+		KeyBytes:  keyBytes,
+		Alignment: 128,
+	})
+	if err != nil {
+		_ = arena.Free()
+		return nil, fmt.Errorf("flat transaction ID map: %w", err)
+	}
+	return &flatTxCollectionState{
+		lookup:  lookup,
+		arena:   arena,
+		slots:   slots,
+		entries: make([]flatTxEntry, 0, count),
+	}, nil
+}
+
+func (s *flatTxCollectionState) close() {
+	if s == nil {
+		return
+	}
+	if s.lookup != nil {
+		_ = s.lookup.Free()
+		s.lookup = nil
+	}
+	if s.arena != nil {
+		_ = s.arena.Free()
+		s.arena = nil
+	}
+	s.slots = nil
+	s.entries = nil
+}
+
+func (s *flatTxCollectionState) entry(ctx context.Context, collection *Collection, id string) (*flatTxEntry, error) {
+	if slot, ok := s.lookup.GetString(id); ok {
+		return &s.entries[slot.row], nil
+	}
+
+	store := collection.storage
+	if collection.shards != nil {
+		store = collection.getShard(id).storage
+	}
+	var base *index.VectorEntry
+	entry, err := store.Get(ctx, id)
+	if err != nil {
+		if !isNotFoundError(err) {
+			return nil, fmt.Errorf("load transaction record %s: %w", id, err)
+		}
+	} else {
+		base = entry
+	}
+
+	slotIndex := len(s.slots)
+	s.slots = s.slots[:slotIndex+1]
+	slot := &s.slots[slotIndex]
+	*slot = flatTxSlot{row: uint32(len(s.entries))}
+	s.entries = append(s.entries, flatTxEntry{
+		id:      id,
+		base:    base,
+		current: base,
+		slot:    slot,
+	})
+	if err := s.lookup.PutString(id, slot); err != nil {
+		s.entries = s.entries[:len(s.entries)-1]
+		s.slots = s.slots[:len(s.slots)-1]
+		return nil, fmt.Errorf("index flat transaction record %s: %w", id, err)
+	}
+	return &s.entries[slot.row], nil
+}
+
+func (s *flatTxCollectionState) sortEntries() {
+	sort.Slice(s.entries, func(i, j int) bool { return s.entries[i].id < s.entries[j].id })
+	for i := range s.entries {
+		s.entries[i].slot.row = uint32(i)
+	}
+}
+
+func (s *flatTxCollectionState) apply(ctx context.Context, collection *Collection, op txMutation) error {
+	entry, err := s.entry(ctx, collection, op.id)
+	if err != nil {
+		return err
+	}
+	if op.hasExpectedVersion {
+		if entry.hasExpectedVersion && entry.expectedVersion != op.expectedVersion {
+			return fmt.Errorf("%w: conflicting expected versions for %s/%s", ErrTxConflict, op.collection, op.id)
+		}
+		entry.expectedVersion = op.expectedVersion
+		entry.hasExpectedVersion = true
+	}
+
+	switch op.kind {
+	case txMutationInsert:
+		if entry.current != nil && entry.base != nil {
+			return fmt.Errorf("%w: record %s already exists in collection %s", ErrTxConflict, op.id, op.collection)
+		}
+		replacement := &index.VectorEntry{ID: op.id, Vector: op.vector, Metadata: op.metadata}
+		if entry.current != nil {
+			replacement.Ordinal = entry.current.Ordinal
+		}
+		entry.current = replacement
+	case txMutationUpsert:
+		replacement := &index.VectorEntry{ID: op.id, Vector: op.vector, Metadata: op.metadata}
+		if entry.current != nil {
+			replacement.Ordinal = entry.current.Ordinal
+		}
+		entry.current = replacement
+	case txMutationUpdate:
+		if entry.current == nil {
+			if op.hasExpectedVersion {
+				return fmt.Errorf("%w: %s", ErrRecordNotFound, op.id)
+			}
+			return fmt.Errorf("%w: vector with ID %s not found", ErrTxValidation, op.id)
+		}
+		updated := cloneIndexEntry(entry.current)
+		if op.vector != nil {
+			updated.Vector = cloneVector(op.vector)
+		}
+		if op.metadata == nil {
+			updated.Metadata = cloneMetadata(entry.current.Metadata)
+		} else {
+			merged := cloneMetadata(entry.current.Metadata)
+			if merged == nil {
+				merged = make(map[string]interface{}, len(op.metadata))
+			}
+			for k, v := range op.metadata {
+				merged[k] = v
+			}
+			updated.Metadata = merged
+		}
+		entry.current = updated
+	case txMutationDelete:
+		if entry.current == nil {
+			if op.hasExpectedVersion {
+				return fmt.Errorf("%w: %s", ErrRecordNotFound, op.id)
+			}
+			return nil
+		}
+		entry.current = nil
+	default:
+		return fmt.Errorf("%w: unsupported mutation %d", ErrTxValidation, op.kind)
+	}
+	return nil
+}
+
+func buildTransactionState(ctx context.Context, collections map[string]*Collection, names []string, ops []txMutation) (*txCommitState, error) {
 	state := &txCommitState{
 		collections: make(map[string]*txCollectionState, len(names)),
+	}
+	fail := func(err error) (*txCommitState, error) {
+		state.close()
+		return nil, err
 	}
 
 	for _, name := range names {
 		collection := collections[name]
+		if _, isDelta := collection.index.(index.DeltaIndex); isDelta {
+			flat, err := newFlatTxCollectionState(ops, name)
+			if err != nil {
+				return fail(err)
+			}
+			state.collections[name] = &txCollectionState{collection: collection, flat: flat}
+			continue
+		}
 		entries, err := collection.getAllVectors(ctx)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 
 		base := make(map[string]*index.VectorEntry, len(entries))
@@ -674,11 +916,23 @@ func buildTransactionState(ctx context.Context, collections map[string]*Collecti
 	return state, nil
 }
 
-func (s *txCommitState) apply(ops []txMutation) error {
+func (s *txCommitState) close() {
+	for _, state := range s.collections {
+		state.flat.close()
+	}
+}
+
+func (s *txCommitState) apply(ctx context.Context, ops []txMutation) error {
 	for _, op := range ops {
 		state := s.collections[op.collection]
 		if state == nil {
 			return fmt.Errorf("%w: collection %s not found", ErrTxValidation, op.collection)
+		}
+		if state.flat != nil {
+			if err := state.flat.apply(ctx, state.collection, op); err != nil {
+				return err
+			}
+			continue
 		}
 		state.touched[op.id] = struct{}{}
 		if op.hasExpectedVersion {
@@ -761,6 +1015,34 @@ func (s *txCommitState) apply(ops []txMutation) error {
 func (s *txCommitState) storageOps() []storage.TxOperation {
 	ops := make([]storage.TxOperation, 0)
 	for collectionName, state := range s.collections {
+		if state.flat != nil {
+			state.flat.sortEntries()
+			for i := range state.flat.entries {
+				entry := &state.flat.entries[i]
+				switch {
+				case entry.current == nil && entry.base != nil:
+					ops = append(ops, storage.TxOperation{
+						Type:               storage.TxOperationDelete,
+						Collection:         collectionName,
+						ID:                 entry.id,
+						ExpectedVersion:    entry.expectedVersion,
+						HasExpectedVersion: entry.hasExpectedVersion,
+					})
+				case entry.current != nil:
+					ops = append(ops, storage.TxOperation{
+						Type:               storage.TxOperationPut,
+						Collection:         collectionName,
+						ID:                 entry.id,
+						Ordinal:            entry.current.Ordinal,
+						Vector:             entry.current.Vector,
+						Metadata:           entry.current.Metadata,
+						ExpectedVersion:    entry.expectedVersion,
+						HasExpectedVersion: entry.hasExpectedVersion,
+					})
+				}
+			}
+			continue
+		}
 		ids := make([]string, 0, len(state.touched))
 		for id := range state.touched {
 			ids = append(ids, id)
@@ -800,6 +1082,26 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 
 func (s *txCommitState) validateCAS() error {
 	for collectionName, state := range s.collections {
+		if state.flat != nil {
+			for i := range state.flat.entries {
+				entry := &state.flat.entries[i]
+				if !entry.hasExpectedVersion {
+					continue
+				}
+				if entry.base == nil {
+					return fmt.Errorf("%w: %s", ErrRecordNotFound, entry.id)
+				}
+				if entry.base.Version != entry.expectedVersion {
+					return &VersionConflictError{
+						Collection:      collectionName,
+						ID:              entry.id,
+						ExpectedVersion: entry.expectedVersion,
+						ActualVersion:   entry.base.Version,
+					}
+				}
+			}
+			continue
+		}
 		for id, expectedVersion := range state.expected {
 			current := state.base[id]
 			if current == nil {
@@ -825,6 +1127,18 @@ func (s *txCommitState) applyPreparedOrdinals(ops []storage.TxOperation) {
 		}
 		state := s.collections[op.Collection]
 		if state == nil {
+			continue
+		}
+		if state.flat != nil {
+			slot, ok := state.flat.lookup.GetString(op.ID)
+			if !ok {
+				continue
+			}
+			entry := &state.flat.entries[slot.row]
+			if entry.current == nil {
+				continue
+			}
+			entry.current.Ordinal = op.Ordinal
 			continue
 		}
 		entry := state.working[op.ID]

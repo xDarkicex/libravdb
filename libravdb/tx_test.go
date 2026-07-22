@@ -6,7 +6,26 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/xDarkicex/libravdb/internal/index"
+	"github.com/xDarkicex/libravdb/internal/storage"
 )
+
+type txStorageProbe struct {
+	storage.Collection
+	gets     int
+	iterates int
+}
+
+func (p *txStorageProbe) Get(ctx context.Context, id string) (*index.VectorEntry, error) {
+	p.gets++
+	return p.Collection.Get(ctx, id)
+}
+
+func (p *txStorageProbe) Iterate(ctx context.Context, fn func(*index.VectorEntry) error) error {
+	p.iterates++
+	return p.Collection.Iterate(ctx, fn)
+}
 
 func TestCASSuccessIncrementsVersion(t *testing.T) {
 	ctx := context.Background()
@@ -89,6 +108,65 @@ func TestFlatTransactionPublishesDeltaWithoutRebuild(t *testing.T) {
 	}
 	if seen["old"] || !seen["new"] || !seen["keep"] {
 		t.Fatalf("unexpected visible IDs after Flat delta: %#v", seen)
+	}
+}
+
+func TestFlatTransactionStateLoadsOnlyTouchedRecords(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(testDBPath(t)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	collection, err := db.CreateCollection(ctx, "flat_tx_overlay", WithDimension(2), WithFlat())
+	if err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+	for i := 0; i < 96; i++ {
+		id := fmt.Sprintf("seed-%03d", i)
+		if err := collection.Insert(ctx, id, []float32{1, 0}, map[string]interface{}{"seed": i}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	probe := &txStorageProbe{Collection: collection.storage}
+	collection.storage = probe
+	defer func() { collection.storage = probe.Collection }()
+
+	ops := []txMutation{{
+		kind:       txMutationUpdate,
+		collection: "flat_tx_overlay",
+		id:         "seed-042",
+		metadata:   map[string]interface{}{"changed": true},
+	}}
+	collections, names, err := db.txCollections(ops)
+	if err != nil {
+		t.Fatalf("collections: %v", err)
+	}
+	state, err := buildTransactionState(ctx, collections, names, ops)
+	if err != nil {
+		t.Fatalf("build state: %v", err)
+	}
+	defer state.close()
+
+	flat := state.collections["flat_tx_overlay"].flat
+	if flat == nil {
+		t.Fatal("Flat collection selected historical transaction staging")
+	}
+	if len(flat.entries) != 0 {
+		t.Fatalf("state eagerly loaded %d records", len(flat.entries))
+	}
+	if err := state.apply(ctx, ops); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if probe.iterates != 0 {
+		t.Fatalf("Flat transaction iterated tenant storage %d times", probe.iterates)
+	}
+	if probe.gets != 1 || len(flat.entries) != 1 {
+		t.Fatalf("Flat transaction Get calls=%d entries=%d, want one touched record", probe.gets, len(flat.entries))
+	}
+	if flat.entries[0].base == nil || flat.entries[0].current == nil {
+		t.Fatal("touched record was not hydrated into the bounded overlay")
 	}
 }
 

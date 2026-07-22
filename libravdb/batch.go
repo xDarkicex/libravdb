@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
-	"github.com/xDarkicex/memory"
 )
 
 // BatchOperation represents a batch operation that can be executed
@@ -397,12 +396,6 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	arena, err := memory.NewArena(1024*1024, 64)
-	if err != nil {
-		return nil, fmt.Errorf("arena create: %w", err)
-	}
-	defer arena.Free()
-
 	type chunkOutcome struct {
 		err      error
 		result   *chunkResult
@@ -440,16 +433,13 @@ func (b *BatchInsert) executeConcurrent(ctx context.Context, result *BatchResult
 		close(waitDone)
 	}()
 
-	chunkResults, err := memory.ArenaSlice[*chunkResult](arena, totalChunks)
-	if err != nil {
-		return nil, fmt.Errorf("arena chunkResults: %w", err)
-	}
-	chunkResults = chunkResults[:totalChunks]
-	chunkErrors, err := memory.ArenaSlice[error](arena, totalChunks)
-	if err != nil {
-		return nil, fmt.Errorf("arena chunkErrors: %w", err)
-	}
-	chunkErrors = chunkErrors[:totalChunks]
+	// chunkResult contains Go maps and chunkErrors contains interface values.
+	// These arrays are explicit GC roots until the single merge pass completes;
+	// putting either in mmap-backed Arena memory would make those references
+	// invisible to the collector and can free a chunk's error map mid-merge.
+	// They are bounded by this request's chunk count, never tenant cardinality.
+	chunkResults := make([]*chunkResult, totalChunks)
+	chunkErrors := make([]error, totalChunks)
 
 	completedChunks := 0
 	for completedChunks < totalChunks {
@@ -553,38 +543,22 @@ func (b *BatchInsert) tryProcessChunkFast(ctx context.Context, chunk []*VectorEn
 		}, true, nil
 	}
 
-	arena := b.collection.db.scratchPool.Get().(*memory.Arena)
-	defer func() {
-		arena.Reset()
-		b.collection.db.scratchPool.Put(arena)
-	}()
-
-	structsSlice, err := memory.ArenaSlice[index.VectorEntry](arena, len(chunk))
-	if err != nil {
-		return nil, false, nil // fall back to heap path
-	}
-	structsSlice = structsSlice[:len(chunk)]
-	pointersSlice, err := memory.ArenaSlice[*index.VectorEntry](arena, len(chunk))
-	if err != nil {
-		return nil, false, nil // fall back to heap path
-	}
-	pointersSlice = pointersSlice[:len(chunk)]
-
-	validCount := 0
+	// Index implementations are allowed to retain VectorEntry pointers. Arena
+	// storage is request-local and is reset as soon as this function returns,
+	// so passing arena-backed entries across insertBatch is invalid ownership.
+	// Keep this bounded request payload on the heap, where the index can retain
+	// it safely; it is not a tenant-sized staging structure.
+	indexEntries := make([]*index.VectorEntry, 0, len(chunk))
 	for _, entry := range chunk {
 		if err := b.validateEntry(entry); err != nil {
 			return nil, false, nil
 		}
-		structsSlice[validCount] = index.VectorEntry{
+		indexEntries = append(indexEntries, &index.VectorEntry{
 			ID:       entry.ID,
 			Vector:   entry.Vector,
 			Metadata: entry.Metadata,
-		}
-		pointersSlice[validCount] = &structsSlice[validCount]
-		validCount++
+		})
 	}
-
-	indexEntries := pointersSlice[:validCount]
 
 	if err := b.collection.insertBatch(ctx, indexEntries); err != nil {
 		return nil, false, nil
