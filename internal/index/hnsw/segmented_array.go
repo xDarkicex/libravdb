@@ -34,8 +34,10 @@ type segmentedNodeArray struct {
 
 func newSegmentedArrayPool() (*memory.Pool, error) {
 	return memory.NewPool(memory.AllocatorConfig{
-		PoolSize: segmentedPoolSize,
-		SlabSize: segmentedSlabSize,
+		PoolSize:      segmentedPoolSize,
+		SlabSize:      segmentedSlabSize,
+		LockMemory:    true,
+		MadviseRandom: true,
 	}, 64)
 }
 

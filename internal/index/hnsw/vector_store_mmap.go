@@ -27,6 +27,7 @@ func NewMmapRawVectorStore(dim int, active int, mmap *memory.MemoryMap) *MmapRaw
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
+		MadviseRandom: true,
 	}, 64)
 	if err != nil {
 		// Fallback: nil pool means Get() will use make().
