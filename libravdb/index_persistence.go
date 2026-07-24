@@ -123,10 +123,13 @@ func (b *indexPersistenceBridge) RebuildIndex(collectionName string, config *sto
 		return fmt.Errorf("rebuild: get storage for %s: %w", collectionName, err)
 	}
 
-	// Build list of entries from storage records.
+	// Build list of entries from storage records. Skip legacy entries
+	// with empty IDs that were never indexed (sentinel/root records).
 	var entries []*index.VectorEntry
 	err = col.Iterate(context.Background(), func(entry *index.VectorEntry) error {
-		entries = append(entries, entry)
+		if entry.ID != "" {
+			entries = append(entries, entry)
+		}
 		return nil
 	})
 	if err != nil {
@@ -174,6 +177,13 @@ func (b *indexPersistenceBridge) ApplyIndexPut(
 	if err != nil {
 		return err
 	}
+	// Skip entries with empty IDs — these are legacy sentinel/root entries
+	// from databases created before v1.3.x. The flat index validator rejects
+	// empty IDs, but they carry no searchable content and are safe to skip
+	// during recovery.
+	if entry.ID == "" {
+		return nil
+	}
 	if replace {
 		if err := deleteIndexEntry(context.Background(), idx, entry.ID, previousOrdinal); err != nil {
 			return fmt.Errorf("delete replaced index entry %s/%s: %w", collectionName, entry.ID, err)
@@ -191,6 +201,11 @@ func (b *indexPersistenceBridge) ApplyIndexDelete(
 	ordinal uint32,
 	_ *storage.CollectionConfig,
 ) error {
+	// Skip deletes for empty IDs — legacy sentinel entries that were never
+	// indexed continue to be absent after recovery.
+	if id == "" {
+		return nil
+	}
 	idx, err := b.cachedRecoveryIndex(collectionName)
 	if err != nil {
 		return err
