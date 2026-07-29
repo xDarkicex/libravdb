@@ -42,13 +42,12 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 		oldTail := frontier.tail
 		g.pagePool.HyalineEnter(int(shard))
 
-		pageSlot := g.index.Lookup(node)
-		if pageSlot == 0 {
+		page := g.index.Lookup(node)
+		if page == nil {
 			g.pagePool.HyalineLeave(int(shard))
 			continue
 		}
 
-		page := g.pageReg.Get(pageSlot)
 		gen := atomic.LoadUint32(&page.Header.Generation)
 		totalCount := page.Header.Count
 

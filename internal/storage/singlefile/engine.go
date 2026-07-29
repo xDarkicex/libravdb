@@ -158,6 +158,7 @@ type walRecord struct {
 type persistedState struct {
 	Collections      map[string]*persistedCollection `json:"collections"`
 	NextCollectionID uint64                          `json:"next_collection_id"`
+	NextGraphNodeID  uint64                          `json:"next_graph_node_id"`
 }
 
 type persistedCollection struct {
@@ -176,13 +177,14 @@ type persistedCollection struct {
 }
 
 type recordValue struct {
-	Metadata   map[string]interface{} `json:"metadata"`
-	Vector     []float32              `json:"vector"`
-	Version    uint64                 `json:"version"`
-	CreatedLSN uint64                 `json:"created_lsn"`
-	UpdatedLSN uint64                 `json:"updated_lsn"`
-	Ordinal    uint32                 `json:"ordinal"`
-	Deleted    bool                   `json:"deleted"`
+	Metadata    map[string]interface{} `json:"metadata"`
+	Vector      []float32              `json:"vector"`
+	Version     uint64                 `json:"version"`
+	CreatedLSN  uint64                 `json:"created_lsn"`
+	UpdatedLSN  uint64                 `json:"updated_lsn"`
+	Ordinal     uint32                 `json:"ordinal"`
+	GraphNodeID uint64                 `json:"graph_node_id"`
+	Deleted     bool                   `json:"deleted"`
 }
 
 type collectionCreatePayload struct {
@@ -195,11 +197,12 @@ type collectionDeletePayload struct {
 }
 
 type recordPutPayload struct {
-	Metadata   map[string]interface{} `json:"metadata"`
-	Collection string                 `json:"collection"`
-	ID         string                 `json:"id"`
-	Vector     []float32              `json:"vector"`
-	Ordinal    uint32                 `json:"ordinal"`
+	Metadata    map[string]interface{} `json:"metadata"`
+	Collection  string                 `json:"collection"`
+	ID          string                 `json:"id"`
+	Vector      []float32              `json:"vector"`
+	Ordinal     uint32                 `json:"ordinal"`
+	GraphNodeID uint64                 `json:"graph_node_id"`
 }
 
 type recordDeletePayload struct {
@@ -294,7 +297,7 @@ type Engine struct {
 	}
 	dirtyOps             int
 	compactionErrors     uint64
-	lastTxID             uint64
+	lastTxID             atomic.Uint64
 	fileID               uint64
 	dirtyBytes           uint64
 	metaEpoch            uint64
@@ -308,16 +311,50 @@ type Engine struct {
 	rebuiltIndexes       uint64
 	replayedIndexPuts    uint64
 	replayedIndexDeletes uint64
-	lastLSN              uint64
+	lastLSN              atomic.Uint64
 	activeMetaPage       uint64
+	nextGraphNodeID      atomic.Uint64
+	reverseDir           *reverseDirectory
 	mu                   sync.RWMutex
 	status               atomic.Int32
 	closed               atomic.Bool
-	walSync              bool
-	groupCommitTarget    int32
-	groupCommitMaxDelay  time.Duration
-	walSyncFn            func(*os.File) error // test hook; nil uses (*os.File).Sync
-	dirty                bool                 // completion channels for foreground flushes
+	// writesDisabled is set when a post-WAL-write durability failure
+	// (sync or short write) makes the committed/uncommitted boundary
+	// ambiguous. All mutation paths must reject writes until the
+	// engine is closed and reopened for recovery. Never reset
+	// in-process: reserved GraphNodeID capacity stays reserved.
+	writesDisabled        atomic.Bool
+	walSync               bool
+	groupCommitTarget     int32
+	groupCommitMaxDelay   time.Duration
+	reverseDirectoryLimit int
+	walWriteFn            func([]byte) (int, error) // test hook; nil uses e.file.Write
+	walSyncFn             func(*os.File) error      // test hook; nil uses (*os.File).Sync
+	// checkpointWriteFn intercepts every raw file write issued by
+	// checkpointLocked (snapshot chunk, metapage, header). Test hook;
+	// nil uses the direct file methods.
+	checkpointWriteFn func(offset int64, data []byte) (int, error)
+	// checkpointSyncFn intercepts the fsync issued by checkpointLocked.
+	// Test hook; nil uses e.file.Sync.
+	checkpointSyncFn func(*os.File) error
+	// batchQueueOwnedHook is a test-only synchronization seam invoked after
+	// flushBatch detaches the current queue and before it acquires e.mu. The
+	// replacement queue accepts concurrent admissions in this exact window.
+	// Production engines leave it nil.
+	batchQueueOwnedHook func()
+	dirty               bool // completion channels for foreground flushes
+	collectionsByID     map[uint64]string
+}
+
+// newNodeAssignment records a freshly allocated GraphNodeID together
+// with its pre-admitted reverse-directory slot. The reservedPtr comes
+// from reverseDirectory.reserve() and must be committed after sync
+// succeeds; it is abandoned (leaked) on abort.
+type newNodeAssignment struct {
+	graphNodeID  uint64
+	reservedPtr  unsafe.Pointer
+	collectionID uint64
+	ordinal      uint32
 }
 
 // batchEntry holds a buffered record pending WAL flush.
@@ -333,6 +370,14 @@ type batchEntry struct {
 	// When set, flushBatch passes these to WAL framing to avoid
 	// re-encoding under e.mu.Lock().
 	encoded []encodedPayload
+	// assignedNodeIDs holds GraphNodeIDs assigned during WAL framing,
+	// indexed 1:1 with entries (by count()). Written back to caller's
+	// VectorEntry only after sync succeeds.
+	assignedNodeIDs []uint64
+	// newNodeAssignments holds reverse-directory reservation state for
+	// entries that received a fresh GraphNodeID. The reserved pointers are
+	// committed (reverseDir.commitEntry) after sync succeeds.
+	newNodeAssignments []newNodeAssignment
 }
 
 func (b *batchEntry) count() int {
@@ -383,6 +428,17 @@ type Collection struct {
 
 // Option is a functional option for New.
 type Option func(*Engine) error
+
+// WithReverseDirectoryLimit configures the memory boundary for the off-heap reverse directory.
+func WithReverseDirectoryLimit(limit int) Option {
+	return func(e *Engine) error {
+		if limit <= 0 {
+			return fmt.Errorf("Reverse directory limit must be positive")
+		}
+		e.reverseDirectoryLimit = limit
+		return nil
+	}
+}
 
 // WithIndexSnapshotProvider wires the index persistence bridge before recovery
 // so persisted indexes can be deserialized during openExisting/loadIndexes.
@@ -457,7 +513,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	engine := &Engine{
 		path:        resolved,
 		file:        file,
-		state:       &persistedState{NextCollectionID: 1, Collections: make(map[string]*persistedCollection)},
+		state:       &persistedState{NextCollectionID: 1, NextGraphNodeID: 1, Collections: make(map[string]*persistedCollection)},
 		collections: make(map[string]*Collection),
 		walSync:     true,
 	}
@@ -487,6 +543,14 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	if err != nil {
 		file.Close()
 		return nil, fmt.Errorf("initialize WAL request pool: %w", err)
+	}
+
+	// Initialize reverse directory for both new and existing databases.
+	engine.reverseDir, err = newReverseDirectory(engine.reverseDirectoryLimit)
+	if err != nil {
+		_ = engine.walRequests.close()
+		file.Close()
+		return nil, fmt.Errorf("initialize reverse directory: %w", err)
 	}
 
 	if stat.Size() == 0 {
@@ -582,8 +646,23 @@ func (e *Engine) openExisting() error {
 	}
 	e.metaEpoch = chosen.meta.MetaEpoch
 	e.activeMetaPage = metaPageNumber(chosen.meta)
-	e.lastLSN = chosen.meta.LastAppliedLSN
+	e.lastLSN.Store(chosen.meta.LastAppliedLSN)
 	e.state = chosen.state
+	e.collectionsByID = make(map[uint64]string, len(e.state.Collections))
+	for name, col := range e.state.Collections {
+		e.collectionsByID[col.ID] = name
+	}
+	e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+	// Reset reverse directory for this open (close the pre-allocated one, create fresh).
+	if e.reverseDir != nil {
+		e.reverseDir.close()
+	}
+	var revDirErr error
+	e.reverseDir, revDirErr = newReverseDirectory(e.reverseDirectoryLimit)
+	if revDirErr != nil {
+		e.fail(fmt.Errorf("create reverse directory: %w", revDirErr))
+		return revDirErr
+	}
 
 	// Phase 1 was completed while selecting a complete recovery candidate. State
 	// is only published after the newest complete snapshot has been decoded.
@@ -603,8 +682,79 @@ func (e *Engine) openExisting() error {
 		return err
 	}
 
+	// Phase 4: legacy V2 migration — assign GraphNodeIDs to any live records
+	// that lack one (written by pre-v3 codec). Must checkpoint durably before
+	// StatusReady so the next open does not re-migrate.
+	if migrated, err := e.migrateV2GraphNodeIDsLocked(); err != nil {
+		e.fail(fmt.Errorf("V2 graph node ID migration: %w", err))
+		return err
+	} else if migrated {
+		// Synchronous checkpoint to persist the assigned IDs as a v3 snapshot.
+		e.dirty = true
+		if err := e.checkpointLocked(); err != nil {
+			e.fail(fmt.Errorf("V2 migration checkpoint: %w", err))
+			return err
+		}
+	}
+
+	// Phase 5: rebuild reverse directory from final state (post-WAL, post-migration).
+	if err := e.rebuildReverseDirectoryFromRecords(); err != nil {
+		e.fail(fmt.Errorf("rebuild reverse directory: %w", err))
+		return err
+	}
+	// Sync nextGraphNodeID atomic with state (migration may have advanced it).
+	e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+
 	e.status.Store(int32(storage.StatusReady))
 	return nil
+}
+
+// migrateV2GraphNodeIDsLocked scans all live records with GraphNodeID == 0
+// and assigns fresh, monotonically increasing IDs. It returns true if any
+// records were migrated. Must be called with e.mu held (or during single-
+// threaded recovery).
+func (e *Engine) migrateV2GraphNodeIDsLocked() (bool, error) {
+	next := e.state.NextGraphNodeID
+	if next == 0 {
+		next = 1
+	}
+	migrated := false
+	// Deterministic ordering: sort collection names, then record IDs within each.
+	colNames := make([]string, 0, len(e.state.Collections))
+	for name := range e.state.Collections {
+		colNames = append(colNames, name)
+	}
+	sort.Strings(colNames)
+	for _, name := range colNames {
+		col := e.state.Collections[name]
+		if col == nil || col.Deleted {
+			continue
+		}
+		// Deterministic ordinal-order traversal: iterate ordinalToID
+		// instead of building an O(V) string slice. Ordinal assignment
+		// is deterministic within a collection replay, so this produces
+		// deterministic GraphNodeID assignments without heap materialization.
+		for ordinal := 0; ordinal < len(col.ordinalToID); ordinal++ {
+			id := col.ordinalToID[ordinal]
+			if id == "" {
+				continue
+			}
+			rec := col.Records[id]
+			if rec == nil || rec.Deleted || rec.GraphNodeID != 0 {
+				continue
+			}
+			if next == 0 || next == ^uint64(0) {
+				return migrated, fmt.Errorf("graph node ID space exhausted during V2 migration")
+			}
+			rec.GraphNodeID = next
+			next++
+			migrated = true
+		}
+	}
+	if migrated {
+		e.state.NextGraphNodeID = next
+	}
+	return migrated, nil
 }
 
 // loadIndexes loads serialized indexes from the index chunk, or rebuilds
@@ -723,6 +873,64 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 }
 
 // rebuildIndexesFromRecords rebuilds every collection's index from its Records map.
+func (e *Engine) rebuildReverseDirectoryFromRecords() error {
+	// If no reverse directory exists yet, create one.
+	if e.reverseDir == nil {
+		var revDirErr error
+		e.reverseDir, revDirErr = newReverseDirectory(e.reverseDirectoryLimit)
+		if revDirErr != nil {
+			return revDirErr
+		}
+	}
+
+	colNames := make([]string, 0, len(e.state.Collections))
+	for name := range e.state.Collections {
+		colNames = append(colNames, name)
+	}
+	sort.Strings(colNames)
+
+	// Iterate Records directly to capture tombstones and deleted entries
+	// that are no longer reachable via ordinalToID.
+	for _, name := range colNames {
+		col := e.state.Collections[name]
+		if col.Deleted {
+			// Still publish tombstones for records in deleted collections.
+			for _, rec := range col.Records {
+				if rec == nil || rec.GraphNodeID == 0 {
+					continue
+				}
+				if err := e.reverseDir.put(rec.GraphNodeID, reverseEntry{
+					collectionID: uint64(col.ID),
+					ordinal:      rec.Ordinal,
+					tombstone:    true,
+				}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		for id, rec := range col.Records {
+			if rec == nil || rec.GraphNodeID == 0 {
+				continue
+			}
+			// Skip records with no ordinal (e.g. zero-GraphNodeID entries
+			// that were never fully committed).
+			if id == "" {
+				continue
+			}
+			err := e.reverseDir.put(rec.GraphNodeID, reverseEntry{
+				collectionID: uint64(col.ID),
+				ordinal:      rec.Ordinal,
+				tombstone:    rec.Deleted,
+			})
+			if err != nil {
+				return err // memory limit exceeded
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Engine) rebuildIndexesFromRecords() error {
 	if e.indexProvider == nil {
 		return nil
@@ -753,10 +961,100 @@ func (e *Engine) rebuildCollectionIndexFromRecords(name string, collection *pers
 	return nil
 }
 
+// errRecoveryRequired is returned by every mutation path after a post-WAL
+// durability failure. The live instance cannot distinguish committed from
+// uncommitted transactions, so writes are refused until close and reopen.
+var errRecoveryRequired = errors.New("storage: recovery required; close and reopen the database before writing")
+
+// ambiguousWriteError marks a WAL append where an unknown nonzero prefix
+// reached the file. Callers must treat the transaction as potentially
+// durable and gate further writes; a plain error with n == 0 is a known
+// pre-write failure and safe to retry.
+type ambiguousWriteError struct {
+	n   int
+	err error
+}
+
+func (e *ambiguousWriteError) Error() string { return e.err.Error() }
+func (e *ambiguousWriteError) Unwrap() error { return e.err }
+
+// isAmbiguousWriteError reports whether err came from a WAL append that may
+// have persisted bytes.
+func isAmbiguousWriteError(err error) bool {
+	var a *ambiguousWriteError
+	return errors.As(err, &a)
+}
+
+// disableWrites permanently gates all mutation paths on this instance.
+// Reserved GraphNodeID capacity from the ambiguous transaction is neither
+// reused nor released in-process; recovery at reopen reconciles the WAL.
+func (e *Engine) disableWrites() {
+	e.writesDisabled.Store(true)
+}
+
+// writesAvailable returns errRecoveryRequired if a post-WAL durability
+// failure has gated writes on this instance.
+func (e *Engine) writesAvailable() error {
+	if e.writesDisabled.Load() {
+		return errRecoveryRequired
+	}
+	return nil
+}
+
 // fail transitions the engine to storage.StatusFailed and stores the error.
 func (e *Engine) fail(err error) {
 	e.recoveryErr.Store(err)
 	e.status.Store(int32(storage.StatusFailed))
+}
+
+func (e *Engine) ResolveNodeID(ctx context.Context, id uint64) (string, string, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.reverseDir == nil {
+		return "", "", storage.ErrUnknownGraphNodeID
+	}
+	entry, ok := e.reverseDir.get(id)
+	if !ok {
+		return "", "", storage.ErrUnknownGraphNodeID
+	}
+	if entry.tombstone {
+		return "", "", storage.ErrTombstonedGraphNodeID
+	}
+
+	name, ok := e.collectionsByID[entry.collectionID]
+	if !ok {
+		return "", "", fmt.Errorf("collection ID %d not found", entry.collectionID)
+	}
+
+	col := e.state.Collections[name]
+	if col == nil || col.Deleted {
+		return "", "", storage.ErrUnknownGraphNodeID
+	}
+	if int(entry.ordinal) >= len(col.ordinalToID) {
+		return "", "", storage.ErrUnknownGraphNodeID
+	}
+	recordID := col.ordinalToID[entry.ordinal]
+	if recordID == "" {
+		return "", "", storage.ErrUnknownGraphNodeID
+	}
+	return name, recordID, nil
+}
+
+func (e *Engine) GetNodeID(ctx context.Context, collection, id string) (uint64, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	col := e.state.Collections[collection]
+	if col == nil || col.Deleted {
+		return 0, fmt.Errorf("collection %s not found", collection)
+	}
+	rec := col.Records[id]
+	if rec == nil || rec.Deleted {
+		return 0, fmt.Errorf("record %s not found", id)
+	}
+	if rec.GraphNodeID == 0 {
+		return 0, storage.ErrUnknownGraphNodeID
+	}
+	return rec.GraphNodeID, nil
 }
 
 func metaPageNumber(meta *metaPage) uint64 {
@@ -1132,20 +1430,20 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 				return err
 			}
 			e.replayedTxs++
-			if record.Header.LSN > e.lastLSN {
-				e.lastLSN = record.Header.LSN
+			if record.Header.LSN > e.lastLSN.Load() {
+				e.lastLSN.Store(record.Header.LSN)
 			}
-			if record.Header.TxID > e.lastTxID {
-				e.lastTxID = record.Header.TxID
+			if record.Header.TxID > e.lastTxID.Load() {
+				e.lastTxID.Store(record.Header.TxID)
 			}
 			delete(pending, record.Header.TxID)
 		case recordTypeTxAbort:
 			e.discardedTxs++
-			if record.Header.LSN > e.lastLSN {
-				e.lastLSN = record.Header.LSN
+			if record.Header.LSN > e.lastLSN.Load() {
+				e.lastLSN.Store(record.Header.LSN)
 			}
-			if record.Header.TxID > e.lastTxID {
-				e.lastTxID = record.Header.TxID
+			if record.Header.TxID > e.lastTxID.Load() {
+				e.lastTxID.Store(record.Header.TxID)
 			}
 			delete(pending, record.Header.TxID)
 		default:
@@ -1314,13 +1612,18 @@ func (e *Engine) applyCreateCollection(name string, config storage.CollectionCon
 	if collection := e.state.Collections[name]; collection != nil && !collection.Deleted {
 		return
 	}
-	e.state.Collections[name] = &persistedCollection{
+	newCol := &persistedCollection{
 		ID:         e.state.NextCollectionID,
 		Config:     config,
 		CreatedLSN: lsn,
 		UpdatedLSN: lsn,
 		Records:    make(map[string]*recordValue),
 	}
+	e.state.Collections[name] = newCol
+	if e.collectionsByID == nil {
+		e.collectionsByID = make(map[uint64]string)
+	}
+	e.collectionsByID[newCol.ID] = name
 	e.state.NextCollectionID++
 }
 
@@ -1328,6 +1631,16 @@ func (e *Engine) applyDeleteCollection(name string, lsn uint64) {
 	if collection := e.state.Collections[name]; collection != nil {
 		collection.Deleted = true
 		collection.UpdatedLSN = lsn
+		// Tombstone all GraphNodeIDs in the deleted collection.
+		if e.reverseDir != nil {
+			for _, rec := range collection.Records {
+				if rec != nil && rec.GraphNodeID != 0 {
+					_ = e.reverseDir.tombstone(rec.GraphNodeID)
+				}
+			}
+		}
+		// Remove from reverse-lookup map.
+		delete(e.collectionsByID, collection.ID)
 		// Free all off-heap vector slots. Individual deallocation is
 		// unnecessary: Free() releases all mmap'd slabs at once.
 		if collection.vectorSFL != nil {
@@ -1339,11 +1652,11 @@ func (e *Engine) applyDeleteCollection(name string, lsn uint64) {
 }
 
 func (e *Engine) applyRecordPut(payload recordPutPayload, lsn uint64) error {
-	return e.applyRecordPutFields(payload.Collection, payload.ID, payload.Ordinal, payload.Vector, payload.Metadata, lsn, false)
+	return e.applyRecordPutFields(payload.Collection, payload.ID, payload.Ordinal, payload.GraphNodeID, payload.Vector, payload.Metadata, lsn, false)
 }
 
 func (e *Engine) applyRecordPutOwned(payload recordPutPayload, lsn uint64, adopt bool) error {
-	return e.applyRecordPutFields(payload.Collection, payload.ID, payload.Ordinal, payload.Vector, payload.Metadata, lsn, adopt)
+	return e.applyRecordPutFields(payload.Collection, payload.ID, payload.Ordinal, payload.GraphNodeID, payload.Vector, payload.Metadata, lsn, adopt)
 }
 
 // sflMetadataOverhead is the minimum reserved bytes at the start of each
@@ -1359,7 +1672,7 @@ func (c *persistedCollection) initVectorSFL() error {
 	}
 	// Slot must hold the vector data plus the SFL internal metadata prefix.
 	slotSize := uint64(sflMetadataOverhead + c.Config.Dimension*4)
-	slotSize = (slotSize + 7) &^ 7 // 8-byte alignment
+	slotSize = (slotSize + 7) &^ 7              // 8-byte alignment
 	poolSize := uint64(64 * 1024 * 1024 * 1024) // 64GB default
 	if c.Config.RawStoreCap > 0 {
 		if required := uint64(c.Config.RawStoreCap) * slotSize; required > poolSize {
@@ -1423,7 +1736,7 @@ func (c *persistedCollection) freeVectorSlot(ordinal uint32) {
 	}
 }
 
-func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32, vector []float32, metadata map[string]interface{}, lsn uint64, adopt bool) error {
+func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32, graphNodeID uint64, vector []float32, metadata map[string]interface{}, lsn uint64, adopt bool) error {
 	collection := e.state.Collections[collectionName]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found during replay", collectionName)
@@ -1458,8 +1771,25 @@ func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32,
 	} else {
 		current.Metadata = cloneMetadata(metadata)
 	}
+	current.GraphNodeID = graphNodeID
 	current.UpdatedLSN = lsn
 	collection.UpdatedLSN = lsn
+	// During WAL replay (adopt=false), reserve the replayed ID in the
+	// allocator and populate the reverse directory so subsequent delete
+	// operations can tombstone the correct ID. Replayed GraphNodeIDs must
+	// never be reused: the durable WAL is authoritative for allocation.
+	if !adopt && graphNodeID != 0 {
+		if graphNodeID >= e.state.NextGraphNodeID {
+			e.state.NextGraphNodeID = graphNodeID + 1
+		}
+		if e.reverseDir != nil {
+			_ = e.reverseDir.put(graphNodeID, reverseEntry{
+				collectionID: uint64(collection.ID),
+				ordinal:      ordinal,
+				tombstone:    false,
+			})
+		}
+	}
 	return nil
 }
 
@@ -1530,6 +1860,13 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	}
 	if int(current.Ordinal) < len(collection.ordinalToID) {
 		collection.ordinalToID[current.Ordinal] = ""
+	}
+	if e.reverseDir != nil && current.GraphNodeID != 0 {
+		if err := e.reverseDir.tombstone(current.GraphNodeID); err != nil {
+			// Tombstone error is non-fatal for the delete path; the WAL is
+			// already synced. Log and continue.
+			_ = err
+		}
 	}
 	collection.UpdatedLSN = lsn
 }
@@ -1674,6 +2011,38 @@ func (e *Engine) serializeIndexEntry(name string, checkpointLSN uint64) (indexBl
 	}, true, nil
 }
 
+// checkpointWriteAtLocked issues a raw positioned write for checkpoint data,
+// routing through checkpointWriteFn when installed.
+func (e *Engine) checkpointWriteAtLocked(offset int64, data []byte) error {
+	if e.checkpointWriteFn != nil {
+		n, err := e.checkpointWriteFn(offset, data)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return fmt.Errorf("checkpoint short write: wrote %d of %d bytes", n, len(data))
+		}
+		return nil
+	}
+	n, err := e.file.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return fmt.Errorf("checkpoint short write: wrote %d of %d bytes", n, len(data))
+	}
+	return nil
+}
+
+// checkpointSyncLocked issues the checkpoint fsync, routing through
+// checkpointSyncFn when installed.
+func (e *Engine) checkpointSyncLocked() error {
+	if e.checkpointSyncFn != nil {
+		return e.checkpointSyncFn(e.file)
+	}
+	return e.file.Sync()
+}
+
 func (e *Engine) checkpointLocked() error {
 	if !e.dirty {
 		return nil
@@ -1699,7 +2068,7 @@ func (e *Engine) checkpointLocked() error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			entry, present, err := e.serializeIndexEntry(name, e.lastLSN)
+			entry, present, err := e.serializeIndexEntry(name, e.lastLSN.Load())
 			if err != nil {
 				return fmt.Errorf("serialize index for %s: %w", name, err)
 			}
@@ -1743,7 +2112,7 @@ func (e *Engine) checkpointLocked() error {
 		MetaEpoch:       e.metaEpoch,
 		RootCatalog:     3,
 		RootFreelist:    rootFreelist,
-		LastAppliedLSN:  e.lastLSN,
+		LastAppliedLSN:  e.lastLSN.Load(),
 		PageCount:       pageCount,
 		CollectionCount: uint64(e.visibleCollectionCountLocked()),
 		SnapshotOffset:  snapshotOffset,
@@ -1760,10 +2129,10 @@ func (e *Engine) checkpointLocked() error {
 		buf[i] = 0
 	}
 	// STEP 4: fsync (durable: snapshot + index + metapage)
-	if err := writeFixedPage(e.file, nextMetaPage, encodeMeta(meta, buf)); err != nil {
+	if err := e.checkpointWriteAtLocked(int64(nextMetaPage)*pageSize, encodeMeta(meta, buf)); err != nil {
 		return err
 	}
-	if err := e.file.Sync(); err != nil {
+	if err := e.checkpointSyncLocked(); err != nil {
 		return err
 	}
 
@@ -1772,17 +2141,17 @@ func (e *Engine) checkpointLocked() error {
 	if err != nil {
 		return err
 	}
-	header.LastCheckpointLSN = e.lastLSN
+	header.LastCheckpointLSN = e.lastLSN.Load()
 	header.ActiveMetaPage = nextMetaPage
 	header.WALHeadPage = pageCount
 
 	for i := range buf {
 		buf[i] = 0
 	}
-	if err := writeFixedPage(e.file, 0, encodeHeader(header, buf)); err != nil {
+	if err := e.checkpointWriteAtLocked(0, encodeHeader(header, buf)); err != nil {
 		return err
 	}
-	if err := e.file.Sync(); err != nil {
+	if err := e.checkpointSyncLocked(); err != nil {
 		return err
 	}
 
@@ -1805,6 +2174,7 @@ func (e *Engine) checkpointLocked() error {
 func captureState(e *Engine) *persistedState {
 	cloned := &persistedState{
 		NextCollectionID: e.state.NextCollectionID,
+		NextGraphNodeID:  e.state.NextGraphNodeID,
 		Collections:      make(map[string]*persistedCollection, len(e.state.Collections)),
 	}
 	for name, coll := range e.state.Collections {
@@ -1820,12 +2190,13 @@ func captureState(e *Engine) *persistedState {
 		}
 		for id, rec := range coll.Records {
 			r := &recordValue{
-				Vector:     append([]float32(nil), rec.Vector...),
-				Version:    rec.Version,
-				CreatedLSN: rec.CreatedLSN,
-				UpdatedLSN: rec.UpdatedLSN,
-				Ordinal:    rec.Ordinal,
-				Deleted:    rec.Deleted,
+				Vector:      append([]float32(nil), rec.Vector...),
+				Version:     rec.Version,
+				CreatedLSN:  rec.CreatedLSN,
+				UpdatedLSN:  rec.UpdatedLSN,
+				Ordinal:     rec.Ordinal,
+				GraphNodeID: rec.GraphNodeID,
+				Deleted:     rec.Deleted,
 			}
 			if rec.Metadata != nil {
 				r.Metadata = make(map[string]interface{}, len(rec.Metadata))
@@ -1876,7 +2247,7 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		e.mu.Unlock()
 		return fmt.Errorf("vacuum read header: %w", err)
 	}
-	phase1LSN := e.lastLSN
+	phase1LSN := e.lastLSN.Load()
 	e.mu.Unlock()
 
 	// Phase 2: Serialization and writing temp file (Unlocked)
@@ -2129,7 +2500,7 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		e.mu.Unlock()
 		return fmt.Errorf("backup read header: %w", err)
 	}
-	phase1LSN := e.lastLSN
+	phase1LSN := e.lastLSN.Load()
 	e.mu.Unlock()
 
 	// Phase 2: Serialization and writing backup file (Unlocked)
@@ -2377,7 +2748,7 @@ func (e *Engine) compactFileLocked() error {
 		sort.Strings(names)
 		entries := make([]indexBlockEntry, 0, len(names))
 		for _, name := range names {
-			entry, present, err := e.serializeIndexEntry(name, e.lastLSN)
+			entry, present, err := e.serializeIndexEntry(name, e.lastLSN.Load())
 			if err != nil {
 				return fmt.Errorf("compact: serialize index for %s: %w", name, err)
 			}
@@ -2423,7 +2794,7 @@ func (e *Engine) compactFileLocked() error {
 		FileID:            origHeader.FileID,
 		CreatedUnixNano:   origHeader.CreatedUnixNano,
 		Creator:           origHeader.Creator,
-		LastCheckpointLSN: e.lastLSN,
+		LastCheckpointLSN: e.lastLSN.Load(),
 		ActiveMetaPage:    1,
 		WALStartPage:      pageCount, // no WAL in compacted file
 		WALHeadPage:       pageCount,
@@ -2448,7 +2819,7 @@ func (e *Engine) compactFileLocked() error {
 		MetaEpoch:       1,
 		RootCatalog:     3,
 		RootFreelist:    0, // meta A marker
-		LastAppliedLSN:  e.lastLSN,
+		LastAppliedLSN:  e.lastLSN.Load(),
 		PageCount:       pageCount,
 		CollectionCount: uint64(e.visibleCollectionCountLocked()),
 		SnapshotOffset:  snapshotOffset,
@@ -2675,8 +3046,23 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 		written += uint64(16 + 40 + len(record.Payload))
 	}
 
-	if _, err := e.file.Write(buf); err != nil {
-		return written, err
+	var writeErr error
+	var n int
+	if e.walWriteFn != nil {
+		n, writeErr = e.walWriteFn(buf)
+	} else {
+		n, writeErr = e.file.Write(buf)
+	}
+	if writeErr != nil {
+		if n > 0 {
+			// Partial bytes reached the file before the error: ambiguous.
+			return written, &ambiguousWriteError{n: n, err: writeErr}
+		}
+		// Nothing reached the file: known pre-write failure, safe to retry.
+		return written, writeErr
+	}
+	if n != len(buf) {
+		return written, &ambiguousWriteError{n: n, err: fmt.Errorf("short write: wrote %d of %d bytes", n, len(buf))}
 	}
 	e.walTransactions++
 	e.walBytes += written
@@ -2752,14 +3138,12 @@ func (e *Engine) allocateWALWriteBufferLocked(size int) ([]byte, *memory.Arena, 
 	return buf, arena, nil
 }
 
-func (e *Engine) nextLSNLocked() uint64 {
-	e.lastLSN++
-	return e.lastLSN
+func (e *Engine) nextLSN() uint64 {
+	return e.lastLSN.Add(1)
 }
 
-func (e *Engine) nextTxIDLocked() uint64 {
-	e.lastTxID++
-	return e.lastTxID
+func (e *Engine) nextTxID() uint64 {
+	return e.lastTxID.Add(1)
 }
 
 func newFrame(recordType uint16, lsn, txID, prevLSN uint64, payload encodedPayload) walRecord {
@@ -2793,6 +3177,9 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
@@ -2804,10 +3191,10 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	if err != nil {
 		return err
 	}
-	txID := e.nextTxIDLocked()
-	beginLSN := e.nextLSNLocked()
-	opLSN := e.nextLSNLocked()
-	commitLSN := e.nextLSNLocked()
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeCollectionCreate, opLSN, txID, beginLSN, payload),
@@ -2815,9 +3202,13 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
 		return err
 	}
 	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
 		return err
 	}
 	e.applyCreateCollection(name, config, opLSN)
@@ -2937,6 +3328,9 @@ func (e *Engine) flushBatch() error {
 	e.batchBuffer.spareFlushNow = nil
 	e.batchBuffer.mu.Unlock()
 	atomic.AddInt32(&e.batchBuffer.pendingWaiters, -int32(len(pendingFlushes)))
+	if e.batchQueueOwnedHook != nil {
+		e.batchQueueOwnedHook()
+	}
 	defer func() {
 		for i := range entries {
 			releaseBatchEntryPayloads(&entries[i])
@@ -2980,6 +3374,18 @@ func (e *Engine) flushBatch() error {
 		return fmt.Errorf("database is closed")
 	}
 
+	// Re-check the write gate AFTER taking ownership of the queue. A writer
+	// may have been admitted just before another batch hit an ambiguous
+	// WAL/sync failure; its entry now sits in this owned buffer. No queued
+	// work may survive the transition into recovery-required state: complete
+	// every waiter with errRecoveryRequired, recycle the entries without
+	// any WAL write, and never write back GraphNodeIDs.
+	if err := e.writesAvailable(); err != nil {
+		signalErr(err)
+		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
+		return err
+	}
+
 	batchedEntries := 0
 	for i := range entries {
 		batchedEntries += entries[i].count()
@@ -2994,9 +3400,13 @@ func (e *Engine) flushBatch() error {
 		}
 		written, firstLSN, commitLSN, err := e.appendBatchRunWALLocked(entries[start:end])
 		if err != nil {
-			// A write failure makes the on-disk prefix ambiguous. Do not retry
-			// automatically and risk duplicating a transaction; recovery will
-			// accept only complete framed commits.
+			// Ambiguous write: partial bytes may have reached the file. Gate
+			// all further writes on this instance; recovery at reopen
+			// reconciles the WAL. A known pre-write failure (zero bytes)
+			// stays retryable.
+			if isAmbiguousWriteError(err) {
+				e.disableWrites()
+			}
 			signalErr(err)
 			atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 			return err
@@ -3009,9 +3419,53 @@ func (e *Engine) flushBatch() error {
 		start = end
 	}
 	if err := e.syncWALLocked(); err != nil {
+		// Post-WAL-write sync failure: the transaction is ambiguous — it may
+		// replay after restart. Refuse all further writes on this instance
+		// so no candidate ID can be reused in-process.
+		e.disableWrites()
 		signalErr(err)
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return err
+	}
+	// Sync succeeded — now commit GraphNodeID state: advance counter,
+	// publish reverse-directory mappings, and write IDs back to caller entries.
+	for start := 0; start < len(entries); {
+		end := start + 1
+		for end < len(entries) && entries[end].collection == entries[start].collection {
+			end++
+		}
+		for i := start; i < end; i++ {
+			for j := 0; j < entries[i].count(); j++ {
+				if j >= len(entries[i].assignedNodeIDs) {
+					continue
+				}
+				gid := entries[i].assignedNodeIDs[j]
+				if gid == 0 {
+					continue
+				}
+				entry := entries[i].entryAt(j)
+				// Only advance counter for freshly allocated IDs (those >= current state).
+				if gid >= e.state.NextGraphNodeID {
+					e.state.NextGraphNodeID = gid + 1
+					e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+				}
+				// Write-back to caller's entry — safe now that sync succeeded.
+				entry.GraphNodeID = gid
+			}
+			entries[i].assignedNodeIDs = nil
+		}
+		// Publish reverse-directory mappings for fresh IDs.
+		if e.reverseDir != nil {
+			for _, a := range entries[start].newNodeAssignments {
+				e.reverseDir.commitEntry(a.graphNodeID, a.reservedPtr, reverseEntry{
+					collectionID: a.collectionID,
+					ordinal:      a.ordinal,
+					tombstone:    false,
+				})
+			}
+		}
+		entries[start].newNodeAssignments = nil
+		start = end
 	}
 	for start := 0; start < len(entries); {
 		end := start + 1
@@ -3022,7 +3476,7 @@ func (e *Engine) flushBatch() error {
 		for i := start; i < end; i++ {
 			for j := 0; j < entries[i].count(); j++ {
 				entry := entries[i].entryAt(j)
-				if err := e.applyRecordPutFields(entries[i].collection, entry.ID, entry.Ordinal, entry.Vector, entry.Metadata, lsn, true); err != nil {
+				if err := e.applyRecordPutFields(entries[i].collection, entry.ID, entry.Ordinal, entry.GraphNodeID, entry.Vector, entry.Metadata, lsn, true); err != nil {
 					signalErr(err)
 					atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 					return err
@@ -3078,31 +3532,108 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 	}
 	ensureRecordCapacity(collection, entryCount)
 
-	txID := e.nextTxIDLocked()
-	beginLSN := e.nextLSNLocked()
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
 	frames := make([]walRecord, entryCount+2)
 	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	prevLSN := beginLSN
 	frameIndex := 1
+
+	type recordKey struct{ id string }
+	assignedIDs := make(map[recordKey]uint64)
+	nextID := e.state.NextGraphNodeID
+	numAllocated := uint64(0)
+	// entryNodeIDs[i][j] is the GraphNodeID for batches[i].entryAt(j).
+	// Populated here, written to caller entries only after sync succeeds.
+	entryNodeIDs := make([][]uint64, len(batches))
+	for i := range batches {
+		entryNodeIDs[i] = make([]uint64, batches[i].count())
+	}
+
+	// Phase 1: determine candidate GraphNodeIDs for every entry. New IDs
+	// are counted but NOT yet published to the reverse directory.
 	for i := range batches {
 		for j := 0; j < batches[i].count(); j++ {
 			entry := batches[i].entryAt(j)
-			encoded := batches[i].encodedAt(j)
-			if encoded.encoder == nil {
-				var err error
-				encoded, err = encodeRecordPutPayloadBinary(recordPutPayload{
-					Collection: batches[i].collection,
-					ID:         entry.ID,
-					Ordinal:    entry.Ordinal,
-					Vector:     entry.Vector,
-					Metadata:   entry.Metadata,
-				})
-				if err != nil {
+
+			var graphNodeID uint64
+			mapKey := recordKey{id: entry.ID}
+
+			current := collection.Records[entry.ID]
+			if assigned, ok := assignedIDs[mapKey]; ok {
+				graphNodeID = assigned
+			} else if current != nil && !current.Deleted && current.GraphNodeID != 0 {
+				graphNodeID = current.GraphNodeID
+			} else {
+				if nextID == math.MaxUint64 {
 					releaseWALFramePayloads(frames[:frameIndex])
-					return 0, 0, 0, err
+					return 0, 0, 0, fmt.Errorf("GraphNodeID overflow")
 				}
+				graphNodeID = nextID
+				nextID++
+				numAllocated++
+				assignedIDs[mapKey] = graphNodeID
 			}
-			lsn := e.nextLSNLocked()
+
+			entryNodeIDs[i][j] = graphNodeID
+		}
+	}
+
+	// Phase 2: pre-admission — reserve reverse directory capacity for new
+	// IDs before WAL append. Failing here means we reject the batch before
+	// writing anything to disk.
+	var newAssignments []newNodeAssignment
+	if e.reverseDir != nil && numAllocated > 0 {
+		ptrs, err := e.reverseDir.reserve(int(numAllocated))
+		if err != nil {
+			releaseWALFramePayloads(frames[:frameIndex])
+			return 0, 0, 0, err
+		}
+		seenGIDs := make(map[uint64]bool, int(numAllocated))
+		ptrIdx := 0
+		for i := range batches {
+			for j := 0; j < batches[i].count(); j++ {
+				entry := batches[i].entryAt(j)
+				gid := entryNodeIDs[i][j]
+				// Only freshly-allocated IDs need a reverse mapping.
+				if _, isAssigned := assignedIDs[recordKey{id: entry.ID}]; !isAssigned {
+					continue
+				}
+				if seenGIDs[gid] {
+					continue
+				}
+				seenGIDs[gid] = true
+				newAssignments = append(newAssignments, newNodeAssignment{
+					graphNodeID:  gid,
+					reservedPtr:  ptrs[ptrIdx],
+					collectionID: uint64(collection.ID),
+					ordinal:      entry.Ordinal,
+				})
+				ptrIdx++
+			}
+		}
+	}
+
+	// Phase 3: build WAL frames with candidate IDs.
+	for i := range batches {
+		for j := 0; j < batches[i].count(); j++ {
+			entry := batches[i].entryAt(j)
+			graphNodeID := entryNodeIDs[i][j]
+
+			encoded, err := encodeRecordPutPayloadBinary(recordPutPayload{
+				Collection:  batches[i].collection,
+				ID:          entry.ID,
+				Ordinal:     entry.Ordinal,
+				Vector:      entry.Vector,
+				Metadata:    entry.Metadata,
+				GraphNodeID: graphNodeID,
+			})
+			if err != nil {
+				releaseWALFramePayloads(frames[:frameIndex])
+				return 0, 0, 0, err
+			}
+
+			lsn := e.nextLSN()
 			frames[frameIndex] = newFrame(recordTypeRecordPut, lsn, txID, prevLSN, encoded)
 			if batches[i].entry != nil {
 				batches[i].encodedOne = encodedPayload{}
@@ -3113,8 +3644,9 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 			frameIndex++
 		}
 	}
-	commitLSN := e.nextLSNLocked()
+	commitLSN := e.nextLSN()
 	frames[frameIndex] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
+
 	written, err := e.appendTransactionLocked(frames)
 	for i := range batches {
 		batches[i].encoded = nil
@@ -3122,6 +3654,18 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 	if err != nil {
 		return written, 0, 0, err
 	}
+
+	// WAL bytes are on disk (not yet synced). Store per-entry IDs and
+	// reverse-directory reservations so flushBatch can publish them after
+	// sync succeeds. Do NOT advance NextGraphNodeID or write to caller
+	// entries yet.
+	for i := range batches {
+		batches[i].assignedNodeIDs = entryNodeIDs[i]
+	}
+	if len(newAssignments) > 0 {
+		batches[0].newNodeAssignments = newAssignments
+	}
+
 	return written, frames[1].Header.LSN, commitLSN, nil
 }
 
@@ -3139,42 +3683,20 @@ func releaseBatchEntryPayloads(batch *batchEntry) {
 }
 
 func (e *Engine) putRecords(ctx context.Context, name string, entries []*index.VectorEntry) (walRequestHandle, error) {
+	if err := e.writesAvailable(); err != nil {
+		return walRequestHandle{}, err
+	}
 	if e.closed.Load() {
 		return walRequestHandle{}, fmt.Errorf("database is closed")
 	}
 
-	// Pre-encode recordPut payloads before acquiring any locks.
-	encoded := make([]encodedPayload, len(entries))
-	for i, entry := range entries {
-		if i%100 == 0 {
-			select {
-			case <-ctx.Done():
-				for j := 0; j < i; j++ {
-					releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
-				}
-				return walRequestHandle{}, ctx.Err()
-			default:
-			}
-		}
-		payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
-			Collection: name,
-			ID:         entry.ID,
-			Ordinal:    entry.Ordinal,
-			Vector:     entry.Vector,
-			Metadata:   entry.Metadata,
-		})
-		if err != nil {
-			for j := 0; j < i; j++ {
-				releaseDetachedPayload(encoded[j].bytes, encoded[j].encoder)
-			}
-			return walRequestHandle{}, err
-		}
-		encoded[i] = payload
-	}
-	return e.admitBatch(batchEntry{collection: name, entries: entries, encoded: encoded}, len(entries))
+	return e.admitBatch(batchEntry{collection: name, entries: entries}, len(entries))
 }
 
 func (e *Engine) putRecord(ctx context.Context, name string, entry *index.VectorEntry) (walRequestHandle, error) {
+	if err := e.writesAvailable(); err != nil {
+		return walRequestHandle{}, err
+	}
 	if e.closed.Load() {
 		return walRequestHandle{}, fmt.Errorf("database is closed")
 	}
@@ -3183,20 +3705,13 @@ func (e *Engine) putRecord(ctx context.Context, name string, entry *index.Vector
 		return walRequestHandle{}, ctx.Err()
 	default:
 	}
-	encoded, err := encodeRecordPutPayloadBinary(recordPutPayload{
-		Collection: name,
-		ID:         entry.ID,
-		Ordinal:    entry.Ordinal,
-		Vector:     entry.Vector,
-		Metadata:   entry.Metadata,
-	})
-	if err != nil {
-		return walRequestHandle{}, err
-	}
-	return e.admitBatch(batchEntry{collection: name, entry: entry, encodedOne: encoded}, 1)
+	return e.admitBatch(batchEntry{collection: name, entry: entry}, 1)
 }
 
 func (e *Engine) admitBatch(batch batchEntry, entryCount int) (walRequestHandle, error) {
+	if err := e.writesAvailable(); err != nil {
+		return walRequestHandle{}, err
+	}
 	request := e.walRequests.acquire(entryCount)
 	e.batchBuffer.mu.Lock()
 	if e.closed.Load() {
@@ -3245,6 +3760,9 @@ func (e *Engine) deleteRecord(name, id string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
@@ -3261,10 +3779,10 @@ func (e *Engine) deleteRecord(name, id string) error {
 	if err != nil {
 		return err
 	}
-	txID := e.nextTxIDLocked()
-	beginLSN := e.nextLSNLocked()
-	opLSN := e.nextLSNLocked()
-	commitLSN := e.nextLSNLocked()
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeRecordDelete, opLSN, txID, beginLSN, payload),
@@ -3272,9 +3790,13 @@ func (e *Engine) deleteRecord(name, id string) error {
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
 		return err
 	}
 	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
 		return err
 	}
 	e.applyRecordDelete(name, id, opLSN)
@@ -3350,15 +3872,23 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 
-	txID := e.nextTxIDLocked()
-	beginLSN := e.nextLSNLocked()
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
 	frames := make([]walRecord, len(ops)+2)
 	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	prevLSN := beginLSN
+
+	type recordKey struct{ collection, id string }
+	assignedIDs := make(map[recordKey]uint64)
+	nextID := e.state.NextGraphNodeID
+	numAllocated := uint64(0)
 
 	for i, op := range ops {
 		if err := ctx.Err(); err != nil {
@@ -3370,15 +3900,34 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 			return fmt.Errorf("collection %s not found", op.Collection)
 		}
 
-		lsn := e.nextLSNLocked()
+		lsn := e.nextLSN()
 		switch op.Type {
 		case storage.TxOperationPut:
+			current := collection.Records[op.ID]
+			var graphNodeID uint64
+
+			mapKey := recordKey{collection: op.Collection, id: op.ID}
+			if assigned, ok := assignedIDs[mapKey]; ok {
+				graphNodeID = assigned
+			} else if current != nil && !current.Deleted && current.GraphNodeID != 0 {
+				graphNodeID = current.GraphNodeID
+			} else {
+				if nextID == math.MaxUint64 {
+					return fmt.Errorf("GraphNodeID overflow")
+				}
+				graphNodeID = nextID
+				nextID++
+				numAllocated++
+				assignedIDs[mapKey] = graphNodeID
+			}
+
 			payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
-				Collection: op.Collection,
-				ID:         op.ID,
-				Ordinal:    op.Ordinal,
-				Vector:     op.Vector,
-				Metadata:   op.Metadata,
+				Collection:  op.Collection,
+				ID:          op.ID,
+				Ordinal:     op.Ordinal,
+				Vector:      op.Vector,
+				Metadata:    op.Metadata,
+				GraphNodeID: graphNodeID,
 			})
 			if err != nil {
 				return err
@@ -3399,21 +3948,75 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 		prevLSN = lsn
 	}
 
-	commitLSN := e.nextLSNLocked()
+	// Pre-admission: reserve reverse directory capacity before any WAL bytes.
+	var reservedPtrs []unsafe.Pointer
+	if e.reverseDir != nil && numAllocated > 0 {
+		var rerr error
+		reservedPtrs, rerr = e.reverseDir.reserve(int(numAllocated))
+		if rerr != nil {
+			return rerr
+		}
+	}
+
+	commitLSN := e.nextLSN()
 	frames[len(frames)-1] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
 		return err
 	}
 	if err := e.syncWALLocked(); err != nil {
+		// Post-WAL-write sync failure: transaction may replay after restart.
+		// Refuse all further writes on this instance.
+		e.disableWrites()
 		return err
+	}
+
+	if numAllocated > 0 {
+		e.state.NextGraphNodeID += numAllocated
+		e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+	}
+	// Publish reverse-directory mappings after durable sync.
+	if e.reverseDir != nil && numAllocated > 0 {
+		ptrIdx := 0
+		seenGIDs := make(map[uint64]bool, int(numAllocated))
+		for _, op := range ops {
+			if op.Type != storage.TxOperationPut {
+				continue
+			}
+			mapKey := recordKey{collection: op.Collection, id: op.ID}
+			gid, ok := assignedIDs[mapKey]
+			if !ok || seenGIDs[gid] {
+				continue
+			}
+			seenGIDs[gid] = true
+			col := e.state.Collections[op.Collection]
+			e.reverseDir.commitEntry(gid, reservedPtrs[ptrIdx], reverseEntry{
+				collectionID: uint64(col.ID),
+				ordinal:      op.Ordinal,
+				tombstone:    false,
+			})
+			ptrIdx++
+		}
+	}
+	for i, op := range ops {
+		if op.Type == storage.TxOperationPut {
+			mapKey := recordKey{collection: op.Collection, id: op.ID}
+			if assigned, ok := assignedIDs[mapKey]; ok {
+				ops[i].GraphNodeID = assigned
+			} else if current := e.state.Collections[op.Collection].Records[op.ID]; current != nil && current.GraphNodeID != 0 {
+				ops[i].GraphNodeID = current.GraphNodeID
+			}
+		}
 	}
 
 	for i, op := range ops {
 		recordLSN := frames[i+1].Header.LSN
 		switch op.Type {
 		case storage.TxOperationPut:
-			if err := e.applyRecordPutFields(op.Collection, op.ID, op.Ordinal, op.Vector, op.Metadata, recordLSN, false); err != nil {
+			if err := e.applyRecordPutFields(op.Collection, op.ID, op.Ordinal, ops[i].GraphNodeID, op.Vector, op.Metadata, recordLSN, false); err != nil {
 				return err
 			}
 		case storage.TxOperationDelete:
@@ -3495,6 +4098,9 @@ func (e *Engine) DeleteCollection(name string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
@@ -3506,10 +4112,10 @@ func (e *Engine) DeleteCollection(name string) error {
 	if err != nil {
 		return err
 	}
-	txID := e.nextTxIDLocked()
-	beginLSN := e.nextLSNLocked()
-	opLSN := e.nextLSNLocked()
-	commitLSN := e.nextLSNLocked()
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeCollectionDelete, opLSN, txID, beginLSN, payload),
@@ -3517,9 +4123,13 @@ func (e *Engine) DeleteCollection(name string) error {
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
 		return err
 	}
 	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
 		return err
 	}
 	e.applyDeleteCollection(name, opLSN)
@@ -3571,6 +4181,10 @@ func (e *Engine) Close() error {
 		}
 	}
 	e.closed.Store(true)
+	if e.reverseDir != nil {
+		e.reverseDir.close()
+		e.reverseDir = nil
+	}
 	return e.file.Close()
 }
 
@@ -3636,11 +4250,12 @@ func cloneMetadata(metadata map[string]interface{}) map[string]interface{} {
 
 func cloneEntry(record *recordValue) *index.VectorEntry {
 	return &index.VectorEntry{
-		ID:       "",
-		Ordinal:  record.Ordinal,
-		Vector:   append([]float32(nil), record.Vector...),
-		Metadata: cloneMetadata(record.Metadata),
-		Version:  record.Version,
+		ID:          "",
+		Ordinal:     record.Ordinal,
+		Vector:      append([]float32(nil), record.Vector...),
+		Metadata:    cloneMetadata(record.Metadata),
+		Version:     record.Version,
+		GraphNodeID: record.GraphNodeID,
 	}
 }
 
@@ -3759,7 +4374,7 @@ func (c *Collection) InsertBatchDurableRange(ctx context.Context, entries []*ind
 func (c *Collection) DurableFrontier() uint64 {
 	c.engine.mu.RLock()
 	defer c.engine.mu.RUnlock()
-	return c.engine.lastLSN
+	return c.engine.lastLSN.Load()
 }
 
 // Get returns a persisted entry by ID.

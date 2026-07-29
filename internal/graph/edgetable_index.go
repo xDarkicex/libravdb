@@ -1,142 +1,83 @@
 package graph
 
 import (
-	"sync/atomic"
+	"unsafe"
+
+	"github.com/xDarkicex/memory"
 )
 
-// Node 0 is reserved as an empty-slot sentinel.
-// Tombstone represents a deleted slot
-const Tombstone uint32 = 0xFFFFFFFF
+// EdgeTableIndex is a zero-allocation, wait-free concurrent map
+// backed by mmap'd off-heap memory.
+type EdgeTableIndex struct {
+	m *memory.HashMap
+}
 
-// hashUint64 provides a fast integer hash using the SplitMix64 algorithm.
-func hashUint64(x uint64) uint64 {
-	x ^= x >> 30
-	x *= 0xbf58476d1ce4e5b9
-	x ^= x >> 27
-	x *= 0x94d049bb133111eb
-	x ^= x >> 31
-	return x
+// NewEdgeTableIndex creates a new lock-free EdgeTableIndex.
+func NewEdgeTableIndex(capacity uint64) *EdgeTableIndex {
+	m, err := memory.NewHashMap(memory.HashMapConfig{
+		Capacity: capacity,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return &EdgeTableIndex{
+		m: m,
+	}
+}
+
+// InsertIfAbsent adds a node's page slot in the index concurrently safely.
+// Returns the actual page (existing or newly inserted) and a boolean indicating
+// if an existing page was loaded (true) or the new page was inserted (false).
+//
+//go:nocheckptr
+func (idx *EdgeTableIndex) InsertIfAbsent(nodeID uint64, page *EdgeTablePage) (*EdgeTablePage, bool) {
+	existing, inserted := idx.m.PutIfAbsent(nodeID, unsafe.Pointer(page))
+	if !inserted {
+		return (*EdgeTablePage)(existing), true
+	}
+	return page, false
 }
 
 // Insert adds or updates a node's page slot in the index.
-// Not safe for concurrent writes; writers must synchronize.
-func (idx *EdgeTableIndex) Insert(nodeID uint64, pageSlot uint32) {
-	if float64(idx.size+1) >= float64(idx.capacity)*idx.loadFactor {
-		idx.resize()
-	}
-
-	mask := idx.capacity - 1
-	start := hashUint64(nodeID) & mask
-
-	insertPos := int64(-1)
-
-	for i := uint64(0); i < idx.capacity; i++ {
-		pos := (start + i) & mask
-		entry := &idx.table[pos]
-
-		slot := atomic.LoadUint32(&entry.PageSlot)
-		if slot == 0 {
-			if insertPos != -1 {
-				pos = uint64(insertPos)
-				entry = &idx.table[pos]
-			}
-			entry.NodeID = nodeID
-			atomic.StoreUint32(&entry.PageSlot, pageSlot)
-			idx.size++
-			return
-		}
-
-		if slot == Tombstone {
-			if insertPos == -1 {
-				insertPos = int64(pos)
-			}
-			continue
-		}
-
-		if entry.NodeID == nodeID {
-			// Update existing
-			atomic.StoreUint32(&entry.PageSlot, pageSlot)
-			return
-		}
-	}
-
-	if insertPos != -1 {
-		pos := uint64(insertPos)
-		entry := &idx.table[pos]
-		entry.NodeID = nodeID
-		atomic.StoreUint32(&entry.PageSlot, pageSlot)
-		idx.size++
-	}
+//
+//go:nocheckptr
+func (idx *EdgeTableIndex) Insert(nodeID uint64, page *EdgeTablePage) {
+	idx.m.Put(nodeID, unsafe.Pointer(page))
 }
 
-// Lookup finds the page slot for a node ID.
+// Lookup finds the page for a node ID.
 // Safe for concurrent lock-free reads.
-func (idx *EdgeTableIndex) Lookup(nodeID uint64) uint32 {
-	if idx.size == 0 {
-		return 0
+//
+//go:nocheckptr
+func (idx *EdgeTableIndex) Lookup(nodeID uint64) *EdgeTablePage {
+	ptr, ok := idx.m.Get(nodeID)
+	if !ok {
+		return nil
 	}
-
-	mask := idx.capacity - 1
-	start := hashUint64(nodeID) & mask
-
-	for i := uint64(0); i < idx.capacity; i++ {
-		pos := (start + i) & mask
-		entry := &idx.table[pos]
-
-		slot := atomic.LoadUint32(&entry.PageSlot)
-		if slot == 0 {
-			// Hit empty slot, node not in table
-			return 0
-		}
-		if slot == Tombstone {
-			continue
-		}
-
-		if entry.NodeID == nodeID {
-			return slot
-		}
-	}
-
-	return 0
+	return (*EdgeTablePage)(ptr)
 }
 
-func (idx *EdgeTableIndex) resize() {
-	oldTable := idx.table
-	newCap := idx.capacity * 2
-	idx.table = make([]EdgeTableLocator, newCap)
-	idx.capacity = newCap
-	idx.size = 0 // Recalculated during insertion
-
-	for i := range oldTable {
-		slot := oldTable[i].PageSlot
-		if slot != 0 && slot != Tombstone {
-			idx.Insert(oldTable[i].NodeID, slot)
-		}
-	}
+// Iterate visits every non-empty node in the table.
+func (idx *EdgeTableIndex) Iterate(fn func(nodeID uint64)) {
+	idx.m.Range(func(k uint64, v unsafe.Pointer) bool {
+		fn(k)
+		return true
+	})
 }
 
-// Delete marks a node's page slot as deleted using a tombstone.
+// Delete removes a node's page slot from the index.
 func (idx *EdgeTableIndex) Delete(nodeID uint64) {
-	if idx.size == 0 {
-		return
+	idx.m.Delete(nodeID)
+}
+
+// Close unmaps the underlying memory map.
+func (idx *EdgeTableIndex) Close() error {
+	if idx == nil || idx.m == nil {
+		return nil
 	}
-
-	mask := idx.capacity - 1
-	start := hashUint64(nodeID) & mask
-
-	for i := uint64(0); i < idx.capacity; i++ {
-		pos := (start + i) & mask
-		entry := &idx.table[pos]
-
-		slot := atomic.LoadUint32(&entry.PageSlot)
-		if slot == 0 {
-			return // Not found
-		}
-
-		if slot != Tombstone && entry.NodeID == nodeID {
-			atomic.StoreUint32(&entry.PageSlot, Tombstone)
-			idx.size--
-			return
-		}
+	if err := idx.m.Free(); err != nil {
+		return err
 	}
+	idx.m = nil
+	return nil
 }

@@ -1020,9 +1020,9 @@ func TestReplayIgnoresUncommittedTransactions(t *testing.T) {
 	}
 
 	engine.mu.Lock()
-	txID := engine.nextTxIDLocked()
-	beginLSN := engine.nextLSNLocked()
-	putLSN := engine.nextLSNLocked()
+	txID := engine.nextTxID()
+	beginLSN := engine.nextLSN()
+	putLSN := engine.nextLSN()
 	begin := newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
 		Collection: "global",
@@ -1107,9 +1107,9 @@ func TestRecoveryStatsTrackReplayedAndDiscardedTransactions(t *testing.T) {
 	}
 
 	engine.mu.Lock()
-	txID := engine.nextTxIDLocked()
-	beginLSN := engine.nextLSNLocked()
-	putLSN := engine.nextLSNLocked()
+	txID := engine.nextTxID()
+	beginLSN := engine.nextLSN()
+	putLSN := engine.nextLSN()
 	begin := newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	payload, err := encodeRecordPutPayloadBinary(recordPutPayload{
 		Collection: "global",

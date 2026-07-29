@@ -104,9 +104,9 @@ func TestIVFPQWithQuantizationIntegration(t *testing.T) {
 
 			// First result should be the exact match (or very close)
 			if len(results) > 0 {
-				if results[0].ID != testEntries[0].ID {
-					t.Logf("Warning: first result ID %s doesn't match query ID %s (may be due to quantization)",
-						results[0].ID, testEntries[0].ID)
+				if results[0].Ordinal != testEntries[0].Ordinal {
+					t.Logf("Warning: first result Ordinal %d doesn't match query Ordinal %d (may be due to quantization)",
+						results[0].Ordinal, testEntries[0].Ordinal)
 				}
 
 				// Score should be reasonable (close to 0 for exact match)
@@ -267,8 +267,9 @@ func TestIVFPQSearchAccuracy(t *testing.T) {
 
 	for i, vec := range knownVectors {
 		entry := &VectorEntry{
-			ID:     fmt.Sprintf("known_%d", i),
-			Vector: vec,
+			ID:      fmt.Sprintf("known_%d", i),
+			Ordinal: uint32(i + 1), // 1-based to avoid 0
+			Vector:  vec,
 		}
 		err := idx.Insert(ctx, entry)
 		if err != nil {
@@ -291,16 +292,16 @@ func TestIVFPQSearchAccuracy(t *testing.T) {
 
 		// The exact vector should be found (though not necessarily first due to clustering)
 		found := false
-		expectedID := fmt.Sprintf("known_%d", i)
+		expectedOrdinal := uint32(i + 1)
 		for _, result := range results {
-			if result.ID == expectedID {
+			if result.Ordinal == expectedOrdinal {
 				found = true
 				break
 			}
 		}
 
 		if !found {
-			t.Errorf("exact match not found for query vector %d (ID: %s)", i, expectedID)
+			t.Errorf("exact match not found for query vector %d (Ordinal: %d)", i, expectedOrdinal)
 		}
 	}
 }

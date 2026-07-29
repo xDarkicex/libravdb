@@ -37,6 +37,10 @@ type Engine interface {
 	Vacuum(ctx context.Context) error
 	Backup(ctx context.Context, destPath string) error
 	Drop(ctx context.Context) error
+
+	// Graph Identity API
+	GetNodeID(ctx context.Context, collection, id string) (uint64, error)
+	ResolveNodeID(ctx context.Context, graphNodeID uint64) (string, string, error)
 }
 
 // WriteStats captures coarse write-path instrumentation for benchmarking.
@@ -60,6 +64,12 @@ const (
 	StatusFailed                                 // fatal recovery error, engine unusable
 )
 
+var (
+	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
+	ErrUnknownGraphNodeID    = errors.New("unknown graph node ID")
+	ErrTombstonedGraphNodeID = errors.New("tombstoned graph node ID")
+)
+
 // WriteStatsProvider is an optional interface for engines that expose write-path counters.
 type WriteStatsProvider interface {
 	WriteStats() WriteStats
@@ -81,6 +91,7 @@ type TxOperation struct {
 	Vector             []float32
 	ExpectedVersion    uint64
 	Ordinal            uint32
+	GraphNodeID        uint64
 	Type               TxOperationType
 	HasExpectedVersion bool
 }

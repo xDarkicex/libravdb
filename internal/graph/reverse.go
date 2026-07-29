@@ -1,6 +1,10 @@
 package graph
 
-import "github.com/xDarkicex/memory"
+import (
+	"errors"
+
+	"github.com/xDarkicex/memory"
+)
 
 // ReverseIndex maintains inbound edges symmetrically to the forward index.
 // It is used to quickly locate all inbound edges for a node when performing DropNodeEdges.
@@ -28,5 +32,21 @@ func newReverseIndex(cfg GraphConfig) (*ReverseIndex, error) {
 }
 
 func (r *ReverseIndex) Close() error {
-	return r.pool.Free()
+	if r == nil {
+		return nil
+	}
+	var locatorErr, poolErr error
+	if r.locator != nil {
+		locatorErr = r.locator.Close()
+		if locatorErr == nil {
+			r.locator = nil
+		}
+	}
+	if r.pool != nil {
+		poolErr = r.pool.Free()
+		if poolErr == nil {
+			r.pool = nil
+		}
+	}
+	return errors.Join(locatorErr, poolErr)
 }

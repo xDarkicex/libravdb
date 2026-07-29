@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	indexmodel "github.com/xDarkicex/libravdb/internal/index/model"
 	internalmemory "github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -110,14 +111,8 @@ func (r *inFlightRegistry) GetSnapshot(buf []uint32) []uint32 {
 	return buf
 }
 
-// VectorEntry represents a vector entry for HNSW indexing
-type VectorEntry struct {
-	Metadata map[string]interface{}
-	ID       string
-	Vector   []float32
-	Version  uint64
-	Ordinal  uint32
-}
+// VectorEntry is the shared caller-owned vector ingress record.
+type VectorEntry = indexmodel.VectorEntry
 
 // SearchResult represents a search result from HNSW
 type SearchResult struct {

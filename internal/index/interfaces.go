@@ -8,15 +8,13 @@ import (
 	"os"
 	"time"
 
-	"unsafe"
-
 	"github.com/xDarkicex/libravdb/internal/index/flat"
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
 	"github.com/xDarkicex/libravdb/internal/index/ivfpq"
+	indexmodel "github.com/xDarkicex/libravdb/internal/index/model"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/record"
 	"github.com/xDarkicex/libravdb/internal/util"
-	"github.com/xDarkicex/memory"
 )
 
 // GraphFilter is an interface used to filter search candidates based on a graph bitset.
@@ -58,14 +56,8 @@ type DeltaIndex interface {
 	PrepareMutations(ctx context.Context, puts []*VectorEntry, deletes []string) (PreparedMutation, error)
 }
 
-// VectorEntry represents a vector entry (avoid circular imports)
-type VectorEntry struct {
-	Metadata map[string]interface{}
-	ID       string
-	Vector   []float32
-	Version  uint64
-	Ordinal  uint32
-}
+// VectorEntry is the shared caller-owned vector ingress record.
+type VectorEntry = indexmodel.VectorEntry
 
 // SearchResult represents a search result (avoid circular imports)
 type SearchResult struct {
@@ -154,7 +146,6 @@ type FlatConfig struct {
 // hnswWrapper wraps the HNSW index to adapt between interface types
 type hnswWrapper struct {
 	index *hnsw.Index
-	sfl   *memory.ShardedFreeList
 }
 
 func (w *hnswWrapper) RawVectorStoreProfile() map[string]any {
@@ -163,42 +154,14 @@ func (w *hnswWrapper) RawVectorStoreProfile() map[string]any {
 
 // Insert adapts the interface VectorEntry to HNSW VectorEntry
 func (w *hnswWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
-	hnswEntry := &hnsw.VectorEntry{
-		ID:       entry.ID,
-		Ordinal:  entry.Ordinal,
-		Vector:   entry.Vector,
-		Metadata: entry.Metadata,
-		Version:  entry.Version,
-	}
-	return w.index.Insert(ctx, hnswEntry)
+	return w.index.Insert(ctx, entry)
 }
 
-// BatchInsert adapts the interface VectorEntry slice to HNSW VectorEntry slice
+// BatchInsert passes the shared ingress records directly to HNSW. The shared
+// type removes the old adapter allocation and, critically, avoids copying
+// Go-pointer-bearing records into unscanned off-heap slots.
 func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	hnswEntries := make([]*hnsw.VectorEntry, len(entries))
-	slots := make([][]byte, len(entries))
-	for i, entry := range entries {
-		slot, err := w.sfl.Allocate()
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = w.sfl.Deallocate(slots[j])
-			}
-			return err
-		}
-		slots[i] = slot
-		hnswEntry := (*hnsw.VectorEntry)(unsafe.Pointer(&slot[48]))
-		hnswEntry.ID = entry.ID
-		hnswEntry.Ordinal = entry.Ordinal
-		hnswEntry.Vector = entry.Vector
-		hnswEntry.Metadata = entry.Metadata
-		hnswEntry.Version = entry.Version
-		hnswEntries[i] = hnswEntry
-	}
-	err := w.index.BatchInsert(ctx, hnswEntries)
-	for _, slot := range slots {
-		_ = w.sfl.Deallocate(slot)
-	}
-	return err
+	return w.index.BatchInsert(ctx, entries)
 }
 
 // Search adapts the search results from HNSW to interface types
@@ -239,9 +202,6 @@ func (w *hnswWrapper) MemoryUsage() int64 {
 
 // Close delegates to the wrapped index
 func (w *hnswWrapper) Close() error {
-	if w.sfl != nil {
-		_ = w.sfl.Free()
-	}
 	return w.index.Close()
 }
 
@@ -313,28 +273,12 @@ func NewHNSW(config *HNSWConfig) (Index, error) {
 		return nil, err
 	}
 
-	slotSize := 48 + uint64(unsafe.Sizeof(hnsw.VectorEntry{}))
-	slotSize = (slotSize + 7) &^ 7
-	if slotSize < 32 {
-		slotSize = 32
-	}
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		SlotSize:  slotSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 4,
-	}, 64, 16)
-	if err != nil {
-		hnswIndex.Close()
-		return nil, err
-	}
-
-	return &hnswWrapper{index: hnswIndex, sfl: sfl}, nil
+	return &hnswWrapper{index: hnswIndex}, nil
 }
 
 // ivfpqWrapper wraps the IVF-PQ index to adapt between interface types
 type ivfpqWrapper struct {
 	index *ivfpq.Index
-	sfl   *memory.ShardedFreeList
 }
 
 func (w *ivfpqWrapper) Train(ctx context.Context, vectors [][]float32) error {
@@ -345,60 +289,14 @@ func (w *ivfpqWrapper) IsTrained() bool {
 	return w.index.IsTrained()
 }
 
-// HasDeserializedMeta reports whether deserialized entry metadata is pending
-// population. Used by the collection layer to decide between two-phase
-// deserialization (PopulateEntriesFromStorage) and a fully-populated index.
-func (w *ivfpqWrapper) HasDeserializedMeta() bool {
-	return w.index.HasDeserializedMeta()
-}
-
-// PopulateEntriesFromStorage delegates to the wrapped IVFPQ index so the
-// collection layer can wire deserialized centroids/codebooks to storage entries.
-// Uses anonymous interface to match the type assertion in the collection layer.
-func (w *ivfpqWrapper) PopulateEntriesFromStorage(provider interface {
-	IterateEntries(fn func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error) error
-}) error {
-	return w.index.PopulateEntriesFromStorage(provider)
-}
-
-// Insert adapts the interface VectorEntry to IVF-PQ VectorEntry
+// Insert delegates to the underlying IVF-PQ index
 func (w *ivfpqWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
-	ivfpqEntry := &ivfpq.VectorEntry{
-		ID:       entry.ID,
-		Ordinal:  entry.Ordinal,
-		Vector:   entry.Vector,
-		Metadata: entry.Metadata,
-		Version:  entry.Version,
-	}
-	return w.index.Insert(ctx, ivfpqEntry)
+	return w.index.Insert(ctx, entry)
 }
 
 // BatchInsert delegates batch insertion to the underlying IVF-PQ index
 func (w *ivfpqWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	ivfpqEntries := make([]*ivfpq.VectorEntry, len(entries))
-	slots := make([][]byte, len(entries))
-	for i, entry := range entries {
-		slot, err := w.sfl.Allocate()
-		if err != nil {
-			for j := 0; j < i; j++ {
-				_ = w.sfl.Deallocate(slots[j])
-			}
-			return err
-		}
-		slots[i] = slot
-		ivfpqEntry := (*ivfpq.VectorEntry)(unsafe.Pointer(&slot[48]))
-		ivfpqEntry.ID = entry.ID
-		ivfpqEntry.Ordinal = entry.Ordinal
-		ivfpqEntry.Vector = entry.Vector
-		ivfpqEntry.Metadata = entry.Metadata
-		ivfpqEntry.Version = entry.Version
-		ivfpqEntries[i] = ivfpqEntry
-	}
-	err := w.index.BatchInsert(ctx, ivfpqEntries)
-	for _, slot := range slots {
-		_ = w.sfl.Deallocate(slot)
-	}
-	return err
+	return w.index.BatchInsert(ctx, entries)
 }
 
 // Search adapts the search results from IVF-PQ to interface types
@@ -411,11 +309,8 @@ func (w *ivfpqWrapper) Search(ctx context.Context, query []float32, k int, filte
 	results := make([]*SearchResult, len(ivfpqResults))
 	for i, r := range ivfpqResults {
 		results[i] = &SearchResult{
-			ID:       r.ID,
-			Score:    r.Score,
-			Vector:   r.Vector,
-			Metadata: r.Metadata,
-			Version:  r.Version,
+			Ordinal: r.Ordinal,
+			Score:   r.Score,
 		}
 	}
 	return results, nil
@@ -424,6 +319,11 @@ func (w *ivfpqWrapper) Search(ctx context.Context, query []float32, k int, filte
 // Delete delegates to the wrapped index
 func (w *ivfpqWrapper) Delete(ctx context.Context, id string) error {
 	return w.index.Delete(ctx, id)
+}
+
+// DeleteByOrdinal delegates to the wrapped index
+func (w *ivfpqWrapper) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
+	return w.index.DeleteByOrdinal(ctx, ordinal)
 }
 
 // Size delegates to the wrapped index
@@ -438,9 +338,6 @@ func (w *ivfpqWrapper) MemoryUsage() int64 {
 
 // Close delegates to the wrapped index
 func (w *ivfpqWrapper) Close() error {
-	if w.sfl != nil {
-		_ = w.sfl.Free()
-	}
 	return w.index.Close()
 }
 
@@ -491,13 +388,27 @@ func (w *ivfpqWrapper) GetPersistenceMetadata() *PersistenceMetadata {
 
 // NewIVFPQ creates a new IVF-PQ index
 func NewIVFPQ(config *IVFPQConfig) (Index, error) {
+	quantization := config.Quantization
+	if quantization == nil {
+		// IVF-PQ requires a PQ encoder even when the collection did not
+		// explicitly select a quantization profile. PQ subspaces must divide
+		// the vector dimension, so choose the largest valid default up to 8.
+		quantization = quant.DefaultConfig(quant.ProductQuantization)
+		for codebooks := min(quantization.Codebooks, config.Dimension); codebooks >= 1; codebooks-- {
+			if config.Dimension%codebooks == 0 {
+				quantization.Codebooks = codebooks
+				break
+			}
+		}
+	}
+
 	// Convert to internal IVF-PQ config
 	ivfpqConfig := &ivfpq.Config{
 		Dimension:     config.Dimension,
 		NClusters:     config.NClusters,
 		NProbes:       config.NProbes,
 		Metric:        config.Metric,
-		Quantization:  config.Quantization,
+		Quantization:  quantization,
 		MaxIterations: config.MaxIterations,
 		Tolerance:     config.Tolerance,
 		RandomSeed:    config.RandomSeed,
@@ -508,22 +419,7 @@ func NewIVFPQ(config *IVFPQConfig) (Index, error) {
 		return nil, err
 	}
 
-	slotSize := 48 + uint64(unsafe.Sizeof(ivfpq.VectorEntry{}))
-	slotSize = (slotSize + 7) &^ 7
-	if slotSize < 32 {
-		slotSize = 32
-	}
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		SlotSize:  slotSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 4,
-	}, 64, 16)
-	if err != nil {
-		ivfpqIndex.Close()
-		return nil, err
-	}
-
-	return &ivfpqWrapper{index: ivfpqIndex, sfl: sfl}, nil
+	return &ivfpqWrapper{index: ivfpqIndex}, nil
 }
 
 // flatWrapper wraps the Flat index to adapt between interface types
@@ -546,7 +442,11 @@ func flatDeltaBytes(entries []*VectorEntry) uint64 {
 		if entry == nil {
 			continue
 		}
-		bytes += uint64(len(entry.ID)) + uint64(len(entry.Vector))*4 + 256
+		// Per-entry arena cost: stageCell allocates id copy + mutationCell (~48B);
+		// RecordBuilder.Seal allocates recordHeader (~48B) + id + vector + metadata.
+		// The 512B overhead covers the doubled ID copy, both struct headers, and
+		// per-record metadata without assuming it fits in a tight constant.
+		bytes += uint64(len(entry.ID))*2 + uint64(len(entry.Vector))*4 + 512
 	}
 	return bytes
 }

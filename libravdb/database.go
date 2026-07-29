@@ -953,3 +953,24 @@ func (db *Database) Drop(ctx context.Context) error {
 
 	return fmt.Errorf("underlying storage engine does not support Drop")
 }
+
+// ResolveNodeID looks up a system-scoped GraphNodeID and returns its corresponding
+// collection name and record ID. If the ID is unknown or deleted, it returns an error.
+// This is an O(1) operation designed for rapid reverse-lookup during graph traversal.
+func (db *Database) ResolveNodeID(ctx context.Context, id uint64) (string, string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return "", "", ErrDatabaseClosed
+	}
+	colName, recID, err := db.storage.ResolveNodeID(ctx, id)
+	if err != nil {
+		return "", "", err
+	}
+	// Translate internal shard names back to logical collection names.
+	if parent, _, ok := parseShardName(colName); ok {
+		return parent, recID, nil
+	}
+	return colName, recID, nil
+}

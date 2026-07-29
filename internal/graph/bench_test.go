@@ -58,7 +58,7 @@ func BenchmarkEdgeTableIndex(b *testing.B) {
 
 	// Pre-populate
 	for i := 0; i < 10000; i++ {
-		idx.Insert(uint64(i), uint32(i+100))
+		idx.Insert(uint64(i), &EdgeTablePage{})
 	}
 
 	b.ResetTimer()
@@ -70,7 +70,7 @@ func BenchmarkEdgeTableIndex(b *testing.B) {
 
 	b.Run("Insert", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			idx.Insert(uint64(i+10000), uint32(i+20000))
+			idx.Insert(uint64(i+10000), &EdgeTablePage{})
 		}
 	})
 }

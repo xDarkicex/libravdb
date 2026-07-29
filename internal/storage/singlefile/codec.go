@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	codecVersion byte = 2 // Binary payload encoding (snapshot state, WAL frames, collection records)
+	codecVersion byte = 3 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
 type encodedPayload struct {
@@ -34,6 +34,7 @@ func encodeStateBinary(state *persistedState) ([]byte, error) {
 	defer util.ReleaseBinaryEncoder(enc)
 	enc.WriteByte(codecVersion)
 	enc.WriteUint64(state.NextCollectionID)
+	enc.WriteUint64(state.NextGraphNodeID)
 	names := make([]string, 0, len(state.Collections))
 	for name := range state.Collections {
 		names = append(names, name)
@@ -56,12 +57,20 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version != codecVersion && version != 1 {
+	if version < 1 || version > codecVersion {
 		return nil, fmt.Errorf("unsupported snapshot codec version %d", version)
 	}
 	nextCollectionID, err := dec.ReadUint64()
 	if err != nil {
 		return nil, err
+	}
+	// NextGraphNodeID: present in v3+, absent in v1/v2 (legacy).
+	nextGraphNodeID := uint64(1)
+	if version >= 3 {
+		nextGraphNodeID, err = dec.ReadUint64()
+		if err != nil {
+			return nil, err
+		}
 	}
 	count, err := dec.ReadUint32()
 	if err != nil {
@@ -69,6 +78,7 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 	}
 	state := &persistedState{
 		NextCollectionID: nextCollectionID,
+		NextGraphNodeID:  nextGraphNodeID,
 		Collections:      make(map[string]*persistedCollection, count),
 	}
 	for i := uint32(0); i < count; i++ {
@@ -76,7 +86,7 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 		if err != nil {
 			return nil, err
 		}
-		collection, err := readCollection(dec)
+		collection, err := readCollection(dec, version)
 		if err != nil {
 			return nil, err
 		}
@@ -137,6 +147,7 @@ func encodeRecordPutPayloadBinary(payload recordPutPayload) (encodedPayload, err
 	enc.WriteString(payload.Collection)
 	enc.WriteString(payload.ID)
 	enc.WriteUint32(payload.Ordinal)
+	enc.WriteUint64(payload.GraphNodeID)
 	enc.WriteVector(payload.Vector)
 	if err := enc.WriteMetadata(payload.Metadata); err != nil {
 		util.ReleaseBinaryEncoder(enc)
@@ -147,8 +158,12 @@ func encodeRecordPutPayloadBinary(payload recordPutPayload) (encodedPayload, err
 
 func decodeRecordPutPayloadBinary(data []byte) (recordPutPayload, error) {
 	dec := &util.BinaryDecoder{Data: data}
-	if err := dec.ExpectVersion(); err != nil {
+	version, err := dec.ReadByte()
+	if err != nil {
 		return recordPutPayload{}, err
+	}
+	if version < 1 || version > codecVersion {
+		return recordPutPayload{}, fmt.Errorf("unsupported record put codec version %d", version)
 	}
 	collection, err := dec.ReadString()
 	if err != nil {
@@ -162,6 +177,14 @@ func decodeRecordPutPayloadBinary(data []byte) (recordPutPayload, error) {
 	if err != nil {
 		return recordPutPayload{}, err
 	}
+	// GraphNodeID is present in v3+ WAL payloads, absent in v1/v2.
+	graphNodeID := uint64(0)
+	if version >= 3 {
+		graphNodeID, err = dec.ReadUint64()
+		if err != nil {
+			return recordPutPayload{}, err
+		}
+	}
 	vector, err := dec.ReadVector()
 	if err != nil {
 		return recordPutPayload{}, err
@@ -170,7 +193,14 @@ func decodeRecordPutPayloadBinary(data []byte) (recordPutPayload, error) {
 	if err != nil {
 		return recordPutPayload{}, err
 	}
-	return recordPutPayload{Collection: collection, ID: id, Ordinal: ordinal, Vector: vector, Metadata: metadata}, nil
+	return recordPutPayload{
+		Collection:  collection,
+		ID:          id,
+		Ordinal:     ordinal,
+		GraphNodeID: graphNodeID,
+		Vector:      vector,
+		Metadata:    metadata,
+	}, nil
 }
 
 func encodeRecordDeletePayloadBinary(payload recordDeletePayload) (encodedPayload, error) {
@@ -245,6 +275,7 @@ func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) e
 		enc.WriteUint64(record.UpdatedLSN)
 		enc.WriteBool(record.Deleted)
 		enc.WriteUint32(record.Ordinal)
+		enc.WriteUint64(record.GraphNodeID)
 		enc.WriteVector(record.Vector)
 		if err := enc.WriteMetadata(record.Metadata); err != nil {
 			return err
@@ -254,7 +285,7 @@ func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) e
 }
 
 func estimateStateSize(state *persistedState) int {
-	size := 1 + 8 + 4
+	size := 1 + 8 + 8 + 4 // version + NextCollectionID + NextGraphNodeID + collection count
 	for name, collection := range state.Collections {
 		size += 4 + len(name)
 		size += estimateCollectionSize(collection)
@@ -269,7 +300,7 @@ func estimateCollectionSize(collection *persistedCollection) int {
 	size := 8 + estimateCollectionConfigSize(collection.Config) + 8 + 8 + 1 + 8 + 4 + 4
 	for id, record := range collection.Records {
 		size += 4 + len(id)
-		size += 8 + 8 + 8 + 1 + 4
+		size += 8 + 8 + 8 + 1 + 4 + 8 // version, createdLSN, updatedLSN, deleted, ordinal, graphNodeID
 		size += 4 + len(record.Vector)*4
 		size += util.EstimateMetadataSize(record.Metadata)
 	}
@@ -289,7 +320,7 @@ func estimateCollectionCreatePayloadSize(payload collectionCreatePayload) int {
 }
 
 func estimateRecordPutPayloadSize(payload recordPutPayload) int {
-	return 1 + 4 + len(payload.Collection) + 4 + len(payload.ID) + 4 + 4 + len(payload.Vector)*4 + util.EstimateMetadataSize(payload.Metadata)
+	return 1 + 4 + len(payload.Collection) + 4 + len(payload.ID) + 4 + 8 + 4 + len(payload.Vector)*4 + util.EstimateMetadataSize(payload.Metadata)
 }
 
 func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, error) {
@@ -400,7 +431,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	}, nil
 }
 
-func readCollection(dec *util.BinaryDecoder) (*persistedCollection, error) {
+func readCollection(dec *util.BinaryDecoder, snapshotVersion byte) (*persistedCollection, error) {
 	id, err := dec.ReadUint64()
 	if err != nil {
 		return nil, err
@@ -459,6 +490,14 @@ func readCollection(dec *util.BinaryDecoder) (*persistedCollection, error) {
 		if err != nil {
 			return nil, err
 		}
+		// GraphNodeID is present in v3+ format only.
+		graphNodeID := uint64(0)
+		if snapshotVersion >= 3 {
+			graphNodeID, err = dec.ReadUint64()
+			if err != nil {
+				return nil, err
+			}
+		}
 		vector, err := dec.ReadVector()
 		if err != nil {
 			return nil, err
@@ -468,13 +507,14 @@ func readCollection(dec *util.BinaryDecoder) (*persistedCollection, error) {
 			return nil, err
 		}
 		records[recordID] = &recordValue{
-			Version:    version,
-			CreatedLSN: recordCreatedLSN,
-			UpdatedLSN: recordUpdatedLSN,
-			Deleted:    recordDeleted,
-			Ordinal:    ordinal,
-			Vector:     vector,
-			Metadata:   metadata,
+			Version:     version,
+			CreatedLSN:  recordCreatedLSN,
+			UpdatedLSN:  recordUpdatedLSN,
+			Deleted:     recordDeleted,
+			Ordinal:     ordinal,
+			GraphNodeID: graphNodeID,
+			Vector:      vector,
+			Metadata:    metadata,
 		}
 	}
 	collection := &persistedCollection{

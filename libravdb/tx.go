@@ -446,6 +446,10 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 		return ErrTxEngineUnsupported
 	}
 
+	ops, err := db.routeTxMutations(ops)
+	if err != nil {
+		return err
+	}
 	collections, names, err := db.txCollections(ops)
 	if err != nil {
 		return err
@@ -455,7 +459,7 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	locked := make([]*Collection, 0, len(names))
 	defer func() {
 		for i := len(locked) - 1; i >= 0; i-- {
-			locked[i].mu.Unlock()
+			locked[i].unlockForTransaction()
 		}
 		for i := len(releases) - 1; i >= 0; i-- {
 			releases[i]()
@@ -471,9 +475,9 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 	for _, name := range names {
 		collection := collections[name]
-		collection.mu.Lock()
+		collection.lockForTransaction()
 		if collection.closed {
-			collection.mu.Unlock()
+			collection.unlockForTransaction()
 			return ErrCollectionClosed
 		}
 		locked = append(locked, collection)
@@ -553,11 +557,52 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 		collection := collections[name]
 		oldIndex := collection.index
 		collection.index = newIndexes[name]
+		if collection.transactionShard != nil {
+			collection.transactionShard.index = collection.index
+		}
 		delete(newIndexes, name)
 		_ = oldIndex.Close()
 	}
 
 	return nil
+}
+
+func (c *Collection) lockForTransaction() {
+	if c.transactionMu != nil {
+		c.transactionMu.Lock()
+		return
+	}
+	c.mu.Lock()
+}
+
+func (c *Collection) unlockForTransaction() {
+	if c.transactionMu != nil {
+		c.transactionMu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+}
+
+// routeTxMutations translates logical sharded collection names to the
+// owning physical shard before constructing transaction state. Public
+// callers continue to stage operations against the logical collection.
+func (db *Database) routeTxMutations(ops []txMutation) ([]txMutation, error) {
+	routed := append([]txMutation(nil), ops...)
+	for i := range routed {
+		collection, err := db.GetCollection(routed[i].collection)
+		if err != nil {
+			return nil, err
+		}
+		if len(collection.shards) == 0 {
+			continue
+		}
+		shardIndex := shardForID(routed[i].id)
+		if shardIndex < 0 || shardIndex >= len(collection.shards) {
+			return nil, fmt.Errorf("%w: shard %d unavailable for collection %s", ErrTxValidation, shardIndex, routed[i].collection)
+		}
+		routed[i].collection = collection.shards[shardIndex].name
+	}
+	return routed, nil
 }
 
 // prepareIndexDeltas builds unpublished generation candidates for indexes that
@@ -650,7 +695,27 @@ func (db *Database) txCollections(ops []txMutation) (map[string]*Collection, []s
 	for _, name := range names {
 		collection, err := db.GetCollection(name)
 		if err != nil {
-			return nil, nil, err
+			parentName, shardIndex, isShard := parseShardName(name)
+			if !isShard {
+				return nil, nil, err
+			}
+			parent, parentErr := db.GetCollection(parentName)
+			if parentErr != nil || shardIndex < 0 || shardIndex >= len(parent.shards) {
+				return nil, nil, err
+			}
+			physical := &parent.shards[shardIndex]
+			config := *parent.config
+			config.Sharded = false
+			collection = &Collection{
+				name:             physical.name,
+				config:           &config,
+				storage:          physical.storage,
+				index:            physical.index,
+				writes:           parent.writes,
+				graph:            parent.graph,
+				transactionMu:    &physical.mu,
+				transactionShard: physical,
+			}
 		}
 		collections[name] = collection
 	}

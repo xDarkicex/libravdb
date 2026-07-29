@@ -63,7 +63,7 @@ func OpenV1(path string) (*Engine, error) {
 	}
 	engine.metaEpoch = chosen.meta.MetaEpoch
 	engine.activeMetaPage = metaPageNumber(chosen.meta)
-	engine.lastLSN = chosen.meta.LastAppliedLSN
+	engine.lastLSN.Store(chosen.meta.LastAppliedLSN)
 	engine.state = chosen.state
 	engine.replayedTxs = 0
 	engine.discardedTxs = 0

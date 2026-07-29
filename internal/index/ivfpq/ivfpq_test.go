@@ -285,10 +285,10 @@ func TestInsertAndSearch(t *testing.T) {
 
 	// Insert test entries
 	entries := []*VectorEntry{
-		{ID: "1", Vector: []float32{1, 0, 0, 0}, Metadata: map[string]interface{}{"label": "a"}},
-		{ID: "2", Vector: []float32{0, 1, 0, 0}, Metadata: map[string]interface{}{"label": "b"}},
-		{ID: "3", Vector: []float32{0, 0, 1, 0}, Metadata: map[string]interface{}{"label": "c"}},
-		{ID: "4", Vector: []float32{0, 0, 0, 1}, Metadata: map[string]interface{}{"label": "d"}},
+		{ID: "1", Ordinal: 1, Vector: []float32{1, 0, 0, 0}, Metadata: map[string]interface{}{"label": "a"}},
+		{ID: "2", Ordinal: 2, Vector: []float32{0, 1, 0, 0}, Metadata: map[string]interface{}{"label": "b"}},
+		{ID: "3", Ordinal: 3, Vector: []float32{0, 0, 1, 0}, Metadata: map[string]interface{}{"label": "c"}},
+		{ID: "4", Ordinal: 4, Vector: []float32{0, 0, 0, 1}, Metadata: map[string]interface{}{"label": "d"}},
 	}
 
 	for _, entry := range entries {
@@ -314,8 +314,8 @@ func TestInsertAndSearch(t *testing.T) {
 	}
 
 	// First result should be closest to query
-	if len(results) > 0 && results[0].ID != "1" {
-		t.Errorf("expected first result to be ID '1', got '%s'", results[0].ID)
+	if len(results) > 0 && results[0].Ordinal != 1 {
+		t.Errorf("expected first result to have Ordinal 1, got %d", results[0].Ordinal)
 	}
 }
 

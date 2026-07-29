@@ -68,12 +68,9 @@ func (g *graphStore) FlushToSegment(path string) error {
 	defer f.Close()
 
 	var nodeIDs []uint64
-	for i := uint64(0); i < g.index.capacity; i++ {
-		slot := atomic.LoadUint32(&g.index.table[i].PageSlot)
-		if slot != 0 && slot != Tombstone {
-			nodeIDs = append(nodeIDs, g.index.table[i].NodeID)
-		}
-	}
+	g.index.Iterate(func(nodeID uint64) {
+		nodeIDs = append(nodeIDs, nodeID)
+	})
 
 	sort.Slice(nodeIDs, func(i, j int) bool { return nodeIDs[i] < nodeIDs[j] })
 

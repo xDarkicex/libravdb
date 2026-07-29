@@ -8,6 +8,26 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
+func TestGraphCloseReleasesEdgeTableIndexes(t *testing.T) {
+	store, err := NewGraph(DefaultGraphConfig())
+	if err != nil {
+		t.Fatalf("NewGraph: %v", err)
+	}
+	g := store.(*graphStore)
+	forward := g.index
+	reverse := g.reverse.locator
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if forward.m != nil {
+		t.Fatal("forward edge table index retained its off-heap hash map after close")
+	}
+	if reverse.m != nil {
+		t.Fatal("reverse edge table index retained its off-heap hash map after close")
+	}
+}
+
 func testConfig() GraphConfig {
 	return GraphConfig{
 		EdgeSlots:        120000,
@@ -42,11 +62,10 @@ func TestEdgeTable_InlineFirst8(t *testing.T) {
 			}
 
 			gs := store.(*graphStore)
-			slot := gs.index.Lookup(1)
-			if slot == 0 {
+			page := gs.index.Lookup(1)
+			if page == nil {
 				return edgeCount == 0
 			}
-			page := gs.pageReg.Get(slot)
 
 			// Verify inline storage: Overflow must be 0 if count <= 8
 			if edgeCount <= 8 && page.Header.Overflow != 0 {
@@ -82,11 +101,10 @@ func TestEdgeTable_OverflowActivation(t *testing.T) {
 			}
 
 			gs := store.(*graphStore)
-			slot := gs.index.Lookup(1)
-			if slot == 0 {
+			page := gs.index.Lookup(1)
+			if page == nil {
 				return false
 			}
-			page := gs.pageReg.Get(slot)
 
 			// Verify overflow chain
 			if edgeCount > 250 && page.Header.Overflow == 0 {
@@ -122,8 +140,7 @@ func TestGraph_GenerationMonotonicity(t *testing.T) {
 				if err := store.AddEdge(txn, 1, uint64(i), 1.0, 0); err != nil {
 					return false
 				}
-				slot := gs.index.Lookup(1)
-				page := gs.pageReg.Get(slot)
+				page := gs.index.Lookup(1)
 				gen := page.Header.Generation
 				if gen <= lastGen {
 					return false

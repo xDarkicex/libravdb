@@ -18,7 +18,7 @@ const (
 )
 
 const (
-	codecVersion byte = 2 // Tagged-value wire format (vectors, metadata, value types)
+	codecVersion byte = 3 // Tagged-value wire format (vectors, metadata, value types)
 
 	minPooledEncoderCapacity = 256
 	maxPooledEncoderCapacity = 16 << 10
@@ -327,7 +327,7 @@ func (dec *BinaryDecoder) ExpectVersion() error {
 	if err != nil {
 		return err
 	}
-	if version != codecVersion && version != 1 {
+	if version < 1 || version > codecVersion {
 		return fmt.Errorf("unsupported codec version %d", version)
 	}
 	return nil

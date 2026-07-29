@@ -14,6 +14,7 @@ import (
 
 	"github.com/xDarkicex/memory"
 
+	indexmodel "github.com/xDarkicex/libravdb/internal/index/model"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
@@ -30,23 +31,13 @@ type Config struct {
 	RandomSeed    int64
 }
 
-// VectorEntry represents a vector entry
-type VectorEntry struct {
-	Metadata   map[string]interface{}
-	ID         string
-	Vector     []float32
-	Compressed []byte
-	Version    uint64
-	Ordinal    uint32
-}
+// VectorEntry = indexmodel.VectorEntry
+type VectorEntry = indexmodel.VectorEntry
 
 // SearchResult represents a search result
 type SearchResult struct {
-	Metadata map[string]interface{}
-	ID       string
-	Vector   []float32
-	Version  uint64
-	Score    float32
+	Ordinal uint32
+	Score   float32
 }
 
 // DefaultConfig returns a default IVF-PQ configuration
@@ -147,25 +138,23 @@ func AutoTuneConfig(dimension int, estimatedVectors int, targetMemoryMB int) *Co
 
 // Cluster represents a single inverted list cluster
 type Cluster struct {
-	CompressedVectors map[string][]byte
-	Centroid          []float32
-	Entries           []*VectorEntry
-	ID                int
-	mutex             sync.RWMutex
-	centroidNorm2     float32
-	centroidNorm      float32
+	Ordinals      []uint32
+	Codes         []byte
+	Centroid      []float32
+	ID            int
+	mutex         sync.RWMutex
+	centroidNorm2 float32
+	centroidNorm  float32
 }
 
 // Index implements IVF-PQ (Inverted File with Product Quantization) index
 type Index struct {
 	quantizer            quant.Quantizer
 	rand                 *rand.Rand
-	deserMeta            *deserializedMeta
 	distanceFunc         util.DistanceFunc
 	searchStats          *SearchStats
 	config               *Config
 	scratchPool          *sync.Pool
-	idToCluster          sync.Map
 	clusters             []*Cluster
 	size                 int
 	mutex                sync.RWMutex
@@ -173,6 +162,17 @@ type Index struct {
 	trained              bool
 	populatedFromStorage bool
 	queryTiers           [4]ivfPoolTier
+}
+
+// codeSize returns the size of the compressed code for a single vector
+func (idx *Index) codeSize() int {
+	if idx.config != nil && idx.config.Quantization != nil {
+		// Product quantization packs one code of Bits bits for each codebook.
+		// Codebooks is not a byte count when Bits is below eight.
+		bits := idx.config.Quantization.Codebooks * idx.config.Quantization.Bits
+		return (bits + 7) / 8
+	}
+	return 0
 }
 
 // SearchStats tracks search performance for adaptive optimization
@@ -186,15 +186,14 @@ type SearchStats struct {
 }
 
 type candidate struct {
-	entry       *VectorEntry
+	ordinal     uint32
 	distance    float32
 	clusterDist float32
 }
 
 // ivfHeapElement is a max-heap node storing a candidate entry and its distance.
-// Sized at 16 bytes (pointer=8 + float32=4 + padding=4) — fits two per cache line.
 type ivfHeapElement struct {
-	entry    *VectorEntry
+	ordinal  uint32
 	distance float32
 }
 
@@ -323,10 +322,10 @@ func NewIVFPQ(config *Config) (*Index, error) {
 	clusters := make([]*Cluster, config.NClusters)
 	for i := 0; i < config.NClusters; i++ {
 		clusters[i] = &Cluster{
-			ID:                i,
-			Centroid:          make([]float32, config.Dimension),
-			Entries:           make([]*VectorEntry, 0),
-			CompressedVectors: make(map[string][]byte),
+			ID:       i,
+			Centroid: make([]float32, config.Dimension),
+			Ordinals: make([]uint32, 0),
+			Codes:    make([]byte, 0),
 		}
 	}
 
@@ -717,7 +716,7 @@ func (idx *Index) GetClusterInfo() []ClusterInfo {
 		cluster.mutex.RLock()
 		info[i] = ClusterInfo{
 			ID:       cluster.ID,
-			Size:     len(cluster.Entries),
+			Size:     len(cluster.Ordinals),
 			Centroid: make([]float32, len(cluster.Centroid)),
 		}
 		copy(info[i].Centroid, cluster.Centroid)
@@ -810,12 +809,19 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 		return fmt.Errorf("failed to assign vector to cluster: %w", err)
 	}
 
+	codeSize := 0
+	var compressed []byte
 	// Compress vector if quantization is enabled
 	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
+		codeSize = idx.codeSize()
+		compressed, err = idx.quantizer.Compress(entry.Vector)
 		if err != nil {
 			idx.mutex.RUnlock()
 			return fmt.Errorf("failed to compress vector: %w", err)
+		}
+		if len(compressed) != codeSize {
+			idx.mutex.RUnlock()
+			return fmt.Errorf("compressed code size = %d, want %d", len(compressed), codeSize)
 		}
 	}
 
@@ -824,17 +830,9 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	idx.mutex.RUnlock()
 	cluster.mutex.Lock()
 
-	// Guard against nil (post-Deserialize or post-Close).
-	if cluster.CompressedVectors == nil {
-		cluster.CompressedVectors = make(map[string][]byte)
-	}
-
-	idx.idToCluster.Store(entry.ID, clusterID)
-	cluster.Entries = append(cluster.Entries, entry)
-
-	// Store compressed version in the cluster map for persistence.
-	if entry.Compressed != nil {
-		cluster.CompressedVectors[entry.ID] = entry.Compressed
+	cluster.Ordinals = append(cluster.Ordinals, entry.Ordinal)
+	if codeSize > 0 {
+		cluster.Codes = append(cluster.Codes, compressed...)
 	}
 
 	cluster.mutex.Unlock()
@@ -878,10 +876,9 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 	workers := parallelismFor(len(entries))
 
 	type processedEntry struct {
-		err        error
-		entry      *VectorEntry
-		compressed []byte
-		clusterID  int
+		ordinal     uint32
+		clusterID   int
+		sourceIndex int
 	}
 
 	arena := idx.scratchPool.Get().(*memory.Arena)
@@ -896,6 +893,19 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 		return err
 	}
 	processed := processedSlice[:len(entries)]
+	errs := make([]error, len(entries))
+
+	codeSize := 0
+	if idx.quantizer != nil && idx.quantizer.IsTrained() {
+		codeSize = idx.codeSize()
+	}
+	codesSlice, err := memory.ArenaSlice[byte](arena, len(entries)*codeSize)
+	if err != nil {
+		idx.mutex.RUnlock()
+		return err
+	}
+	codes := codesSlice[:len(entries)*codeSize]
+
 	var wg sync.WaitGroup
 	chunkSize := (len(entries) + workers - 1) / workers
 
@@ -912,41 +922,46 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 			for i := start; i < end; i++ {
 				select {
 				case <-ctx.Done():
-					processed[i].err = ctx.Err()
+					errs[i] = ctx.Err()
 					return
 				default:
 				}
 
 				entry := entries[i]
 				if entry == nil {
-					processed[i].err = fmt.Errorf("entry cannot be nil")
+					errs[i] = fmt.Errorf("entry cannot be nil")
 					continue
 				}
 
 				if len(entry.Vector) != idx.config.Dimension {
-					processed[i].err = fmt.Errorf("vector dimension %d does not match index dimension %d",
+					errs[i] = fmt.Errorf("vector dimension %d does not match index dimension %d",
 						len(entry.Vector), idx.config.Dimension)
 					continue
 				}
 
 				clusterID, err := idx.assignToCluster(entry.Vector)
 				if err != nil {
-					processed[i].err = fmt.Errorf("failed to assign vector to cluster: %w", err)
+					errs[i] = fmt.Errorf("failed to assign vector to cluster: %w", err)
 					continue
 				}
 
-				if idx.quantizer != nil && idx.quantizer.IsTrained() {
-					entry.Compressed, err = idx.quantizer.Compress(entry.Vector)
+				if codeSize > 0 {
+					code, err := idx.quantizer.Compress(entry.Vector)
 					if err != nil {
-						processed[i].err = fmt.Errorf("failed to compress vector: %w", err)
+						errs[i] = fmt.Errorf("failed to compress vector: %w", err)
 						continue
 					}
+					if len(code) != codeSize {
+						errs[i] = fmt.Errorf("compressed code size = %d, want %d", len(code), codeSize)
+						continue
+					}
+					copy(codes[i*codeSize:(i+1)*codeSize], code)
 				}
 
 				processed[i] = processedEntry{
-					entry:      entry,
-					clusterID:  clusterID,
-					compressed: entry.Compressed,
+					ordinal:     entry.Ordinal,
+					clusterID:   clusterID,
+					sourceIndex: i,
 				}
 			}
 		}(start, end)
@@ -955,33 +970,26 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 	wg.Wait()
 	idx.mutex.RUnlock()
 
-	for _, p := range processed {
-		if p.err != nil {
-			return p.err
+	for _, e := range errs {
+		if e != nil {
+			return e
 		}
 	}
 
-	// Allocate counts array from Arena
 	countsSlice, err := memory.ArenaSlice[int](arena, len(idx.clusters))
 	if err != nil {
 		return fmt.Errorf("arena allocate counts: %w", err)
 	}
 	counts := countsSlice[:len(idx.clusters)]
-	clear(counts) // Zero out memory from previous arena uses
+	clear(counts)
 
 	for _, p := range processed {
-		if p.err == nil {
-			counts[p.clusterID]++
-		}
+		counts[p.clusterID]++
 	}
 
-	// Allocate updates arrays from Arena
-	clusterUpdatesSlice, err := memory.ArenaSlice[[]processedEntry](arena, len(idx.clusters))
-	if err != nil {
-		return fmt.Errorf("arena allocate cluster updates: %w", err)
-	}
-	clusterUpdates := clusterUpdatesSlice[:len(idx.clusters)]
-	clear(clusterUpdates) // Zero out memory from previous arena uses
+	// The outer slice holds Go slice headers, so it must remain on the Go heap.
+	// Only pointer-free processedEntry values live in the unscanned arena.
+	clusterUpdates := make([][]processedEntry, len(idx.clusters))
 
 	for i, c := range counts {
 		if c > 0 {
@@ -994,9 +1002,11 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 	}
 
 	for _, p := range processed {
-		if p.err == nil {
-			clusterUpdates[p.clusterID] = append(clusterUpdates[p.clusterID], p)
-		}
+		clusterUpdates[p.clusterID] = append(clusterUpdates[p.clusterID], processedEntry{
+			ordinal:     p.ordinal,
+			clusterID:   p.clusterID,
+			sourceIndex: p.sourceIndex,
+		})
 	}
 
 	for clusterID, updates := range clusterUpdates {
@@ -1008,10 +1018,10 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 		cluster.mutex.Lock()
 
 		for _, p := range updates {
-			idx.idToCluster.Store(p.entry.ID, clusterID)
-			cluster.Entries = append(cluster.Entries, p.entry)
-			if p.compressed != nil {
-				cluster.CompressedVectors[p.entry.ID] = p.compressed
+			cluster.Ordinals = append(cluster.Ordinals, p.ordinal)
+			if codeSize > 0 {
+				origIndex := p.sourceIndex
+				cluster.Codes = append(cluster.Codes, codes[origIndex*codeSize:(origIndex+1)*codeSize]...)
 			}
 		}
 
@@ -1049,14 +1059,15 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 		return nil, fmt.Errorf("Search: %w", util.ErrNotTrained)
 	}
 
-	// Adjust probe count if adaptive mode is enabled (touches searchStats).
-	idx.adjustProbeCount()
-
 	// Capture a local reference to clusters under the lock so that a
 	// concurrent Close (which takes Lock and nils idx.clusters) cannot
 	// cause a nil-pointer dereference after we release RLock.
 	clusters := idx.clusters
 	idx.mutex.RUnlock()
+
+	// Adaptive counters are advisory. Do not allow a caller inspecting stats
+	// to stall the retrieval path while holding its read lock.
+	idx.adjustProbeCount()
 
 	// Acquire a scratch arena for search-scoped allocations (same pool
 	// used by BatchInsert). Reset + return on exit.
@@ -1088,10 +1099,8 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 
 	for i, cand := range candidates {
 		results[i] = &SearchResult{
-			ID:       cand.entry.ID,
-			Score:    cand.distance,
-			Vector:   cand.entry.Vector,
-			Metadata: cand.entry.Metadata,
+			Ordinal: cand.ordinal,
+			Score:   cand.distance,
 		}
 	}
 
@@ -1118,11 +1127,9 @@ func (idx *Index) collectCandidates(ctx context.Context, query []float32, probeC
 	}
 
 	chunkSize := (len(probeClusters) + workers - 1) / workers
-	results, err := memory.ArenaSlice[[]candidate](arena, workers)
-	if err != nil {
-		return nil, fmt.Errorf("arena allocate results: %w", err)
-	}
-	results = results[:workers]
+	// []candidate contains a Go slice header and must not be placed in the
+	// unscanned arena. The candidate payloads themselves remain pointer-free.
+	results := make([][]candidate, workers)
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -1284,6 +1291,12 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 	}
 
 	count := 0
+	codeSize := 0
+	if idx.quantizer != nil && idx.quantizer.IsTrained() {
+		codeSize = idx.codeSize()
+	} else {
+		return nil, fmt.Errorf("quantizer is required for IVF-PQ search")
+	}
 
 	for i, clusterID := range probeClusters {
 		select {
@@ -1294,14 +1307,19 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 
 		cluster := clusters[clusterID]
 		cluster.mutex.RLock()
+		if len(cluster.Codes) != len(cluster.Ordinals)*codeSize {
+			cluster.mutex.RUnlock()
+			return nil, fmt.Errorf("cluster %d has %d code bytes for %d ordinals at width %d", cluster.ID, len(cluster.Codes), len(cluster.Ordinals), codeSize)
+		}
 		clusterDist := clusterDistances[i]
 
-		for _, entry := range cluster.Entries {
-			if filter != nil && !filter.Test(uint64(entry.Ordinal)) {
+		for j, ordinal := range cluster.Ordinals {
+			if filter != nil && !filter.Test(uint64(ordinal)) {
 				continue
 			}
 
-			distance, err := idx.distanceToEntry(query, cluster, entry, queryState)
+			compressed := cluster.Codes[j*codeSize : (j+1)*codeSize]
+			distance, err := idx.quantizer.DistanceToQuery(compressed, query, queryState)
 			if err != nil {
 				cluster.mutex.RUnlock()
 				return nil, err
@@ -1309,11 +1327,11 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 			_ = clusterDist
 
 			if count < k {
-				heapBuf[count] = ivfHeapElement{entry: entry, distance: distance}
+				heapBuf[count] = ivfHeapElement{ordinal: ordinal, distance: distance}
 				ivfUpHeap(heapBuf, count)
 				count++
 			} else if distance < heapBuf[0].distance {
-				heapBuf[0] = ivfHeapElement{entry: entry, distance: distance}
+				heapBuf[0] = ivfHeapElement{ordinal: ordinal, distance: distance}
 				ivfDownHeap(heapBuf, 0, count)
 			}
 		}
@@ -1334,35 +1352,13 @@ func (idx *Index) collectCandidatesSequential(ctx context.Context, query []float
 		ivfDownHeap(heapBuf, 0, count)
 
 		candidates[i] = candidate{
-			entry:       elem.entry,
+			ordinal:     elem.ordinal,
 			distance:    elem.distance,
 			clusterDist: 0,
 		}
 	}
 
 	return candidates, nil
-}
-
-func (idx *Index) distanceToEntry(query []float32, _ *Cluster, entry *VectorEntry, queryState any) (float32, error) {
-	if idx.quantizer != nil && idx.quantizer.IsTrained() {
-		compressed := entry.Compressed
-		if compressed == nil {
-			var err error
-			compressed, err = idx.quantizer.Compress(entry.Vector)
-			if err != nil {
-				return 0, fmt.Errorf("failed to compress vector: %w", err)
-			}
-			entry.Compressed = compressed
-		}
-
-		distance, err := idx.quantizer.DistanceToQuery(compressed, query, queryState)
-		if err != nil {
-			return 0, fmt.Errorf("failed to compute quantized distance: %w", err)
-		}
-		return distance, nil
-	}
-
-	return idx.distanceFunc(query, entry.Vector), nil
 }
 
 // findProbeClustersWithDistances finds probe clusters and returns their distances to query
@@ -1498,7 +1494,9 @@ func (idx *Index) adjustProbeCount() {
 		return
 	}
 
-	idx.searchStats.mutex.Lock()
+	if !idx.searchStats.mutex.TryLock() {
+		return
+	}
 	defer idx.searchStats.mutex.Unlock()
 
 	// Only adjust every 100 searches or after 30 seconds
@@ -1546,7 +1544,9 @@ func (idx *Index) recordSearchStats(latencyMs int64, accuracy float64) {
 		return
 	}
 
-	idx.searchStats.mutex.Lock()
+	if !idx.searchStats.mutex.TryLock() {
+		return
+	}
 	defer idx.searchStats.mutex.Unlock()
 
 	idx.searchStats.totalSearches++
@@ -1554,43 +1554,53 @@ func (idx *Index) recordSearchStats(latencyMs int64, accuracy float64) {
 	idx.searchStats.accuracySum += accuracy
 }
 
-// Delete removes a vector entry from the index
+// Delete is unsupported, use DeleteByOrdinal
 func (idx *Index) Delete(ctx context.Context, id string) error {
-	if id == "" {
-		return fmt.Errorf("id cannot be empty")
+	return fmt.Errorf("Delete(id) unsupported by IVF-PQ, use DeleteByOrdinal")
+}
+
+// DeleteByOrdinal removes a vector entry from the index by its ordinal
+func (idx *Index) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
+	idx.mutex.RLock()
+	clusters := idx.clusters
+	codeSize := 0
+	if idx.quantizer != nil && idx.quantizer.IsTrained() {
+		codeSize = idx.codeSize()
 	}
+	idx.mutex.RUnlock()
 
-	idx.mutex.Lock()
-
-	clusterIDVal, ok := idx.idToCluster.Load(id)
-	if !ok {
-		idx.mutex.Unlock()
-		return fmt.Errorf("entry with id %s: %w", id, util.ErrNotFound)
-	}
-	clusterID := clusterIDVal.(int)
-	idx.idToCluster.Delete(id)
-
-	// Capture cluster reference under the lock to prevent races with Close.
-	cluster := idx.clusters[clusterID]
-	idx.mutex.Unlock()
-	cluster.mutex.Lock()
-
-	for i, entry := range cluster.Entries {
-		if entry.ID == id {
-			cluster.Entries[i] = cluster.Entries[len(cluster.Entries)-1]
-			cluster.Entries = cluster.Entries[:len(cluster.Entries)-1]
-			delete(cluster.CompressedVectors, id)
+	// Search clusters for the ordinal
+	// This does a linear scan, but since deletes are usually handled via DeltaIndex
+	// or background compaction, this is acceptable for now.
+	for _, cluster := range clusters {
+		cluster.mutex.Lock()
+		if len(cluster.Codes) != len(cluster.Ordinals)*codeSize {
 			cluster.mutex.Unlock()
-
-			idx.mutex.Lock()
-			idx.size--
-			idx.mutex.Unlock()
-			return nil
+			return fmt.Errorf("cluster %d has %d code bytes for %d ordinals at width %d", cluster.ID, len(cluster.Codes), len(cluster.Ordinals), codeSize)
 		}
+		for i, o := range cluster.Ordinals {
+			if o == ordinal {
+				lastIdx := len(cluster.Ordinals) - 1
+				cluster.Ordinals[i] = cluster.Ordinals[lastIdx]
+				cluster.Ordinals = cluster.Ordinals[:lastIdx]
+
+				if codeSize > 0 {
+					copy(cluster.Codes[i*codeSize:(i+1)*codeSize], cluster.Codes[lastIdx*codeSize:(lastIdx+1)*codeSize])
+					cluster.Codes = cluster.Codes[:lastIdx*codeSize]
+				}
+
+				cluster.mutex.Unlock()
+
+				idx.mutex.Lock()
+				idx.size--
+				idx.mutex.Unlock()
+				return nil
+			}
+		}
+		cluster.mutex.Unlock()
 	}
 
-	cluster.mutex.Unlock()
-	return fmt.Errorf("entry with id %s in cluster %d: %w", id, clusterID, util.ErrNotFound)
+	return fmt.Errorf("entry with ordinal %d: %w", ordinal, util.ErrNotFound)
 }
 
 // Size returns the number of vectors in the index
@@ -1613,19 +1623,9 @@ func (idx *Index) MemoryUsage() int64 {
 	// Vector entries and compressed vectors
 	for _, cluster := range idx.clusters {
 		cluster.mutex.RLock()
-		for _, entry := range cluster.Entries {
-			// Vector data (original)
-			usage += int64(len(entry.Vector) * 4) // float32 = 4 bytes
-			// ID string (approximate)
-			usage += int64(len(entry.ID))
-			// Metadata (approximate)
-			usage += int64(len(entry.Metadata) * 50) // Rough estimate
-		}
 
-		// Compressed vectors storage
-		for _, compressed := range cluster.CompressedVectors {
-			usage += int64(len(compressed))
-		}
+		usage += int64(len(cluster.Ordinals) * 4) // uint32 = 4 bytes
+		usage += int64(len(cluster.Codes))        // byte = 1 byte
 
 		cluster.mutex.RUnlock()
 	}
@@ -1646,9 +1646,9 @@ func (idx *Index) Close() error {
 	// Clear all clusters
 	for _, cluster := range idx.clusters {
 		cluster.mutex.Lock()
-		cluster.Entries = nil
+		cluster.Ordinals = nil
 		cluster.Centroid = nil
-		cluster.CompressedVectors = nil
+		cluster.Codes = nil
 		cluster.mutex.Unlock()
 	}
 
@@ -1666,8 +1666,6 @@ func (idx *Index) Close() error {
 	}
 	idx.trained = false
 	idx.size = 0
-	idx.deserMeta = nil
-	idx.idToCluster = sync.Map{}
 
 	return nil
 }
@@ -1697,9 +1695,7 @@ func (idx *Index) GetPersistenceMetadata() *PersistenceMetadata {
 	}
 	for _, cluster := range idx.clusters {
 		cluster.mutex.RLock()
-		for _, compressed := range cluster.CompressedVectors {
-			meta.CompressedSize += int64(len(compressed))
-		}
+		meta.CompressedSize += int64(len(cluster.Codes))
 		cluster.mutex.RUnlock()
 	}
 	return meta

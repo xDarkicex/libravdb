@@ -36,6 +36,8 @@ type Collection struct {
 	mutationState          atomic.Pointer[mutationStateTable]
 	asyncMutation          sync.RWMutex
 	mu                     sync.RWMutex
+	transactionMu          *sync.RWMutex // physical-shard lock for transaction views
+	transactionShard       *shard        // index publication target for transaction views
 	closed                 bool
 	optimizationInProgress bool
 	graph                  Graph
@@ -788,9 +790,13 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 
 	// Non-sharded path: use single storage and index
 	if c.shards == nil {
+		// Keep the collection read lock until the mutation guard has released
+		// its off-heap slot. Close takes c.mu exclusively before freeing that
+		// arena, so defer registration order is a lifetime invariant here:
+		// mutation.unlock must run before c.mu.RUnlock.
+		defer c.mu.RUnlock()
 		mutation := c.lockMutationID(id)
 		defer mutation.unlock()
-		defer c.mu.RUnlock()
 
 		if exists, err := c.storage.Exists(ctx, id); err != nil {
 			return fmt.Errorf("failed to check existing vector: %w", err)
@@ -987,9 +993,10 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 		defer c.mu.RUnlock()
 		return c.insertBatchSharded(ctx, entries, shards)
 	}
-	c.mu.RUnlock()
-
-	// Non-sharded path (fallback - should not reach here for supported indexes)
+	// Non-sharded path (fallback - should not reach here for supported indexes).
+	// Retain c.mu.RLock until the mutation guard is released: Close must not
+	// free the off-heap mutation table while this batch owns slots in it.
+	defer c.mu.RUnlock()
 	mutation := c.lockMutationEntries(entries)
 	defer mutation.unlock()
 	// Check existence against persisted storage
@@ -1185,9 +1192,11 @@ func (c *Collection) Update(ctx context.Context, id string, vector []float32, me
 
 	// Non-sharded path
 	if c.shards == nil {
+		// The guard releases before the collection read lock (LIFO defers),
+		// preventing Close from freeing its off-heap table early.
+		defer c.mu.RUnlock()
 		mutation := c.lockMutationID(id)
 		defer mutation.unlock()
-		defer c.mu.RUnlock()
 		return c.updateNonSharded(ctx, id, vector, metadata)
 	}
 
@@ -1279,9 +1288,10 @@ func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, me
 	}
 
 	if c.shards == nil {
+		// Keep the collection alive through mutation-slot release.
+		defer c.mu.RUnlock()
 		mutation := c.lockMutationID(id)
 		defer mutation.unlock()
-		defer c.mu.RUnlock()
 		return c.upsertNonSharded(ctx, id, vector, metadata)
 	}
 
@@ -1512,9 +1522,10 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 
 	// Non-sharded path
 	if c.shards == nil {
+		// Keep the collection alive through mutation-slot release.
+		defer c.mu.RUnlock()
 		mutation := c.lockMutationID(id)
 		defer mutation.unlock()
-		defer c.mu.RUnlock()
 
 		entry, err := c.storage.Get(ctx, id)
 		var hasEntry bool
@@ -1578,8 +1589,9 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		return nil
 	}
 
-	// Sharded path: route to the correct shard for this ID
-	c.mu.RUnlock()
+	// Sharded path: keep the collection read lock until the mutation guard is
+	// released. The guard owns an off-heap mutation table that Close destroys.
+	defer c.mu.RUnlock()
 	mutation := c.lockMutationID(id)
 	defer mutation.unlock()
 
@@ -1903,8 +1915,13 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 
 	// Search all shards in parallel and collect results
 	type shardResult struct {
-		err     error
-		results []*index.SearchResult
+		err      error
+		results  []*index.SearchResult
+		shardIdx int // -1 for an unsharded collection
+	}
+	type indexedResult struct {
+		result   *index.SearchResult
+		shardIdx int
 	}
 
 	var resultsCh chan shardResult
@@ -1920,7 +1937,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 				// Each shard only needs its local top-k; the parent merges all shard results.
 				shardK := k
 				results, err := shardIndexes[shardIdx].Search(ctx, indexVector, shardK, indexFilter)
-				resultsCh <- shardResult{results: results, err: err}
+				resultsCh <- shardResult{results: results, err: err, shardIdx: shardIdx}
 			}(i)
 		}
 	} else {
@@ -1930,7 +1947,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 		go func() {
 			defer wg.Done()
 			results, err := idx.Search(ctx, indexVector, k, indexFilter)
-			resultsCh <- shardResult{results: results, err: err}
+			resultsCh <- shardResult{results: results, err: err, shardIdx: -1}
 		}()
 	}
 
@@ -1940,7 +1957,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 	}()
 
 	// Collect all shard results
-	var allResults []*index.SearchResult
+	var allResults []indexedResult
 	for sr := range resultsCh {
 		if sr.err != nil {
 			// Handle empty index gracefully - just means no results from this shard
@@ -1952,14 +1969,22 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 			}
 			return nil, fmt.Errorf("shard search failed: %w", sr.err)
 		}
-		allResults = append(allResults, sr.results...)
+		for _, result := range sr.results {
+			allResults = append(allResults, indexedResult{result: result, shardIdx: sr.shardIdx})
+		}
 	}
 
 	// Convert and merge results.
 	// For sharded collections, parallelize the storage hydration step so the
 	// merge phase does not become a sequential bottleneck.
 	publicResults := make([]*SearchResult, len(allResults))
-	hydrateResult := func(i int, r *index.SearchResult) {
+	distanceFunc, err := util.GetDistanceFunc(util.DistanceMetric(c.config.Metric))
+	if err != nil {
+		return nil, fmt.Errorf("resolve collection distance metric: %w", err)
+	}
+	hydrateResult := func(i int, indexed indexedResult) {
+		r := indexed.result
+		ordinalOnly := r.ID == ""
 		result := &SearchResult{
 			ID:      r.ID,
 			Score:   r.Score,
@@ -1974,13 +1999,25 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 
 		// Get full record from storage if needed.
 		if result.Vector == nil || result.Metadata == nil || result.Version == 0 {
-			shardIdx := shardForID(r.ID)
 			var entry *index.VectorEntry
 			var getErr error
 			if c.shards != nil {
-				entry, getErr = c.shards[shardIdx].storage.Get(ctx, r.ID)
+				shardStorage := c.shards[indexed.shardIdx].storage
+				id := r.ID
+				if id == "" {
+					id, getErr = shardStorage.GetIDByOrdinal(ctx, r.Ordinal)
+				}
+				if getErr == nil {
+					entry, getErr = shardStorage.Get(ctx, id)
+				}
 			} else {
-				entry, getErr = c.storage.Get(ctx, r.ID)
+				id := r.ID
+				if id == "" {
+					id, getErr = c.storage.GetIDByOrdinal(ctx, r.Ordinal)
+				}
+				if getErr == nil {
+					entry, getErr = c.storage.Get(ctx, id)
+				}
 			}
 			if getErr == nil {
 				result.ID = entry.ID
@@ -1994,6 +2031,12 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 			} else if result.Metadata == nil {
 				result.Metadata = map[string]interface{}{}
 			}
+		}
+		// IVF-PQ retains only ordinal and PQ-code state. Once its candidate has
+		// been hydrated from authoritative storage, compute the exact score used
+		// by the public search contract rather than exposing a quantized distance.
+		if ordinalOnly && len(result.Vector) > 0 {
+			result.Score = distanceFunc(indexVector, vectorForIndex(c.config.Metric, result.Vector))
 		}
 		publicResults[i] = result
 	}
@@ -2009,20 +2052,20 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 
 		var hydrateWG sync.WaitGroup
 		sem := make(chan struct{}, workerCount)
-		for i, r := range allResults {
-			i, r := i, r
+		for i, result := range allResults {
+			i, result := i, result
 			hydrateWG.Add(1)
 			go func() {
 				defer hydrateWG.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				hydrateResult(i, r)
+				hydrateResult(i, result)
 			}()
 		}
 		hydrateWG.Wait()
 	} else {
-		for i, r := range allResults {
-			hydrateResult(i, r)
+		for i, result := range allResults {
+			hydrateResult(i, result)
 		}
 	}
 
@@ -2958,4 +3001,22 @@ func (config *CollectionConfig) validate() error {
 	}
 
 	return nil
+}
+
+// LookupNodeID looks up a record ID within this collection and returns its underlying
+// system-scoped GraphNodeID. Returns an error if the record is not found.
+func (c *Collection) LookupNodeID(ctx context.Context, id string) (uint64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return 0, ErrCollectionClosed
+	}
+	// For sharded collections, route to the correct shard.
+	if len(c.shards) > 0 {
+		si := shardForID(id)
+		sname := shardName(c.name, si)
+		return c.db.storage.GetNodeID(ctx, sname, id)
+	}
+	return c.db.storage.GetNodeID(ctx, c.name, id)
 }

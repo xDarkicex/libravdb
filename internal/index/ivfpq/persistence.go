@@ -19,26 +19,6 @@ const (
 
 var ivfpqMagicBytes = []byte("LIBRAIVF")
 
-// ivfpqClusterMeta stores per-cluster entry metadata deserialized from the
-// inverted lists section. Each entry records its ordinal and compressed PQ codes.
-type ivfpqClusterMeta struct {
-	entries []ivfpqEntryMeta
-}
-
-// ivfpqEntryMeta pairs an ordinal with its compressed PQ representation.
-type ivfpqEntryMeta struct {
-	compressed []byte
-	ordinal    uint32
-}
-
-// deserializedMeta stores per-cluster entry metadata between DeserializeFromBytes
-// and PopulateEntriesFromStorage. Cluster membership is authoritative — it was
-// captured during serialize, so PopulateEntriesFromStorage can place entries
-// directly by ordinal without recomputing centroid distances.
-type deserializedMeta struct {
-	clusters []ivfpqClusterMeta
-}
-
 // SerializeToBytes serializes all trained IVF-PQ artifacts to a byte slice.
 // Returns (nil, nil) if the index is not trained.
 func (idx *Index) SerializeToBytes() ([]byte, error) {
@@ -113,13 +93,26 @@ func (idx *Index) SerializeToBytes() ([]byte, error) {
 
 	// ---- Inverted lists: (ordinal, compressed) per cluster ----
 	w.u32(uint32(len(idx.clusters)))
+
+	codeSize := 0
+	if idx.quantizer != nil && idx.quantizer.IsTrained() {
+		codeSize = idx.codeSize()
+	}
+
 	for _, cluster := range idx.clusters {
 		cluster.mutex.RLock()
+		if len(cluster.Codes) != len(cluster.Ordinals)*codeSize {
+			cluster.mutex.RUnlock()
+			return nil, fmt.Errorf("cluster %d has %d code bytes for %d ordinals at width %d", cluster.ID, len(cluster.Codes), len(cluster.Ordinals), codeSize)
+		}
 		w.u32(uint32(cluster.ID))
-		w.u32(uint32(len(cluster.Entries)))
-		for _, entry := range cluster.Entries {
-			compressed := cluster.CompressedVectors[entry.ID]
-			w.u32(entry.Ordinal)
+		w.u32(uint32(len(cluster.Ordinals)))
+		for i, ordinal := range cluster.Ordinals {
+			w.u32(ordinal)
+			var compressed []byte
+			if codeSize > 0 {
+				compressed = cluster.Codes[i*codeSize : (i+1)*codeSize]
+			}
 			w.u32(uint32(len(compressed)))
 			if len(compressed) > 0 {
 				w.raw(compressed)
@@ -135,18 +128,11 @@ func (idx *Index) SerializeToBytes() ([]byte, error) {
 	return w.buf, nil
 }
 
-// DeserializeFromBytes restores trained IVF-PQ centroids and codebooks from
-// serialized bytes without retraining. Cluster entries and compressed vectors
-// are stored in idx.deserMeta for later population via PopulateEntriesFromStorage.
+// DeserializeFromBytes restores trained IVF-PQ centroids, codebooks, ordinals,
+// and compressed codes without retaining caller-owned document records.
 func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	idx.mutex.Lock()
 	defer idx.mutex.Unlock()
-
-	// Clear previous idToCluster map — rebuilt by PopulateEntriesFromStorage.
-	idx.idToCluster.Range(func(key, _ any) bool {
-		idx.idToCluster.Delete(key)
-		return true
-	})
 
 	if len(data) < 20 {
 		return fmt.Errorf("IVF-PQ data too short: %d bytes", len(data))
@@ -364,9 +350,7 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	if nClusters2 != nClusters {
 		return fmt.Errorf("inverted list cluster count mismatch: %d vs %d", nClusters2, nClusters)
 	}
-	meta := &deserializedMeta{
-		clusters: make([]ivfpqClusterMeta, nClusters),
-	}
+
 	for i := 0; i < nClusters; i++ {
 		clusterIDV, err := r.u32()
 		if err != nil {
@@ -378,7 +362,17 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 			return err
 		}
 		entryCount := int(entryCountV)
-		meta.clusters[i].entries = make([]ivfpqEntryMeta, 0, entryCount)
+
+		cluster := idx.clusters[i]
+		cluster.Ordinals = make([]uint32, 0, entryCount)
+
+		// If quantization is used, preallocate codes slice
+		codeSize := 0
+		if idx.quantizer != nil && idx.quantizer.IsTrained() {
+			codeSize = idx.codeSize()
+			cluster.Codes = make([]byte, 0, entryCount*codeSize)
+		}
+
 		for e := 0; e < entryCount; e++ {
 			if e%1024 == 0 {
 				select {
@@ -398,22 +392,25 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 				return err
 			}
 			compressedLen := int(compressedLenV)
-			var compressed []byte
+			if codeSize > 0 && compressedLen != codeSize {
+				return fmt.Errorf("cluster %d entry %d compressed code size = %d, want %d", cluster.ID, e, compressedLen, codeSize)
+			}
+			if codeSize == 0 && compressedLen != 0 {
+				return fmt.Errorf("cluster %d entry %d has compressed code without a trained quantizer", cluster.ID, e)
+			}
+
+			cluster.Ordinals = append(cluster.Ordinals, ordinal)
+			idx.size++
+
 			if compressedLen > 0 {
-				compressed = make([]byte, compressedLen)
 				raw, err := r.raw(compressedLen)
 				if err != nil {
 					return err
 				}
-				copy(compressed, raw)
+				cluster.Codes = append(cluster.Codes, raw...)
 			}
-			meta.clusters[i].entries = append(meta.clusters[i].entries, ivfpqEntryMeta{
-				ordinal:    ordinal,
-				compressed: compressed,
-			})
 		}
 	}
-	idx.deserMeta = meta
 
 	// ---- Footer (CRC32 already validated at entry) ----
 	if _, err := r.u32(); err != nil { // checksum already validated
@@ -422,101 +419,6 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 
 	idx.trained = true
 	return nil
-}
-
-// HasDeserializedMeta reports whether deserialized entry metadata is pending
-// population. Used by the collection layer to decide whether to call
-// PopulateEntriesFromStorage or rebuild from scratch.
-func (idx *Index) HasDeserializedMeta() bool {
-	idx.mutex.RLock()
-	defer idx.mutex.RUnlock()
-	return idx.deserMeta != nil
-}
-
-// PopulateEntriesFromStorage wires storage records into the already-deserialized
-// index using authoritative cluster membership from the persisted inverted lists.
-// No centroid-distance recomputation is performed — each entry is placed directly
-// into its stored cluster by ordinal.
-func (idx *Index) PopulateEntriesFromStorage(provider EntryProvider) error {
-	idx.mutex.Lock()
-	defer idx.mutex.Unlock()
-
-	if !idx.trained {
-		return fmt.Errorf("index not trained; call DeserializeFromBytes first")
-	}
-	if idx.deserMeta == nil {
-		// Index was fully rebuilt from records (not deserialized from a
-		// checkpoint). Entries are already present; nothing to populate.
-		return nil
-	}
-
-	// Compute total entry count from persisted metadata for pre-sizing.
-	totalEntries := 0
-	for cid := range idx.deserMeta.clusters {
-		if cid >= len(idx.clusters) {
-			break
-		}
-		totalEntries += len(idx.deserMeta.clusters[cid].entries)
-	}
-
-	// Build ordinal → entry map from storage in a single pass.
-	// Map is pre-sized to avoid rehash cascades during insertion.
-	ordinalToEntry := make(map[uint32]*VectorEntry, totalEntries)
-	err := provider.IterateEntries(func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error {
-		ordinalToEntry[ordinal] = &VectorEntry{
-			ID:       id,
-			Ordinal:  ordinal,
-			Vector:   vector,
-			Metadata: metadata,
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("iterate storage: %w", err)
-	}
-
-	// Place entries directly by ordinal using stored cluster membership.
-	// Slices and maps are pre-sized to avoid incremental growth allocations.
-	for cid := range idx.deserMeta.clusters {
-		if cid >= len(idx.clusters) {
-			break
-		}
-		cluster := idx.clusters[cid]
-		clusterMeta := idx.deserMeta.clusters[cid]
-		n := len(clusterMeta.entries)
-		if n == 0 {
-			continue
-		}
-		cluster.mutex.Lock()
-		if cap(cluster.Entries) < n {
-			cluster.Entries = make([]*VectorEntry, 0, n)
-		}
-		if cluster.CompressedVectors == nil {
-			cluster.CompressedVectors = make(map[string][]byte, n)
-		}
-		for _, em := range clusterMeta.entries {
-			entry, ok := ordinalToEntry[em.ordinal]
-			if !ok {
-				continue
-			}
-			cluster.Entries = append(cluster.Entries, entry)
-			idx.idToCluster.Store(entry.ID, cid)
-			if len(em.compressed) > 0 {
-				cluster.CompressedVectors[entry.ID] = em.compressed
-				entry.Compressed = em.compressed
-			}
-			idx.size++
-		}
-		cluster.mutex.Unlock()
-	}
-
-	idx.deserMeta = nil // consumed
-	return nil
-}
-
-// EntryProvider abstracts storage iteration for entry reconstruction.
-type EntryProvider interface {
-	IterateEntries(fn func(id string, ordinal uint32, vector []float32, metadata map[string]interface{}) error) error
 }
 
 // ---------------------------------------------------------------------------
