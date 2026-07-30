@@ -162,11 +162,17 @@ type persistedState struct {
 }
 
 type persistedCollection struct {
-	Records             map[string]*recordValue `json:"records"`
-	vectorSFL           *memory.ShardedFreeList
+	Records map[string]*recordValue `json:"records"`
+	// vectorSFLs is an append-only chain of bounded fixed-capacity allocators.
+	// ShardedFreeList intentionally precomputes capacity-proportional metadata;
+	// a single database-sized instance therefore should not be used as a
+	// collection's speculative maximum. A full segment stays live for its
+	// existing vector slots while later slots move to the next segment.
+	vectorSFLs          []*memory.ShardedFreeList
 	Config              storage.CollectionConfig `json:"config"`
 	ordinalToID         []string
 	vectorSlots         [][]byte
+	vectorSlotSegments  []uint32
 	ID                  uint64 `json:"id"`
 	CreatedLSN          uint64 `json:"created_lsn"`
 	UpdatedLSN          uint64 `json:"updated_lsn"`
@@ -1643,11 +1649,7 @@ func (e *Engine) applyDeleteCollection(name string, lsn uint64) {
 		delete(e.collectionsByID, collection.ID)
 		// Free all off-heap vector slots. Individual deallocation is
 		// unnecessary: Free() releases all mmap'd slabs at once.
-		if collection.vectorSFL != nil {
-			collection.vectorSFL.Free()
-			collection.vectorSFL = nil
-			collection.vectorSlots = nil
-		}
+		collection.freeVectorSFLs()
 	}
 }
 
@@ -1665,32 +1667,69 @@ func (e *Engine) applyRecordPutOwned(payload recordPutPayload, lsn uint64, adopt
 // up to the nearest 8-byte boundary: 48.
 const sflMetadataOverhead = 48
 
-// initVectorSFL lazily initializes the ShardedFreeList for off-heap vector storage.
-func (c *persistedCollection) initVectorSFL() error {
-	if c.vectorSFL != nil {
-		return nil
-	}
-	// Slot must hold the vector data plus the SFL internal metadata prefix.
-	slotSize := uint64(sflMetadataOverhead + c.Config.Dimension*4)
-	slotSize = (slotSize + 7) &^ 7              // 8-byte alignment
-	poolSize := uint64(64 * 1024 * 1024 * 1024) // 64GB default
-	if c.Config.RawStoreCap > 0 {
-		if required := uint64(c.Config.RawStoreCap) * slotSize; required > poolSize {
-			poolSize = (required + 2*1024*1024 - 1) &^ (2*1024*1024 - 1)
-		}
-	}
+const (
+	vectorSFLSegmentSlabSize           = uint64(2 * 1024 * 1024)
+	vectorSFLSegmentMaxBytes           = uint64(8 * 1024 * 1024 * 1024)
+	vectorSFLSegmentMaxGenerationBytes = uint64(32 * 1024 * 1024)
+	vectorSFLGenerationBytesPerSlot    = uint64(8)
+)
 
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+// vectorSegmentPoolSize bounds one fixed-capacity SFL segment by both payload
+// bytes and its capacity-proportional generation table. Collection growth is
+// represented by another segment, preserving ShardedFreeList's fixed-pool
+// semantics and all of its lock-free/Hyaline invariants.
+func (c *persistedCollection) vectorSegmentPoolSize(slotSize uint64) (uint64, error) {
+	if slotSize == 0 || slotSize > vectorSFLSegmentSlabSize {
+		return 0, fmt.Errorf("vector slot size %d is outside segment slab size %d", slotSize, vectorSFLSegmentSlabSize)
+	}
+	slotsPerSlab := vectorSFLSegmentSlabSize / slotSize
+	if slotsPerSlab == 0 {
+		return 0, fmt.Errorf("vector slot size %d leaves no slots per slab", slotSize)
+	}
+	targetSlots := vectorSFLSegmentMaxGenerationBytes / vectorSFLGenerationBytesPerSlot
+	if byBytes := vectorSFLSegmentMaxBytes / slotSize; byBytes < targetSlots {
+		targetSlots = byBytes
+	}
+	if c.Config.RawStoreCap > 0 && uint64(c.Config.RawStoreCap) < targetSlots {
+		targetSlots = uint64(c.Config.RawStoreCap)
+	}
+	if targetSlots == 0 {
+		targetSlots = 1
+	}
+	slabCount := (targetSlots + slotsPerSlab - 1) / slotsPerSlab
+	if maxSlabs := vectorSFLSegmentMaxBytes / vectorSFLSegmentSlabSize; slabCount > maxSlabs {
+		slabCount = maxSlabs
+	}
+	return slabCount * vectorSFLSegmentSlabSize, nil
+}
+
+func (c *persistedCollection) newVectorSFLSegment() (*memory.ShardedFreeList, error) {
+	slotSize := uint64(sflMetadataOverhead + c.Config.Dimension*4)
+	slotSize = (slotSize + 7) &^ 7 // 8-byte alignment
+	poolSize, err := c.vectorSegmentPoolSize(slotSize)
+	if err != nil {
+		return nil, err
+	}
+	return memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  poolSize,
 		SlotSize:  slotSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 16,
+		SlabSize:  vectorSFLSegmentSlabSize,
+		SlabCount: 1,
 	}, 64, 8)
+}
+
+// initVectorSFL lazily initializes the ShardedFreeList for off-heap vector storage.
+func (c *persistedCollection) initVectorSFL() error {
+	if len(c.vectorSFLs) != 0 {
+		return nil
+	}
+	sfl, err := c.newVectorSFLSegment()
 	if err != nil {
 		return fmt.Errorf("init vector SFL: %w", err)
 	}
-	c.vectorSFL = sfl
+	c.vectorSFLs = []*memory.ShardedFreeList{sfl}
 	c.vectorSlots = make([][]byte, nextOrdinalCapacity(0, 16))
+	c.vectorSlotSegments = make([]uint32, len(c.vectorSlots))
 	return nil
 }
 
@@ -1708,13 +1747,45 @@ func (c *persistedCollection) storeVectorOffHeap(ordinal uint32, vector []float3
 		grown := make([][]byte, nextOrdinalCapacity(len(c.vectorSlots), int(ordinal)+1))
 		copy(grown, c.vectorSlots)
 		c.vectorSlots = grown
+		segments := make([]uint32, len(grown))
+		copy(segments, c.vectorSlotSegments)
+		c.vectorSlotSegments = segments
 	}
 	// Free previous slot if replacing.
 	if existing := c.vectorSlots[ordinal]; existing != nil {
-		c.vectorSFL.Deallocate(existing)
+		segment := c.vectorSlotSegments[ordinal]
+		if int(segment) >= len(c.vectorSFLs) {
+			return nil, fmt.Errorf("vector slot %d references missing segment %d", ordinal, segment)
+		}
+		if err := c.vectorSFLs[segment].Deallocate(existing); err != nil {
+			return nil, fmt.Errorf("free replaced vector slot: %w", err)
+		}
 		c.vectorSlots[ordinal] = nil
 	}
-	slot, err := c.vectorSFL.Allocate()
+	segment := -1
+	var slot []byte
+	var err error
+	// Prefer the newest segment for locality, but reuse free slots in older
+	// segments before growing the chain after updates or deletes.
+	for i := len(c.vectorSFLs) - 1; i >= 0; i-- {
+		slot, err = c.vectorSFLs[i].Allocate()
+		if err == nil {
+			segment = i
+			break
+		}
+		if err != memory.ErrFreelistExhausted {
+			return nil, fmt.Errorf("allocate vector slot: %w", err)
+		}
+	}
+	if segment < 0 {
+		next, newErr := c.newVectorSFLSegment()
+		if newErr != nil {
+			return nil, fmt.Errorf("grow vector SFL segment: %w", newErr)
+		}
+		c.vectorSFLs = append(c.vectorSFLs, next)
+		segment = len(c.vectorSFLs) - 1
+		slot, err = next.Allocate()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("allocate vector slot: %w", err)
 	}
@@ -1722,18 +1793,34 @@ func (c *persistedCollection) storeVectorOffHeap(ordinal uint32, vector []float3
 	data := slot[sflMetadataOverhead:]
 	copy(data, unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4))
 	c.vectorSlots[ordinal] = slot
+	c.vectorSlotSegments[ordinal] = uint32(segment)
 	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), c.Config.Dimension), nil
 }
 
 // freeVectorSlot returns a vector's off-heap slot to the SFL.
 func (c *persistedCollection) freeVectorSlot(ordinal uint32) {
-	if c.vectorSFL == nil || int(ordinal) >= len(c.vectorSlots) {
+	if int(ordinal) >= len(c.vectorSlots) || int(ordinal) >= len(c.vectorSlotSegments) {
 		return
 	}
 	if slot := c.vectorSlots[ordinal]; slot != nil {
-		c.vectorSFL.Deallocate(slot)
+		segment := c.vectorSlotSegments[ordinal]
+		if int(segment) >= len(c.vectorSFLs) {
+			return
+		}
+		_ = c.vectorSFLs[segment].Deallocate(slot)
 		c.vectorSlots[ordinal] = nil
 	}
+}
+
+func (c *persistedCollection) freeVectorSFLs() {
+	for _, sfl := range c.vectorSFLs {
+		if sfl != nil {
+			_ = sfl.Free()
+		}
+	}
+	c.vectorSFLs = nil
+	c.vectorSlots = nil
+	c.vectorSlotSegments = nil
 }
 
 func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32, graphNodeID uint64, vector []float32, metadata map[string]interface{}, lsn uint64, adopt bool) error {
@@ -4157,11 +4244,7 @@ func (e *Engine) Close() error {
 	// Free all off-heap vector storage. Individual slot deallocation is
 	// unnecessary: Free() releases all mmap'd slabs at once.
 	for _, collection := range e.state.Collections {
-		if collection.vectorSFL != nil {
-			collection.vectorSFL.Free()
-			collection.vectorSFL = nil
-			collection.vectorSlots = nil
-		}
+		collection.freeVectorSFLs()
 	}
 	if e.walWriteArena != nil {
 		if err := e.walWriteArena.Free(); err != nil {

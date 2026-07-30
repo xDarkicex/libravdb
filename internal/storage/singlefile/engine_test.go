@@ -329,10 +329,7 @@ func TestRecoveryRebuildsIndexTouchedAfterCheckpoint(t *testing.T) {
 		engine.walWriteArena = nil
 	}
 	for _, persisted := range engine.state.Collections {
-		if persisted.vectorSFL != nil {
-			persisted.vectorSFL.Free()
-			persisted.vectorSFL = nil
-		}
+		persisted.freeVectorSFLs()
 	}
 	if err := engine.file.Close(); err != nil {
 		t.Fatalf("crash close: %v", err)
@@ -2720,5 +2717,90 @@ func TestEngine_Drop(t *testing.T) {
 	// Verify ops fail
 	if err := coll.Insert(context.Background(), &index.VectorEntry{ID: "test"}); err == nil {
 		t.Fatalf("Expected Insert to fail on dropped engine")
+	}
+}
+
+func TestPersistedCollectionVectorSFLSegmentsGrowAndReuse(t *testing.T) {
+	// One vector exactly fills one 2 MiB slab. RawStoreCap=1 therefore makes
+	// each segment one slab, allowing this test to exercise segment growth
+	// without changing the production segment policy.
+	dimension := int((vectorSFLSegmentSlabSize - sflMetadataOverhead) / 4)
+	collection := &persistedCollection{Config: storage.CollectionConfig{
+		Dimension:   dimension,
+		RawStoreCap: 1,
+	}}
+	defer collection.freeVectorSFLs()
+
+	for ordinal := uint32(0); ordinal < 3; ordinal++ {
+		vector := make([]float32, dimension)
+		vector[0] = float32(ordinal + 1)
+		owned, err := collection.storeVectorOffHeap(ordinal, vector)
+		if err != nil {
+			t.Fatalf("store vector %d: %v", ordinal, err)
+		}
+		if owned[0] != vector[0] {
+			t.Fatalf("stored vector %d lost payload: got %v want %v", ordinal, owned[0], vector[0])
+		}
+	}
+	if got := len(collection.vectorSFLs); got != 3 {
+		t.Fatalf("segment count=%d, want 3", got)
+	}
+	for ordinal, want := range []uint32{0, 1, 2} {
+		if got := collection.vectorSlotSegments[ordinal]; got != want {
+			t.Fatalf("slot %d segment=%d, want %d", ordinal, got, want)
+		}
+	}
+
+	// A released slot in an older segment must be reused before another
+	// segment is allocated; otherwise replacement-heavy collections strand
+	// capacity permanently.
+	collection.freeVectorSlot(1)
+	replacement := make([]float32, dimension)
+	replacement[0] = 99
+	owned, err := collection.storeVectorOffHeap(1, replacement)
+	if err != nil {
+		t.Fatalf("replace vector: %v", err)
+	}
+	if got := len(collection.vectorSFLs); got != 3 {
+		t.Fatalf("replacement allocated unnecessary segment: got %d want 3", got)
+	}
+	if got := collection.vectorSlotSegments[1]; got != 1 {
+		t.Fatalf("replacement segment=%d, want reused segment 1", got)
+	}
+	if owned[0] != 99 {
+		t.Fatalf("replacement payload=%v, want 99", owned[0])
+	}
+}
+
+func TestPersistedCollectionVectorSegmentSizingIsBounded(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		dimension int
+		rawCap    int
+	}{
+		{name: "small-vector", dimension: 1},
+		{name: "embedding", dimension: 768},
+		{name: "small-configured-cap", dimension: 1, rawCap: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			collection := &persistedCollection{Config: storage.CollectionConfig{
+				Dimension:   test.dimension,
+				RawStoreCap: test.rawCap,
+			}}
+			slotSize := uint64(sflMetadataOverhead + test.dimension*4)
+			slotSize = (slotSize + 7) &^ 7
+			poolSize, err := collection.vectorSegmentPoolSize(slotSize)
+			if err != nil {
+				t.Fatalf("segment pool size: %v", err)
+			}
+			if poolSize == 0 || poolSize > vectorSFLSegmentMaxBytes {
+				t.Fatalf("segment pool size=%d outside (0,%d]", poolSize, vectorSFLSegmentMaxBytes)
+			}
+			slotsPerSlab := vectorSFLSegmentSlabSize / slotSize
+			generationBytes := (poolSize / vectorSFLSegmentSlabSize) * slotsPerSlab * vectorSFLGenerationBytesPerSlot
+			if generationBytes > vectorSFLSegmentMaxGenerationBytes+slotsPerSlab*vectorSFLGenerationBytesPerSlot {
+				t.Fatalf("generation metadata=%d exceeds bounded segment budget", generationBytes)
+			}
+		})
 	}
 }
