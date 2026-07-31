@@ -139,6 +139,29 @@ type Quantizer interface {
 	// Returns a state object that should be passed to DistanceToQuery.
 	PrepareQuery(query []float32) any
 
+	// CodeSize returns the byte length of a single compressed vector for
+	// the current trained configuration. Returns 0 if the quantizer has
+	// no compressed form (e.g. not trained or no quantization). This is
+	// the canonical width every index layer must use to size retained
+	// storage; callers MUST NOT recompute it from config fields.
+	CodeSize() int
+
+	// Dimension returns the vector dimension the quantizer was trained
+	// for, or 0 if not trained. Used by persistence to validate that the
+	// embedded quantizer agrees with the outer index config.
+	Dimension() int
+
+	// SerializeState returns a portable byte payload describing the
+	// trained quantizer state. The bytes are self-describing and may be
+	// passed to DeserializeState to restore an identical trained state.
+	// Returns an error if the quantizer is not trained.
+	SerializeState() ([]byte, error)
+
+	// DeserializeState restores a previously-SerializeState'd quantizer
+	// into a trained state. After this call, IsTrained returns true and
+	// the quantizer is ready for Compress / Distance / etc.
+	DeserializeState(data []byte) error
+
 	// CompressionRatio returns the compression ratio achieved
 	CompressionRatio() float32
 

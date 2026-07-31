@@ -276,15 +276,11 @@ func TestQuantizationEffectiveness(t *testing.T) {
 	vectors := generateLargeTestDataset(datasetSize, dimension, 42)
 	queries := generateLargeTestDataset(50, dimension, 123)
 
-	// Test different quantization configurations
+	// Test different quantization configurations.
 	quantConfigs := []struct {
 		config *quant.QuantizationConfig
 		name   string
 	}{
-		{
-			name:   "No_Quantization",
-			config: nil,
-		},
 		{
 			name: "PQ_4bit",
 			config: &quant.QuantizationConfig{

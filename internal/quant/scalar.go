@@ -1,6 +1,7 @@
 package quant
 
 import (
+	"encoding/binary"
 	"context"
 	"fmt"
 	"math"
@@ -250,6 +251,176 @@ func (sq *ScalarQuantizer) Distance(compressed1, compressed2 []byte) (float32, e
 // PrepareQuery is a no-op for ScalarQuantizer — no query-dependent cache to warm.
 func (sq *ScalarQuantizer) PrepareQuery(query []float32) any {
 	return nil
+}
+
+// CodeSize returns the byte length of a single compressed vector for
+// scalar quantization: ceil(dimension * bits / 8). Returns 0 if the
+// quantizer has not been trained yet.
+func (sq *ScalarQuantizer) CodeSize() int {
+	sq.mu.RLock()
+	defer sq.mu.RUnlock()
+	if !sq.trained || sq.config == nil {
+		return 0
+	}
+	return (sq.dimension*sq.config.Bits + 7) / 8
+}
+
+func (sq *ScalarQuantizer) Dimension() int {
+	sq.mu.RLock()
+	defer sq.mu.RUnlock()
+	if !sq.trained {
+		return 0
+	}
+	return sq.dimension
+}
+
+func (sq *ScalarQuantizer) SerializeState() ([]byte, error) {
+	sq.mu.RLock()
+	defer sq.mu.RUnlock()
+	if !sq.trained {
+		return nil, fmt.Errorf("ScalarQuantizer not trained")
+	}
+	buf := make([]byte, 0, 64+sq.dimension*16)
+	w := &sqStateWriter{buf: buf}
+	w.u32(uint32(sq.dimension))
+	w.u32(uint32(sq.config.Bits))
+	w.f64(sq.config.TrainRatio)
+	for _, v := range sq.minValues {
+		w.f32(v)
+	}
+	for _, v := range sq.maxValues {
+		w.f32(v)
+	}
+	for _, v := range sq.scales {
+		w.f32(v)
+	}
+	for _, v := range sq.offsets {
+		w.f32(v)
+	}
+	return w.buf, nil
+}
+
+func (sq *ScalarQuantizer) DeserializeState(data []byte) error {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+	if len(data) < 16 {
+		return fmt.Errorf("SQ DeserializeState: too short (%d < 16)", len(data))
+	}
+	r := &sqStateReader{buf: data}
+	dim, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("SQ dim: %w", err)
+	}
+	bits, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("SQ bits: %w", err)
+	}
+	tr, err := r.f64()
+	if err != nil {
+		return fmt.Errorf("SQ trainRatio: %w", err)
+	}
+	if dim < 1 || dim > 65536 {
+		return fmt.Errorf("SQ dim %d invalid", dim)
+	}
+	if bits < 1 || bits > 16 {
+		return fmt.Errorf("SQ bits %d invalid", bits)
+	}
+	if math.IsNaN(tr) || math.IsInf(tr, 0) || tr <= 0 || tr > 1 {
+		return fmt.Errorf("SQ trainRatio %f invalid", tr)
+	}
+	// Exact-length check: 16 header + 4 arrays * dim * 4 bytes.
+	expected := 16 + int(dim)*16
+	if len(data) != expected {
+		return fmt.Errorf("SQ DeserializeState: len=%d expected=%d", len(data), expected)
+	}
+	sq.dimension = int(dim)
+	sq.maxLevel = (1 << int(bits)) - 1
+	sq.config = &QuantizationConfig{Type: ScalarQuantization, Bits: int(bits), TrainRatio: tr}
+	sq.minValues = make([]float32, dim)
+	sq.maxValues = make([]float32, dim)
+	sq.scales = make([]float32, dim)
+	sq.offsets = make([]float32, dim)
+	for i := uint32(0); i < dim; i++ {
+		sq.minValues[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("SQ min[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		sq.maxValues[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("SQ max[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		sq.scales[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("SQ scale[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		sq.offsets[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("SQ offset[%d]: %w", i, err)
+		}
+	}
+	sq.trained = true
+	sq.updateMemoryUsage()
+	return nil
+}
+
+type sqStateWriter struct{ buf []byte }
+
+func (w *sqStateWriter) u32(v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *sqStateWriter) f32(v float32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *sqStateWriter) f64(v float64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+
+type sqStateReader struct {
+	buf []byte
+	pos int
+}
+
+func (r *sqStateReader) need(n int) error {
+	if r.pos+n > len(r.buf) {
+		return fmt.Errorf("truncated at pos %d, need %d", r.pos, n)
+	}
+	return nil
+}
+func (r *sqStateReader) u32() (uint32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return v, nil
+}
+func (r *sqStateReader) f32() (float32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return math.Float32frombits(v), nil
+}
+func (r *sqStateReader) f64() (float64, error) {
+	if err := r.need(8); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
+	r.pos += 8
+	return math.Float64frombits(v), nil
 }
 
 func (sq *ScalarQuantizer) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {

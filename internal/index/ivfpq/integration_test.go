@@ -235,8 +235,9 @@ func TestIVFPQSearchAccuracy(t *testing.T) {
 	config := &Config{
 		Dimension:     dimension,
 		NClusters:     2,
-		NProbes:       2, // Probe both clusters
+		NProbes:       2,
 		Metric:        util.L2Distance,
+		Quantization:  &quant.QuantizationConfig{Type: quant.ProductQuantization, Codebooks: 2, Bits: 4, TrainRatio: 0.5},
 		MaxIterations: 20,
 		Tolerance:     1e-4,
 		RandomSeed:    42,

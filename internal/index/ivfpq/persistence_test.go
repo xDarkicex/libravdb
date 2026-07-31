@@ -70,9 +70,9 @@ func TestSerializeDeserializeRoundTrip(t *testing.T) {
 	}
 
 	// Verify centroids match.
-	for i := range idx.clusters {
-		c1 := idx.clusters[i].Centroid
-		c2 := idx2.clusters[i].Centroid
+	for i := range idx.gen.clusters {
+		c1 := idx.gen.clusters[i].Centroid
+		c2 := idx2.gen.clusters[i].Centroid
 		if len(c1) != len(c2) {
 			t.Fatalf("centroid %d length mismatch: %d vs %d", i, len(c1), len(c2))
 		}

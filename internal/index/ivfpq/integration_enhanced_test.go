@@ -48,7 +48,7 @@ func TestEnhancedIVFPQIntegration(t *testing.T) {
 	t.Logf("Training completed in %v", trainTime)
 
 	// Verify quantizer is trained
-	if idx.quantizer == nil || !idx.quantizer.IsTrained() {
+	if idx.gen.quantizer == nil || !idx.gen.quantizer.IsTrained() {
 		t.Errorf("Quantizer should be trained after index training")
 	}
 
@@ -117,8 +117,8 @@ func TestEnhancedIVFPQIntegration(t *testing.T) {
 	t.Logf("Memory usage: %.2f MB", memUsageMB)
 
 	// Verify compression ratio if quantization is enabled
-	if idx.quantizer != nil {
-		compressionRatio := idx.quantizer.CompressionRatio()
+	if idx.gen.quantizer != nil {
+		compressionRatio := idx.gen.quantizer.CompressionRatio()
 		t.Logf("Compression ratio: %.2fx", compressionRatio)
 
 		if compressionRatio < 2.0 {
@@ -316,18 +316,18 @@ func TestQuantizationIntegration(t *testing.T) {
 		t.Errorf("Index should be trained")
 	}
 
-	if idx.quantizer == nil || !idx.quantizer.IsTrained() {
+	if idx.gen.quantizer == nil || !idx.gen.quantizer.IsTrained() {
 		t.Errorf("Fine quantizer should be trained")
 	}
 
 	// Test compression and decompression
 	testVector := vectors[0]
-	compressed, err := idx.quantizer.Compress(testVector)
+	compressed, err := idx.gen.quantizer.Compress(testVector)
 	if err != nil {
 		t.Fatalf("Failed to compress vector: %v", err)
 	}
 
-	decompressed, err := idx.quantizer.Decompress(compressed)
+	decompressed, err := idx.gen.quantizer.Decompress(compressed)
 	if err != nil {
 		t.Fatalf("Failed to decompress vector: %v", err)
 	}

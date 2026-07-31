@@ -260,12 +260,13 @@ func TestInsertAndSearch(t *testing.T) {
 	ctx := context.Background()
 	dimension := 4
 
-	// Create and train index
+	// Create and train index with PQ so Search works.
 	config := &Config{
 		Dimension:     dimension,
 		NClusters:     2,
 		NProbes:       2,
 		Metric:        util.L2Distance,
+		Quantization:  &quant.QuantizationConfig{Type: quant.ProductQuantization, Codebooks: 1, Bits: 4, TrainRatio: 0.5},
 		MaxIterations: 10,
 		Tolerance:     1e-4,
 		RandomSeed:    42,
@@ -418,11 +419,11 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("failed to train index: %v", err)
 	}
 
-	// Insert entries
+	// Insert entries with explicit ordinals for DeleteByOrdinal.
 	entries := []*VectorEntry{
-		{ID: "1", Vector: []float32{1, 0, 0, 0}},
-		{ID: "2", Vector: []float32{0, 1, 0, 0}},
-		{ID: "3", Vector: []float32{0, 0, 1, 0}},
+		{ID: "1", Ordinal: 1, Vector: []float32{1, 0, 0, 0}},
+		{ID: "2", Ordinal: 2, Vector: []float32{0, 1, 0, 0}},
+		{ID: "3", Ordinal: 3, Vector: []float32{0, 0, 1, 0}},
 	}
 
 	for _, entry := range entries {
@@ -434,26 +435,20 @@ func TestDelete(t *testing.T) {
 
 	initialSize := idx.Size()
 
-	// Delete existing entry
-	err = idx.Delete(ctx, "2")
+	// Delete existing entry by ordinal (Delete(id) is unsupported).
+	err = idx.DeleteByOrdinal(ctx, 2)
 	if err != nil {
-		t.Errorf("failed to delete entry: %v", err)
+		t.Fatalf("failed to delete entry: %v", err)
 	}
 
 	if idx.Size() != initialSize-1 {
 		t.Errorf("expected size %d after deletion, got %d", initialSize-1, idx.Size())
 	}
 
-	// Try to delete non-existent entry
-	err = idx.Delete(ctx, "nonexistent")
+	// Try to delete non-existent ordinal.
+	err = idx.DeleteByOrdinal(ctx, 9999)
 	if err == nil {
-		t.Errorf("expected error when deleting non-existent entry")
-	}
-
-	// Try to delete empty ID
-	err = idx.Delete(ctx, "")
-	if err == nil {
-		t.Errorf("expected error when deleting empty ID")
+		t.Errorf("expected error when deleting non-existent ordinal")
 	}
 }
 

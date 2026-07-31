@@ -1,6 +1,7 @@
 package quant
 
 import (
+	"encoding/binary"
 	"context"
 	"fmt"
 	"math"
@@ -42,6 +43,13 @@ func (fq *FSQQuantizer) Configure(config *QuantizationConfig) error {
 	}
 	if config.Type != FiniteScalarQuantization {
 		return fmt.Errorf("expected FiniteScalarQuantization type, got %s", config.Type.String())
+	}
+
+	// Reject custom levels that can't be round-tripped through uint32.
+	for _, lv := range config.Levels {
+		if int64(lv) > int64(math.MaxUint32) {
+			return fmt.Errorf("FSQ level %d exceeds uint32 max", lv)
+		}
 	}
 
 	fq.mu.Lock()
@@ -199,6 +207,253 @@ func (fq *FSQQuantizer) Distance(compressed1, compressed2 []byte) (float32, erro
 
 func (fq *FSQQuantizer) PrepareQuery(query []float32) any {
 	return nil
+}
+
+// CodeSize returns the byte length of a single compressed vector for
+// finite scalar quantization: ceil(sum(bitWidths) / 8). Returns 0 if the
+// quantizer has not been trained yet.
+func (fq *FSQQuantizer) CodeSize() int {
+	fq.mu.RLock()
+	defer fq.mu.RUnlock()
+	if !fq.trained {
+		return 0
+	}
+	return (fq.totalBitsLocked() + 7) / 8
+}
+
+func (fq *FSQQuantizer) Dimension() int {
+	fq.mu.RLock()
+	defer fq.mu.RUnlock()
+	if !fq.trained {
+		return 0
+	}
+	return fq.dimension
+}
+
+func (fq *FSQQuantizer) SerializeState() ([]byte, error) {
+	fq.mu.RLock()
+	defer fq.mu.RUnlock()
+	if !fq.trained {
+		return nil, fmt.Errorf("FSQQuantizer not trained")
+	}
+	// Reject levels that would truncate when cast to uint32.
+	for i, lv := range fq.levels {
+		if int64(lv) > int64(math.MaxUint32) {
+			return nil, fmt.Errorf("FSQ level[%d]=%d exceeds uint32 max", i, lv)
+		}
+	}
+	buf := make([]byte, 0, 64+fq.dimension*40)
+	w := &fqStateWriter{buf: buf}
+	w.u32(uint32(fq.dimension))
+	w.u32(uint32(fq.config.Bits))
+	w.f64(fq.config.TrainRatio)
+	for _, v := range fq.levels {
+		w.u32(uint32(v))
+	}
+	for _, v := range fq.bitWidths {
+		w.u32(uint32(v))
+	}
+	for _, v := range fq.minValues {
+		w.f32(v)
+	}
+	for _, v := range fq.maxValues {
+		w.f32(v)
+	}
+	for _, v := range fq.halfLevels {
+		w.f32(v)
+	}
+	for _, v := range fq.levelOffsets {
+		w.f32(v)
+	}
+	for _, v := range fq.levelShifts {
+		w.f32(v)
+	}
+	for _, v := range fq.decodeScales {
+		w.f32(v)
+	}
+	for _, v := range fq.decodeOffsets {
+		w.f32(v)
+	}
+	return w.buf, nil
+}
+
+func (fq *FSQQuantizer) DeserializeState(data []byte) error {
+	fq.mu.Lock()
+	defer fq.mu.Unlock()
+	if len(data) < 16 {
+		return fmt.Errorf("FSQ DeserializeState: too short (%d < 16)", len(data))
+	}
+	r := &fqStateReader{buf: data}
+	dim, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("FSQ dim: %w", err)
+	}
+	bits, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("FSQ bits: %w", err)
+	}
+	tr, err := r.f64()
+	if err != nil {
+		return fmt.Errorf("FSQ trainRatio: %w", err)
+	}
+	if dim < 1 || dim > 65536 {
+		return fmt.Errorf("FSQ dim %d invalid", dim)
+	}
+	if bits < 1 || bits > 16 {
+		return fmt.Errorf("FSQ bits %d invalid", bits)
+	}
+	if math.IsNaN(tr) || math.IsInf(tr, 0) || tr <= 0 || tr > 1 {
+		return fmt.Errorf("FSQ trainRatio %f invalid", tr)
+	}
+	// 16 header + 2*u32 per dim (levels + bitWidths = 8) + 7*f32 per dim = 28
+	expected := 16 + int(dim)*36
+	if len(data) != expected {
+		return fmt.Errorf("FSQ DeserializeState: len=%d expected=%d", len(data), expected)
+	}
+	fq.dimension = int(dim)
+	fq.levels = make([]int, dim)
+	fq.bitWidths = make([]int, dim)
+	fq.minValues = make([]float32, dim)
+	fq.maxValues = make([]float32, dim)
+	fq.halfLevels = make([]float32, dim)
+	fq.levelOffsets = make([]float32, dim)
+	fq.levelShifts = make([]float32, dim)
+	fq.decodeScales = make([]float32, dim)
+	fq.decodeOffsets = make([]float32, dim)
+	for i := uint32(0); i < dim; i++ {
+		v, err := r.u32()
+		if err != nil {
+			return fmt.Errorf("FSQ levels[%d]: %w", i, err)
+		}
+		fq.levels[i] = int(v)
+	}
+	for i := uint32(0); i < dim; i++ {
+		v, err := r.u32()
+		if err != nil {
+			return fmt.Errorf("FSQ bitWidths[%d]: %w", i, err)
+		}
+		fq.bitWidths[i] = int(v)
+	}
+	// Validate FSQ invariants before using the restored state.
+	var totalBits int64
+	for i := uint32(0); i < dim; i++ {
+		if fq.levels[i] < 2 {
+			return fmt.Errorf("FSQ level[%d]=%d must be >= 2", i, fq.levels[i])
+		}
+		expected := bitsForLevel(fq.levels[i])
+		if fq.bitWidths[i] != expected {
+			return fmt.Errorf("FSQ bitWidth[%d]=%d, expected %d for level %d", i, fq.bitWidths[i], expected, fq.levels[i])
+		}
+		totalBits += int64(fq.bitWidths[i])
+	}
+	if totalBits == 0 || totalBits > int64(dim)*32 {
+		return fmt.Errorf("FSQ totalBits %d out of range", totalBits)
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.minValues[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ min[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.maxValues[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ max[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.halfLevels[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ half[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.levelOffsets[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ lvlOff[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.levelShifts[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ lvlShift[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.decodeScales[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ decScale[%d]: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < dim; i++ {
+		fq.decodeOffsets[i], err = r.f32()
+		if err != nil {
+			return fmt.Errorf("FSQ decOff[%d]: %w", i, err)
+		}
+	}
+	// Populate config.Levels from restored levels for round-trip fidelity.
+	cfgLevels := make([]int, dim)
+	for i := uint32(0); i < dim; i++ {
+		cfgLevels[i] = fq.levels[i]
+	}
+	fq.config = &QuantizationConfig{Type: FiniteScalarQuantization, Bits: int(bits), TrainRatio: tr, Levels: cfgLevels}
+	fq.trained = true
+	fq.memoryUsage = int64((len(fq.minValues)+len(fq.maxValues)+len(fq.halfLevels)+len(fq.levelOffsets)+len(fq.levelShifts)+len(fq.decodeScales)+len(fq.decodeOffsets))*4 + len(fq.levels)*8 + len(fq.bitWidths)*8)
+	return nil
+}
+
+type fqStateWriter struct{ buf []byte }
+
+func (w *fqStateWriter) u32(v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *fqStateWriter) f32(v float32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *fqStateWriter) f64(v float64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+
+type fqStateReader struct {
+	buf []byte
+	pos int
+}
+
+func (r *fqStateReader) need(n int) error {
+	if r.pos+n > len(r.buf) {
+		return fmt.Errorf("truncated at pos %d, need %d", r.pos, n)
+	}
+	return nil
+}
+func (r *fqStateReader) u32() (uint32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return v, nil
+}
+func (r *fqStateReader) f32() (float32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return math.Float32frombits(v), nil
+}
+func (r *fqStateReader) f64() (float64, error) {
+	if err := r.need(8); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
+	r.pos += 8
+	return math.Float64frombits(v), nil
 }
 
 func (fq *FSQQuantizer) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {

@@ -3,6 +3,7 @@ package quant
 import (
 	"github.com/xDarkicex/memory"
 
+	"encoding/binary"
 	"context"
 	"fmt"
 	"math"
@@ -22,6 +23,209 @@ type ProductQuantizer struct {
 	memoryUsage   int64
 	mu            sync.RWMutex
 	trained       bool
+}
+
+// CodeSize returns the byte length of a single compressed vector for
+// product quantization: ceil(subspaces * bits / 8). Returns 0 if the
+// quantizer has not been trained yet.
+func (pq *ProductQuantizer) CodeSize() int {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	if !pq.trained || pq.config == nil {
+		return 0
+	}
+	return (pq.subspaces*pq.config.Bits + 7) / 8
+}
+
+func (pq *ProductQuantizer) Dimension() int {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	if !pq.trained {
+		return 0
+	}
+	return pq.dimension
+}
+
+func (pq *ProductQuantizer) SerializeState() ([]byte, error) {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	if !pq.trained {
+		return nil, fmt.Errorf("ProductQuantizer not trained")
+	}
+	buf := make([]byte, 0, 8*1024)
+	w := &pqStateWriter{buf: buf}
+	w.u32(uint32(pq.dimension))
+	w.u32(uint32(pq.subspaces))
+	cps := 0
+	if pq.subspaces > 0 && len(pq.centroids) > 0 {
+		cps = len(pq.centroids[0])
+	}
+	w.u32(uint32(cps))
+	w.u32(uint32(pq.subDim))
+	w.u32(uint32(pq.config.Bits))
+	w.f64(pq.config.TrainRatio)
+	w.u32(uint32(pq.config.CacheSize))
+	for _, ss := range pq.centroids {
+		for _, c := range ss {
+			for _, v := range c {
+				w.f32(v)
+			}
+		}
+	}
+	return w.buf, nil
+}
+
+func (pq *ProductQuantizer) DeserializeState(data []byte) error {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	if len(data) < 32 {
+		return fmt.Errorf("PQ DeserializeState: too short (%d < 32)", len(data))
+	}
+	r := &pqStateReader{buf: data}
+	dim, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ dim: %w", err)
+	}
+	subsp, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ subsp: %w", err)
+	}
+	cps, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ cps: %w", err)
+	}
+	subDim, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ subDim: %w", err)
+	}
+	bitsV, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ bits: %w", err)
+	}
+	tr, err := r.f64()
+	if err != nil {
+		return fmt.Errorf("PQ trainRatio: %w", err)
+	}
+	cs, err := r.u32()
+	if err != nil {
+		return fmt.Errorf("PQ cacheSize: %w", err)
+	}
+	// Validate header fields.
+	if dim < 1 || dim > 65536 {
+		return fmt.Errorf("PQ dim %d invalid", dim)
+	}
+	if subsp < 1 || subsp > 1024 {
+		return fmt.Errorf("PQ subsp %d invalid", subsp)
+	}
+	if subDim < 1 || subDim > 65536 {
+		return fmt.Errorf("PQ subDim %d invalid", subDim)
+	}
+	if int(subsp)*int(subDim) != int(dim) {
+		return fmt.Errorf("PQ geometry mismatch: %d*%d != %d", subsp, subDim, dim)
+	}
+	if cps < 1 || cps > 65536 {
+		return fmt.Errorf("PQ cps %d invalid", cps)
+	}
+	if int64(bitsV) < 1 || int64(bitsV) > 16 {
+		return fmt.Errorf("PQ bits %d invalid", bitsV)
+	}
+	if math.IsNaN(tr) || math.IsInf(tr, 0) || tr <= 0 || tr > 1 {
+		return fmt.Errorf("PQ trainRatio %f invalid", tr)
+	}
+	// Calculate exact expected length with int64 to avoid uint32 wrap.
+	fps := int64(cps) * int64(subDim)
+	tf := int64(subsp) * fps
+	if int64(subsp) > 0 && tf/int64(subsp) != fps {
+		return fmt.Errorf("PQ state overflow: subsp=%d cps=%d subDim=%d", subsp, cps, subDim)
+	}
+	tfb := tf * 4
+	if tf > 0 && tfb/tf != 4 {
+		return fmt.Errorf("PQ state overflow: totalFloats=%d", tf)
+	}
+	expected := int64(32) + tfb
+	const qCeil = int64(1 << 26)
+	if expected > qCeil {
+		return fmt.Errorf("PQ state %d bytes exceeds ceiling %d", expected, qCeil)
+	}
+	if len(data) != int(expected) {
+		return fmt.Errorf("PQ DeserializeState: len=%d expected=%d", len(data), expected)
+	}
+	// All fields validated; commit.
+	pq.dimension = int(dim)
+	pq.subspaces = int(subsp)
+	pq.subDim = int(subDim)
+	pq.config = &QuantizationConfig{Type: ProductQuantization, Codebooks: int(subsp), Bits: int(bitsV), TrainRatio: tr, CacheSize: int(cs)}
+	pq.centroids = make([][][]float32, int(subsp))
+	for s := uint32(0); s < subsp; s++ {
+		pq.centroids[s] = make([][]float32, cps)
+		for c := uint32(0); c < cps; c++ {
+			pq.centroids[s][c] = make([]float32, subDim)
+			for d := uint32(0); d < subDim; d++ {
+				v, err := r.f32()
+				if err != nil {
+					return fmt.Errorf("PQ centroids[%d][%d][%d]: %w", s, c, d, err)
+				}
+				pq.centroids[s][c][d] = v
+			}
+		}
+	}
+	pq.trained = true
+	pq.updateMemoryUsage()
+	return nil
+}
+
+type pqStateWriter struct{ buf []byte }
+
+func (w *pqStateWriter) u32(v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *pqStateWriter) f32(v float32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+func (w *pqStateWriter) f64(v float64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+	w.buf = append(w.buf, b[:]...)
+}
+
+type pqStateReader struct {
+	buf []byte
+	pos int
+}
+
+func (r *pqStateReader) need(n int) error {
+	if r.pos+n > len(r.buf) {
+		return fmt.Errorf("truncated at pos %d, need %d", r.pos, n)
+	}
+	return nil
+}
+func (r *pqStateReader) u32() (uint32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return v, nil
+}
+func (r *pqStateReader) f32() (float32, error) {
+	if err := r.need(4); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
+	r.pos += 4
+	return math.Float32frombits(v), nil
+}
+func (r *pqStateReader) f64() (float64, error) {
+	if err := r.need(8); err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
+	r.pos += 8
+	return math.Float64frombits(v), nil
 }
 
 // PrepareQuery precomputes distance tables for a query so that concurrent
