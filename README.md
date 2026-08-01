@@ -37,6 +37,7 @@
 - [Advanced Features](#-advanced-features)
 - [Roadmap](#-roadmap)
 - [Use Cases](#-use-cases)
+- [Native Language SDKs](#-native-language-sdks)
 - [Development](#-development)
 - [Testing](#-testing)
 - [Contributing](#-contributing)
@@ -324,6 +325,23 @@ if err := collection.FlushIndex(ctx); err != nil {
     log.Fatal(err)
 }
 ```
+
+## 🌍 Native Language SDKs
+
+LibraVDB provides official, high-performance SDK bindings for 12 native languages, built to seamlessly interact with the Go C-shared engine natively.
+
+- [Python SDK (`sdk/python`)](sdk/python/README.md) - `ctypes` bindings with zero-copy NumPy array support.
+- [Node.js / TypeScript SDK (`sdk/ts`)](sdk/ts/README.md) - Full TypeScript support via `node-ffi-napi`.
+- [Ruby SDK (`sdk/ruby`)](sdk/ruby/README.md) - FFI wrapper using Ruby `ffi`.
+- [Rust SDK (`sdk/rust`)](sdk/rust/README.md) - Zero-cost `bindgen` wrapper with strict ownership.
+- [C++ SDK (`sdk/cpp`)](sdk/cpp/README.md) - RAII-based wrapper natively integrating STL vectors.
+- [Java SDK (`sdk/java`)](sdk/java/README.md) - Panama-based Foreign Function & Memory API wrapper.
+- [Kotlin Native SDK (`sdk/kotlin`)](sdk/kotlin/README.md) - K/N `cinterop` integration utilizing `memScoped`.
+- [C# / .NET SDK (`sdk/csharp`)](sdk/csharp/README.md) - Unsafe `DllImport` with `fixed` pointer optimization.
+- [Swift SDK (`sdk/swift`)](sdk/swift/README.md) - Native SPM C-interop integration.
+- [Odin SDK (`sdk/odin`)](sdk/odin/README.md) - Zero-overhead native `foreign` bindings.
+- [Perl SDK (`sdk/perl`)](sdk/perl/README.md) - Platypus FFI integration with Core JSON::PP AST handling.
+- [PHP SDK (`sdk/php`)](sdk/php/README.md) - Modern native PHP FFI class structure utilizing static typing.
 
 ## 🚀 Quick Start
 

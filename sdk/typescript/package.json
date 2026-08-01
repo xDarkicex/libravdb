@@ -1,0 +1,23 @@
+{
+  "name": "libravdb-ts",
+  "version": "1.0.0",
+  "description": "LibraVDB TypeScript SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "ext"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "ts-node tests/run_tests.ts"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.0.0"
+  }
+}

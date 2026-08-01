@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="LibraVDB.Tests/LibraVDB.Tests.csproj" />
+  <Project Path="LibraVDB/LibraVDB.csproj" />
+</Solution>

@@ -1,0 +1,21 @@
+PATH
+  remote: .
+  specs:
+    libravdb (1.0.0)
+      ffi (~> 1.15.0)
+      json
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ffi (1.15.5)
+    json (2.7.6)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  libravdb!
+
+BUNDLED WITH
+   1.17.2

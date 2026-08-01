@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libravdb"
+version = "1.0.0"
+authors = [
+  { name="LibraVDB Team" },
+]
+description = "Python SDK for LibraVDB"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = []
+
+[tool.setuptools]
+packages = ["libravdb"]
+
+[tool.setuptools.package-data]
+libravdb = ["ext/*"]

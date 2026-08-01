@@ -2,6 +2,7 @@ package ivfpq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -18,6 +19,11 @@ import (
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
+
+// ErrHydrationConflict reports that the active IVF-PQ generation changed
+// while DeserializeFromBytes was staging a replacement. Retrying against a
+// quiescent index is safe; committing the stale replacement is not.
+var ErrHydrationConflict = errors.New("IVF-PQ hydration conflicts with a live mutation")
 
 // Config holds configuration for IVF-PQ index
 type Config struct {
@@ -309,9 +315,9 @@ type Cluster struct {
 	centroidNorm  float32
 }
 
-// generation is an immutable snapshot of IVF-PQ state. Published generations
-// are never mutated (Insert holds RLock preventing concurrent hydrate swap).
-// Hydration builds a fresh generation and swaps one pointer under idx.mutex.Lock().
+// generation owns one IVF-PQ state lifetime. Searches pin it while it is
+// readable; writes mutate it under Index.RLock. Hydration stages a replacement
+// and may publish it only if this generation's mutation epoch is unchanged.
 type generation struct {
 	pool      *memory.Pool
 	poolCfg   memory.AllocatorConfig
@@ -319,6 +325,7 @@ type generation struct {
 	quantizer quant.Quantizer
 	config    *Config
 	size      atomic.Int64
+	mutation  atomic.Uint64
 	trained   bool
 	refs      atomic.Int32
 	retired   atomic.Bool
@@ -543,8 +550,8 @@ func NewIVFPQ(config *Config) (*Index, error) {
 		// without descriptor-table exhaustion. 16 is enough for ≤16
 		// in-flight allocations per concurrent writer; deeper parallelism
 		// is still safe because Pool.Allocate grows the descriptor table.
-		SlabCount: 16,
-		Prealloc:  false,
+		SlabCount:     16,
+		Prealloc:      false,
 		MadviseRandom: true,
 	}, 64)
 	if err != nil {
@@ -607,6 +614,16 @@ func NewIVFPQ(config *Config) (*Index, error) {
 
 // Train trains the IVF-PQ index using k-means clustering
 func (idx *Index) Train(ctx context.Context, vectors [][]float32) error {
+	// Training mutates centroids, the quantizer, and every cluster's code
+	// width. Keep it exclusive so hydration cannot stage from one training
+	// state and commit over another, and so readers never observe a partially
+	// trained generation.
+	idx.mutex.Lock()
+	defer idx.mutex.Unlock()
+	if idx.gen == nil {
+		return fmt.Errorf("index closed")
+	}
+
 	if len(vectors) == 0 {
 		return fmt.Errorf("no training vectors provided")
 	}
@@ -635,7 +652,6 @@ func (idx *Index) Train(ctx context.Context, vectors [][]float32) error {
 		}
 	}
 
-	idx.mutex.Lock()
 	// Now that the fine quantizer is trained, propagate its canonical
 	// code width to every cluster's storage. Without this, the storage
 	// keeps its NewIVFPQ-time width (0 for an untrained quantizer) and
@@ -645,7 +661,7 @@ func (idx *Index) Train(ctx context.Context, vectors [][]float32) error {
 		c.storage.setCodeWidth(width)
 	}
 	idx.gen.trained = true
-	idx.mutex.Unlock()
+	idx.gen.mutation.Add(1)
 	return nil
 }
 
@@ -1100,6 +1116,7 @@ func (idx *Index) Insert(ctx context.Context, entry *VectorEntry) error {
 	}
 
 	gen.size.Add(1)
+	gen.mutation.Add(1)
 	return nil
 }
 
@@ -1277,7 +1294,7 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 			var code []byte
 			if codeSize > 0 {
 				origIndex := p.sourceIndex
-				code = codes[origIndex*codeSize:(origIndex+1)*codeSize]
+				code = codes[origIndex*codeSize : (origIndex+1)*codeSize]
 			}
 			err := cluster.storage.append(p.ordinal, code, gen.pool)
 			if err != nil {
@@ -1290,6 +1307,7 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 	}
 
 	gen.size.Add(int64(len(entries)))
+	gen.mutation.Add(1)
 	return nil
 }
 
@@ -1775,6 +1793,7 @@ func (idx *Index) DeleteByOrdinal(ctx context.Context, ordinal uint32) error {
 		if cluster.storage.deleteByOrdinal(ordinal) {
 			cluster.mutex.Unlock()
 			gen.size.Add(-1)
+			gen.mutation.Add(1)
 			return nil
 		}
 		cluster.mutex.Unlock()
@@ -1809,7 +1828,7 @@ func (idx *Index) MemoryUsage() int64 {
 	for _, cluster := range idx.gen.clusters {
 		cluster.mutex.RLock()
 
-		usage += int64(len(cluster.storage.segments)) * int64(cluster.storage.segmentCapacity) * 4 // uint32 = 4 bytes
+		usage += int64(len(cluster.storage.segments)) * int64(cluster.storage.segmentCapacity) * 4                                // uint32 = 4 bytes
 		usage += int64(len(cluster.storage.segments)) * int64(cluster.storage.segmentCapacity) * int64(cluster.storage.codeWidth) // byte = 1 byte
 
 		cluster.mutex.RUnlock()

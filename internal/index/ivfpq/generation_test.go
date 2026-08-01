@@ -2,6 +2,7 @@ package ivfpq
 
 import (
 	"context"
+	"errors"
 	"hash/crc32"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,48 @@ import (
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
+
+// TestHydrationRejectsConcurrentInsert proves a successful live write cannot
+// disappear behind a replacement staged from an older generation.
+func TestHydrationRejectsConcurrentInsert(t *testing.T) {
+	const dim = 8
+	idx := trainedPQ(t, dim, 2)
+	defer idx.Close()
+
+	data, err := idx.SerializeToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := idx.gen.id
+	ctx := &blockCtx{Context: context.Background(), after: 1, blocked: make(chan struct{}), unblock: make(chan struct{})}
+	errCh := make(chan error, 1)
+	go func() { errCh <- idx.DeserializeFromBytes(ctx, data) }()
+
+	// The hydrate captured the generation and is now staging. Insert succeeds
+	// against that live generation before the hydrate is allowed to commit.
+	<-ctx.blocked
+	v := make([]float32, dim)
+	for i := range v {
+		v[i] = float32(i+1) / 10
+	}
+	const ordinal uint32 = 900001
+	if err := idx.Insert(context.Background(), &VectorEntry{ID: "concurrent", Ordinal: ordinal, Vector: v}); err != nil {
+		t.Fatalf("concurrent Insert: %v", err)
+	}
+	close(ctx.unblock)
+	if err := <-errCh; !errors.Is(err, ErrHydrationConflict) {
+		t.Fatalf("DeserializeFromBytes error = %v, want ErrHydrationConflict", err)
+	}
+	if idx.gen.id != before {
+		t.Fatalf("stale hydrate replaced live generation: %d -> %d", before, idx.gen.id)
+	}
+	if idx.Size() != 1 {
+		t.Fatalf("Size = %d, want concurrent write retained", idx.Size())
+	}
+	if err := idx.DeleteByOrdinal(context.Background(), ordinal); err != nil {
+		t.Fatalf("concurrent write was lost: %v", err)
+	}
+}
 
 // TestHydrationExhaustionPreservesLive verifies that staging pool exhaustion
 // leaves the live generation unchanged.
@@ -421,5 +464,5 @@ func (c *blockCtx) Err() error {
 	}
 	return nil
 }
-func (c *blockCtx) Done() <-chan struct{} { return nil }
+func (c *blockCtx) Done() <-chan struct{}       { return nil }
 func (c *blockCtx) Deadline() (time.Time, bool) { return time.Time{}, false }

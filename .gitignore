@@ -237,3 +237,21 @@ CLAUDE.md
 
 # Lynx Codex analysis tool config
 lynx.toml
+
+# SDK dependency caches, compiler output, local FFI libraries, and integration
+# databases are reproducible from the tracked SDK source and must not ship in
+# source commits.
+/sdk/**/node_modules/
+/sdk/**/.dart_tool/
+/sdk/**/.gradle/
+/sdk/**/.build/
+/sdk/**/.bundle/
+/sdk/**/bin/
+/sdk/**/obj/
+/sdk/**/target/
+/sdk/**/build/
+/sdk/perl/local/
+/sdk/**/test_db
+/sdk/**/test_db_*
+/sdk/**/integration_test
+/sdk/**/hello

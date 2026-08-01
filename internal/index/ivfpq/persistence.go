@@ -8,14 +8,14 @@ import (
 	"math"
 	"os"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
+	"github.com/xDarkicex/memory"
 )
 
 const (
-	ivfpqFormatVersion      uint16 = 3
+	ivfpqFormatVersion       uint16 = 3
 	ivfpqFormatVersionLegacy uint16 = 2
-	ivfpqIndexType          uint8  = 2
+	ivfpqIndexType           uint8  = 2
 )
 
 var ivfpqMagicBytes = []byte("LIBRAIVF")
@@ -28,16 +28,16 @@ const (
 )
 
 const (
-	maxHydrateDim        = 65536
-	maxHydrateClusters   = 16384
-	maxHydrateProbes     = 16384
-	maxHydrateRecsList   = 1 << 24
-	maxHydrateQState     = 1 << 26
-	maxHydrateSubsp      = 1024
-	maxHydrateCPerSS     = 65536
-	maxHydrateSubDim     = 65536
-	maxHydrateTotalRecs  = 1 << 28
-	maxHydrateCodeBytes  = 262144
+	maxHydrateDim       = 65536
+	maxHydrateClusters  = 16384
+	maxHydrateProbes    = 16384
+	maxHydrateRecsList  = 1 << 24
+	maxHydrateQState    = 1 << 26
+	maxHydrateSubsp     = 1024
+	maxHydrateCPerSS    = 65536
+	maxHydrateSubDim    = 65536
+	maxHydrateTotalRecs = 1 << 28
+	maxHydrateCodeBytes = 262144
 )
 
 func qTag(q quant.Quantizer) uint8 {
@@ -199,6 +199,7 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	}
 	base := idx.gen
 	base.acquire()
+	baseMutation := base.mutation.Load()
 	idx.mutex.RUnlock()
 	defer base.release()
 
@@ -367,6 +368,12 @@ func (idx *Index) DeserializeFromBytes(ctx context.Context, data []byte) error {
 		replGen.retired.Store(true)
 		replGen.release()
 		return fmt.Errorf("index closed during hydration commit")
+	}
+	if idx.gen != base || base.mutation.Load() != baseMutation {
+		idx.mutex.Unlock()
+		replGen.retired.Store(true)
+		replGen.release()
+		return fmt.Errorf("%w: live generation changed while replacement staged", ErrHydrationConflict)
 	}
 	previous := idx.gen
 	idx.gen = replGen
@@ -834,9 +841,13 @@ func (w *sliceWriter) u16(v uint16)   { w.buf = binary.LittleEndian.AppendUint16
 func (w *sliceWriter) u32(v uint32)   { w.buf = binary.LittleEndian.AppendUint32(w.buf, v) }
 func (w *sliceWriter) i64(v int64)    { w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v)) }
 func (w *sliceWriter) bytes(v []byte) { w.buf = append(w.buf, v...) }
-func (w *sliceWriter) f32(v float32)  { w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(v)) }
-func (w *sliceWriter) f64(v float64)  { w.buf = binary.LittleEndian.AppendUint64(w.buf, math.Float64bits(v)) }
-func (w *sliceWriter) raw(v []byte)   { w.buf = append(w.buf, v...) }
+func (w *sliceWriter) f32(v float32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, math.Float32bits(v))
+}
+func (w *sliceWriter) f64(v float64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, math.Float64bits(v))
+}
+func (w *sliceWriter) raw(v []byte) { w.buf = append(w.buf, v...) }
 
 type sliceReader struct {
 	buf []byte
