@@ -1,0 +1,144 @@
+name: SDK Release Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.2.0)'
+        required: true
+        type: string
+
+jobs:
+  build-core-binaries:
+    name: Build LibraVDB Core for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-latest
+            ext: so
+            goos: linux
+            goarch: amd64
+          - target: darwin-arm64
+            os: macos-14
+            ext: dylib
+            goos: darwin
+            goarch: arm64
+          - target: windows-amd64
+            os: windows-latest
+            ext: dll
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Compile CGO Library
+        run: |
+          cd sdk/cgo
+          go build -buildmode=c-shared -o libravdb.${{ matrix.ext }} .
+        env:
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libravdb-${{ matrix.target }}
+          path: sdk/cgo/libravdb.${{ matrix.ext }}
+          retention-days: 7
+
+  publish-sdks:
+    name: Publish Language SDKs
+    needs: build-core-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Download all artifacts built in the previous job
+      - name: Download Built Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bin
+
+      # ---------------------------------------------------------
+      # 1. Distribute binaries into SDK ext/ folders
+      # ---------------------------------------------------------
+      - name: Copy Binaries to SDKs
+        run: |
+          mkdir -p release-binaries
+          mv bin/libravdb-linux-amd64/libravdb.so release-binaries/
+          mv bin/libravdb-darwin-arm64/libravdb.dylib release-binaries/
+          mv bin/libravdb-windows-amd64/libravdb.dll release-binaries/
+
+          # Ruby
+          mkdir -p sdk/ruby/lib/ext
+          cp release-binaries/* sdk/ruby/lib/ext/
+
+          # Python
+          mkdir -p sdk/python/libravdb/ext
+          cp release-binaries/* sdk/python/libravdb/ext/
+
+          # TypeScript
+          mkdir -p sdk/typescript/ext
+          cp release-binaries/* sdk/typescript/ext/
+
+      # ---------------------------------------------------------
+      # 2. Publish RubyGems
+      # ---------------------------------------------------------
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Publish RubyGem
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.GEM_HOST_API_KEY }}
+        run: |
+          cd sdk/ruby
+          gem build libravdb.gemspec
+          gem push libravdb-*.gem
+
+      # ---------------------------------------------------------
+      # 3. Publish NPM
+      # ---------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish NPM Package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd sdk/typescript
+          npm install
+          npm run build
+          npm publish
+
+      # ---------------------------------------------------------
+      # 4. Publish PyPI
+      # ---------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Publish Python Package
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          cd sdk/python
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine upload dist/*
