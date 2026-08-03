@@ -287,7 +287,7 @@ func (g *graphStore) LoadFromSegment(path string, w *wal.WAL) error {
 				if stamp > maxStamp {
 					maxStamp = stamp
 				}
-				err := g.appendEdgeToTable(nodeID, edges[j], g.index, g.pagePool)
+				err := g.appendEdgeToTable(nodeID, edges[j], g.index, g.pagePools[0])
 				if err != nil {
 					return err
 				}

@@ -54,25 +54,25 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 		shard := node % uint64(g.cfg.PageShards)
 	retry:
 		oldTail := frontier.tail
-		g.pagePool.HyalineEnter(int(shard))
+		g.pagePools[0].HyalineEnter(int(shard))
 
 		page := g.index.Lookup(node)
 		if page == nil {
-			g.pagePool.HyalineLeave(int(shard))
+			g.pagePools[0].HyalineLeave(int(shard))
 			continue
 		}
 
 		gen := g.enumerateTargets(page, 0, step, bitset, frontier, KindSet{}, 1)
 
 		if atomic.LoadUint32(&page.Header.Generation) != gen {
-			g.pagePool.HyalineLeave(int(shard))
+			g.pagePools[0].HyalineLeave(int(shard))
 			for i := oldTail; i < frontier.tail; i++ {
 				bitset.ClearBit(frontier.data[i].NodeID)
 			}
 			frontier.tail = oldTail
 			goto retry
 		}
-		g.pagePool.HyalineLeave(int(shard))
+		g.pagePools[0].HyalineLeave(int(shard))
 	}
 
 	return nil
@@ -120,7 +120,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 
 			// Forward direction (outbound)
 			if dir >= 0 {
-				g.pagePool.HyalineEnter(int(shard))
+				g.pagePools[0].HyalineEnter(int(shard))
 				oldTail := frontier.tail
 				page := g.index.Lookup(node)
 				if page != nil {
@@ -133,7 +133,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 						frontier.tail = oldTail
 					}
 				}
-				g.pagePool.HyalineLeave(int(shard))
+				g.pagePools[0].HyalineLeave(int(shard))
 			}
 
 			// Reverse direction (inbound)
