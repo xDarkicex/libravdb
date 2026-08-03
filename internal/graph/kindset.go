@@ -25,3 +25,40 @@ func NewKindSet(kinds ...uint8) KindSet {
 	}
 	return ks
 }
+
+// EdgeKindRegistry maps edge type names to their assigned uint8 kind values.
+// Register kinds before using them in graph queries with typed edges.
+var EdgeKindRegistry = struct {
+	byName map[string]uint8
+	byKind map[uint8]string
+}{
+	byName: make(map[string]uint8),
+	byKind: make(map[uint8]string),
+}
+
+// RegisterEdgeKind assigns a kind number to an edge type name.
+// Kind 0 is reserved (treated as "no filter"). Returns false on conflict.
+func RegisterEdgeKind(name string, kind uint8) bool {
+	if kind == 0 {
+		return false
+	}
+	if _, exists := EdgeKindRegistry.byName[name]; exists {
+		return false
+	}
+	if _, exists := EdgeKindRegistry.byKind[kind]; exists {
+		return false
+	}
+	EdgeKindRegistry.byName[name] = kind
+	EdgeKindRegistry.byKind[kind] = name
+	return true
+}
+
+// ResolveEdgeKind returns the kind value for an edge type name, or 0 if not found.
+func ResolveEdgeKind(name string) uint8 {
+	return EdgeKindRegistry.byName[name]
+}
+
+// EdgeKindName returns the name for a kind value, or empty string if not found.
+func EdgeKindName(kind uint8) string {
+	return EdgeKindRegistry.byKind[kind]
+}

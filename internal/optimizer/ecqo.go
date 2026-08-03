@@ -7,6 +7,7 @@ import (
 
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
+	"github.com/xDarkicex/libravdb/internal/graph"
 )
 
 var (
@@ -43,11 +44,13 @@ type JoinPlan struct {
 }
 
 // GraphEdgePlan is a single edge extracted from the MATCH path,
-// carrying its direction and quantifier bounds for traversal.
+// carrying its direction, quantifier bounds, and optional type/kind for traversal.
 type GraphEdgePlan struct {
 	Direction int8   // -1=inbound, 0=undirected, 1=outbound (from parser.Edge.Direction)
 	QuantMin  uint16 // minimum hops (0 for ->*)
 	QuantMax  uint16 // maximum hops (0=default→1, QuantUnbounded for ->+/->*)
+	EdgeType  string // edge type name from source (e.g., "KNOWS"); empty if not specified
+	EdgeKind  uint8  // resolved kind number from registry; 0 if not specified/registered
 }
 
 // PhysicalPlan represents the executable operations derived from the AST.
@@ -77,6 +80,7 @@ type PhysicalPlan struct {
 	ExplicitSeedID    uint64
 	HasVectorAnchor   bool
 	GraphAnchorVector []float32
+	SeedLabel         string // vertex label for label-scan seeding (e.g., "Person")
 
 	// Relational query fields — populated when Kind == QueryKindRelational
 	HasRelationalQuery bool
@@ -176,6 +180,16 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 		// Parse MatchPath into GraphEdgePlans
 		if gt.MatchPath.Kind == parser.NodeKindMatchPath {
 			mp := &doc.MatchPaths[gt.MatchPath.ID]
+			// Extract seed label from the first vertex in the match path.
+			if mp.PathNodesCount > 0 {
+				firstRef := doc.Nodes[mp.PathNodesStart]
+				if firstRef.Kind == parser.NodeKindVertex {
+					v := &doc.Vertexes[firstRef.ID]
+					if v.LabelStart != v.LabelEnd {
+						plan.SeedLabel = string(src[v.LabelStart:v.LabelEnd])
+					}
+				}
+			}
 			plan.MaxHops = 0
 			for i := int32(0); i < mp.PathNodesCount; i++ {
 				ref := doc.Nodes[mp.PathNodesStart+i]
@@ -187,6 +201,10 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 					Direction: e.Direction,
 					QuantMin:  e.QuantMin,
 					QuantMax:  e.QuantMax,
+				}
+				if e.TypeStart != e.TypeEnd {
+					gep.EdgeType = string(src[e.TypeStart:e.TypeEnd])
+					gep.EdgeKind = graph.ResolveEdgeKind(gep.EdgeType)
 				}
 				plan.GraphEdges = append(plan.GraphEdges, gep)
 

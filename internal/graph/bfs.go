@@ -14,9 +14,11 @@ type VisitAction func(nodeID uint64, depth int) bool
 // A MATCH path (a)-[e1]->{1,3}(b)-[e2]->(c) produces two EdgePlans:
 // {Dir:1, Min:1, Max:3}, {Dir:1, Min:0, Max:1}.
 type EdgePlan struct {
-	Dir int8 // 1=outbound (forward index), -1=inbound (reverse index), 0=both
-	Min int  // minimum hops (0 for ->*, 1 for ->+ or default)
-	Max int  // maximum hops (repeat count: 1 for default, large for ->+/->*)
+	Dir     int8    // 1=outbound, -1=inbound, 0=both
+	_       [7]byte // align following fields to 8-byte boundary
+	KindSet KindSet // edge kind filter; zero value means no filtering
+	Min     int     // minimum hops (0 for ->*, 1 for ->+ or default)
+	Max     int     // maximum hops (repeat count: 1 for default, large for ->+/->*)
 }
 
 // edgeDirAt returns the direction for the given depth by scanning
@@ -31,6 +33,20 @@ func edgeDirAt(edges []EdgePlan, depth int) int8 {
 		offset = end
 	}
 	return 1 // fallback: outbound (should not be reached)
+}
+
+// kindSetAt returns the KindSet filter for the given flattened depth.
+// A zero-value KindSet means no filtering is needed (match all kinds).
+func kindSetAt(edges []EdgePlan, depth int) KindSet {
+	offset := 0
+	for i := range edges {
+		end := offset + edges[i].Max
+		if depth < end {
+			return edges[i].KindSet
+		}
+		offset = end
+	}
+	return KindSet{}
 }
 
 // BFS performs a lock-free breadth-first search starting from 'start'.
@@ -70,7 +86,7 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 			continue
 		}
 
-		gen := g.enumerateTargets(page, depth, bitset, frontier)
+		gen := g.enumerateTargets(page, depth, bitset, frontier, KindSet{})
 
 		if atomic.LoadUint32(&page.Header.Generation) != gen {
 			g.pagePool.HyalineLeave(int(shard))
@@ -111,6 +127,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 		}
 
 		dir := edgeDirAt(edges, depth)
+		ks := kindSetAt(edges, depth)
 		shard := node % uint64(g.cfg.PageShards)
 
 		// Forward direction (outbound)
@@ -119,7 +136,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 			oldTail := frontier.tail
 			page := g.index.Lookup(node)
 			if page != nil {
-				gen := g.enumerateTargets(page, depth, bitset, frontier)
+				gen := g.enumerateTargets(page, depth, bitset, frontier, ks)
 				if atomic.LoadUint32(&page.Header.Generation) != gen {
 					for i := oldTail; i < frontier.tail; i++ {
 						bitset.ClearBit(frontier.data[i].NodeID)
@@ -136,7 +153,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 			oldTail := frontier.tail
 			page := g.reverse.locator.Lookup(node)
 			if page != nil {
-				gen := g.enumerateTargets(page, depth, bitset, frontier)
+				gen := g.enumerateTargets(page, depth, bitset, frontier, ks)
 				if atomic.LoadUint32(&page.Header.Generation) != gen {
 					for i := oldTail; i < frontier.tail; i++ {
 						bitset.ClearBit(frontier.data[i].NodeID)
@@ -155,7 +172,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 // into the frontier. The caller must hold HyalineEnter on the appropriate pool.
 // Returns the generation snapshot taken at entry; the caller compares with a
 // re-read to detect concurrent writes.
-func (g *graphStore) enumerateTargets(page *EdgeTablePage, depth int, bitset *Bitset, frontier *FrontierBuf) uint32 {
+func (g *graphStore) enumerateTargets(page *EdgeTablePage, depth int, bitset *Bitset, frontier *FrontierBuf, kindFilter KindSet) uint32 {
 	gen := atomic.LoadUint32(&page.Header.Generation)
 	totalCount := page.Header.Count
 
@@ -168,8 +185,12 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, depth int, bitset *Bi
 			pageCount = 250
 		}
 
+		filterActive := kindFilter != (KindSet{})
 		if pageCount <= 8 {
 			for i := uint16(0); i < pageCount; i++ {
+				if filterActive && !kindFilter.Has(currPage.Inline[i].GetKind()) {
+					continue
+				}
 				target := currPage.Inline[i].Target
 				if !bitset.Test(target) {
 					if frontier.Push(target, depth+1) {
@@ -189,6 +210,9 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, depth int, bitset *Bi
 			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
 			extraCount := pageCount - 8
 			for i := uint16(0); i < extraCount; i++ {
+				if filterActive && !kindFilter.Has(extra[i].GetKind()) {
+					continue
+				}
 				target := extra[i].Target
 				if !bitset.Test(target) {
 					if frontier.Push(target, depth+1) {

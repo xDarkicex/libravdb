@@ -32,6 +32,10 @@ type Graph interface {
 	GetFrontierBuf() (*graph.FrontierBuf, error)
 	PutFrontierBuf(f *graph.FrontierBuf)
 
+	// Vertex label registry (MVP: in-memory only, not persisted).
+	RegisterVertexLabel(nodeID uint64, label string)
+	GetLabelNodes(label string) []uint64
+
 	// Lifecycle.
 	Stats() graph.GraphStats
 	Close() error

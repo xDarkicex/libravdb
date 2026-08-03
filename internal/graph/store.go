@@ -71,6 +71,10 @@ type Graph interface {
 	PutFrontierBuf(f *FrontierBuf)
 	Stats() GraphStats
 
+	// Vertex label registry (MVP: in-memory only, not persisted).
+	RegisterVertexLabel(nodeID uint64, label string)
+	GetLabelNodes(label string) []uint64
+
 	Close() error
 }
 
@@ -89,6 +93,10 @@ type graphStore struct {
 	lastFlushedGen uint32
 	nextTxnID      atomic.Uint64
 	wal            *wal.WAL
+
+	// MVP node label registry: in-memory only, not persisted.
+	// Used for label-scan seeding in graph queries.
+	labelToNodes map[string][]uint64 // label → node IDs
 }
 
 // NewGraph initializes the Graph store with off-heap allocators.
@@ -162,6 +170,7 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 		index:        NewEdgeTableIndex(1024),
 		reverse:      revIdx,
 		manifest:     NewDBManifest(),
+		labelToNodes: make(map[string][]uint64),
 	}, nil
 }
 
@@ -832,4 +841,22 @@ func (g *graphStore) rebuildReverseIndex() {
 			_ = g.appendEdgeToTable(e.Target, rEdge, g.reverse.locator, g.reverse.pool)
 		}
 	})
+}
+
+// RegisterVertexLabel assigns a label to a graph node. This mapping is
+// in-memory only and is not persisted. It is an MVP feature for label-scan
+// seeding in graph queries.
+func (g *graphStore) RegisterVertexLabel(nodeID uint64, label string) {
+	if g.labelToNodes == nil {
+		g.labelToNodes = make(map[string][]uint64)
+	}
+	// Simple append — duplicates are possible if called twice for same node+label.
+	// The caller is responsible for deduplication if needed.
+	g.labelToNodes[label] = append(g.labelToNodes[label], nodeID)
+}
+
+// GetLabelNodes returns all node IDs registered under the given label.
+// Returns nil if no nodes have the label.
+func (g *graphStore) GetLabelNodes(label string) []uint64 {
+	return g.labelToNodes[label]
 }

@@ -211,12 +211,22 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 		}
 	}
 
-	// Priority 3: label-scan — not yet supported
+	// Priority 3: label-scan seeding
+	if len(seeds) == 0 && plan.SeedLabel != "" {
+		col, err := e.db.GetCollection(plan.CollectionName)
+		if err != nil {
+			return nil, fmt.Errorf("label-scan seed: %w", err)
+		}
+		g := col.GetGraph()
+		if g != nil {
+			seeds = g.GetLabelNodes(plan.SeedLabel)
+		}
+	}
 	if len(seeds) == 0 {
 		return nil, errors.New(
-			"graph query requires either WHERE a.id = N (explicit seed) " +
-				"or a vector predicate (vector-anchored traversal); " +
-				"label-scan seeding not supported yet")
+			"graph query requires either WHERE a.id = N (explicit seed), " +
+				"a vector predicate (vector-anchored traversal), " +
+				"or a labeled start vertex (label-scan seeding)")
 	}
 
 	col, err := e.db.GetCollection(plan.CollectionName)
@@ -257,7 +267,11 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 				max = 1 << 20 // ->+ unbounded
 			}
 		}
-		edges[i] = EdgePlan{Dir: gep.Direction, Min: int(gep.QuantMin), Max: max}
+		ep := EdgePlan{Dir: gep.Direction, Min: int(gep.QuantMin), Max: max}
+		if gep.EdgeKind != 0 {
+			ep.KindSet.Set(gep.EdgeKind)
+		}
+		edges[i] = ep
 		totalMinDepth += int(gep.QuantMin)
 	}
 
