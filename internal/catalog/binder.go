@@ -23,6 +23,9 @@ func NewBinder(cat *Catalog, src []byte) *Binder {
 // It returns an error if any identifier fails to resolve against the catalog.
 func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	var scope []*TableDef
+	// aliasScope maps qualifier name → TableDef for qualified identifiers
+	// (s.owner_id). Both the raw table name and any FROM alias resolve here.
+	aliasScope := make(map[uint64]*TableDef)
 
 	// 1. Resolve tables in FROM clauses and build scope stack.
 	for i := 0; i < len(doc.TableExprs); i++ {
@@ -36,12 +39,20 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			if sysDef, ok := ResolveSystemTable(name); ok {
 				t.TableOID = sysDef.OID
 				scope = append(scope, sysDef)
+				aliasScope[hash] = sysDef
+				if t.AliasEnd > t.Alias {
+					aliasScope[hashIdentifier(b.src, t.Alias, t.AliasEnd)] = sysDef
+				}
 				continue
 			}
 			return fmt.Errorf("table '%s' not found", name)
 		}
 		t.TableOID = def.OID
 		scope = append(scope, def)
+		aliasScope[hash] = def
+		if t.AliasEnd > t.Alias {
+			aliasScope[hashIdentifier(b.src, t.Alias, t.AliasEnd)] = def
+		}
 	}
 
 	for i := 0; i < len(doc.GraphTables); i++ {
@@ -53,12 +64,44 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			if sysDef, ok := ResolveSystemTable(name); ok {
 				gt.TableOID = sysDef.OID
 				scope = append(scope, sysDef)
+				aliasScope[hash] = sysDef
 				continue
 			}
 			return fmt.Errorf("graph table '%s' not found", name)
 		}
 		gt.TableOID = def.OID
 		scope = append(scope, def)
+		aliasScope[hash] = def
+	}
+
+	// 1a. Bind JOIN MATCH graph joins: the anchor vertex (first vertex in the
+	// match path) must be the FROM alias, e.g. FROM services s JOIN MATCH
+	// (s)-[:DEPENDS_ON*1..3]->(api). Vertex aliases beyond the anchor are graph
+	// node aliases and do not resolve against the catalog.
+	for i := 0; i < len(doc.SelectStmts); i++ {
+		stmt := &doc.SelectStmts[i]
+		for j := range stmt.Joins {
+			jc := &stmt.Joins[j]
+			if jc.MatchPath.Kind != parser.NodeKindMatchPath {
+				continue
+			}
+			mp := &doc.MatchPaths[jc.MatchPath.ID]
+			if mp.PathNodesCount == 0 {
+				continue
+			}
+			firstRef := doc.Nodes[mp.PathNodesStart]
+			if firstRef.Kind != parser.NodeKindVertex {
+				continue
+			}
+			v := &doc.Vertexes[firstRef.ID]
+			if v.AliasEnd <= v.Alias {
+				return fmt.Errorf("JOIN MATCH anchor vertex must have an alias matching a FROM alias")
+			}
+			ah := hashIdentifier(b.src, v.Alias, v.AliasEnd)
+			if _, ok := aliasScope[ah]; !ok {
+				return fmt.Errorf("JOIN MATCH anchor vertex '%s' does not match any FROM alias", string(b.src[v.Alias:v.AliasEnd]))
+			}
+		}
 	}
 
 	// 1b. Resolve CRUD statement tables.
@@ -131,9 +174,14 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		
 		resolved := false
 
-		// Check scope tables for columns deterministically.
-		// System tables use a hardcoded column registry instead of the catalog binary.
-		for _, tDef := range scope {
+		// Qualified identifier: s.owner_id resolves only against the qualifier's
+		// table (FROM alias or table name). No cross-table fallback.
+		if id.QualStart != 0 {
+			qhash := hashIdentifier(b.src, id.QualStart, id.QualEnd)
+			tDef, ok := aliasScope[qhash]
+			if !ok {
+				return fmt.Errorf("unknown qualifier '%s'", string(b.src[id.QualStart:id.QualEnd]))
+			}
 			var col *ColumnDef
 			var colErr error
 			if IsSystemTableOID(tDef.OID) {
@@ -141,12 +189,31 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			} else {
 				col, colErr = b.catalog.GetColumn(tDef, hash)
 			}
-			if colErr == nil {
-				id.TableOID = tDef.OID
-				id.ColumnOID = col.OID
-				id.ResolvedKind = parser.ResolvedKindColumn
-				resolved = true
-				break
+			if colErr != nil {
+				return fmt.Errorf("column '%s' not found in table '%s'", string(b.src[id.Start:id.End]), string(b.src[id.QualStart:id.QualEnd]))
+			}
+			id.TableOID = tDef.OID
+			id.ColumnOID = col.OID
+			id.ResolvedKind = parser.ResolvedKindColumn
+			resolved = true
+		} else {
+			// Unqualified: check scope tables for columns deterministically.
+			// System tables use a hardcoded column registry instead of the catalog binary.
+			for _, tDef := range scope {
+				var col *ColumnDef
+				var colErr error
+				if IsSystemTableOID(tDef.OID) {
+					col, colErr = ResolveSystemColumn(tDef.OID, hash)
+				} else {
+					col, colErr = b.catalog.GetColumn(tDef, hash)
+				}
+				if colErr == nil {
+					id.TableOID = tDef.OID
+					id.ColumnOID = col.OID
+					id.ResolvedKind = parser.ResolvedKindColumn
+					resolved = true
+					break
+				}
 			}
 		}
 		

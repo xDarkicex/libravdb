@@ -56,10 +56,20 @@ func (b *Bitset) ClearBit(nodeID uint64) {
 	b.data[word] &^= (1 << bit)
 }
 
+// VisitedKey computes the bitset index for a (node, band) pair.
+// numBands is the total number of edge bands in the pattern.
+// Index = nodeID * numBands + band.  Callers must ensure the result
+// fits within the bitset capacity (1M bits for default slot).
+func VisitedKey(nodeID uint64, band int, numBands int) uint64 {
+	return nodeID*uint64(numBands) + uint64(band)
+}
+
 // NodeDepth represents an entry in the BFS frontier queue.
+// Kept at 16 bytes so pool sizing (4096 entries per 65536 B slot) is unchanged.
 type NodeDepth struct {
 	NodeID uint64
-	Depth  int
+	Band   int32
+	Step   int32
 }
 
 // FrontierBuf is an off-heap queue for BFS traversal.
@@ -80,7 +90,7 @@ func newFrontierBuf(slot []byte) *FrontierBuf {
 }
 
 // Push adds an item to the frontier queue.
-func (f *FrontierBuf) Push(nodeID uint64, depth int) bool {
+func (f *FrontierBuf) Push(nodeID uint64, band, step int) bool {
 	if f.tail == len(f.data) {
 		// Shift items to the front if we have space
 		if f.head > 0 {
@@ -92,19 +102,19 @@ func (f *FrontierBuf) Push(nodeID uint64, depth int) bool {
 			return false // Queue full
 		}
 	}
-	f.data[f.tail] = NodeDepth{NodeID: nodeID, Depth: depth}
+	f.data[f.tail] = NodeDepth{NodeID: nodeID, Band: int32(band), Step: int32(step)}
 	f.tail++
 	return true
 }
 
 // Pop removes and returns the first item in the frontier queue.
-func (f *FrontierBuf) Pop() (uint64, int) {
+func (f *FrontierBuf) Pop() (uint64, int, int) {
 	if f.head == f.tail {
-		return 0, 0
+		return 0, 0, 0
 	}
 	item := f.data[f.head]
 	f.head++
-	return item.NodeID, item.Depth
+	return item.NodeID, int(item.Band), int(item.Step)
 }
 
 // Empty returns true if the queue is empty.

@@ -44,6 +44,18 @@ type JoinPlan struct {
 	JoinType       uint8 // parser.JoinType value
 }
 
+// GraphJoinPlan represents a single JOIN MATCH graph join:
+//   FROM services s JOIN MATCH (s)-[:DEPENDS_ON*1..3]->(api:Endpoint)
+// The LeftAlias anchors the traversal: each row of the left collection is
+// resolved to a graph node, and BFS is seeded from that node over GraphEdges.
+type GraphJoinPlan struct {
+	LeftAlias      string          // FROM alias anchoring the path (e.g. "s")
+	LeftCollection string          // left (FROM) collection name
+	GraphEdges     []GraphEdgePlan // edges extracted from the match path
+	MaxHops        int             // sum of QuantMax across edges
+	JoinType       uint8           // parser.JoinType value
+}
+
 // VectorFuncProjection is a SIMILARITY()/VECTOR_DISTANCE() entry in the
 // SELECT list. Name is the projected column name (alias if given, else the
 // function name); IsDistance distinguishes VECTOR_DISTANCE from SIMILARITY;
@@ -109,6 +121,11 @@ type PhysicalPlan struct {
 
 	// JOIN fields — populated when Kind == QueryKindJoin
 	Joins []JoinPlan
+
+	// Graph JOIN fields — populated when a JOIN MATCH clause is present.
+	// Left collection is CollectionName; each entry adds a graph traversal
+	// seeded from every row of the left collection.
+	GraphJoins []GraphJoinPlan
 
 	// CRUD fields — populated for INSERT/UPDATE/DELETE
 	InsertColumns []string // column names
@@ -208,38 +225,7 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 					}
 				}
 			}
-			plan.MaxHops = 0
-			for i := int32(0); i < mp.PathNodesCount; i++ {
-				ref := doc.Nodes[mp.PathNodesStart+i]
-				if ref.Kind != parser.NodeKindEdge {
-					continue
-				}
-				e := &doc.Edges[ref.ID]
-				gep := GraphEdgePlan{
-					Direction: e.Direction,
-					QuantMin:  e.QuantMin,
-					QuantMax:  e.QuantMax,
-				}
-				if e.TypeStart != e.TypeEnd {
-					gep.EdgeType = string(src[e.TypeStart:e.TypeEnd])
-					gep.EdgeKind = graph.ResolveEdgeKind(gep.EdgeType)
-				}
-				plan.GraphEdges = append(plan.GraphEdges, gep)
-
-				// Compute MaxHops: sum QuantMax across all edges
-				max := int(e.QuantMax)
-				if e.QuantMax == 0 {
-					if e.QuantMin == 0 {
-						max = 1 // default: exactly 1 hop
-					} else {
-						max = 1 << 20 // ->+ : unbounded
-					}
-				}
-				plan.MaxHops += max
-			}
-			if plan.MaxHops == 0 {
-				plan.MaxHops = 1
-			}
+			plan.GraphEdges, plan.MaxHops = o.extractMatchPath(doc, src, mp)
 		}
 	} else {
 		return nil, fmt.Errorf("unsupported FROM clause kind")
@@ -405,6 +391,33 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 
 	// 3. Map JOIN clauses
 	for _, jc := range stmt.Joins {
+		// Graph join: JOIN MATCH (s)-[e]->(b). The match path defines the
+		// right side; the left side is the FROM collection (plan.CollectionName).
+		if jc.MatchPath.Kind == parser.NodeKindMatchPath {
+			mp := &doc.MatchPaths[jc.MatchPath.ID]
+			gjp := GraphJoinPlan{
+				LeftAlias:      plan.CollectionName,
+				LeftCollection: plan.CollectionName,
+				JoinType:       uint8(jc.Type),
+			}
+			// Anchor alias = first vertex alias in the path (e.g. "s" in
+			// (s)-[:DEPENDS_ON*1..3]->(api)). The binder verified it matches a
+			// FROM alias; at plan time the anchor is the left collection itself.
+			if mp.PathNodesCount > 0 {
+				firstRef := doc.Nodes[mp.PathNodesStart]
+				if firstRef.Kind == parser.NodeKindVertex {
+					v := &doc.Vertexes[firstRef.ID]
+					if v.AliasEnd > v.Alias {
+						gjp.LeftAlias = string(src[v.Alias:v.AliasEnd])
+					}
+				}
+			}
+			gjp.GraphEdges, gjp.MaxHops = o.extractMatchPath(doc, src, mp)
+			plan.GraphJoins = append(plan.GraphJoins, gjp)
+			plan.Kind = QueryKindJoin
+			continue
+		}
+
 		jp := JoinPlan{
 			CollectionName: string(src[jc.TableStart:jc.TableEnd]),
 			JoinType:       uint8(jc.Type),
@@ -570,6 +583,45 @@ func (o *Optimizer) setRelationalKind(plan *PhysicalPlan) {
 
 // extractRelationalPredicates recursively walks a WHERE expression tree,
 // decomposing AND nodes and collecting leaf predicates (Identifier op Literal).
+// extractMatchPath converts a MatchPath AST node into GraphEdgePlans and the
+// cumulative MaxHops bound. Shared by GRAPH_TABLE FROM clauses and JOIN MATCH.
+func (o *Optimizer) extractMatchPath(doc *parser.QueryDoc, src []byte, mp *parser.MatchPath) ([]GraphEdgePlan, int) {
+	var edges []GraphEdgePlan
+	maxHops := 0
+	for i := int32(0); i < mp.PathNodesCount; i++ {
+		ref := doc.Nodes[mp.PathNodesStart+i]
+		if ref.Kind != parser.NodeKindEdge {
+			continue
+		}
+		e := &doc.Edges[ref.ID]
+		gep := GraphEdgePlan{
+			Direction: e.Direction,
+			QuantMin:  e.QuantMin,
+			QuantMax:  e.QuantMax,
+		}
+		if e.TypeStart != e.TypeEnd {
+			gep.EdgeType = string(src[e.TypeStart:e.TypeEnd])
+			gep.EdgeKind = graph.ResolveEdgeKind(gep.EdgeType)
+		}
+		edges = append(edges, gep)
+
+		// Compute MaxHops: sum QuantMax across all edges
+		max := int(e.QuantMax)
+		if e.QuantMax == 0 {
+			if e.QuantMin == 0 {
+				max = 1 // default: exactly 1 hop
+			} else {
+				max = 1 << 20 // ->+ : unbounded
+			}
+		}
+		maxHops += max
+	}
+	if maxHops == 0 {
+		maxHops = 1
+	}
+	return edges, maxHops
+}
+
 func (o *Optimizer) extractRelationalPredicates(doc *parser.QueryDoc, src []byte, plan *PhysicalPlan, node parser.NodeRef) {
 	if node.Kind != parser.NodeKindBinaryExpr {
 		return

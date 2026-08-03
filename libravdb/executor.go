@@ -325,25 +325,16 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 		totalMinDepth += int(gep.QuantMin)
 	}
 
-	// BFS from each seed, tracking min depth per node
-	seen := make(map[uint64]int) // nodeID → min depth reached
-	firstEdgeHasZeroMin := len(plan.GraphEdges) > 0 && plan.GraphEdges[0].QuantMin == 0
+	// BFS from each seed, tracking visited nodes (band-stateful traversal).
+	seen := make(map[uint64]bool) // nodeID → reached in any band
 
 	for _, seed := range seeds {
-		if firstEdgeHasZeroMin {
-			if _, exists := seen[seed]; !exists {
-				seen[seed] = 0
-			}
-		}
-
 		if plan.Limit > 0 && len(seen) >= plan.Limit {
 			break
 		}
 
-		if err := g.BFSPattern(seed, edges, plan.MaxHops, func(nodeID uint64, depth int) bool {
-			if existing, ok := seen[nodeID]; !ok || depth < existing {
-				seen[nodeID] = depth
-			}
+		if err := g.BFSPattern(seed, edges, plan.MaxHops, func(nodeID uint64, band int, step int) bool {
+			seen[nodeID] = true
 			return plan.Limit <= 0 || len(seen) < plan.Limit
 		}, bitset, frontier); err != nil {
 			return nil, err
@@ -351,13 +342,6 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 
 		bitset.Clear()
 		frontier.Clear()
-	}
-
-	// Filter by cumulative minimum depth: nodes must satisfy all edge QuantMin requirements
-	for nodeID, depth := range seen {
-		if depth < totalMinDepth && !(depth == 0 && firstEdgeHasZeroMin) {
-			delete(seen, nodeID)
-		}
 	}
 
 	// Project GraphNodeIDs to SearchResults via ResolveNodeID
@@ -982,6 +966,11 @@ func (e *Executor) executeDelete(ctx context.Context, plan *optimizer.PhysicalPl
 // Both cursors advance in lockstep — O(N+M) with zero extra structures.
 // Supports INNER (default), LEFT, and CROSS join types.
 func (e *Executor) executeJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	// Graph joins (JOIN MATCH) take precedence: every row of the left
+	// collection seeds a BFS traversal over the match-path edges.
+	if len(plan.GraphJoins) > 0 {
+		return e.executeGraphJoin(ctx, plan)
+	}
 	if len(plan.Joins) == 0 {
 		return e.executeRelational(ctx, plan)
 	}
@@ -1061,6 +1050,127 @@ func (e *Executor) executeJoin(ctx context.Context, plan *optimizer.PhysicalPlan
 	return &SearchResults{Results: results, Total: len(results)}, nil
 }
 
+
+// executeGraphJoin implements JOIN MATCH: for each row of the left (FROM)
+// collection, resolve the row's key to a graph node and run a BFS over the
+// match-path edges. Each reached vertex emits a joined row (leftKey|vertexID).
+// LEFT JOIN emits left rows even when no vertex is reached.
+func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	leftTree, ok := leftCol.GetIndex().(interface{ Tree() *btree.BTree })
+	if !ok {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q does not support Tree() access", plan.CollectionName)
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+
+	// Acquire pooled off-heap buffers (reused across all rows and joins)
+	bitset, err := g.GetBitset()
+	if err != nil {
+		return nil, err
+	}
+	defer g.PutBitset(bitset)
+	frontier, err := g.GetFrontierBuf()
+	if err != nil {
+		return nil, err
+	}
+	defer g.PutFrontierBuf(frontier)
+
+	var results []*SearchResult
+	for _, gjp := range plan.GraphJoins {
+		isLeftJoin := gjp.JoinType == 1 // parser.JoinLeft
+
+		// Convert optimizer.GraphEdgePlan to graph.EdgePlan
+		edges := make([]EdgePlan, len(gjp.GraphEdges))
+		totalMinDepth := 0
+		for i, gep := range gjp.GraphEdges {
+			max := int(gep.QuantMax)
+			if max == 0 {
+				if gep.QuantMin == 0 {
+					max = 1 // default: exactly 1 hop
+				} else {
+					max = 1 << 20 // ->+ unbounded
+				}
+			}
+			ep := EdgePlan{Dir: gep.Direction, Min: int(gep.QuantMin), Max: max}
+			if gep.EdgeKind != 0 {
+				ep.KindSet.Set(gep.EdgeKind)
+			}
+			edges[i] = ep
+			totalMinDepth += int(gep.QuantMin)
+		}
+
+		c := leftTree.Tree().SeekFirst()
+		for c.Valid() {
+			leftKey := string(c.Key())
+
+			// Resolve this row's key to a graph node (the anchor).
+			nodeID, err := e.db.GetNodeID(ctx, plan.CollectionName, leftKey)
+			if err != nil {
+				// Row is not a graph node — no traversal possible.
+				if isLeftJoin {
+					results = append(results, &SearchResult{ID: leftKey + "|", Score: 1.0})
+				}
+				c.Next()
+				continue
+			}
+
+			seedID := nodeID
+			seen := make(map[uint64]bool) // nodeID → reached via traversal
+
+			if err := g.BFSPattern(nodeID, edges, gjp.MaxHops, func(vid uint64, band int, step int) bool {
+				// Include the seed only if the first band allows zero-hop
+				// matches (Min == 0 for ->*).  Otherwise exclude the seed
+				// initialization visit — it must be reached via expansion
+				// or band transition to count.
+				if vid == seedID && band == 0 && step == 0 {
+					if edges[0].Min == 0 {
+						seen[vid] = true
+					}
+				} else {
+					seen[vid] = true
+				}
+				return plan.Limit <= 0 || len(results) < plan.Limit
+			}, bitset, frontier); err != nil {
+				return nil, err
+			}
+
+			bitset.Clear()
+			frontier.Clear()
+
+			// Emit joined rows: leftKey|vertexRecID, filtering by min depth.
+			emitted := false
+			for vid := range seen {
+				_, recID, err := e.db.ResolveNodeID(ctx, vid)
+				if err != nil {
+					continue
+				}
+				results = append(results, &SearchResult{ID: leftKey + "|" + recID, Score: 1.0})
+				emitted = true
+				if plan.Limit > 0 && len(results) >= plan.Limit {
+					break
+				}
+			}
+			if !emitted && isLeftJoin {
+				results = append(results, &SearchResult{ID: leftKey + "|", Score: 1.0})
+			}
+
+			c.Next()
+			if plan.Limit > 0 && len(results) >= plan.Limit {
+				break
+			}
+		}
+		if plan.Limit > 0 && len(results) >= plan.Limit {
+			break
+		}
+	}
+	return &SearchResults{Results: results, Total: len(results)}, nil
+}
 
 // aggregateColumnName returns the output column name for an aggregate function.
 func aggregateColumnName(funcType uint8) string {
