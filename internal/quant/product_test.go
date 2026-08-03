@@ -625,3 +625,79 @@ func euclideanDistance(a, b []float32) float32 {
 	}
 	return float32(math.Sqrt(float64(sum)))
 }
+
+func TestRealCentroidDistance(t *testing.T) {
+	pq := NewProductQuantizer()
+	// Mock a trained PQ codebook
+	pq.config = &QuantizationConfig{Bits: 8}
+	pq.trained = true
+	pq.subspaces = 2
+	pq.subDim = 2
+	pq.dimension = 4
+
+	pq.centroids = [][][]float32{
+		{
+			{1.0, 2.0}, // Subspace 0, Centroid 0
+			{4.0, 6.0}, // Subspace 0, Centroid 1
+		},
+		{
+			{0.0, 0.0}, // Subspace 1, Centroid 0
+			{3.0, 4.0}, // Subspace 1, Centroid 1
+		},
+	}
+
+	// Pack IDs: subspace << 8 | centroid
+	idSub0Cent0 := uint32(0<<8 | 0)
+	idSub0Cent1 := uint32(0<<8 | 1)
+	idSub1Cent0 := uint32(1<<8 | 0)
+	idSub1Cent1 := uint32(1<<8 | 1)
+
+	// Distance between Sub 0 Cent 0 and Sub 0 Cent 1
+	// dx = 4.0 - 1.0 = 3.0, dy = 6.0 - 2.0 = 4.0. dist = sqrt(9 + 16) = 5.0
+	dist := pq.CentroidDistance(idSub0Cent0, idSub0Cent1)
+	if math.Abs(float64(dist-5.0)) > 1e-6 {
+		t.Errorf("Expected distance 5.0, got %f", dist)
+	}
+
+	// Distance between Sub 1 Cent 0 and Sub 1 Cent 1
+	// dx = 3.0, dy = 4.0. dist = 5.0
+	dist2 := pq.CentroidDistance(idSub1Cent0, idSub1Cent1)
+	if math.Abs(float64(dist2-5.0)) > 1e-6 {
+		t.Errorf("Expected distance 5.0, got %f", dist2)
+	}
+
+	// Cross-subspace should return MaxFloat32
+	dist3 := pq.CentroidDistance(idSub0Cent0, idSub1Cent0)
+	if dist3 != math.MaxFloat32 {
+		t.Errorf("Expected MaxFloat32 for cross-subspace distance, got %f", dist3)
+	}
+}
+
+func TestMaxResidualBound(t *testing.T) {
+	pq := NewProductQuantizer()
+	pq.config = &QuantizationConfig{Bits: 8}
+	pq.trained = true
+	pq.subspaces = 2
+	pq.subDim = 2
+	pq.dimension = 4
+
+	pq.centroids = [][][]float32{
+		{
+			{1.0, 1.0}, // normSq = 2.0
+			{3.0, 4.0}, // normSq = 25.0
+		},
+		{
+			{5.0, 12.0}, // normSq = 169.0
+			{0.0, 0.0},  // normSq = 0.0
+		},
+	}
+
+	// Max possible normSq across subspaces = 25.0 (sub0) + 169.0 (sub1) = 194.0
+	// Max bound = sqrt(194.0) = 13.928388
+	bound := pq.MaxResidualBound()
+	expected := float32(math.Sqrt(194.0))
+
+	if math.Abs(float64(bound-expected)) > 1e-6 {
+		t.Errorf("Expected bound %f, got %f", expected, bound)
+	}
+}

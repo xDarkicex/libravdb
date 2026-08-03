@@ -29,6 +29,26 @@ type Filter struct {
 	Operator FilterOperator
 }
 
+// GraphEdge is the user-facing edge type.
+type GraphEdge = Edge
+
+// thresholdGraphFilter implements both GraphFilter and ThresholdFilter
+type thresholdGraphFilter struct {
+	base      GraphFilter
+	threshold float32
+}
+
+func (t *thresholdGraphFilter) Test(idx uint64) bool {
+	if t.base != nil {
+		return t.base.Test(idx)
+	}
+	return true
+}
+
+func (t *thresholdGraphFilter) Threshold() float32 {
+	return t.threshold
+}
+
 // FilterOperator defines filter comparison operations (deprecated, use filter package)
 type FilterOperator int
 
@@ -339,8 +359,17 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	// Optimize filters before execution
 	optimizedFilters := qb.optimizeFilters()
 
+	// Wrap graph filter with threshold filter if threshold is set
+	var execFilter GraphFilter = qb.graphFilter
+	if qb.thresholdSet {
+		execFilter = &thresholdGraphFilter{
+			base:      qb.graphFilter,
+			threshold: qb.threshold,
+		}
+	}
+
 	// Get initial search results from vector index
-	result, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), qb.graphFilter)
+	result, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), execFilter)
 	if err != nil {
 		return nil, err
 	}

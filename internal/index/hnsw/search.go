@@ -15,6 +15,11 @@ import (
 	"golang.org/x/sys/cpu"
 )
 
+type commBound struct {
+	gen   uint32
+	bound float32
+}
+
 type searchScratch struct {
 	slot          uint8
 	arena         *memory.Arena
@@ -24,9 +29,11 @@ type searchScratch struct {
 	minHeapBuf    []util.Candidate
 	soaIDs        []uint32
 	soaDistances  []float32
-	pruneBuf      []util.Candidate
-	inFlightBuf   []uint32
-	prefetchedIDs []uint32
+	pruneBuf        []util.Candidate
+	commLowerBounds []commBound
+	commGen         uint32
+	inFlightBuf     []uint32
+	prefetchedIDs   []uint32
 	prefetchPtrs  []unsafe.Pointer
 	prefetchVecs  [][]float32
 	visitMark     uint32
@@ -912,7 +919,7 @@ func (h *Index) searchLevelForConstruction(query []float32, entryPoint *Node, ef
 	scratch := h.acquireSearchScratchWithEF(ef)
 	defer h.releaseSearchScratch(scratch)
 
-	return h.searchLevelValuesWithScratch(context.Background(), query, entryPoint, ef, level, false, scratch, queryState, nil)
+	return h.searchLevelValuesWithScratch(context.Background(), query, entryPoint, ef, level, false, scratch, queryState, nil, false)
 }
 
 // searchAndSelectForConstruction finds neighbors at a specific level and selects the best ones for construction
@@ -932,7 +939,7 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 	scratch *searchScratch,
 	queryState any,
 ) ([]util.Candidate, error) {
-	workingSet, err := h.searchLevelScratchValues(context.Background(), query, entryPoint, ef, level, scratch, queryState, nil)
+	workingSet, err := h.searchLevelScratchValues(context.Background(), query, entryPoint, ef, level, scratch, queryState, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -972,7 +979,7 @@ func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, ent
 	scratch := h.acquireSearchScratchWithEF(ef)
 	defer h.releaseSearchScratch(scratch)
 
-	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState, filter)
+	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState, filter, true)
 	if err != nil {
 		return nil, err
 	}
@@ -991,9 +998,9 @@ func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, ent
 	return result, nil
 }
 
-func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }) ([]util.Candidate, error) {
+func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }, isQuery bool) ([]util.Candidate, error) {
 	if !sortResults {
-		values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter)
+		values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter, isQuery)
 		if err != nil {
 			return nil, err
 		}
@@ -1005,7 +1012,7 @@ func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float3
 		return result, nil
 	}
 
-	values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter)
+	values, err := h.searchLevelScratchValues(ctx, query, entryPoint, ef, level, scratch, queryState, filter, isQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -1017,7 +1024,7 @@ func (h *Index) searchLevelValuesWithScratch(ctx context.Context, query []float3
 	return values, nil
 }
 
-func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }) ([]util.Candidate, error) {
+func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, scratch *searchScratch, queryState any, filter interface{ Test(idx uint64) bool }, isQuery bool) ([]util.Candidate, error) {
 	if ef <= 0 {
 		return nil, nil
 	}
@@ -1043,6 +1050,40 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done()
+	}
+
+	if isQuery && h.communities != nil {
+		communities := h.communities
+		
+		maxCommID := uint32(0)
+		for commID := range communities.Bounds {
+			if commID > maxCommID {
+				maxCommID = commID
+			}
+		}
+		neededCap := maxCommID + 1
+		
+		if uint32(cap(scratch.commLowerBounds)) < neededCap {
+			scratch.commLowerBounds = make([]commBound, neededCap)
+		}
+		scratch.commLowerBounds = scratch.commLowerBounds[:neededCap]
+		
+		scratch.commGen++
+		if scratch.commGen == 0 {
+			// rare overflow, reset all
+			for i := range scratch.commLowerBounds {
+				scratch.commLowerBounds[i].gen = 0
+			}
+			scratch.commGen = 1
+		}
+
+		for commID, bounds := range communities.Bounds {
+			dist := h.distance(query, bounds.Mean)
+			scratch.commLowerBounds[commID] = commBound{
+				gen:   scratch.commGen,
+				bound: dist - bounds.Radius,
+			}
+		}
 	}
 
 	// Initialize with entry point
@@ -1122,6 +1163,32 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 		if level < (currentNode.Level + 1) {
 			// Process neighbors in batches for better cache locality
 			neighbors := h.getNodeLinks(currentNode, level)
+			
+			var worstDist float32
+			var canPrune bool
+			if isQuery && h.communities != nil {
+				if soaMode {
+					if soaCandidates.size >= ef {
+						worstDist = soaCandidates.Worst().Distance
+						canPrune = true
+					}
+				} else if heapMode {
+					if len(heapCandidates.items) >= ef {
+						worstDist = heapCandidates.items[0].Distance
+						canPrune = true
+					}
+				} else if reservoirMode {
+					if reservoirCandidates.Full() {
+						worstDist = reservoirCandidates.Threshold().Distance
+						canPrune = true
+					}
+				} else {
+					if len(unsortedCandidates.items) >= ef {
+						worstDist = unsortedCandidates.items[unsortedCandidates.worstIdx].Distance
+						canPrune = true
+					}
+				}
+			}
 			// Pass 1: Gather and logically prefetch
 			scratch.prefetchedIDs = scratch.prefetchedIDs[:0]
 			scratch.prefetchPtrs = scratch.prefetchPtrs[:0]
@@ -1130,6 +1197,15 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			for _, neighborID := range neighbors {
 				if neighborID < uint32(len(visited)) && visited[neighborID] != visitMark && neighborID != SentinelNodeID {
 					visited[neighborID] = visitMark
+
+					if canPrune {
+						if commID := h.communities.NodeToComm[neighborID]; commID < uint32(len(scratch.commLowerBounds)) {
+							cb := scratch.commLowerBounds[commID]
+							if cb.gen == scratch.commGen && cb.bound > worstDist {
+								continue
+							}
+						}
+					}
 
 					node := h.nodes.Get(neighborID)
 					if node != nil {
@@ -1167,6 +1243,15 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			for _, neighborID := range backlinks {
 				if neighborID < uint32(len(visited)) && visited[neighborID] != visitMark && neighborID != SentinelNodeID {
 					visited[neighborID] = visitMark
+
+					if canPrune {
+						if commID := h.communities.NodeToComm[neighborID]; commID < uint32(len(scratch.commLowerBounds)) {
+							cb := scratch.commLowerBounds[commID]
+							if cb.gen == scratch.commGen && cb.bound > worstDist {
+								continue
+							}
+						}
+					}
 
 					node := h.nodes.Get(neighborID)
 					if node != nil {
@@ -1351,6 +1436,8 @@ func (h *Index) normalizeQuantizedDistance(distance float32) float32 {
 
 // computeDistanceOptimized provides optimized distance computation with error handling
 func (h *Index) computeDistanceOptimized(query []float32, node *Node, queryState any) (float32, error) {
+	h.distanceToQuery.Add(1)
+	
 	if node == nil {
 		return -1, fmt.Errorf("node is nil")
 	}

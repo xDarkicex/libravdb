@@ -1,0 +1,109 @@
+package catalog
+
+import (
+	"fmt"
+
+	"github.com/xDarkicex/lexer/parser"
+)
+
+// Binder performs the OID resolution pass over the SoA QueryDoc.
+type Binder struct {
+	catalog *Catalog
+	src     []byte // The original SQL source byte slice
+}
+
+func NewBinder(cat *Catalog, src []byte) *Binder {
+	return &Binder{
+		catalog: cat,
+		src:     src,
+	}
+}
+
+// Bind modifies the doc in-place, filling in TableOID and ColumnOID for Identifiers.
+// It returns an error if any identifier fails to resolve against the catalog.
+func (b *Binder) Bind(doc *parser.QueryDoc) error {
+	var scope []*TableDef
+
+	// 1. Resolve tables in FROM clauses and build scope stack.
+	for i := 0; i < len(doc.TableExprs); i++ {
+		t := &doc.TableExprs[i]
+		hash := hashIdentifier(b.src, t.Start, t.End)
+		def, err := b.catalog.GetTable(hash)
+		if err != nil {
+			return fmt.Errorf("table '%s' not found", string(b.src[t.Start:t.End]))
+		}
+		t.TableOID = def.OID
+		scope = append(scope, def)
+	}
+
+	for i := 0; i < len(doc.GraphTables); i++ {
+		gt := &doc.GraphTables[i]
+		hash := hashIdentifier(b.src, gt.TableStart, gt.TableEnd)
+		def, err := b.catalog.GetTable(hash)
+		if err != nil {
+			return fmt.Errorf("graph table '%s' not found", string(b.src[gt.TableStart:gt.TableEnd]))
+		}
+		gt.TableOID = def.OID
+		scope = append(scope, def)
+	}
+
+	// 2. Resolve identifiers (columns, vectors, graphs) deterministically using scope.
+	for i := 0; i < len(doc.Identifiers); i++ {
+		id := &doc.Identifiers[i]
+		hash := hashIdentifier(b.src, id.Start, id.End)
+		
+		resolved := false
+
+		// Check scope tables for columns deterministically
+		for _, tDef := range scope {
+			col, err := b.catalog.GetColumn(tDef, hash)
+			if err == nil {
+				id.TableOID = tDef.OID
+				id.ColumnOID = col.OID
+				id.ResolvedKind = parser.ResolvedKindColumn
+				resolved = true
+				break
+			}
+		}
+		
+		if !resolved {
+			// Check if it's a Vector Index
+			vec, err := b.catalog.GetVectorIndex(hash)
+			if err == nil {
+				id.TableOID = vec.OID
+				id.ResolvedKind = parser.ResolvedKindVector
+				resolved = true
+				continue
+			}
+			
+			// Check if it's a Graph Label
+			graph, err := b.catalog.GetGraphLabel(hash)
+			if err == nil {
+				id.TableOID = graph.OID
+				id.ResolvedKind = parser.ResolvedKindGraph
+				resolved = true
+				continue
+			}
+			
+			return fmt.Errorf("identifier '%s' not found in scope or catalog", string(b.src[id.Start:id.End]))
+		}
+	}
+	
+	return nil
+}
+
+// hashIdentifier computes a case-insensitive FNV-1a hash directly from the source slice.
+// This ensures 0 allocations on the bind path.
+func hashIdentifier(src []byte, start, end uint32) uint64 {
+	var hash uint64 = 14695981039346656037
+	for i := start; i < end; i++ {
+		c := src[i]
+		// Convert ASCII uppercase to lowercase
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		hash ^= uint64(c)
+		hash *= 1099511628211
+	}
+	return hash
+}

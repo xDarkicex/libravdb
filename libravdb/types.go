@@ -31,6 +31,7 @@ type SearchResult struct {
 	Vector   []float32              `json:"vector,omitempty"`
 	Version  uint64                 `json:"version"`
 	Score    float32                `json:"score"`
+	Ordinal  uint32                 `json:"ordinal,omitempty"`
 }
 
 // SearchResults represents the complete search response.

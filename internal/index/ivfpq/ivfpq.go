@@ -1313,7 +1313,7 @@ func (idx *Index) batchInsertChunk(ctx context.Context, entries []*VectorEntry) 
 
 // findProbeClusters returns the top probeClusters for a query, using only
 // generation-owned state. No Index dereference.
-func findProbeClusters(gen *generation, query []float32, arena *memory.Arena) ([]int, []float32, error) {
+func findProbeClusters(gen *generation, query []float32, arena *memory.Arena, filter interface{ Test(idx uint64) bool }) ([]int, []float32, error) {
 	clusters := gen.clusters
 	nProbes := gen.config.NProbes
 	distances, err := memory.ArenaSlice[clusterDistance](arena, len(clusters))
@@ -1321,6 +1321,20 @@ func findProbeClusters(gen *generation, query []float32, arena *memory.Arena) ([
 		return nil, nil, fmt.Errorf("arena allocate distances: %w", err)
 	}
 	distances = distances[:len(clusters)]
+
+	// Check if filter provides a distance threshold via ThresholdFilter interface
+	var maxDistBound float32 = math.MaxFloat32
+	if tf, ok := filter.(interface{ Threshold() float32 }); ok {
+		if simThreshold := tf.Threshold(); simThreshold > 0 {
+			// Convert similarity threshold to max allowed distance
+			distanceThreshold := (1.0 / simThreshold) - 1.0
+			// Get max possible residual from quantizer if it provides one
+			if cp, ok := gen.quantizer.(interface{ MaxResidualBound() float32 }); ok {
+				maxDistBound = float32(distanceThreshold) + cp.MaxResidualBound()
+			}
+		}
+	}
+
 	workers := parallelismFor(len(clusters))
 	if workers == 1 {
 		for i, cluster := range clusters {
@@ -1347,6 +1361,18 @@ func findProbeClusters(gen *generation, query []float32, arena *memory.Arena) ([
 		}
 		wg.Wait()
 	}
+
+	// Pre-prune clusters whose distance exceeds the mathematically possible bound
+	if maxDistBound < math.MaxFloat32 {
+		filtered := distances[:0]
+		for _, cd := range distances {
+			if cd.distance <= maxDistBound {
+				filtered = append(filtered, cd)
+			}
+		}
+		distances = filtered
+	}
+
 	probeCount := nProbes
 	if probeCount > len(distances) {
 		probeCount = len(distances)
@@ -1434,6 +1460,13 @@ func collectCandidatesSeqGen(ctx context.Context, query []float32, probeClusters
 	heapBuf = heapBuf[:k]
 	count := 0
 
+	var distanceThreshold float32 = math.MaxFloat32
+	if tf, ok := filter.(interface{ Threshold() float32 }); ok {
+		if simThreshold := tf.Threshold(); simThreshold > 0 {
+			distanceThreshold = (1.0 / simThreshold) - 1.0
+		}
+	}
+
 	for _, clusterID := range probeClusters {
 		select {
 		case <-ctx.Done():
@@ -1456,6 +1489,9 @@ func collectCandidatesSeqGen(ctx context.Context, query []float32, probeClusters
 						cluster.mutex.RUnlock()
 						return nil, err
 					}
+				}
+				if distance > distanceThreshold {
+					continue
 				}
 				if count < k {
 					heapBuf[count] = ivfHeapElement{ordinal: ordinal, distance: distance}
@@ -1530,7 +1566,7 @@ func (idx *Index) Search(ctx context.Context, query []float32, k int, filter int
 		cs = gen.quantizer.CodeSize()
 	}
 
-	probeClusters, clusterDistances, err := findProbeClusters(gen, query, arena)
+	probeClusters, clusterDistances, err := findProbeClusters(gen, query, arena, filter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find probe clusters: %w", err)
 	}

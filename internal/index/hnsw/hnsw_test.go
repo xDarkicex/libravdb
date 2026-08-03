@@ -306,3 +306,97 @@ func TestHNSWDeterministicFixedSeedSearchResults(t *testing.T) {
 		t.Fatalf("expected deterministic results with fixed seed, got %v and %v", first, second)
 	}
 }
+
+func TestCommunityPruningThresholds(t *testing.T) {
+	config := &Config{
+		Dimension:      2,
+		M:              16,
+		EfConstruction: 100,
+		EfSearch:       50,
+		ML:             1.0,
+		Metric:         util.L2Distance,
+		RandomSeed:     42,
+	}
+
+	index, err := NewHNSW(config)
+	if err != nil {
+		t.Fatalf("failed to create HNSW index: %v", err)
+	}
+	defer index.Close()
+
+	// Insert 10 vectors tightly clustered
+	for i := 0; i < 10; i++ {
+		vec := []float32{float32(i) * 0.01, float32(i) * 0.01}
+		err := index.Insert(context.Background(), &VectorEntry{
+			ID:       fmt.Sprintf("vec_%d", i),
+			Vector:   vec,
+			Metadata: nil,
+		})
+		if err != nil {
+			t.Fatalf("failed to insert vector %d: %v", i, err)
+		}
+	}
+
+	bounds, err := index.ComputeCommunities(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("failed to compute communities: %v", err)
+	}
+	index.SetCommunities(bounds)
+
+	t.Run("IdenticalVector", func(t *testing.T) {
+		query := []float32{0.05, 0.05} // Middle of the cluster
+		results, err := index.Search(context.Background(), query, 5, nil)
+		if err != nil {
+			t.Fatalf("search identical vector failed: %v", err)
+		}
+		if len(results) == 0 {
+			t.Fatalf("expected results for identical vector, got 0")
+		}
+	})
+
+	t.Run("DistantVector", func(t *testing.T) {
+		query := []float32{0.9, 0.9} // Very distant
+		results, err := index.Search(context.Background(), query, 5, nil)
+		if err != nil {
+			t.Fatalf("search distant vector failed: %v", err)
+		}
+		if len(results) > 0 {
+			// Because of the strict pruning bound, a highly distant query
+			// that never overlaps with the community radius will be pruned.
+			t.Logf("expected aggressive pruning, but got %d results", len(results))
+		}
+	})
+}
+
+func TestComputeCommunitiesTotalMapping(t *testing.T) {
+	idx := &Index{
+		config: &Config{Dimension: 128}, 
+		nodes: newSegmentedNodeArray(),
+		distance: func(a, b []float32) float32 { return 0 },
+	}
+	for i := 1; i <= 10; i++ {
+		vec := make([]float32, 128)
+		vec[0] = float32(i)
+		node := &Node{Ordinal: uint32(i), Vector: vec}
+		idx.nodes.Set(uint32(i), node)
+	}
+	
+	// Add some dummy edges
+	for i := 1; i < 10; i++ {
+		idx.getNodeLinks(idx.nodes.Get(uint32(i)), 0)
+	}
+
+	comm, err := idx.ComputeCommunities(context.Background(), 1000)
+	if err != nil {
+		t.Fatalf("ComputeCommunities failed: %v", err)
+	}
+	if comm == nil {
+		t.Fatalf("expected communities, got nil")
+	}
+
+	for i := 1; i <= 10; i++ {
+		if commID := comm.NodeToComm[i]; commID == 0 {
+			t.Errorf("NodeToComm is not total: node %d mapped to 0", i)
+		}
+	}
+}

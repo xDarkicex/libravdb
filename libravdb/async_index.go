@@ -70,6 +70,7 @@ type asyncIndexQueue struct {
 	workers    int
 	wg         sync.WaitGroup
 	applyGate  sync.RWMutex
+	maintainWakeup chan struct{}
 
 	enqueuePos  atomic.Uint64
 	_           [56]byte
@@ -125,6 +126,7 @@ func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndex
 		arena:      arena,
 		slots:      slots,
 		workReady:  make(chan struct{}, workers),
+		maintainWakeup: make(chan struct{}, 1),
 		capacity:   uint64(depth),
 		workers:    workers,
 	}
@@ -132,10 +134,11 @@ func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndex
 	q.durable.Store(frontier)
 	q.applied.Store(frontier)
 	q.accepting.Store(true)
-	q.wg.Add(workers)
+	q.wg.Add(workers + 1)
 	for i := 0; i < workers; i++ {
 		go q.worker()
 	}
+	go q.maintainWorker()
 	return q, nil
 }
 
@@ -218,6 +221,38 @@ func (q *asyncIndexQueue) worker() {
 	}
 }
 
+// physicalMigrator is implemented by indexes that support physical node relocation (e.g., hmgi).
+type physicalMigrator interface {
+	IncrementalMigrate(cursor *uint32, budget int)
+}
+
+func (q *asyncIndexQueue) maintainWorker() {
+	defer q.wg.Done()
+	
+	lastMaintainLSN := q.applied.Load()
+	cursor := uint32(1)
+	
+	for {
+		<-q.maintainWakeup
+		if q.closing.Load() {
+			return
+		}
+		
+		applied := q.applied.Load()
+		if applied - lastMaintainLSN >= 10000 {
+			if q.collection != nil && q.collection.db != nil {
+				_ = q.collection.db.Maintain(context.Background(), q.collection.name, 10000)
+			}
+			lastMaintainLSN = applied
+		}
+		
+		// Bounded random walk physical migration (trickles work between ticks)
+		if pm, ok := q.collection.index.(physicalMigrator); ok {
+			pm.IncrementalMigrate(&cursor, 100)
+		}
+	}
+}
+
 func (q *asyncIndexQueue) pop() (asyncIndexTask, uint64, bool) {
 	for {
 		pos := q.dequeuePos.Load()
@@ -294,8 +329,13 @@ func (q *asyncIndexQueue) close() error {
 	owner := q.closing.CompareAndSwap(false, true)
 	if owner {
 		q.accepting.Store(false)
-		_ = q.flush(context.Background())
 		q.signalWorkers(q.workers)
+		// Wake maintainWorker so it sees closing=true and exits
+		select {
+		case q.maintainWakeup <- struct{}{}:
+		default:
+		}
+		_ = q.flush(context.Background())
 		q.wg.Wait()
 		q.closed.Store(true)
 	} else {
@@ -410,6 +450,10 @@ func (q *asyncIndexQueue) currentError(fallback error) error {
 func (q *asyncIndexQueue) advanceAppliedIfDrained() {
 	if q.outstanding.Load() == 0 && q.failure.Load() == nil {
 		q.applied.Store(q.durable.Load())
+		select {
+		case q.maintainWakeup <- struct{}{}:
+		default:
+		}
 	}
 }
 

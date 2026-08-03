@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/obs"
+	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 	"github.com/xDarkicex/memory"
@@ -35,6 +37,8 @@ type Database struct {
 	healthMonitor *SystemHealthMonitorImpl
 	config        *Config
 	scratchPool   *sync.Pool
+	catalog       *catalog.Catalog
+	quantRegistry *quant.Registry
 	mu            sync.RWMutex
 	closed        bool
 }
@@ -136,12 +140,13 @@ func Open(opts ...Option) (*Database, error) {
 	}
 
 	db := &Database{
-		collections: make(map[string]*Collection),
-		storage:     storageEngine,
-		bridge:      bridge,
-		metrics:     metrics,
-		config:      config,
-		logger:      config.Logger,
+		collections:   make(map[string]*Collection),
+		storage:       storageEngine,
+		bridge:        bridge,
+		metrics:       metrics,
+		config:        config,
+		logger:        config.Logger,
+		quantRegistry: quant.NewRegistry(),
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
 				arena, err := memory.NewArena(1024*1024, 64)
@@ -152,6 +157,10 @@ func Open(opts ...Option) (*Database, error) {
 			},
 		},
 	}
+	
+	// Create an empty catalog for now. The singlefile engine will be updated later 
+	// to properly load and expose the mmap'd catalog section.
+	db.catalog, _ = catalog.Load(make([]byte, 1024), db.quantRegistry)
 
 	// Wire the bridge back to the database so SerializeIndex can access
 	// collection indexes during checkpoint.
@@ -973,4 +982,16 @@ func (db *Database) ResolveNodeID(ctx context.Context, id uint64) (string, strin
 		return parent, recID, nil
 	}
 	return colName, recID, nil
+}
+
+// GetNodeID resolves a (collection, recordID) pair to a system-scoped GraphNodeID.
+// This is the forward direction of the node ID mapping; ResolveNodeID is the reverse.
+func (db *Database) GetNodeID(ctx context.Context, collection, id string) (uint64, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if db.closed {
+		return 0, ErrDatabaseClosed
+	}
+	return db.storage.GetNodeID(ctx, collection, id)
 }

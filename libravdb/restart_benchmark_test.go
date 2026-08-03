@@ -268,8 +268,19 @@ func corruptIndexChunk(tb testing.TB, path string) {
 		tb.Fatalf("read active metapage: %v", err)
 	}
 
+	// Determine metapage CRC layout from magic: V2 checksums over [:88] with
+	// the checksum at [88:92]; V3 (community registry) over [:108] at [108:112].
+	crcLen := 88
+	crcPos := 92
+	magic := binary.LittleEndian.Uint32(metaBuf[0:4])
+	const metaMagicV3 = 0x4C56444F // "LVDN+1"
+	if magic == metaMagicV3 {
+		crcLen = 108
+		crcPos = 112
+	}
+
 	// Verify metapage CRC to ensure we're reading correctly.
-	if crc32.Checksum(metaBuf[:88], crc32.MakeTable(crc32.Castagnoli)) != binary.LittleEndian.Uint32(metaBuf[88:92]) {
+	if crc32.Checksum(metaBuf[:crcLen], crc32.MakeTable(crc32.Castagnoli)) != binary.LittleEndian.Uint32(metaBuf[crcPos-4:crcPos]) {
 		// Active metapage is corrupt — try the other one.
 		otherPage := uint64(1)
 		if activeMetaPage == 1 {
@@ -278,7 +289,12 @@ func corruptIndexChunk(tb testing.TB, path string) {
 		if _, err := f.ReadAt(metaBuf, int64(otherPage)*pageSize); err != nil {
 			tb.Fatalf("read fallback metapage: %v", err)
 		}
-		if crc32.Checksum(metaBuf[:88], crc32.MakeTable(crc32.Castagnoli)) != binary.LittleEndian.Uint32(metaBuf[88:92]) {
+		magic = binary.LittleEndian.Uint32(metaBuf[0:4])
+		if magic == metaMagicV3 {
+			crcLen = 108
+			crcPos = 112
+		}
+		if crc32.Checksum(metaBuf[:crcLen], crc32.MakeTable(crc32.Castagnoli)) != binary.LittleEndian.Uint32(metaBuf[crcPos-4:crcPos]) {
 			tb.Fatalf("no valid metapage found")
 		}
 	}

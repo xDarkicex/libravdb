@@ -424,9 +424,15 @@ func (mq *mockQuantizerForErrors) Distance(compressed1, compressed2 []byte) (flo
 
 func (mq *mockQuantizerForErrors) PrepareQuery(query []float32) any { return nil }
 
+func (mq *mockQuantizerForErrors) CodeSize() int { return 4 }
+
+func (mq *mockQuantizerForErrors) Dimension() int { return 4 }
 func (mq *mockQuantizerForErrors) DistanceToQuery(compressed []byte, query []float32, state any) (float32, error) {
 	return 0.3, nil
 }
+
+func (mq *mockQuantizerForErrors) SerializeState() ([]byte, error) { return []byte{}, nil }
+func (mq *mockQuantizerForErrors) DeserializeState(data []byte) error { return nil }
 
 func (mq *mockQuantizerForErrors) CompressionRatio() float32 {
 	return 8.0

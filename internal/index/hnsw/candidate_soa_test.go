@@ -101,7 +101,7 @@ func TestSOACandidateModeBuildsConnectedGraph(t *testing.T) {
 		t.Fatalf("SoA construction produced a sparse graph: %d links for %d nodes", totalLinks, index.nodes.Len())
 	}
 	scratch := index.acquireSearchScratchWithEF(16)
-	candidates, err := index.searchLevelScratchValues(ctx, query, index.getEntryPoint(), 16, 0, scratch, nil, nil)
+	candidates, err := index.searchLevelScratchValues(ctx, query, index.getEntryPoint(), 16, 0, scratch, nil, nil, true)
 	index.releaseSearchScratch(scratch)
 	if err != nil {
 		t.Fatal(err)

@@ -14,6 +14,11 @@ The SDKs in this directory provide idiomatic, language-specific wrappers over th
 *   **[Java SDK](./java/README.md)**: A pure Java enterprise wrapper using JNA and Jackson for seamless FFI bindings without requiring JNI compilation.
 *   **[Dart SDK](./dart/README.md)**: A high-performance Dart implementation leveraging `dart:ffi` and `malloc`, perfect for Flutter edge-AI or Dart backend services.
 *   **[Kotlin SDK](./kotlin/README.md)**: A true Kotlin Native multiplatform implementation utilizing `cinterop` and `memScoped` memory management, compiling to native machine code without the JVM.
+*   **[C# / .NET SDK](./csharp/README.md)**: An optimized P/Invoke implementation utilizing `DllImport` and `fixed` pointers to bypass managed-to-unmanaged memory copying.
+*   **[Swift SDK](./swift/README.md)**: A native integration utilizing Swift Package Manager and direct C-interoperability for on-device Apple Silicon deployments.
+*   **[Odin SDK](./odin/README.md)**: Zero-overhead native `foreign` bindings utilizing direct slice mapping `raw_data(vector)` for seamless memory mapping.
+*   **[Perl SDK](./perl/README.md)**: A robust native FFI wrapper utilizing CPAN's `FFI::Platypus` and the Core `JSON::PP` module.
+*   **[PHP SDK](./php/README.md)**: Utilizes PHP's native `FFI` extension (PHP 7.4+) enabling zero-copy batching of multi-dimensional PHP float arrays.
 
 ## The CGO Bridge
 All SDKs communicate with the native Go engine via the `libravdb` C-Shared Library. 

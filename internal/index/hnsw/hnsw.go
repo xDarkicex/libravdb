@@ -138,6 +138,11 @@ type Index struct {
 	quantizer             quant.Quantizer
 	rawVectorStore        RawVectorStore
 	idToIndex             *memory.TypedIDMap[Node]
+
+	communityMu           sync.RWMutex
+	communities           *CommunityRegistry
+	distanceToQuery       atomic.Int64 // Tracks distance computations in candidate evaluation
+
 	globalState           atomic.Uint64 // Packs entryPoint ID (32 bits) and maxLevel (32 bits)
 	distance              util.DistanceFunc
 	vecMmap               *internalmemory.MemoryMap
@@ -958,7 +963,7 @@ func (h *Index) Search(ctx context.Context, query []float32, k int, filter inter
 	// produce unacceptable tail recall even when the graph topology is sound,
 	// so keep a degree/construction-aware floor while still honoring larger
 	// caller-specified beams.
-	candidates, err := h.searchLevelValuesWithScratch(ctx, query, ep, ef, 0, true, scratch, queryState, filter)
+	candidates, err := h.searchLevelValuesWithScratch(ctx, query, ep, ef, 0, true, scratch, queryState, filter, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2023,4 +2028,24 @@ func (h *Index) freeLinkArray(level int, ptr *uint32) {
 			_ = h.linkSFL.Deallocate(slot)
 		}
 	}
+}
+
+func (h *Index) SetCommunities(registry *CommunityRegistry) {
+	h.communityMu.Lock()
+	defer h.communityMu.Unlock()
+	h.communities = registry
+}
+
+func (h *Index) GetCommunities() *CommunityRegistry {
+	h.communityMu.RLock()
+	defer h.communityMu.RUnlock()
+	return h.communities
+}
+
+func (h *Index) DistanceToQueryCount() int64 {
+	return h.distanceToQuery.Load()
+}
+
+func (h *Index) ResetDistanceToQueryCount() {
+	h.distanceToQuery.Store(0)
 }

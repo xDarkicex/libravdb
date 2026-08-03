@@ -168,7 +168,7 @@ type Quantizer interface {
 	// MemoryUsage returns the memory usage in bytes
 	MemoryUsage() int64
 
-	// IsTrained returns true if the quantizer has been trained
+	// IsTrained returns whether the quantizer has been trained
 	IsTrained() bool
 
 	// Config returns the current configuration
@@ -178,6 +178,18 @@ type Quantizer interface {
 	Close() error
 }
 
+// CentroidProvider is an optional interface implemented by quantizers that explicitly model
+// centroids (like ProductQuantizer or IVF coarse quantizers). It provides exact mathematical
+// distance between packed centroid IDs, allowing for exact cardinality pruning over codebooks.
+type CentroidProvider interface {
+	// CentroidDistance computes the exact mathematical distance between two packed centroid IDs.
+	// For PQ, the ID is typically packed as `subspace << bits | centroid`.
+	CentroidDistance(a, b uint32) float32
+
+	// MaxResidualBound returns the maximum possible length (L2 norm) of any quantized residual
+	// produced by this codebook. Used for exact cardinality pruning of clusters.
+	MaxResidualBound() float32
+}
 // QuantizerFactory creates quantizer instances
 type QuantizerFactory interface {
 	// Create creates a new quantizer instance

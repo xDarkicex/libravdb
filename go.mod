@@ -6,6 +6,7 @@ require (
 	github.com/leanovate/gopter v0.2.11
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/prometheus/client_golang v1.17.0
+	github.com/xDarkicex/lexer v0.0.0-00010101000000-000000000000
 	github.com/xDarkicex/memory v1.2.8
 	go.uber.org/goleak v1.3.0
 	golang.org/x/sys v0.46.0
@@ -24,3 +25,5 @@ require (
 	golang.org/x/tools v0.47.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 )
+
+replace github.com/xDarkicex/lexer => ../lexer

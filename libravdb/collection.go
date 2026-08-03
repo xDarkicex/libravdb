@@ -147,6 +147,20 @@ func (c *Collection) SetGraph(g Graph) {
 	c.mu.Unlock()
 }
 
+// GetIndex returns the collection's index, or nil if none is configured.
+func (c *Collection) GetIndex() index.Index {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.index
+}
+
+// GetGraph returns the collection's graph layer, or nil if none is configured.
+func (c *Collection) GetGraph() Graph {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.graph
+}
+
 func trainingIndexState(idx index.Index) (trainableIndex, bool) {
 	trainable, ok := idx.(trainableIndex)
 	if !ok || trainable.IsTrained() {
@@ -284,6 +298,11 @@ func createIndexForCollection(config *CollectionConfig, provider interface {
 			Metric:       util.DistanceMetric(config.Metric),
 			Quantization: config.Quantization,
 		})
+	case BTree:
+		return index.NewBTree(&index.BTreeConfig{
+			PageSlots:  config.M,      // reuse M field for page slots
+			PageShards: config.NProbes, // reuse NProbes for page shards
+		})
 	default:
 		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
 	}
@@ -315,6 +334,7 @@ const (
 	HNSW IndexType = iota
 	IVFPQ
 	Flat
+	BTree
 )
 
 // DefaultAutoIndexThresholds defines the default thresholds for auto-index selection.

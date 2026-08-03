@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/index/btree"
 	"github.com/xDarkicex/libravdb/internal/index/flat"
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
 	"github.com/xDarkicex/libravdb/internal/index/ivfpq"
@@ -20,6 +21,13 @@ import (
 // GraphFilter is an interface used to filter search candidates based on a graph bitset.
 type GraphFilter interface {
 	Test(idx uint64) bool
+}
+
+// ThresholdFilter is an optional interface for filters that enforce a minimum similarity.
+// Indexes can use this to aggressively prune clusters or candidates that mathematically
+// cannot clear the threshold, enabling exact-cardinality bounds checking.
+type ThresholdFilter interface {
+	Threshold() float32
 }
 
 // Index defines the interface for all vector index implementations
@@ -88,6 +96,7 @@ const (
 	IndexTypeHNSW IndexType = iota
 	IndexTypeIVFPQ
 	IndexTypeFlat
+	IndexTypeBTree
 )
 
 // String returns the string representation of the index type
@@ -99,6 +108,8 @@ func (it IndexType) String() string {
 		return "IVF-PQ"
 	case IndexTypeFlat:
 		return "Flat"
+	case IndexTypeBTree:
+		return "BTree"
 	default:
 		return "Unknown"
 	}
@@ -134,6 +145,12 @@ type IVFPQConfig struct {
 	MaxIterations int
 	Tolerance     float64
 	RandomSeed    int64
+}
+
+// BTreeConfig holds configuration for BTree index
+type BTreeConfig struct {
+	PageSlots  int
+	PageShards int
 }
 
 // FlatConfig holds configuration for Flat index
@@ -203,6 +220,16 @@ func (w *hnswWrapper) MemoryUsage() int64 {
 // Close delegates to the wrapped index
 func (w *hnswWrapper) Close() error {
 	return w.index.Close()
+}
+
+// ComputeCommunities delegates to the wrapped HNSW index.
+func (w *hnswWrapper) ComputeCommunities(ctx context.Context, budget int) (*hnsw.CommunityRegistry, error) {
+	return w.index.ComputeCommunities(ctx, budget)
+}
+
+// SetCommunities delegates to the wrapped HNSW index.
+func (w *hnswWrapper) SetCommunities(registry *hnsw.CommunityRegistry) {
+	w.index.SetCommunities(registry)
 }
 
 // NEW: SaveToDisk delegates persistence to the wrapped index
@@ -800,4 +827,86 @@ func NewFlat(config *FlatConfig) (Index, error) {
 	}
 
 	return newFlatWrapper(flatIndex)
+}
+
+// btreeWrapper adapts the B-tree index to the Index interface.
+type btreeWrapper struct {
+	index *btree.Index
+}
+
+// Tree returns the underlying B-tree for direct cursor/key access.
+func (w *btreeWrapper) Tree() *btree.BTree { return w.index.Tree }
+
+func (w *btreeWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
+	return w.index.Insert(ctx, entry.ID, entry.Ordinal, uint32(entry.Version), entry.GraphNodeID)
+}
+
+func (w *btreeWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
+	pairs := make([]btree.KVPair, len(entries))
+	for i, e := range entries {
+		pairs[i] = btree.KVPair{
+			Key:   []byte(e.ID),
+			Value: btree.EncodeValue(e.Ordinal, uint32(e.Version), e.GraphNodeID),
+		}
+	}
+	return w.index.Tree.BatchInsert(ctx, pairs)
+}
+
+func (w *btreeWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
+	// B-tree is an ordered index, not a vector index. Range scans use cursor directly.
+	return nil, nil
+}
+
+func (w *btreeWrapper) Delete(ctx context.Context, id string) error {
+	return w.index.Delete(ctx, id)
+}
+
+func (w *btreeWrapper) Size() int { return w.index.Len() }
+
+func (w *btreeWrapper) MemoryUsage() int64 {
+	return int64(w.index.Len()) * btree.PageSize
+}
+
+func (w *btreeWrapper) Close() error { return w.index.Close() }
+
+func (w *btreeWrapper) SaveToDisk(ctx context.Context, path string) error {
+	return w.index.SaveToDisk(ctx, path)
+}
+
+func (w *btreeWrapper) LoadFromDisk(ctx context.Context, path string) error {
+	return w.index.LoadFromDisk(ctx, path)
+}
+
+func (w *btreeWrapper) SerializeToBytes() ([]byte, error) {
+	return w.index.SerializeToBytes()
+}
+
+func (w *btreeWrapper) DeserializeFromBytes(ctx context.Context, data []byte) error {
+	return w.index.DeserializeFromBytes(ctx, data)
+}
+
+func (w *btreeWrapper) GetPersistenceMetadata() *PersistenceMetadata {
+	meta := w.index.GetPersistenceMetadata()
+	return &PersistenceMetadata{
+		Version:   meta.Version,
+		NodeCount: meta.NodeCount,
+		IndexType: "BTree",
+		CreatedAt: meta.CreatedAt,
+	}
+}
+
+// NewBTree creates a new B-tree index.
+func NewBTree(config *BTreeConfig) (Index, error) {
+	cfg := btree.Config{
+		PageSlots:  config.PageSlots,
+		PageShards: config.PageShards,
+	}
+	if cfg.PageSlots <= 0 {
+		cfg = btree.DefaultConfig()
+	}
+	idx, err := btree.NewIndex(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &btreeWrapper{index: idx}, nil
 }

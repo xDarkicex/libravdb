@@ -542,7 +542,7 @@ func searchExplicitEFOrdinals(ctx context.Context, index *Index, query []float32
 	}
 
 	scratch := index.acquireSearchScratchWithEF(ef)
-	candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil)
+	candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil, true)
 	candidateCount := len(candidates)
 	if err == nil && candidateCount > 0 {
 		slices.SortFunc(candidates, compareCandidateValues)
@@ -937,7 +937,7 @@ func BenchmarkHNSWSearchTraversalOnly(b *testing.B) {
 		}
 
 		scratch := index.acquireSearchScratchWithEF(ef)
-		candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil)
+		candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil, true)
 		index.releaseSearchScratch(scratch)
 		if err != nil {
 			b.Fatalf("level search failed: %v", err)
@@ -1005,7 +1005,7 @@ func BenchmarkHNSWSearchTraversalCandidateModes(b *testing.B) {
 				}
 
 				scratch := index.acquireSearchScratchWithEF(ef)
-				candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil)
+				candidates, err := index.searchLevelScratchValues(ctx, query, ep, ef, 0, scratch, queryState, nil, true)
 				index.releaseSearchScratch(scratch)
 				if err != nil {
 					b.Fatalf("level search failed: %v", err)

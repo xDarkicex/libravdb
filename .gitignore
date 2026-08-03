@@ -255,3 +255,19 @@ lynx.toml
 /sdk/**/test_db_*
 /sdk/**/integration_test
 /sdk/**/hello
+
+# =============================================================================
+# Local dev leftovers (profiles, scratch patches, demo artifacts)
+# =============================================================================
+# CPU/memory profiles
+*.prof
+# Debug scratch patches
+debug*.patch
+# One-off fix/patch scripts
+fix*.py
+patch*.py
+# Scratch assembly
+scratch_test.s
+# Demo databases / index binaries
+demo_db*
+demo_index_phase4.bin

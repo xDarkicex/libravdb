@@ -64,6 +64,7 @@ type Graph interface {
 	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
 
 	BFS(start uint64, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error
+	BFSPattern(start uint64, edges []EdgePlan, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error
 	GetBitset() (*Bitset, error)
 	PutBitset(b *Bitset)
 	GetFrontierBuf() (*FrontierBuf, error)

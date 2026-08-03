@@ -33,13 +33,15 @@ const (
 	headerMagic   uint32 = 0x4C564442
 	metaMagic     uint32 = 0x4C56444D
 	metaMagicV2   uint32 = 0x4C56444E // V2 metapage includes index persistence fields
+	metaMagicV3   uint32 = 0x4C56444F // V3 metapage includes community registry fields
 	chunkMagic    uint32 = 0x4C564443
 
-	chunkTypeSnapshot = uint16(1)
-	chunkTypeWAL      = uint16(2)
-	chunkTypeIndex    = uint16(3)
-	indexBlockMagic   = uint32(0x4C564449) // "LVDI"
-	indexBlockVersion = uint16(1)
+	chunkTypeSnapshot  = uint16(1)
+	chunkTypeWAL       = uint16(2)
+	chunkTypeIndex     = uint16(3)
+	chunkTypeCommunity = uint16(4)
+	indexBlockMagic    = uint32(0x4C564449) // "LVDI"
+	indexBlockVersion  = uint16(1)
 
 	recordTypeTxBegin          = uint16(1)
 	recordTypeTxCommit         = uint16(2)
@@ -120,9 +122,12 @@ type metaPage struct {
 	SnapshotOffset  uint64
 	SnapshotLength  uint64
 	IndexOffset     uint64 // byte offset of index chunk (0 = no index persisted)
-	IndexLength     uint64 // payload length of index chunk
-	IndexChecksum   uint32 // CRC32 of entire indexBlock payload
-	Checksum        uint32
+	IndexLength            uint64 // payload length of index chunk
+	IndexChecksum          uint32 // CRC32 of entire indexBlock payload
+	CommunityOffset        uint64 // byte offset of community chunk
+	CommunityLength        uint64 // payload length of community chunk
+	CommunityIndexChecksum uint32 // snapshot of IndexChecksum when communities were built
+	Checksum               uint32
 }
 
 type recoveryCandidate struct {
@@ -350,6 +355,9 @@ type Engine struct {
 	batchQueueOwnedHook func()
 	dirty               bool // completion channels for foreground flushes
 	collectionsByID     map[uint64]string
+	
+	pendingCommunityChunk    []byte
+	pendingCommunityChecksum uint32
 }
 
 // newNodeAssignment records a freshly allocated GraphNodeID together
@@ -789,6 +797,15 @@ func (e *Engine) loadIndexes(chosen *metaPage) error {
 		return e.rebuildIndexesFromRecords()
 	}
 
+	// Validate community registry staleness
+	// If the community snapshot of the index checksum doesn't match the current index checksum,
+	// the community registry is stale and should be ignored/rebuilt lazily.
+	communitiesStale := false
+	if chosen.Magic == metaMagicV3 && chosen.CommunityIndexChecksum != chosen.IndexChecksum {
+		communitiesStale = true
+	}
+	_ = communitiesStale // TODO: pass staleness down to collections if needed, or simply don't load communities
+
 	entries, err := decodeIndexBlock(indexBlock)
 	if err != nil {
 		return e.rebuildIndexesFromRecords()
@@ -1133,7 +1150,7 @@ func encodeHeader(header *fileHeader, buf []byte) []byte {
 }
 
 func encodeMeta(meta *metaPage, buf []byte) []byte {
-	binary.LittleEndian.PutUint32(buf[0:4], metaMagicV2)
+	binary.LittleEndian.PutUint32(buf[0:4], metaMagicV3) // Update to V3
 	binary.LittleEndian.PutUint64(buf[4:12], meta.MetaEpoch)
 	binary.LittleEndian.PutUint64(buf[12:20], meta.RootCatalog)
 	binary.LittleEndian.PutUint64(buf[20:28], meta.RootFreelist)
@@ -1145,8 +1162,11 @@ func encodeMeta(meta *metaPage, buf []byte) []byte {
 	binary.LittleEndian.PutUint64(buf[68:76], meta.IndexOffset)
 	binary.LittleEndian.PutUint64(buf[76:84], meta.IndexLength)
 	binary.LittleEndian.PutUint32(buf[84:88], meta.IndexChecksum)
-	checksum := crc32.Checksum(buf[:88], castagnoli)
-	binary.LittleEndian.PutUint32(buf[88:92], checksum)
+	binary.LittleEndian.PutUint64(buf[88:96], meta.CommunityOffset)
+	binary.LittleEndian.PutUint64(buf[96:104], meta.CommunityLength)
+	binary.LittleEndian.PutUint32(buf[104:108], meta.CommunityIndexChecksum)
+	checksum := crc32.Checksum(buf[:108], castagnoli)
+	binary.LittleEndian.PutUint32(buf[108:112], checksum)
 	return buf
 }
 
@@ -1218,6 +1238,18 @@ func (e *Engine) readMetaPage(page uint64) (*metaPage, error) {
 	meta.SnapshotLength = binary.LittleEndian.Uint64(buf[60:68])
 
 	switch magic {
+	case metaMagicV3:
+		meta.IndexOffset = binary.LittleEndian.Uint64(buf[68:76])
+		meta.IndexLength = binary.LittleEndian.Uint64(buf[76:84])
+		meta.IndexChecksum = binary.LittleEndian.Uint32(buf[84:88])
+		meta.CommunityOffset = binary.LittleEndian.Uint64(buf[88:96])
+		meta.CommunityLength = binary.LittleEndian.Uint64(buf[96:104])
+		meta.CommunityIndexChecksum = binary.LittleEndian.Uint32(buf[104:108])
+		meta.Checksum = binary.LittleEndian.Uint32(buf[108:112])
+		expected := crc32.Checksum(buf[:108], castagnoli)
+		if meta.Checksum != expected {
+			return nil, fmt.Errorf("invalid V3 metapage checksum")
+		}
 	case metaMagicV2:
 		meta.IndexOffset = binary.LittleEndian.Uint64(buf[68:76])
 		meta.IndexLength = binary.LittleEndian.Uint64(buf[76:84])
@@ -2130,6 +2162,17 @@ func (e *Engine) checkpointSyncLocked() error {
 	return e.file.Sync()
 }
 
+// SetPendingCommunityState stages a computed community chunk for persistence
+// in the next checkpoint. This fulfills the requirement that communities are
+// snapshotted alongside a durable index state.
+func (e *Engine) SetPendingCommunityState(chunk []byte, checksum uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pendingCommunityChunk = chunk
+	e.pendingCommunityChecksum = checksum
+	e.dirty = true
+}
+
 func (e *Engine) checkpointLocked() error {
 	if !e.dirty {
 		return nil
@@ -2179,6 +2222,19 @@ func (e *Engine) checkpointLocked() error {
 		indexLength = uint64(len(indexBlock))
 	}
 
+	// STEP 2b: serialize and write community chunk
+	var communityOffset uint64
+	var communityLength uint64
+	var communityIndexChecksum uint32
+	if len(e.pendingCommunityChunk) > 0 {
+		communityOffset, err = e.appendChunkLocked(chunkTypeCommunity, e.pendingCommunityChunk)
+		if err != nil {
+			return err
+		}
+		communityLength = uint64(len(e.pendingCommunityChunk))
+		communityIndexChecksum = e.pendingCommunityChecksum
+	}
+
 	// STEP 3: write metapage (now authoritative: snapshot + index)
 	e.metaEpoch++
 	nextMetaPage := uint64(1)
@@ -2195,18 +2251,22 @@ func (e *Engine) checkpointLocked() error {
 	pageCount := uint64((stat.Size() + pageSize - 1) / pageSize)
 
 	meta := &metaPage{
-		Magic:           metaMagicV2,
-		MetaEpoch:       e.metaEpoch,
-		RootCatalog:     3,
-		RootFreelist:    rootFreelist,
-		LastAppliedLSN:  e.lastLSN.Load(),
-		PageCount:       pageCount,
-		CollectionCount: uint64(e.visibleCollectionCountLocked()),
-		SnapshotOffset:  snapshotOffset,
-		SnapshotLength:  uint64(len(snapshot)),
-		IndexOffset:     indexOffset,
-		IndexLength:     indexLength,
-		IndexChecksum:   indexChecksum,
+		PageNumber:             nextMetaPage,
+		Magic:                  metaMagicV3,
+		MetaEpoch:              e.metaEpoch,
+		RootCatalog:            3,
+		RootFreelist:           rootFreelist,
+		LastAppliedLSN:         e.lastLSN.Load(),
+		PageCount:              pageCount,
+		CollectionCount:        uint64(e.visibleCollectionCountLocked()),
+		SnapshotOffset:         snapshotOffset,
+		SnapshotLength:         uint64(len(snapshot)),
+		IndexOffset:            indexOffset,
+		IndexLength:            indexLength,
+		IndexChecksum:          indexChecksum,
+		CommunityOffset:        communityOffset,
+		CommunityLength:        communityLength,
+		CommunityIndexChecksum: communityIndexChecksum,
 	}
 	bufPtr := pagePool.Get().(*[]byte)
 	buf := *bufPtr

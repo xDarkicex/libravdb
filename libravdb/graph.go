@@ -24,6 +24,7 @@ type Graph interface {
 
 	// Traversal.
 	BFS(start uint64, maxDepth int, visit graph.VisitAction, bitset *graph.Bitset, frontier *graph.FrontierBuf) error
+	BFSPattern(start uint64, edges []EdgePlan, maxDepth int, visit graph.VisitAction, bitset *graph.Bitset, frontier *graph.FrontierBuf) error
 
 	// Pool management (caller-managed zero-alloc BFS).
 	GetBitset() (*graph.Bitset, error)
@@ -51,6 +52,9 @@ type Bitset = graph.Bitset
 
 // FrontierBuf is a reusable off-heap ring buffer for BFS queueing.
 type FrontierBuf = graph.FrontierBuf
+
+// EdgePlan describes a single edge band in a BFSPattern traversal.
+type EdgePlan = graph.EdgePlan
 
 // VisitAction is invoked for each node during BFS traversal.
 type VisitAction = graph.VisitAction

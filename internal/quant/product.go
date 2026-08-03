@@ -898,3 +898,64 @@ func (pq *ProductQuantizer) SetCodebooks(codebooks [][][]float32, dimension, sub
 	pq.trained = true
 	pq.updateMemoryUsage()
 }
+
+// CentroidDistance implements CentroidProvider.
+// It computes the Euclidean distance between two packed centroid IDs.
+// For PQ, the ID is packed as: subspace << bits | centroid.
+func (pq *ProductQuantizer) CentroidDistance(a, b uint32) float32 {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+
+	mask := uint32((1 << pq.config.Bits) - 1)
+	subA := int(a >> pq.config.Bits)
+	subB := int(b >> pq.config.Bits)
+	centA := int(a & mask)
+	centB := int(b & mask)
+
+	if subA != subB {
+		// Distance between centroids in different subspaces is mathematically undefined
+		// in the context of single-subspace comparison. Return MaxFloat32.
+		return math.MaxFloat32
+	}
+
+	if subA >= pq.subspaces || centA >= len(pq.centroids[subA]) || centB >= len(pq.centroids[subB]) {
+		return math.MaxFloat32
+	}
+
+	vecA := pq.centroids[subA][centA]
+	vecB := pq.centroids[subA][centB]
+
+	var dist float32
+	// Use manual loop instead of SIMD if it's just a small subDim vector
+	for i := 0; i < pq.subDim; i++ {
+		diff := vecA[i] - vecB[i]
+		dist += diff * diff
+	}
+	return float32(math.Sqrt(float64(dist)))
+}
+
+// MaxResidualBound implements CentroidProvider.
+// It returns the maximum possible length (L2 norm) of any quantized residual produced by this codebook.
+func (pq *ProductQuantizer) MaxResidualBound() float32 {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+
+	var maxNormSq float32
+
+	for i := 0; i < pq.subspaces; i++ {
+		var maxSubspaceNormSq float32
+		for j := 0; j < len(pq.centroids[i]); j++ {
+			var normSq float32
+			for k := 0; k < pq.subDim; k++ {
+				val := pq.centroids[i][j][k]
+				normSq += val * val
+			}
+			if normSq > maxSubspaceNormSq {
+				maxSubspaceNormSq = normSq
+			}
+		}
+		maxNormSq += maxSubspaceNormSq
+	}
+
+	return float32(math.Sqrt(float64(maxNormSq)))
+}

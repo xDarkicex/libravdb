@@ -37,6 +37,11 @@ func (m *mockQuantizer) DistanceToQuery(compressed []byte, query []float32, stat
 	return 0.3, nil
 }
 
+func (m *mockQuantizer) CodeSize() int { return 4 }
+func (m *mockQuantizer) Dimension() int { return 4 }
+func (m *mockQuantizer) SerializeState() ([]byte, error) { return []byte{}, nil }
+func (m *mockQuantizer) DeserializeState(data []byte) error { return nil }
+
 func (m *mockQuantizer) CompressionRatio() float32 {
 	return 8.0
 }
