@@ -47,6 +47,35 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		scope = append(scope, def)
 	}
 
+	// 1b. Resolve CRUD statement tables.
+	for i := 0; i < len(doc.InsertStmts); i++ {
+		stmt := &doc.InsertStmts[i]
+		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
+		def, err := b.catalog.GetTable(hash)
+		if err != nil {
+			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+		}
+		scope = append(scope, def)
+	}
+	for i := 0; i < len(doc.UpdateStmts); i++ {
+		stmt := &doc.UpdateStmts[i]
+		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
+		def, err := b.catalog.GetTable(hash)
+		if err != nil {
+			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+		}
+		scope = append(scope, def)
+	}
+	for i := 0; i < len(doc.DeleteStmts); i++ {
+		stmt := &doc.DeleteStmts[i]
+		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
+		def, err := b.catalog.GetTable(hash)
+		if err != nil {
+			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+		}
+		scope = append(scope, def)
+	}
+
 	// 2. Resolve identifiers (columns, vectors, graphs) deterministically using scope.
 	for i := 0; i < len(doc.Identifiers); i++ {
 		id := &doc.Identifiers[i]

@@ -106,6 +106,16 @@ func WithAsyncIndexing(queueDepth, workers int) Option {
 type CollectionOption func(*CollectionConfig) error
 
 // WithDimension sets the vector dimension for the collection
+// WithMetadataOnly creates a collection without vector storage. Records carry
+// only an ID and metadata map. The B-tree index is selected automatically.
+func WithMetadataOnly() CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.Dimension = 0
+		c.IndexType = BTree
+		return nil
+	}
+}
+
 func WithDimension(dim int) CollectionOption {
 	return func(c *CollectionConfig) error {
 		if dim <= 0 {

@@ -290,6 +290,7 @@ type Engine struct {
 	indexProvider IndexSnapshotProvider
 	cancel        context.CancelFunc
 	file          *os.File
+	catalogData   []byte // persisted catalog binary, written to page 3 at checkpoint
 	walWriteArena *memory.Arena
 	walRequests   *walRequestPool
 	state         *persistedState
@@ -662,6 +663,10 @@ func (e *Engine) openExisting() error {
 	e.activeMetaPage = metaPageNumber(chosen.meta)
 	e.lastLSN.Store(chosen.meta.LastAppliedLSN)
 	e.state = chosen.state
+
+	// Load catalog data from page 3 if present
+	e.catalogData = e.readCatalogPageLocked()
+
 	e.collectionsByID = make(map[uint64]string, len(e.state.Collections))
 	for name, col := range e.state.Collections {
 		e.collectionsByID[col.ID] = name
@@ -1823,9 +1828,14 @@ func (c *persistedCollection) storeVectorOffHeap(ordinal uint32, vector []float3
 	}
 	// Copy vector bytes after the SFL metadata prefix.
 	data := slot[sflMetadataOverhead:]
-	copy(data, unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4))
+	if len(vector) > 0 {
+		copy(data, unsafe.Slice((*byte)(unsafe.Pointer(&vector[0])), len(vector)*4))
+	}
 	c.vectorSlots[ordinal] = slot
 	c.vectorSlotSegments[ordinal] = uint32(segment)
+	if c.Config.Dimension == 0 {
+		return nil, nil
+	}
 	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), c.Config.Dimension), nil
 }
 
@@ -2281,6 +2291,15 @@ func (e *Engine) checkpointLocked() error {
 	}
 	if err := e.checkpointSyncLocked(); err != nil {
 		return err
+	}
+
+	// STEP 4b: write catalog page (page 3, reserved by RootCatalog in the meta page)
+	if len(e.catalogData) > 0 {
+		catalogPage := make([]byte, pageSize)
+		copy(catalogPage, e.catalogData)
+		if err := e.checkpointWriteAtLocked(3*pageSize, catalogPage); err != nil {
+			return fmt.Errorf("write catalog page: %w", err)
+		}
 	}
 
 	// STEP 5: write header (publishes the new metapage as authoritative)
@@ -4224,6 +4243,45 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *stor
 }
 
 // ListCollections returns live persisted collections.
+// SetCatalogData stores catalog bytes to be persisted at the next checkpoint.
+// Called by the Database layer when the catalog is updated.
+func (e *Engine) SetCatalogData(data []byte) {
+	e.mu.Lock()
+	e.catalogData = data
+	e.mu.Unlock()
+}
+
+// CatalogData returns the catalog bytes loaded during recovery.
+func (e *Engine) CatalogData() []byte {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.catalogData
+}
+
+// readCatalogPageLocked reads the catalog from page 3 (RootCatalog).
+// Returns nil if the file is not large enough or page 3 is empty.
+func (e *Engine) readCatalogPageLocked() []byte {
+	stat, err := e.file.Stat()
+	if err != nil {
+		return nil
+	}
+	catalogOffset := int64(3 * pageSize)
+	if stat.Size() < catalogOffset+pageSize {
+		return nil
+	}
+	buf := make([]byte, pageSize)
+	if _, err := e.file.ReadAt(buf, catalogOffset); err != nil {
+		return nil
+	}
+	// Check if the page has any data
+	for _, b := range buf {
+		if b != 0 {
+			return buf
+		}
+	}
+	return nil
+}
+
 func (e *Engine) ListCollections() ([]string, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

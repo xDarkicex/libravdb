@@ -29,6 +29,16 @@ func (db *Database) Query(ctx context.Context, sql string) (*SearchResults, erro
 		return nil, fmt.Errorf("catalog not initialized")
 	}
 
+	// Empty statement list (e.g. comment-only SQL like pgx's "-- ping")
+	// is a valid no-op, mirroring Postgres' EmptyQueryResponse.
+	if len(doc.SelectStmts) == 0 && len(doc.InsertStmts) == 0 &&
+		len(doc.UpdateStmts) == 0 && len(doc.DeleteStmts) == 0 &&
+		len(doc.CreateTableStmts) == 0 && len(doc.DropTableStmts) == 0 &&
+		len(doc.CreateIndexStmts) == 0 && len(doc.DropIndexStmts) == 0 &&
+		len(doc.AlterTableStmts) == 0 {
+		return &SearchResults{}, nil
+	}
+
 	binder := catalog.NewBinder(cat, src)
 	if err := binder.Bind(doc); err != nil {
 		return nil, fmt.Errorf("bind error: %w", err)

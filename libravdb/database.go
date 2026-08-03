@@ -158,9 +158,23 @@ func Open(opts ...Option) (*Database, error) {
 		},
 	}
 	
-	// Create an empty catalog for now. The singlefile engine will be updated later 
-	// to properly load and expose the mmap'd catalog section.
-	db.catalog, _ = catalog.Load(make([]byte, 1024), db.quantRegistry)
+	// Load catalog from storage engine if it was persisted in a previous session.
+	// Falls back to an empty catalog for fresh databases.
+	if data, ok := db.storage.(interface{ CatalogData() []byte }); ok {
+		if catData := data.CatalogData(); len(catData) > 0 {
+			if cat, err := catalog.Load(catData, db.quantRegistry); err == nil {
+				db.catalog = cat
+			}
+		}
+	}
+	if db.catalog == nil {
+		// Fresh database — build a valid empty catalog rather than leaving nil.
+		// A nil catalog makes every query fail with "catalog not initialized",
+		// which breaks e.g. pgx's Ping ("-- ping") on a brand-new database.
+		if cat, err := catalog.Load(catalog.NewBuilder().Build(), db.quantRegistry); err == nil {
+			db.catalog = cat
+		}
+	}
 
 	// Wire the bridge back to the database so SerializeIndex can access
 	// collection indexes during checkpoint.
@@ -237,7 +251,54 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 	}
 
 	db.collections[name] = collection
+	db.registerCollectionInCatalog(name, collection.config)
 	return collection, nil
+}
+
+// registerCollectionInCatalog adds a collection's schema to the SQL catalog
+// so that binder resolution works without manual mock catalog injection.
+// Caller must hold db.mu.
+func (db *Database) registerCollectionInCatalog(name string, config *CollectionConfig) {
+	builder := catalog.NewBuilderFrom(db.catalog)
+	columns := []catalog.ColumnInfo{{Name: "id", Type: catalog.TypeString}}
+	if config != nil && config.MetadataSchema != nil {
+		for fieldName, fieldType := range config.MetadataSchema {
+			columns = append(columns, catalog.ColumnInfo{
+				Name: fieldName,
+				Type: metadataFieldToCatalogType(fieldType),
+			})
+		}
+	}
+	builder.AddTable(name, columns)
+	data := builder.Build()
+	cat, err := catalog.Load(data, db.quantRegistry)
+	if err != nil {
+		// Catalog registration is best-effort; if it fails, queries will
+		// fail at bind time with a clear error message.
+		return
+	}
+	db.catalog = cat
+
+	// Push to storage engine for persistence across restarts
+	if e, ok := db.storage.(interface{ SetCatalogData([]byte) }); ok {
+		e.SetCatalogData(data)
+	}
+}
+
+// metadataFieldToCatalogType maps a metadata FieldType to a catalog column type.
+func metadataFieldToCatalogType(ft FieldType) uint16 {
+	switch ft {
+	case IntField:
+		return catalog.TypeInt
+	case FloatField:
+		return catalog.TypeFloat
+	case StringField, BoolField, TimeField:
+		return catalog.TypeString
+	case StringArrayField, IntArrayField, FloatArrayField:
+		return catalog.TypeString // arrays stored as string representations
+	default:
+		return catalog.TypeString
+	}
 }
 
 // EnsureCollection gets an existing collection, or creates it with the given options.
@@ -259,9 +320,10 @@ func (db *Database) EnsureCollectionRecreateOnDimensionMismatch(ctx context.Cont
 }
 
 func (db *Database) ensureCollection(ctx context.Context, name string, dimension int, recreateOnDimensionMismatch bool, opts ...CollectionOption) (*Collection, error) {
-	if dimension <= 0 {
+	if dimension < 0 {
 		return nil, ErrInvalidDimension
 	}
+	// dimension == 0 is valid: metadata-only collection (no vectors required)
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -274,6 +336,10 @@ func (db *Database) ensureCollection(ctx context.Context, name string, dimension
 	if col, exists := db.collections[name]; exists {
 		if col.Dimension() == dimension {
 			return col, nil
+		}
+		// Metadata-only ↔ vector mode transitions are destructive — reject
+		if col.Dimension() == 0 || dimension == 0 {
+			return nil, fmt.Errorf("cannot change collection %q between metadata-only and vector modes", name)
 		}
 		if !recreateOnDimensionMismatch {
 			return nil, newCollectionDimensionMismatchError(name, col.Dimension(), dimension)
@@ -311,7 +377,10 @@ func newCollectionDimensionMismatchError(name string, existing, requested int) e
 func ensureCollectionOptions(dimension int, opts []CollectionOption) []CollectionOption {
 	createOpts := make([]CollectionOption, 0, len(opts)+1)
 	createOpts = append(createOpts, opts...)
-	createOpts = append(createOpts, WithDimension(dimension))
+	if dimension > 0 {
+		createOpts = append(createOpts, WithDimension(dimension))
+	}
+	// dimension == 0: metadata-only — WithMetadataOnly() is already in opts
 	return createOpts
 }
 
@@ -330,6 +399,7 @@ func (db *Database) createCollectionLocked(ctx context.Context, name string, opt
 		)
 	}
 	db.collections[name] = collection
+	db.registerCollectionInCatalog(name, collection.config)
 	return collection, nil
 }
 
@@ -751,6 +821,7 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 	db.mu.Lock()
 	for name, collection := range loadedCollections {
 		db.collections[name] = collection
+		db.registerCollectionInCatalog(name, collection.config)
 	}
 	db.mu.Unlock()
 	if bridge != nil {

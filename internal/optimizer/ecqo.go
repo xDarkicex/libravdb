@@ -20,6 +20,12 @@ const (
 	QueryKindKNN        QueryKind = iota // vector similarity search (default)
 	QueryKindGraph                       // graph pattern matching via GRAPH_TABLE
 	QueryKindRelational                  // relational exact-match / range scan
+	QueryKindInsert                      // INSERT INTO
+	QueryKindUpdate                      // UPDATE ... SET ... WHERE
+	QueryKindDelete                      // DELETE FROM ... WHERE
+	QueryKindJoin                        // SELECT ... JOIN ... ON
+	QueryKindAggregate                    // SELECT COUNT/SUM/AVG/MIN/MAX ... GROUP BY/HAVING
+	QueryKindDDL                         // CREATE TABLE, DROP TABLE, CREATE INDEX
 )
 
 // RelationalPredicate is a single WHERE clause predicate extracted for relational execution.
@@ -27,6 +33,13 @@ type RelationalPredicate struct {
 	Column   string // column name resolved from source bytes
 	Operator uint8  // lexer.KindEquals, KindGreaterThan, KindLessThan, etc.
 	Value    []byte // literal value from source bytes (number string or unquoted string)
+}
+
+// JoinPlan represents a single JOIN clause.
+type JoinPlan struct {
+	CollectionName string
+	OnPredicates   []RelationalPredicate
+	JoinType       uint8 // parser.JoinType value
 }
 
 // GraphEdgePlan is a single edge extracted from the MATCH path,
@@ -71,6 +84,33 @@ type PhysicalPlan struct {
 	Projections        []string // SELECT column list (empty = all columns)
 	OrderBy            string   // column name for ORDER BY (empty = none)
 	IsDesc             bool     // ORDER BY DESC
+
+	// JOIN fields — populated when Kind == QueryKindJoin
+	Joins []JoinPlan
+
+	// CRUD fields — populated for INSERT/UPDATE/DELETE
+	InsertColumns []string // column names
+	InsertValues  [][]byte // raw value bytes per column, flattened across rows
+	SetColumns    []string // SET column names for UPDATE
+	SetValues     [][]byte // SET value bytes for UPDATE
+
+	// Aggregate fields — populated when Kind == QueryKindAggregate
+	AggregateFunc     uint8    // parser.AggregateFunc value (AggCount, AggSum, etc.)
+	AggregateColumn   string   // column name for the aggregate (empty for COUNT(*))
+	AggregateDistinct bool     // DISTINCT modifier
+	GroupByColumns    []string // GROUP BY column names
+	HavingExpr        string   // HAVING expression column name
+	HavingOp          uint8    // HAVING operator (e.g., KindGreaterThan)
+	HavingValue       []byte   // HAVING literal value
+
+	// DDL fields — populated when Kind == QueryKindDDL
+	DDLKind       uint8  // 0=create table, 1=drop table, 2=create index, 3=drop index, 4=alter table
+	DDLTableName  string
+	DDLIndexName  string
+	DDLColumns    []struct{ Name, Type string } // CREATE TABLE columns
+	DDLColName    string                         // CREATE INDEX column
+	DDLIfExists   bool                           // IF EXISTS modifier
+	DDLUnique     bool                           // UNIQUE INDEX modifier
 }
 
 // Optimizer is the Exact Cardinality Quantized Optimizer (ECQO).
@@ -84,6 +124,34 @@ func NewOptimizer(cat *catalog.Catalog) *Optimizer {
 
 // Optimize maps a bound AST to a PhysicalPlan.
 func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	// DDL statements — dispatched directly
+	if len(doc.CreateTableStmts) > 0 {
+		return o.optimizeCreateTable(doc, src)
+	}
+	if len(doc.DropTableStmts) > 0 {
+		return o.optimizeDropTable(doc, src)
+	}
+	if len(doc.CreateIndexStmts) > 0 {
+		return o.optimizeCreateIndex(doc, src)
+	}
+	if len(doc.DropIndexStmts) > 0 {
+		return o.optimizeDropIndex(doc, src)
+	}
+	if len(doc.AlterTableStmts) > 0 {
+		return o.optimizeAlterTable(doc, src)
+	}
+
+	// CRUD statements — dispatched directly, no WHERE/FROM processing needed
+	if len(doc.InsertStmts) > 0 {
+		return o.optimizeInsert(doc, src)
+	}
+	if len(doc.UpdateStmts) > 0 {
+		return o.optimizeUpdate(doc, src)
+	}
+	if len(doc.DeleteStmts) > 0 {
+		return o.optimizeDelete(doc, src)
+	}
+
 	if len(doc.SelectStmts) == 0 {
 		return nil, ErrUnsupportedQuery
 	}
@@ -298,22 +366,76 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 		}
 	}
 
-	// 3. Map ORDER BY
+	// 3. Map JOIN clauses
+	for _, jc := range stmt.Joins {
+		jp := JoinPlan{
+			CollectionName: string(src[jc.TableStart:jc.TableEnd]),
+			JoinType:       uint8(jc.Type),
+		}
+		if jc.OnExpr.Kind != parser.NodeKindUnknown {
+			// Extract ON predicates into a temporary plan
+			tmp := &PhysicalPlan{Predicates: nil}
+			o.extractRelationalPredicates(doc, src, tmp, jc.OnExpr)
+			jp.OnPredicates = tmp.Predicates
+		}
+		plan.Joins = append(plan.Joins, jp)
+		plan.Kind = QueryKindJoin
+	}
+
+	// 4. Map ORDER BY (now step 4 after JOIN)
 	if stmt.OrderBy.Kind == parser.NodeKindIdentifier {
 		id := &doc.Identifiers[stmt.OrderBy.ID]
 		plan.OrderBy = string(src[id.Start:id.End])
 		plan.IsDesc = stmt.IsDesc
 	}
 
-	// 4. Extract projection columns
+	// 4. Extract projection columns and detect aggregates
+	hasAggregate := len(stmt.GroupBy) > 0 || stmt.HavingExpr.Kind != parser.NodeKindUnknown
 	if stmt.ProjectionsCount > 0 {
 		for i := int32(0); i < stmt.ProjectionsCount; i++ {
 			proj := &doc.Projections[stmt.ProjectionsStart+i]
 			if proj.Expr.Kind == parser.NodeKindIdentifier {
 				id := &doc.Identifiers[proj.Expr.ID]
 				plan.Projections = append(plan.Projections, string(src[id.Start:id.End]))
+			} else if proj.Expr.Kind == parser.NodeKindAggregateExpr {
+				hasAggregate = true
+				ae := &doc.AggregateExprs[proj.Expr.ID]
+				plan.AggregateFunc = uint8(ae.Func)
+				plan.AggregateDistinct = ae.Distinct
+				if ae.Expr.Kind == parser.NodeKindIdentifier {
+					id := &doc.Identifiers[ae.Expr.ID]
+					plan.AggregateColumn = string(src[id.Start:id.End])
+				}
 			}
 		}
+	}
+
+	// GROUP BY columns
+	for _, gb := range stmt.GroupBy {
+		if gb.Kind == parser.NodeKindIdentifier {
+			id := &doc.Identifiers[gb.ID]
+			plan.GroupByColumns = append(plan.GroupByColumns, string(src[id.Start:id.End]))
+		}
+	}
+
+	// HAVING clause
+	if stmt.HavingExpr.Kind == parser.NodeKindBinaryExpr {
+		be := &doc.BinaryExprs[stmt.HavingExpr.ID]
+		if be.Left.Kind == parser.NodeKindIdentifier {
+			id := &doc.Identifiers[be.Left.ID]
+			plan.HavingExpr = string(src[id.Start:id.End])
+			plan.HavingOp = be.Operator
+			if be.Right.Kind == parser.NodeKindNumber {
+				plan.HavingValue = src[doc.Numbers[be.Right.ID].Start:doc.Numbers[be.Right.ID].End]
+			} else if be.Right.Kind == parser.NodeKindString {
+				sl := &doc.Strings[be.Right.ID]
+				plan.HavingValue = src[sl.Start+1 : sl.End-1]
+			}
+		}
+	}
+
+	if hasAggregate {
+		plan.Kind = QueryKindAggregate
 	}
 
 	// 5. Map LIMIT
@@ -455,6 +577,132 @@ func parseVectorLiteral(doc *parser.QueryDoc, src []byte, stringID int32) []floa
 		}
 	}
 	return floats
+}
+
+func (o *Optimizer) optimizeInsert(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.InsertStmts[0]
+	plan := &PhysicalPlan{
+		Kind:           QueryKindInsert,
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}
+	for _, col := range stmt.Columns {
+		id := &doc.Identifiers[col.ID]
+		plan.InsertColumns = append(plan.InsertColumns, string(src[id.Start:id.End]))
+	}
+	for _, val := range stmt.Values {
+		switch val.Kind {
+		case parser.NodeKindString:
+			sl := &doc.Strings[val.ID]
+			plan.InsertValues = append(plan.InsertValues, src[sl.Start+1:sl.End-1])
+		case parser.NodeKindNumber:
+			num := &doc.Numbers[val.ID]
+			plan.InsertValues = append(plan.InsertValues, src[num.Start:num.End])
+		}
+	}
+	return plan, nil
+}
+
+func (o *Optimizer) optimizeUpdate(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.UpdateStmts[0]
+	plan := &PhysicalPlan{
+		Kind:           QueryKindUpdate,
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}
+	for _, col := range stmt.SetColumns {
+		id := &doc.Identifiers[col.ID]
+		plan.SetColumns = append(plan.SetColumns, string(src[id.Start:id.End]))
+	}
+	for _, val := range stmt.SetValues {
+		switch val.Kind {
+		case parser.NodeKindString:
+			sl := &doc.Strings[val.ID]
+			plan.SetValues = append(plan.SetValues, src[sl.Start+1:sl.End-1])
+		case parser.NodeKindNumber:
+			num := &doc.Numbers[val.ID]
+			plan.SetValues = append(plan.SetValues, src[num.Start:num.End])
+		}
+	}
+	// Extract WHERE predicates for ID resolution
+	if stmt.WhereExpr.Kind != parser.NodeKindUnknown {
+		o.extractRelationalPredicates(doc, src, plan, stmt.WhereExpr)
+	}
+	return plan, nil
+}
+
+func (o *Optimizer) optimizeDelete(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.DeleteStmts[0]
+	plan := &PhysicalPlan{
+		Kind:           QueryKindDelete,
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}
+	if stmt.WhereExpr.Kind != parser.NodeKindUnknown {
+		o.extractRelationalPredicates(doc, src, plan, stmt.WhereExpr)
+	}
+	return plan, nil
+}
+
+func (o *Optimizer) optimizeCreateTable(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.CreateTableStmts[0]
+	plan := &PhysicalPlan{
+		Kind:         QueryKindDDL,
+		DDLKind:      0,
+		DDLTableName: string(src[stmt.TableStart:stmt.TableEnd]),
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}
+	for _, col := range stmt.Columns {
+		plan.DDLColumns = append(plan.DDLColumns, struct{ Name, Type string }{
+			Name: string(src[col.NameStart:col.NameEnd]),
+			Type: string(src[col.TypeStart:col.TypeEnd]),
+		})
+	}
+	return plan, nil
+}
+
+func (o *Optimizer) optimizeDropTable(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.DropTableStmts[0]
+	return &PhysicalPlan{
+		Kind:         QueryKindDDL,
+		DDLKind:      1,
+		DDLTableName: string(src[stmt.TableStart:stmt.TableEnd]),
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}, nil
+}
+
+func (o *Optimizer) optimizeCreateIndex(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.CreateIndexStmts[0]
+	return &PhysicalPlan{
+		Kind:         QueryKindDDL,
+		DDLKind:      2,
+		DDLTableName: string(src[stmt.TableStart:stmt.TableEnd]),
+		DDLIndexName: string(src[stmt.IndexStart:stmt.IndexEnd]),
+		DDLColName:   string(src[stmt.ColStart:stmt.ColEnd]),
+		DDLUnique:    stmt.Unique,
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}, nil
+}
+
+func (o *Optimizer) optimizeDropIndex(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.DropIndexStmts[0]
+	return &PhysicalPlan{
+		Kind:         QueryKindDDL,
+		DDLKind:      3,
+		DDLIndexName: string(src[stmt.IndexStart:stmt.IndexEnd]),
+		DDLIfExists:  stmt.IfExists,
+	}, nil
+}
+
+func (o *Optimizer) optimizeAlterTable(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.AlterTableStmts[0]
+	return &PhysicalPlan{
+		Kind:         QueryKindDDL,
+		DDLKind:      4,
+		DDLTableName: string(src[stmt.TableStart:stmt.TableEnd]),
+		DDLColumns: []struct{ Name, Type string }{{
+			Name: string(src[stmt.AddColumn.NameStart:stmt.AddColumn.NameEnd]),
+			Type: string(src[stmt.AddColumn.TypeStart:stmt.AddColumn.TypeEnd]),
+		}},
+		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+	}, nil
 }
 
 // EstimateMaxResidualBound calculates the maxResidualBound algebraically from the quantization step.

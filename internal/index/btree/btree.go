@@ -24,17 +24,23 @@ func DefaultConfig() Config {
 }
 
 // BTree is an off-heap, lock-free-read B-link tree backed by ShardedFreeList pages.
+// Pages are allocated from segmented pools that grow on demand — each segment is
+// a modestly-sized ShardedFreeList. When one segment is exhausted, a new one is
+// created and appended. This avoids pre-allocating large pools for small tables.
 type BTree struct {
-	cfg       Config
-	pageReg   *pageRegistry
-	pagePool  *memory.ShardedFreeList
-	rootID    atomic.Uint32
-	gen       atomic.Uint32
-	mu        sync.Mutex
-	nodeCount atomic.Int64
+	cfg           Config
+	pageReg       *pageRegistry
+	pagePools     []*memory.ShardedFreeList
+	pageSegments  map[uint32]uint8 // slot ID → pool segment index
+	rootID        atomic.Uint32
+	gen           atomic.Uint32
+	mu            sync.Mutex
+	nodeCount     atomic.Int64
 }
 
-// New creates a B-tree with an off-heap page pool.
+const segmentPages = 1024 // 4MB per segment (1024 × 4096)
+
+// New creates a B-tree with a segmented off-heap page pool.
 func New(cfg Config) (*BTree, error) {
 	if cfg.PageSlots <= 0 {
 		cfg = DefaultConfig()
@@ -43,30 +49,68 @@ func New(cfg Config) (*BTree, error) {
 		cfg.PageShards = 64
 	}
 
-	pool, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		PoolSize:  uint64(cfg.PageSlots) * PageSize,
-		SlotSize:  PageSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 32,
-		Prealloc:  false,
-	}, 64, cfg.PageShards)
+	reg := newPageRegistry()
+
+	// Create initial segment
+	pool, err := newSegment(cfg.PageShards)
 	if err != nil {
 		return nil, err
 	}
 
-	reg := newPageRegistry()
-	_, rootID, err := allocPage(pool, reg, P_LEAF, 0)
+	_, rootID, err := allocPageFromPool(pool, reg, P_LEAF, 0)
 	if err != nil {
 		pool.Free()
 		return nil, err
 	}
 
-	t := &BTree{cfg: cfg, pageReg: reg, pagePool: pool}
+	t := &BTree{
+		cfg:          cfg,
+		pageReg:      reg,
+		pagePools:    []*memory.ShardedFreeList{pool},
+		pageSegments: make(map[uint32]uint8),
+	}
+	t.pageSegments[rootID] = 0
 	t.rootID.Store(rootID)
 	return t, nil
 }
 
-func allocPage(pool *memory.ShardedFreeList, reg *pageRegistry, flags uint16, shard int) (*BTreePage, uint32, error) {
+func newSegment(pageShards int) (*memory.ShardedFreeList, error) {
+	return memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  uint64(segmentPages) * PageSize,
+		SlotSize:  PageSize,
+		SlabSize:  2 * 1024 * 1024,
+		SlabCount: 1, // start with 2MB, grows lazily via Prealloc=false
+		Prealloc:  false,
+	}, 64, pageShards)
+}
+
+// allocateSlot gets a page slot from the segmented pools, growing if needed.
+func (t *BTree) allocateSlot() (*memory.ShardedFreeList, int, []byte, error) {
+	// Try newest segment first for locality
+	for i := len(t.pagePools) - 1; i >= 0; i-- {
+		slot, err := t.pagePools[i].Allocate()
+		if err == nil {
+			return t.pagePools[i], i, slot, nil
+		}
+		if err != memory.ErrFreelistExhausted {
+			return nil, 0, nil, err
+		}
+	}
+	// Grow: create new segment
+	pool, err := newSegment(t.cfg.PageShards)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	t.pagePools = append(t.pagePools, pool)
+	idx := len(t.pagePools) - 1
+	slot, err := pool.Allocate()
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	return pool, idx, slot, nil
+}
+
+func allocPageFromPool(pool *memory.ShardedFreeList, reg *pageRegistry, flags uint16, shard int) (*BTreePage, uint32, error) {
 	slot, err := pool.Allocate()
 	if err != nil {
 		return nil, 0, err
@@ -77,16 +121,56 @@ func allocPage(pool *memory.ShardedFreeList, reg *pageRegistry, flags uint16, sh
 	return page, slotID, nil
 }
 
-func freePage(pool *memory.ShardedFreeList, reg *pageRegistry, slotID uint32) {
+func allocPage(t *BTree, reg *pageRegistry, flags uint16, shard int) (*BTreePage, uint32, error) {
+	pool, segIdx, slot, err := t.allocateSlot()
+	if err != nil {
+		return nil, 0, err
+	}
+	page := (*BTreePage)(unsafe.Pointer(&slot[UserDataOffset]))
+	slotID := reg.register(page)
+	page.initPage(flags, slotID, shard)
+	t.pageSegments[slotID] = uint8(segIdx)
+	_ = pool // used
+	return page, slotID, nil
+}
+
+func freePage(t *BTree, reg *pageRegistry, slotID uint32) {
 	if slotID == 0 {
 		return
 	}
 	page := reg.get(slotID)
 	reg.unregister(slotID)
 	if page != nil {
-		slotBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(page))-UserDataOffset)), PageSize)
-		pool.Deallocate(slotBytes)
+		slotBytes := pageSlotBytes(page)
+		if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
+			t.pagePools[seg].Deallocate(slotBytes)
+		}
+		delete(t.pageSegments, slotID)
 	}
+}
+
+func (t *BTree) retireSlot(slotID uint32) {
+	page := t.pageReg.get(slotID)
+	if page == nil {
+		return
+	}
+	slotBytes := pageSlotBytes(page)
+	if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
+		t.pagePools[seg].Retire(slotBytes)
+	}
+	delete(t.pageSegments, slotID)
+}
+
+func (t *BTree) deallocateSlot(slotID uint32) {
+	page := t.pageReg.get(slotID)
+	if page == nil {
+		return
+	}
+	slotBytes := pageSlotBytes(page)
+	if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
+		t.pagePools[seg].Deallocate(slotBytes)
+	}
+	delete(t.pageSegments, slotID)
 }
 
 // Insert inserts or replaces a key-value pair using COW semantics.
@@ -188,7 +272,7 @@ func (t *BTree) insertBranch(ctx context.Context, page *BTreePage, key, value []
 
 // splitLeaf splits a full leaf page, distributes keys, links right sibling.
 func (t *BTree) splitLeaf(page *BTreePage, insertIdx int, key, value []byte) (uint32, error) {
-	rightPage, rightID, err := allocPage(t.pagePool, t.pageReg, P_LEAF, 0)
+	rightPage, rightID, err := allocPage(t, t.pageReg, P_LEAF, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -215,7 +299,7 @@ func (t *BTree) splitLeaf(page *BTreePage, insertIdx int, key, value []byte) (ui
 
 // splitBranch splits a full branch page. Returns (rightPageID, promotedKey, error).
 func (t *BTree) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, newChildID uint32) (uint32, []byte, error) {
-	rightPage, rightID, err := allocPage(t.pagePool, t.pageReg, P_BRANCH, 0)
+	rightPage, rightID, err := allocPage(t, t.pageReg, P_BRANCH, 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -252,7 +336,7 @@ func (t *BTree) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, newCh
 
 // newRoot creates a branch root with two children separated by sepKey.
 func (t *BTree) newRoot(leftID, rightID uint32, sepKey []byte) (uint32, error) {
-	root, rootID, err := allocPage(t.pagePool, t.pageReg, P_BRANCH, 0)
+	root, rootID, err := allocPage(t, t.pageReg, P_BRANCH, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -355,9 +439,10 @@ func (t *BTree) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, id := range t.pageReg.snapshotIDs() {
-		freePage(t.pagePool, t.pageReg, id)
+		freePage(t, t.pageReg, id)
 	}
-	return t.pagePool.Free()
+	for _, p := range t.pagePools { p.Free() }
+	return nil
 }
 
 // BatchInsert inserts multiple key-value pairs within a single COW transaction.

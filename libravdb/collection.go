@@ -300,8 +300,8 @@ func createIndexForCollection(config *CollectionConfig, provider interface {
 		})
 	case BTree:
 		return index.NewBTree(&index.BTreeConfig{
-			PageSlots:  config.M,      // reuse M field for page slots
-			PageShards: config.NProbes, // reuse NProbes for page shards
+			PageSlots:  16384, // 64MB — grows with usage, Prealloc=false
+			PageShards: 64,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported index type: %v", config.IndexType)
@@ -984,10 +984,12 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 
 	// Preflight: vector dimension validation (pure CPU, no shared state)
 	dimension := c.config.Dimension
-	for _, entry := range entries {
-		if len(entry.Vector) != dimension {
-			return fmt.Errorf("vector dimension %d does not match collection dimension %d",
-				len(entry.Vector), dimension)
+	if dimension > 0 {
+		for _, entry := range entries {
+			if len(entry.Vector) != dimension {
+				return fmt.Errorf("vector dimension %d does not match collection dimension %d",
+					len(entry.Vector), dimension)
+			}
 		}
 	}
 
@@ -2936,9 +2938,10 @@ func (c *Collection) RegisterDeleteHook(hook DeleteHook) error {
 
 // validate checks if the collection configuration is valid
 func (config *CollectionConfig) validate() error {
-	if config.Dimension <= 0 {
+	if config.Dimension < 0 {
 		return fmt.Errorf("dimension must be positive, got %d", config.Dimension)
 	}
+	// dimension == 0 is valid: metadata-only collection (WithMetadataOnly)
 
 	if config.M <= 0 {
 		return fmt.Errorf("M must be positive, got %d", config.M)

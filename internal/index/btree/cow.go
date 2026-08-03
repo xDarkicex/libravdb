@@ -20,7 +20,7 @@ type writeTxn struct {
 // Pattern: LMDB mdb_page_copy (line 2934) — copies only used bytes, not free space.
 // The copy is NOT registered in pageReg until commit (avoiding double registration).
 func (txn *writeTxn) copyPage(src *BTreePage) *BTreePage {
-	slot, _ := txn.tree.pagePool.Allocate()
+	_, _, slot, _ := txn.tree.allocateSlot()
 	dst := (*BTreePage)(unsafe.Pointer(&slot[UserDataOffset]))
 
 	srcData := src.pageData()
@@ -56,10 +56,11 @@ func (txn *writeTxn) allocatePage(flags uint16) (*BTreePage, uint32) {
 			return page, id
 		}
 	}
-	slot, _ := txn.tree.pagePool.Allocate()
+	_, segIdx, slot, _ := txn.tree.allocateSlot()
 	page := (*BTreePage)(unsafe.Pointer(&slot[UserDataOffset]))
 	id := txn.tree.pageReg.register(page)
 	page.initPage(flags, id, 0)
+	txn.tree.pageSegments[id] = uint8(segIdx)
 	return page, id
 }
 
@@ -70,16 +71,13 @@ func (txn *writeTxn) commit() {
 		old := txn.tree.pageReg.get(origID)
 		txn.tree.pageReg.replace(origID, dirty)
 		if old != nil {
-			txn.tree.pagePool.Retire(pageSlotBytes(old))
+			txn.tree.retireSlot(origID)
 		}
 	}
 
 	// 2. Remove loose pages (pages no longer in the tree)
 	for _, origID := range txn.loosePages {
-		page := txn.tree.pageReg.get(origID)
-		if page != nil {
-			txn.tree.pagePool.Retire(pageSlotBytes(page))
-		}
+		txn.tree.retireSlot(origID)
 		txn.tree.pageReg.unregister(origID)
 	}
 
@@ -95,7 +93,7 @@ func (txn *writeTxn) commit() {
 func (txn *writeTxn) abort() {
 	// Free dirty copies — never published, no readers can see them
 	for _, dirty := range txn.dirtyPages {
-		txn.tree.pagePool.Deallocate(pageSlotBytes(dirty))
+		txn.tree.deallocateSlot(dirty.Header.PageSlot)
 	}
 	// Loose pages are still valid originals — keep them registered
 }

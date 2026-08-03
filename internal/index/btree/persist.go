@@ -105,7 +105,7 @@ func (t *BTree) DeserializeFromBytes(ctx context.Context, data []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, id := range t.pageReg.snapshotIDs() {
-		freePage(t.pagePool, t.pageReg, id)
+		freePage(t, t.pageReg, id)
 	}
 	t.nodeCount.Store(0)
 
@@ -150,7 +150,7 @@ func (t *BTree) DeserializeFromBytes(ctx context.Context, data []byte) error {
 		generation := binary.LittleEndian.Uint32(data[off:])
 		off += 4
 
-		page, newID, err := allocPage(t.pagePool, t.pageReg, flags, 0)
+		page, newID, err := allocPage(t, t.pageReg, flags, 0)
 		if err != nil {
 			return fmt.Errorf("btree: alloc page %d: %w", origID, err)
 		}

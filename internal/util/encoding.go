@@ -34,6 +34,7 @@ const (
 	valueTypeStringSlice
 	valueTypeInterfaceSlice
 	valueTypeMap
+	valueTypeBytes
 )
 
 type BinaryEncoder struct {
@@ -277,6 +278,9 @@ func (enc *BinaryEncoder) WriteValue(value interface{}) error {
 		if err := enc.WriteMetadata(typed); err != nil {
 			return err
 		}
+	case []byte:
+		enc.WriteByte(valueTypeBytes)
+		enc.WriteBytes(typed)
 	default:
 		return fmt.Errorf("unsupported metadata type %T", value)
 	}
@@ -313,6 +317,8 @@ func EstimateValueSize(value interface{}) int {
 		return size
 	case map[string]interface{}:
 		return 1 + EstimateMetadataSize(typed)
+	case []byte:
+		return 1 + 4 + len(typed)
 	default:
 		return 1
 	}
@@ -501,6 +507,8 @@ func (dec *BinaryDecoder) ReadValue() (interface{}, error) {
 		return values, nil
 	case valueTypeMap:
 		return dec.ReadMetadata()
+	case valueTypeBytes:
+		return dec.ReadBytes()
 	default:
 		return nil, fmt.Errorf("unsupported metadata value type %d", valueType)
 	}

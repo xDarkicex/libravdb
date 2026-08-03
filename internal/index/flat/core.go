@@ -85,6 +85,9 @@ func (idx *Core) Snapshot() *record.Generation {
 	return snapshot
 }
 
+// ErrGenerationChanged is returned when a concurrent write committed before publication.
+var ErrGenerationChanged = fmt.Errorf("flat generation changed before publication")
+
 // CommitDelta publishes an already validated candidate. Storage/WAL callers
 // must invoke it only after durable commit; it performs no allocation after
 // the new generation has been built.
@@ -117,7 +120,7 @@ func (p *PreparedDelta) Commit() error {
 	p.core.mu.Lock()
 	defer p.core.mu.Unlock()
 	if p.core.current != p.base {
-		return fmt.Errorf("flat generation changed before publication")
+		return ErrGenerationChanged
 	}
 	p.core.current = p.next
 	p.base.Release()

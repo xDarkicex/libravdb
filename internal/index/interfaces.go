@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -486,15 +487,31 @@ func (w *flatWrapper) Insert(ctx context.Context, entry *VectorEntry) error {
 }
 
 // BatchInsert stages all writes in one bounded delta and publishes exactly one
-// new generation. The core copies every retained byte into its arena before
-// publication, so caller-owned slices and maps cannot leak into the index.
+// new generation. Retries on concurrent-write conflicts with exponential backoff.
 func (w *flatWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) error {
-	prepared, err := w.PrepareMutations(ctx, entries, nil)
-	if err != nil {
-		return err
+	const maxRetries = 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		prepared, err := w.PrepareMutations(ctx, entries, nil)
+		if err != nil {
+			return err
+		}
+		err = prepared.Commit()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, flat.ErrGenerationChanged) {
+			return err
+		}
+		// Conflict — back off and retry
+		if attempt < maxRetries-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
 	}
-	defer prepared.Abort()
-	return prepared.Commit()
+	return fmt.Errorf("flat batch insert failed after %d attempts: %w", maxRetries, flat.ErrGenerationChanged)
 }
 
 type flatPreparedMutation struct{ prepared *flat.PreparedDelta }
