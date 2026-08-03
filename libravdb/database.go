@@ -270,6 +270,12 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 		}
 	}
 	builder.AddTable(name, columns)
+	// Vector collections register a vector index named after the collection's
+	// vector column ("vector" by convention) so SIMILARITY()/VECTOR_DISTANCE()
+	// and pgvector operators bind against it in SQL.
+	if config != nil && config.Dimension > 0 {
+		builder.AddVectorIndex("vector", uint32(config.Dimension), uint8(config.Metric))
+	}
 	data := builder.Build()
 	cat, err := catalog.Load(data, db.quantRegistry)
 	if err != nil {

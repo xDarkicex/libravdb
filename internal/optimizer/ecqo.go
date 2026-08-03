@@ -27,6 +27,7 @@ const (
 	QueryKindJoin                        // SELECT ... JOIN ... ON
 	QueryKindAggregate                    // SELECT COUNT/SUM/AVG/MIN/MAX ... GROUP BY/HAVING
 	QueryKindDDL                         // CREATE TABLE, DROP TABLE, CREATE INDEX
+	QueryKindVectorProjection            // SELECT with SIMILARITY()/VECTOR_DISTANCE() projections (full vector scan)
 )
 
 // RelationalPredicate is a single WHERE clause predicate extracted for relational execution.
@@ -41,6 +42,17 @@ type JoinPlan struct {
 	CollectionName string
 	OnPredicates   []RelationalPredicate
 	JoinType       uint8 // parser.JoinType value
+}
+
+// VectorFuncProjection is a SIMILARITY()/VECTOR_DISTANCE() entry in the
+// SELECT list. Name is the projected column name (alias if given, else the
+// function name); IsDistance distinguishes VECTOR_DISTANCE from SIMILARITY;
+// QueryVector is the resolved query-side operand. The stored per-record
+// vector comes from the collection at execution time.
+type VectorFuncProjection struct {
+	Name        string
+	IsDistance  bool
+	QueryVector []float32
 }
 
 // GraphEdgePlan is a single edge extracted from the MATCH path,
@@ -88,6 +100,12 @@ type PhysicalPlan struct {
 	Projections        []string // SELECT column list (empty = all columns)
 	OrderBy            string   // column name for ORDER BY (empty = none)
 	IsDesc             bool     // ORDER BY DESC
+
+	// Vector function projections — populated when a SELECT list contains
+	// SIMILARITY(...) or VECTOR_DISTANCE(...). Each entry pairs the projected
+	// column name with its resolved query vector. The projection list itself
+	// lives in Projections; this slice carries the vector-func payload.
+	VectorFuncProjections []VectorFuncProjection
 
 	// JOIN fields — populated when Kind == QueryKindJoin
 	Joins []JoinPlan
@@ -229,7 +247,8 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 
 	// 2. Map WHERE clause (Vector Search + Exact Filters)
 	if stmt.WhereExpr.Kind == parser.NodeKindUnknown {
-		// Full-scan: FROM table with no WHERE → cursor iteration
+		// Full-scan: FROM table with no WHERE → cursor iteration.
+		// Vector-projection queries are classified after projection extraction.
 		if plan.Kind == QueryKindKNN {
 			plan.Kind = QueryKindRelational
 			plan.HasRelationalQuery = true
@@ -424,8 +443,35 @@ func (o *Optimizer) Optimize(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, e
 					id := &doc.Identifiers[ae.Expr.ID]
 					plan.AggregateColumn = string(src[id.Start:id.End])
 				}
+			} else if proj.Expr.Kind == parser.NodeKindVectorFunc {
+				// SIMILARITY(col, vec) / VECTOR_DISTANCE(col, vec) in the SELECT list.
+				vf := &doc.VectorFuncs[proj.Expr.ID]
+				vfp := VectorFuncProjection{IsDistance: !vf.IsMaxSim}
+				// Column name from the alias if present, else the function name.
+				if proj.AliasEnd > proj.Alias {
+					vfp.Name = string(src[proj.Alias:proj.AliasEnd])
+				} else if vf.IsMaxSim {
+					vfp.Name = "similarity"
+				} else {
+					vfp.Name = "vector_distance"
+				}
+				// Resolve the query vector from the second operand (string literal).
+				if vf.VectorB.Kind == parser.NodeKindString {
+					sl := &doc.Strings[vf.VectorB.ID]
+					vfp.QueryVector = parseVectorLiteral(doc, src, sl.ID)
+				}
+				plan.VectorFuncProjections = append(plan.VectorFuncProjections, vfp)
+				plan.Projections = append(plan.Projections, vfp.Name)
 			}
 		}
+	}
+
+	// Vector-func projections without a WHERE vector predicate are a full
+	// vector projection scan, not a relational scan. This must be decided
+	// AFTER projection extraction, since the kind was set at WHERE-mapping time.
+	if len(plan.VectorFuncProjections) > 0 && plan.Kind == QueryKindRelational {
+		plan.Kind = QueryKindVectorProjection
+		plan.HasRelationalQuery = false
 	}
 
 	// GROUP BY columns

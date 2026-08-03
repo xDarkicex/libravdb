@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	btree "github.com/xDarkicex/libravdb/internal/index/btree"
 	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 // Executor dispatches physical plans to concrete execution paths.
@@ -32,6 +34,8 @@ func (e *Executor) Execute(ctx context.Context, plan *optimizer.PhysicalPlan) (*
 	switch plan.Kind {
 	case optimizer.QueryKindKNN:
 		return e.executeKNN(ctx, plan)
+	case optimizer.QueryKindVectorProjection:
+		return e.executeVectorProjection(ctx, plan)
 	case optimizer.QueryKindGraph:
 		return e.executeGraph(ctx, plan)
 	case optimizer.QueryKindRelational:
@@ -90,6 +94,52 @@ func (e *Executor) executeKNN(ctx context.Context, plan *optimizer.PhysicalPlan)
 	}
 
 	return results, nil
+}
+
+// executeVectorProjection runs a full vector scan for SELECT queries whose
+// projection list contains SIMILARITY()/VECTOR_DISTANCE(). Every record's
+// stored vector is scored against each vector-func projection's query vector
+// via the SIMD-backed util distance functions, then ORDER BY is applied.
+func (e *Executor) executeVectorProjection(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	col, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, fmt.Errorf("could not get collection %q: %w", plan.CollectionName, err)
+	}
+	if col.Dimension() == 0 {
+		return nil, fmt.Errorf("collection %q is metadata-only; vector search not available", plan.CollectionName)
+	}
+	records, err := col.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &SearchResults{}
+	for _, rec := range records {
+		if len(rec.Vector) == 0 {
+			continue
+		}
+		sr := &SearchResult{ID: rec.ID, Score: 1.0}
+		// Compute each vector-func projection's score into metadata.
+		if len(plan.VectorFuncProjections) > 0 {
+			sr.Metadata = make(map[string]interface{}, len(plan.VectorFuncProjections)+1)
+			for _, vfp := range plan.VectorFuncProjections {
+				if len(vfp.QueryVector) == 0 || len(vfp.QueryVector) != len(rec.Vector) {
+					continue
+				}
+				sr.Metadata[vfp.Name] = computeVectorScore(col, vfp, rec.Vector)
+			}
+		}
+		out.Results = append(out.Results, sr)
+	}
+	out.Total = len(out.Results)
+	out.Columns = plan.Projections
+	if plan.OrderBy != "" {
+		e.applyOrderBy(out, plan)
+	}
+	if plan.Limit > 0 && len(out.Results) > plan.Limit {
+		out.Results = out.Results[:plan.Limit]
+		out.Total = len(out.Results)
+	}
+	return out, nil
 }
 
 // filterByPredicates applies relational predicates as a post-filter on search results.
@@ -439,7 +489,7 @@ func (e *Executor) buildSelectResult(ctx context.Context, col *Collection, sr *S
 }
 
 // buildSelectResults enriches a batch of search results with record metadata
-// projected to the plan's column list.
+// projected to the plan's column list, then applies ORDER BY if requested.
 func (e *Executor) buildSelectResults(ctx context.Context, col *Collection, results []*SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
 	out := &SearchResults{}
 	if len(results) == 0 {
@@ -451,16 +501,102 @@ func (e *Executor) buildSelectResults(ctx context.Context, col *Collection, resu
 	}
 	out.Total = len(out.Results)
 	out.Columns = plan.Projections
+	if plan.OrderBy != "" {
+		e.applyOrderBy(out, plan)
+	}
 	return out
+}
+
+// applyOrderBy sorts results by the ORDER BY column's value in the result
+// metadata. Numeric-looking values sort numerically; everything else sorts
+// lexically. IsDesc reverses the order.
+func (e *Executor) applyOrderBy(out *SearchResults, plan *optimizer.PhysicalPlan) {
+	colName := plan.OrderBy
+	less := func(a, b *SearchResult) bool {
+		av, aok := a.Metadata[colName]
+		bv, bok := b.Metadata[colName]
+		if !aok && !bok {
+			return a.ID < b.ID
+		}
+		if !aok {
+			return true
+		}
+		if !bok {
+			return false
+		}
+		// Numeric comparison when both parse as float64.
+		af, aIsNum := toFloat(av)
+		bf, bIsNum := toFloat(bv)
+		if aIsNum && bIsNum {
+			if af != bf {
+				return af < bf
+			}
+			// Tie: break deterministically by ID.
+			return a.ID < b.ID
+		}
+		as, bs := fmt.Sprint(av), fmt.Sprint(bv)
+		if as != bs {
+			return as < bs
+		}
+		return a.ID < b.ID
+	}
+	if plan.IsDesc {
+		// Reverse via sort.Slice with inverted comparator.
+		sort.Slice(out.Results, func(i, j int) bool {
+			return less(out.Results[j], out.Results[i])
+		})
+		return
+	}
+	sort.Slice(out.Results, func(i, j int) bool {
+		return less(out.Results[i], out.Results[j])
+	})
+}
+
+// toFloat attempts to convert a metadata value to float64 for numeric ordering.
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
 }
 
 // attachMetadata loads the full record for a result ID and projects its
 // metadata down to the plan's column list. The "id" column is always
-// available from the result itself.
+// available from the result itself. Vector-func projections
+// (SIMILARITY/VECTOR_DISTANCE) are computed from the record's stored
+// vector against the plan's query vector.
 func (e *Executor) attachMetadata(ctx context.Context, col *Collection, sr *SearchResult, plan *optimizer.PhysicalPlan) *SearchResult {
 	rec, err := col.Get(ctx, sr.ID)
 	if err != nil || rec.Metadata == nil {
 		return sr
+	}
+	// Vector-func projections need the record's stored vector. Compute them
+	// before projecting so they land in the output metadata.
+	if len(plan.VectorFuncProjections) > 0 && len(rec.Vector) > 0 {
+		for _, vfp := range plan.VectorFuncProjections {
+			if len(vfp.QueryVector) == 0 || len(vfp.QueryVector) != len(rec.Vector) {
+				continue
+			}
+			score := computeVectorScore(col, vfp, rec.Vector)
+			if sr.Metadata == nil {
+				sr.Metadata = make(map[string]interface{}, len(plan.VectorFuncProjections))
+			}
+			sr.Metadata[vfp.Name] = score
+		}
 	}
 	if len(plan.Projections) == 0 {
 		// All columns: expose every metadata field.
@@ -480,6 +616,30 @@ func (e *Executor) attachMetadata(ctx context.Context, col *Collection, sr *Sear
 	}
 	sr.Metadata = proj
 	return sr
+}
+
+// computeVectorScore computes the SIMILARITY or VECTOR_DISTANCE score for a
+// single record vector against a vector-func projection's query vector,
+// using the collection's configured distance metric. It dispatches through
+// the same SIMD-backed util functions the index uses, so it inherits the
+// AVX2 assembly on amd64 and NEON on arm64.
+func computeVectorScore(col *Collection, vfp optimizer.VectorFuncProjection, recVector []float32) float32 {
+	var score float32
+	switch col.config.Metric {
+	case L2Distance:
+		score = util.L2Distance_func(vfp.QueryVector, recVector)
+	case InnerProduct:
+		score = util.InnerProduct_func(vfp.QueryVector, recVector)
+	case CosineDistance:
+		score = util.CosineDistance_func(vfp.QueryVector, recVector)
+	default:
+		score = util.CosineDistance_func(vfp.QueryVector, recVector)
+	}
+	if vfp.IsDistance {
+		return score
+	}
+	// SIMILARITY = 1 - distance (cosine distance is 1 - cosine sim).
+	return 1 - score
 }
 
 // executeInsert handles INSERT INTO via col.InsertBatch.

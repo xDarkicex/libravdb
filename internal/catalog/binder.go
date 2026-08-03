@@ -107,9 +107,27 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	}
 
 	// 2. Resolve identifiers (columns, vectors, graphs) deterministically using scope.
+	// First collect SELECT projection aliases so ORDER BY can reference them.
+	// Postgres semantics: ORDER BY may use a select-list alias as a column name.
+	aliasSet := make(map[uint64]struct{})
+	for i := 0; i < len(doc.SelectStmts); i++ {
+		stmt := &doc.SelectStmts[i]
+		for j := int32(0); j < stmt.ProjectionsCount; j++ {
+			proj := &doc.Projections[stmt.ProjectionsStart+j]
+			if proj.AliasEnd > proj.Alias {
+				aliasSet[hashIdentifier(b.src, proj.Alias, proj.AliasEnd)] = struct{}{}
+			}
+		}
+	}
 	for i := 0; i < len(doc.Identifiers); i++ {
 		id := &doc.Identifiers[i]
 		hash := hashIdentifier(b.src, id.Start, id.End)
+		
+		// ORDER BY alias: resolve against the SELECT list before catalog lookup.
+		if _, isAlias := aliasSet[hash]; isAlias {
+			id.ResolvedKind = parser.ResolvedKindColumn
+			continue
+		}
 		
 		resolved := false
 
