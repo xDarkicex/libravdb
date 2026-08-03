@@ -31,6 +31,13 @@ func (e *Executor) Execute(ctx context.Context, plan *optimizer.PhysicalPlan) (*
 		return e.executeSystemTable(ctx, plan)
 	}
 
+	// Hybrid queries (vector + predicates/graph) route through the adaptive
+	// cost-based dispatcher. Pure vector, pure relational, and pure graph
+	// queries keep their existing fast paths.
+	if isHybridQuery(plan) {
+		return e.executeHybrid(ctx, plan)
+	}
+
 	switch plan.Kind {
 	case optimizer.QueryKindKNN:
 		return e.executeKNN(ctx, plan)

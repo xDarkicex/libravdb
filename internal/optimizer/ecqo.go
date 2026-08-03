@@ -150,7 +150,17 @@ type PhysicalPlan struct {
 	DDLColName    string                         // CREATE INDEX column
 	DDLIfExists   bool                           // IF EXISTS modifier
 	DDLUnique     bool                           // UNIQUE INDEX modifier
+
+	// Recall contract for hybrid vector queries. Default is RecallExact.
+	RecallContract uint8 // 0=Exact, 1=Bounded, 2=BestEffort
 }
+
+// RecallContract values for PhysicalPlan.RecallContract.
+const (
+	RecallExact      uint8 = 0 // complete candidate generation + exact scoring
+	RecallBounded    uint8 = 1 // target recall with confidence/SLA
+	RecallBestEffort uint8 = 2 // time-budgeted ANN, possible shortfall
+)
 
 // Optimizer is the Exact Cardinality Quantized Optimizer (ECQO).
 type Optimizer struct {
