@@ -1,6 +1,58 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+## [v1.4.0] / Go v1.4.0 — 2026-08-03
+
+34 files changed, 3,731 insertions, 77 deletions. This release adds a SQL execution engine, PostgreSQL wire protocol (pgwire), full DDL grammar with constraint parsing, and catalog persistence.
+
+### SQL Execution Engine (`libravdb/sql.go`)
+
+- Full parse → bind (catalog OID resolution) → optimize (ECQO physical plan) → execute pipeline.
+- **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` with `DISTINCT` modifier. Full cursor scan executor in `executeAggregate`.
+- **GROUP BY / HAVING**: parser support for `GROUP BY col1, col2` and `HAVING COUNT(*) > N`.
+- **Subqueries**: `(SELECT ...)` in expression context via `parseSubquery`.
+- **Column aliases**: `SELECT expr AS alias`.
+- **ORDER BY / LIMIT**: existing support wired through optimizer to executor.
+- **DDL**: `CREATE TABLE`, `DROP TABLE [IF EXISTS]`, `CREATE [UNIQUE] INDEX`, `DROP INDEX [IF EXISTS]`, `ALTER TABLE ADD [COLUMN]` with executor dispatch.
+- **JOIN types**: `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS` with merge join executor supporting LEFT JOIN semantics (non-matching left rows emitted with null right side).
+- **Column constraints**: `NOT NULL`, `PRIMARY KEY`, `UNIQUE`, `DEFAULT`, `CHECK`, `REFERENCES`, `CONSTRAINT name` — parsed via `parseColumnConstraints()`.
+- **SQL comments**: `--` line comments and `/* */` block comments, lexed as whitespace.
+
+### pgwire Protocol (`internal/pgwire/` — 12 files, 1,600+ lines)
+
+PostgreSQL v3 wire protocol enabling any PostgreSQL-compatible client (psql, pgx, JDBC, psycopg2, Prisma, GORM, SQLAlchemy) to connect directly.
+
+- **Startup**: SSL negotiation (decline with `'N'`), trust authentication, `ParameterStatus` (server_version, client_encoding, server_encoding), `BackendKeyData`, `ReadyForQuery`.
+- **Simple Query**: `'Q'` message → `db.Query()` → `RowDescription` ('T') → `DataRow` ('D') → `CommandComplete` ('C') → `ReadyForQuery` ('Z').
+- **Extended Query**: `Parse` ('P') → `Bind` ('B') → `Describe` ('D') → `Execute` ('E') → `Sync` ('S') with named prepared statements and portals. Error responses include SQLSTATE codes and do not close the connection.
+- **System functions**: `version()` → `"libraVDB/0.1"`, `current_database()`, `current_schema()`, `pg_typeof()`, `now()`.
+- **pg_catalog emulation**: `pg_class`, `pg_attribute`, `pg_type`, `pg_namespace`, `information_schema.tables` — returns correct column metadata for ORM introspection.
+- **SQLSTATE error codes**: `errorToSQLState()` maps Go errors to 42601 (syntax), 42P01 (undefined table), 42703 (undefined column), 23505 (unique violation), 0A000 (not supported), 58000 (internal error).
+- **Type OID registry**: `catalogTypeToOID()` — TypeInt→23, TypeFloat→701, TypeString→25, TypeVector→1000. `RowDescription` uses actual type OIDs.
+- **COPY protocol**: `COPY table FROM STDIN` — `CopyInResponse` → `CopyData`* → `CopyDone` → batch insert → `CommandComplete`.
+- **Off-heap arena buffers**: 64KB `xDarkicex/memory` arena per connection. `readMessageArena()` reads directly into arena memory, reset between messages for zero heap allocations in steady state.
+- **Connection management**: configurable `MaxConnections` semaphore, graceful shutdown on context cancellation.
+
+### Catalog Auto-Registration (`internal/catalog/builder.go`)
+
+- **Binary catalog builder**: `Builder.AddTable()`, `.AddVectorIndex()`, `.AddGraphLabel()`, `.Build()` — serializes `Header` + `TableDef[]` + `ColumnDef[]` + `VectorIndexDef[]` + `GraphLabelDef[]` into wire-compatible binary. FNV-1a name hashing.
+- **Auto-registration**: `CreateCollection()` now registers the collection as a SQL table in the catalog automatically. No manual mock catalog injection needed.
+- **Catalog persistence**: `Engine.SetCatalogData()` / `CatalogData()`. Written to storage page 3 (`RootCatalog`) at checkpoint via `checkpointWriteAtLocked`. Read during recovery in `readCatalogPageLocked()`. Survives restarts.
+- **Fresh database**: empty catalog built via `NewBuilder().Build()` instead of nil, preventing "catalog not initialized" errors on brand-new databases.
+
+### Storage & Encoding
+
+- **`[]byte` metadata support**: `WriteValue` and `ReadValue` now handle `valueTypeBytes`. `EstimateValueSize` includes byte slice length. Metadata maps with `[]byte` values round-trip through WAL, snapshot, and codec layers.
+- **Encoder tests**: 24-value round-trip test covering all types plus 4 `[]byte` variants (empty, ASCII, binary, 4KB large).
+
+### pgwire Bug Fix
+
+- **ErrorResponse + ReadyForQuery**: Simple Query error responses now correctly send `ReadyForQuery` after `ErrorResponse`, preventing clients from blocking indefinitely.
+
+### Dependency Changes
+
+- `github.com/xDarkicex/lexer` — v0.0.0 (local replace) → v0.1.2
+
 ## [v1.3.0] / Go v1.3.0 — 2026-07-14
 
 This release focuses on high-throughput off-heap HNSW execution, durable asynchronous indexing, and recovery hardening. The scope below is based on the `v1.2.19..v1.3.0` source diff.
