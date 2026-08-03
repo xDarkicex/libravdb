@@ -4,17 +4,17 @@ package pgwire
 // These are the standard OIDs used in RowDescription messages.
 const (
 	// Numeric types
-	OIDInt2   = 21 // smallint
-	OIDInt4   = 23 // integer
-	OIDInt8   = 20 // bigint
+	OIDInt2   = 21  // smallint
+	OIDInt4   = 23  // integer
+	OIDInt8   = 20  // bigint
 	OIDFloat4 = 700 // real
 	OIDFloat8 = 701 // double precision
 
 	// String types
-	OIDText    = 25  // text
+	OIDText    = 25   // text
 	OIDVarchar = 1043 // varchar
 	OIDBPChar  = 1042 // char
-	OIDName    = 19  // name (used for identifiers)
+	OIDName    = 19   // name (used for identifiers)
 
 	// Boolean
 	OIDBool = 16 // boolean

@@ -30,7 +30,15 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		hash := hashIdentifier(b.src, t.Start, t.End)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
-			return fmt.Errorf("table '%s' not found", string(b.src[t.Start:t.End]))
+			// System table fallback: pg_class, etc. are not in the catalog binary
+			// but are resolved via the hardcoded system table registry.
+			name := string(b.src[t.Start:t.End])
+			if sysDef, ok := ResolveSystemTable(name); ok {
+				t.TableOID = sysDef.OID
+				scope = append(scope, sysDef)
+				continue
+			}
+			return fmt.Errorf("table '%s' not found", name)
 		}
 		t.TableOID = def.OID
 		scope = append(scope, def)
@@ -41,7 +49,13 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		hash := hashIdentifier(b.src, gt.TableStart, gt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
-			return fmt.Errorf("graph table '%s' not found", string(b.src[gt.TableStart:gt.TableEnd]))
+			name := string(b.src[gt.TableStart:gt.TableEnd])
+			if sysDef, ok := ResolveSystemTable(name); ok {
+				gt.TableOID = sysDef.OID
+				scope = append(scope, sysDef)
+				continue
+			}
+			return fmt.Errorf("graph table '%s' not found", name)
 		}
 		gt.TableOID = def.OID
 		scope = append(scope, def)
@@ -53,7 +67,13 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
-			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+			name := string(b.src[stmt.TableStart:stmt.TableEnd])
+			if sysDef, ok := ResolveSystemTable(name); ok {
+				// Allow system tables to bind (executor will reject unsupported ops)
+				scope = append(scope, sysDef)
+				continue
+			}
+			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
 	}
@@ -62,7 +82,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
-			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+			name := string(b.src[stmt.TableStart:stmt.TableEnd])
+			if sysDef, ok := ResolveSystemTable(name); ok {
+				scope = append(scope, sysDef)
+				continue
+			}
+			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
 	}
@@ -71,7 +96,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
-			return fmt.Errorf("table '%s' not found", string(b.src[stmt.TableStart:stmt.TableEnd]))
+			name := string(b.src[stmt.TableStart:stmt.TableEnd])
+			if sysDef, ok := ResolveSystemTable(name); ok {
+				scope = append(scope, sysDef)
+				continue
+			}
+			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
 	}
@@ -83,10 +113,17 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		
 		resolved := false
 
-		// Check scope tables for columns deterministically
+		// Check scope tables for columns deterministically.
+		// System tables use a hardcoded column registry instead of the catalog binary.
 		for _, tDef := range scope {
-			col, err := b.catalog.GetColumn(tDef, hash)
-			if err == nil {
+			var col *ColumnDef
+			var colErr error
+			if IsSystemTableOID(tDef.OID) {
+				col, colErr = ResolveSystemColumn(tDef.OID, hash)
+			} else {
+				col, colErr = b.catalog.GetColumn(tDef, hash)
+			}
+			if colErr == nil {
 				id.TableOID = tDef.OID
 				id.ColumnOID = col.OID
 				id.ResolvedKind = parser.ResolvedKindColumn

@@ -12,43 +12,44 @@ import (
 // PostgreSQL protocol v3 message types.
 const (
 	// Frontend (client → server)
-	msgPassword    byte = 'p'
-	msgQuery       byte = 'Q'
-	msgParse       byte = 'P'
-	msgBind        byte = 'B'
-	msgDescribe    byte = 'D'
-	msgExecute     byte = 'E'
-	msgSync        byte = 'S'
-	msgTerminate   byte = 'X'
-	msgFlush       byte = 'H'
-	msgClose       byte = 'C'
-	msgCopyData    byte = 'd' // COPY data from client
-	msgCopyDone    byte = 'c' // COPY complete from client
-	msgCopyFail    byte = 'f' // COPY failed from client
+	msgPassword  byte = 'p'
+	msgQuery     byte = 'Q'
+	msgParse     byte = 'P'
+	msgBind      byte = 'B'
+	msgDescribe  byte = 'D'
+	msgExecute   byte = 'E'
+	msgSync      byte = 'S'
+	msgTerminate byte = 'X'
+	msgFlush     byte = 'H'
+	msgClose     byte = 'C'
+	msgCopyData  byte = 'd' // COPY data from client
+	msgCopyDone  byte = 'c' // COPY complete from client
+	msgCopyFail  byte = 'f' // COPY failed from client
 
 	// Backend (server → client)
-	msgAuth            byte = 'R'
-	msgParameterStatus byte = 'S'
-	msgBackendKeyData  byte = 'K'
-	msgReadyForQuery   byte = 'Z'
-	msgRowDescription  byte = 'T'
-	msgDataRow         byte = 'D'
-	msgCommandComplete byte = 'C'
-	msgErrorResponse   byte = 'E'
-	msgNoticeResponse  byte = 'N'
-	msgEmptyQuery      byte = 'I'
-	msgParseComplete   byte = '1'
-	msgBindComplete    byte = '2'
-	msgCloseComplete   byte = '3'
-	msgNoData          byte = 'n'
-	msgCopyInResponse  byte = 'G'
-	msgCopyOutResponse byte = 'H'
+	msgAuth                 byte = 'R'
+	msgParameterStatus      byte = 'S'
+	msgBackendKeyData       byte = 'K'
+	msgReadyForQuery        byte = 'Z'
+	msgRowDescription       byte = 'T'
+	msgDataRow              byte = 'D'
+	msgCommandComplete      byte = 'C'
+	msgErrorResponse        byte = 'E'
+	msgNoticeResponse       byte = 'N'
+	msgEmptyQuery           byte = 'I'
+	msgParseComplete        byte = '1'
+	msgBindComplete         byte = '2'
+	msgCloseComplete        byte = '3'
+	msgNoData               byte = 'n'
+	msgParameterDescription byte = 't'
+	msgCopyInResponse       byte = 'G'
+	msgCopyOutResponse      byte = 'H'
 
 	// SSL negotiation
 	sslRequestCode int32 = 80877103
 
 	// Authentication types
-	authOK       int32 = 0
+	authOK        int32 = 0
 	authCleartext int32 = 3
 )
 
@@ -68,7 +69,7 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("reading message length: %w", err)
 	}
 	length := int(binary.BigEndian.Uint32(header[1:5])) - 4 // subtract self
-	if length < 0 || length > 1<<24 { // 16MB cap
+	if length < 0 || length > 1<<24 {                       // 16MB cap
 		return 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
 

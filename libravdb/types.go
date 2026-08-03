@@ -40,6 +40,10 @@ type SearchResults struct {
 	Results []*SearchResult `json:"results"`
 	Took    time.Duration   `json:"took"`
 	Total   int             `json:"total"`
+	// Columns holds the projected column names in order (SQL SELECT list).
+	// Empty means the default id/score shape. Populated by the SQL executor
+	// so wire layers (pgwire) can emit a faithful RowDescription.
+	Columns []string `json:"columns,omitempty"`
 }
 
 // DatabaseStats represents database-wide statistics

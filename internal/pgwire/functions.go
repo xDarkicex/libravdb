@@ -22,8 +22,10 @@ func interceptSystemQuery(query string, db *libravdb.Database) (*libravdb.Search
 		return results, columns, true
 	}
 
-	// pg_catalog introspection
-	if strings.Contains(upper, "PG_CATALOG") || strings.Contains(upper, "PG_CLASS") ||
+	// pg_catalog introspection.
+	// PG_CLASS is NOT intercepted — queries like SELECT count(*) FROM pg_class
+	// fall through to the real SQL engine, which materializes system table rows.
+	if strings.Contains(upper, "PG_CATALOG") ||
 		strings.Contains(upper, "PG_ATTRIBUTE") || strings.Contains(upper, "PG_TYPE") ||
 		strings.Contains(upper, "PG_NAMESPACE") || strings.Contains(upper, "INFORMATION_SCHEMA") {
 		return handlePgCatalog(upper, db)
@@ -111,16 +113,16 @@ func handlePgCatalog(sql string, db *libravdb.Database) (*libravdb.SearchResults
 
 	case strings.Contains(sql, "PG_NAMESPACE"):
 		return &libravdb.SearchResults{
-			Results: []*libravdb.SearchResult{
-				{ID: "public", Score: 1.0},
-				{ID: "pg_catalog", Score: 1.0},
-				{ID: "information_schema", Score: 1.0},
-			},
-			Total: 3,
-		}, []ColumnMeta{
-			{Name: "nspname", TypeOID: OIDName},
-			{Name: "nspowner", TypeOID: OIDInt4},
-		}, true
+				Results: []*libravdb.SearchResult{
+					{ID: "public", Score: 1.0},
+					{ID: "pg_catalog", Score: 1.0},
+					{ID: "information_schema", Score: 1.0},
+				},
+				Total: 3,
+			}, []ColumnMeta{
+				{Name: "nspname", TypeOID: OIDName},
+				{Name: "nspowner", TypeOID: OIDInt4},
+			}, true
 
 	case strings.Contains(sql, "INFORMATION_SCHEMA.TABLES") ||
 		strings.Contains(sql, "information_schema") && strings.Contains(sql, "table_name"):

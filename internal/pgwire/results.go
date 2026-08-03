@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/xDarkicex/libravdb/libravdb"
 )
@@ -118,10 +119,41 @@ func buildResultRow(r *libravdb.SearchResult, columns []ColumnMeta) []string {
 		case "ordinal", "ORDINAL":
 			vals[i] = fmt.Sprintf("%d", r.Ordinal)
 		default:
-			if len(columns) == 1 && col.Name == columns[0].Name {
-				vals[i] = r.ID
+			// Projected column: pull from record metadata (SQL SELECT path).
+			if r.Metadata != nil {
+				if v, ok := r.Metadata[col.Name]; ok && v != nil {
+					vals[i] = metadataValueToString(v)
+					continue
+				}
 			}
+			vals[i] = ""
 		}
 	}
 	return vals
+}
+
+// metadataValueToString renders a metadata value for the pgwire text format.
+func metadataValueToString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []byte:
+		return string(t)
+	case int:
+		return strconv.Itoa(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case uint64:
+		return strconv.FormatUint(t, 10)
+	case int32:
+		return strconv.FormatInt(int64(t), 10)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case bool:
+		return strconv.FormatBool(t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
 }

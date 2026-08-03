@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	btree "github.com/xDarkicex/libravdb/internal/index/btree"
+	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
@@ -21,6 +23,12 @@ func newExecutor(db *Database) *Executor {
 
 // Execute routes a physical plan to the appropriate execution engine.
 func (e *Executor) Execute(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	// System tables (pg_class, etc.) are materialized in memory rather than
+	// looked up as collections. The binder assigns reserved OIDs 1-99 to them.
+	if catalog.IsSystemTableOID(plan.CollectionOID) {
+		return e.executeSystemTable(ctx, plan)
+	}
+
 	switch plan.Kind {
 	case optimizer.QueryKindKNN:
 		return e.executeKNN(ctx, plan)
@@ -105,13 +113,64 @@ func filterByPredicates(results *SearchResults, predicates []optimizer.Relationa
 }
 
 func predicateMatches(r *SearchResult, pred optimizer.RelationalPredicate) bool {
-	switch pred.Operator {
+	colName := pred.Column
+	// The record ID is addressable as a column too.
+	if colName == "id" || colName == "ID" {
+		return compareColumn(r.ID, string(pred.Value), pred.Operator)
+	}
+	if r.Metadata == nil {
+		return false
+	}
+	v, ok := r.Metadata[colName]
+	if !ok {
+		return false
+	}
+	var s string
+	switch t := v.(type) {
+	case string:
+		s = t
+	case []byte:
+		s = string(t)
+	case int:
+		s = fmt.Sprintf("%d", t)
+	case int64:
+		s = fmt.Sprintf("%d", t)
+	case uint64:
+		s = fmt.Sprintf("%d", t)
+	case float64:
+		s = strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		s = strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case bool:
+		s = fmt.Sprintf("%t", t)
+	default:
+		s = fmt.Sprintf("%v", t)
+	}
+	return compareColumn(s, string(pred.Value), pred.Operator)
+}
+
+// compareColumn compares a column value with a literal, coercing both sides
+// to numbers when both parse as numbers so "10" > "9" is numeric, not lexical.
+func compareColumn(colVal, lit string, op uint8) bool {
+	if cf, cok := strconv.ParseFloat(colVal, 64); cok == nil {
+		if lf, lok := strconv.ParseFloat(lit, 64); lok == nil {
+			switch op {
+			case 12: // KindEquals
+				return cf == lf
+			case 13: // KindGreaterThan
+				return cf > lf
+			case 14: // KindLessThan
+				return cf < lf
+			}
+		}
+	}
+	switch op {
 	case 12: // KindEquals
-		return r.ID == string(pred.Value)
+		return colVal == lit
 	case 13: // KindGreaterThan
-		return r.ID > string(pred.Value)
+		return colVal > lit
 	case 14: // KindLessThan
-		return r.ID < string(pred.Value)
+		return colVal < lit
 	}
 	return true // unknown operator → include
 }
@@ -278,10 +337,7 @@ func (e *Executor) executeRelational(ctx context.Context, plan *optimizer.Physic
 		val, err := tree.Tree().Search(ctx, pred.Value)
 		if err == nil {
 			ord, ver, _ := btree.DecodeValue(val)
-			return &SearchResults{
-				Results: []*SearchResult{{ID: string(pred.Value), Version: uint64(ver), Score: 1.0, Ordinal: ord}},
-				Total:   1,
-			}, nil
+			return e.buildSelectResult(ctx, col, &SearchResult{ID: string(pred.Value), Version: uint64(ver), Score: 1.0, Ordinal: ord}, plan), nil
 		}
 		return &SearchResults{}, nil
 	}
@@ -351,7 +407,65 @@ func (e *Executor) executeRelational(ctx context.Context, plan *optimizer.Physic
 		advance()
 	}
 
-	return &SearchResults{Results: results, Total: len(results)}, nil
+	return e.buildSelectResults(ctx, col, results, plan), nil
+}
+
+// buildSelectResult enriches a single search result with the record's metadata
+// projected to the plan's column list.
+func (e *Executor) buildSelectResult(ctx context.Context, col *Collection, sr *SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
+	results := &SearchResults{}
+	if sr == nil {
+		return results
+	}
+	sr = e.attachMetadata(ctx, col, sr, plan)
+	results.Results = []*SearchResult{sr}
+	results.Total = 1
+	results.Columns = plan.Projections
+	return results
+}
+
+// buildSelectResults enriches a batch of search results with record metadata
+// projected to the plan's column list.
+func (e *Executor) buildSelectResults(ctx context.Context, col *Collection, results []*SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
+	out := &SearchResults{}
+	if len(results) == 0 {
+		out.Columns = plan.Projections
+		return out
+	}
+	for _, sr := range results {
+		out.Results = append(out.Results, e.attachMetadata(ctx, col, sr, plan))
+	}
+	out.Total = len(out.Results)
+	out.Columns = plan.Projections
+	return out
+}
+
+// attachMetadata loads the full record for a result ID and projects its
+// metadata down to the plan's column list. The "id" column is always
+// available from the result itself.
+func (e *Executor) attachMetadata(ctx context.Context, col *Collection, sr *SearchResult, plan *optimizer.PhysicalPlan) *SearchResult {
+	rec, err := col.Get(ctx, sr.ID)
+	if err != nil || rec.Metadata == nil {
+		return sr
+	}
+	if len(plan.Projections) == 0 {
+		// All columns: expose every metadata field.
+		sr.Metadata = rec.Metadata
+		return sr
+	}
+	// Projected columns: keep only what was selected, in order.
+	proj := make(map[string]interface{}, len(plan.Projections))
+	for _, colName := range plan.Projections {
+		if colName == "id" || colName == "ID" {
+			proj[colName] = sr.ID
+			continue
+		}
+		if v, ok := rec.Metadata[colName]; ok {
+			proj[colName] = v
+		}
+	}
+	sr.Metadata = proj
+	return sr
 }
 
 // executeInsert handles INSERT INTO via col.InsertBatch.
@@ -479,9 +593,16 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 		resultValue = maxVal
 	}
 
+	colName := aggregateColumnName(plan.AggregateFunc)
+	metaValue := aggregateMetaValue(plan.AggregateFunc, count, sum, minVal, maxVal, resultValue)
 	return &SearchResults{
-		Results: []*SearchResult{{ID: resultValue, Score: 1.0}},
+		Results: []*SearchResult{{
+			ID:       resultValue,
+			Score:    1.0,
+			Metadata: map[string]interface{}{colName: metaValue},
+		}},
 		Total:   1,
+		Columns: []string{colName},
 	}, nil
 }
 
@@ -764,4 +885,172 @@ func (e *Executor) executeJoin(ctx context.Context, plan *optimizer.PhysicalPlan
 		}
 	}
 	return &SearchResults{Results: results, Total: len(results)}, nil
+}
+
+
+// aggregateColumnName returns the output column name for an aggregate function.
+func aggregateColumnName(funcType uint8) string {
+	switch funcType {
+	case 0:
+		return "count"
+	case 1:
+		return "sum"
+	case 2:
+		return "avg"
+	case 3:
+		return "min"
+	case 4:
+		return "max"
+	default:
+		return "count"
+	}
+}
+
+// aggregateMetaValue returns the typed aggregate result for Metadata encoding.
+func aggregateMetaValue(funcType uint8, count int64, sum float64, minVal, maxVal, resultValue string) interface{} {
+	switch funcType {
+	case 0: // COUNT
+		return count
+	case 1: // SUM
+		return sum
+	case 2: // AVG
+		if count > 0 {
+			return sum / float64(count)
+		}
+		return float64(0)
+	case 3: // MIN
+		return minVal
+	case 4: // MAX
+		return maxVal
+	}
+	return count
+}
+
+// executeSystemTable handles queries against system tables (pg_class, etc.).
+func (e *Executor) executeSystemTable(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	rows, err := e.materializeSystemTableRows(ctx, plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan.Predicates) > 0 {
+		wrapped := &SearchResults{Results: rows}
+		rows = filterByPredicates(wrapped, plan.Predicates).Results
+	}
+	switch plan.Kind {
+	case optimizer.QueryKindAggregate:
+		return e.computeSystemAggregate(rows, plan), nil
+	case optimizer.QueryKindRelational:
+		if len(plan.Projections) > 0 {
+			for _, r := range rows {
+				proj := make(map[string]interface{}, len(plan.Projections))
+				for _, colName := range plan.Projections {
+					if v, ok := r.Metadata[colName]; ok {
+						proj[colName] = v
+					}
+				}
+				r.Metadata = proj
+			}
+		}
+		if plan.Limit > 0 && plan.Limit < len(rows) {
+			rows = rows[:plan.Limit]
+		}
+		return &SearchResults{Results: rows, Total: len(rows), Columns: plan.Projections}, nil
+	default:
+		return nil, fmt.Errorf("query kind %d not supported on system table %q", plan.Kind, plan.CollectionName)
+	}
+}
+
+// materializeSystemTableRows builds in-memory rows for a system table.
+func (e *Executor) materializeSystemTableRows(ctx context.Context, tableName string) ([]*SearchResult, error) {
+	switch strings.ToLower(tableName) {
+	case "pg_class":
+		return e.materializePgClass(ctx)
+	default:
+		return nil, fmt.Errorf("unsupported system table: %s", tableName)
+	}
+}
+
+// materializePgClass returns one row per real user collection.
+func (e *Executor) materializePgClass(ctx context.Context) ([]*SearchResult, error) {
+	names, err := e.db.ListCollectionsWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pg_class: listing collections: %w", err)
+	}
+	rows := make([]*SearchResult, 0, len(names))
+	for i, name := range names {
+		var rowCount int64
+		if col, colErr := e.db.GetCollection(name); colErr == nil {
+			rowCount = int64(col.Stats(ctx).LiveRecordCount)
+		}
+		rows = append(rows, &SearchResult{
+			ID:    name,
+			Score: 1.0,
+			Metadata: map[string]interface{}{
+				"oid":           int64(100 + i),
+				"relname":       name,
+				"relnamespace":  int64(0),
+				"relkind":       "r",
+				"reltuples":     float64(rowCount),
+			},
+		})
+	}
+	return rows, nil
+}
+
+// computeSystemAggregate computes an aggregate over in-memory system table rows.
+func (e *Executor) computeSystemAggregate(rows []*SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
+	colName := aggregateColumnName(plan.AggregateFunc)
+	count := int64(len(rows))
+	var resultValue interface{} = count
+	if plan.AggregateFunc != 0 {
+		var sum float64
+		var minVal, maxVal string
+		hasMinMax := false
+		validCount := int64(0)
+		for _, r := range rows {
+			if r.Metadata == nil {
+				continue
+			}
+			v, ok := r.Metadata[plan.AggregateColumn]
+			if !ok {
+				continue
+			}
+			validCount++
+			strVal := fmt.Sprintf("%v", v)
+			if !hasMinMax {
+				minVal = strVal
+				maxVal = strVal
+				hasMinMax = true
+			}
+			if strVal < minVal {
+				minVal = strVal
+			}
+			if strVal > maxVal {
+				maxVal = strVal
+			}
+			var f float64
+			if _, err := fmt.Sscanf(strVal, "%f", &f); err == nil {
+				sum += f
+			}
+		}
+		switch plan.AggregateFunc {
+		case 1:
+			resultValue = sum
+		case 2:
+			if validCount > 0 {
+				resultValue = sum / float64(validCount)
+			} else {
+				resultValue = float64(0)
+			}
+		case 3:
+			resultValue = minVal
+		case 4:
+			resultValue = maxVal
+		}
+	}
+	return &SearchResults{
+		Results: []*SearchResult{{ID: fmt.Sprintf("%v", resultValue), Score: 1.0, Metadata: map[string]interface{}{colName: resultValue}}},
+		Total:   1,
+		Columns: []string{colName},
+	}
 }

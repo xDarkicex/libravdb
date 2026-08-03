@@ -364,3 +364,83 @@ func TestSQL_AggregateCount(t *testing.T) {
 	}
 	t.Logf("SELECT id WHERE id='u1' returned: %s", results.Results[0].ID)
 }
+
+func TestSQL_PgClassCount(t *testing.T) {
+	db, err := Open(WithStoragePath(":memory:pgclass_test"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// Create collections so pg_class has real rows.
+	_, err = db.CreateCollection(ctx, "users", WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("CreateCollection users: %v", err)
+	}
+	_, err = db.CreateCollection(ctx, "items", WithMetadataOnly())
+	if err != nil {
+		t.Fatalf("CreateCollection items: %v", err)
+	}
+
+	// COUNT(*) on pg_class with WHERE predicate.
+	results, err := db.Query(ctx, "SELECT count(*) FROM pg_class WHERE relname = 'users'")
+	if err != nil {
+		t.Fatalf("Query pg_class with WHERE failed: %v", err)
+	}
+	if len(results.Results) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(results.Results))
+	}
+	if results.Columns == nil || len(results.Columns) == 0 || results.Columns[0] != "count" {
+		t.Errorf("expected Columns=[count], got %v", results.Columns)
+	}
+	v, ok := results.Results[0].Metadata["count"]
+	if !ok {
+		t.Fatal("expected 'count' in Metadata")
+	}
+	if count, ok := v.(int64); !ok {
+		t.Errorf("expected int64 count, got %T: %v", v, v)
+	} else if count != 1 {
+		t.Errorf("count = %d, want 1", count)
+	}
+	t.Logf("pg_class WHERE relname='users' count: %v", v)
+
+	// COUNT(*) on entire pg_class.
+	results, err = db.Query(ctx, "SELECT count(*) FROM pg_class")
+	if err != nil {
+		t.Fatalf("Count all pg_class failed: %v", err)
+	}
+	v, ok = results.Results[0].Metadata["count"]
+	if !ok {
+		t.Fatal("expected 'count' in Metadata")
+	}
+	if count, ok := v.(int64); !ok || count != 2 {
+		t.Errorf("count = %v, want 2", v)
+	}
+	t.Logf("pg_class total count: %v", v)
+
+	// SELECT relname FROM pg_class.
+	results, err = db.Query(ctx, "SELECT relname FROM pg_class")
+	if err != nil {
+		t.Fatalf("SELECT relname failed: %v", err)
+	}
+	if len(results.Results) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(results.Results))
+	}
+	if results.Columns == nil || len(results.Columns) == 0 || results.Columns[0] != "relname" {
+		t.Errorf("expected Columns=[relname], got %v", results.Columns)
+	}
+	// Verify both table names appear.
+	seen := make(map[string]bool)
+	for _, r := range results.Results {
+		if v, ok := r.Metadata["relname"]; ok {
+			if s, ok := v.(string); ok {
+				seen[s] = true
+			}
+		}
+	}
+	if !seen["users"] || !seen["items"] {
+		t.Errorf("expected both users and items in relnames, got %v", seen)
+	}
+	t.Logf("pg_class relnames: %v", seen)
+}
