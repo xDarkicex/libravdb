@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	btree "github.com/xDarkicex/libravdb/internal/index/btree"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
@@ -484,17 +485,47 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	}, nil
 }
 
+// sqlTypeToFieldType maps SQL column types to metadata FieldTypes for schema
+// registration. Returns ok=false for types without a metadata equivalent.
+func sqlTypeToFieldType(sqlType string) (FieldType, bool) {
+	switch strings.ToUpper(strings.TrimSpace(sqlType)) {
+	case "INT", "INTEGER", "BIGINT", "SMALLINT", "SERIAL":
+		return IntField, true
+	case "TEXT", "VARCHAR", "CHAR", "STRING":
+		return StringField, true
+	case "FLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION", "DECIMAL", "NUMERIC":
+		return FloatField, true
+	case "BOOL", "BOOLEAN":
+		return BoolField, true
+	case "TIMESTAMP", "TIME", "DATE":
+		return TimeField, true
+	default:
+		return StringField, false
+	}
+}
+
 // executeDDL handles CREATE TABLE, DROP TABLE, CREATE INDEX.
 func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
 	switch plan.DDLKind {
 	case 0: // CREATE TABLE
 		opts := []CollectionOption{WithMetadataOnly()}
+		var schema MetadataSchema
 		for _, col := range plan.DDLColumns {
 			if col.Type == "VECTOR" || col.Type == "vector" || col.Type == "FLOAT[]" || col.Type == "float[]" {
 				// Vector column present — switch to vector mode; dimension must be specified
 				// For now, treat any column named "vector" as needing dimension 3
 				opts = []CollectionOption{WithDimension(3)}
+				continue
 			}
+			if schema == nil {
+				schema = make(MetadataSchema)
+			}
+			if ft, ok := sqlTypeToFieldType(col.Type); ok {
+				schema[col.Name] = ft
+			}
+		}
+		if len(schema) > 0 {
+			opts = append(opts, WithMetadataSchema(schema))
 		}
 		_, err := e.db.CreateCollection(ctx, plan.DDLTableName, opts...)
 		if err != nil {
