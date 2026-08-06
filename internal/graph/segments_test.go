@@ -42,7 +42,7 @@ func TestSegmentFlushAndLoadBasic(t *testing.T) {
 	g2 := gi2.(*graphStore)
 	defer g2.Close()
 
-	if err := g2.LoadFromSegment(segPath, nil); err != nil {
+	if err := g2.LoadFromSegment(segPath); err != nil {
 		t.Fatalf("LoadFromSegment: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func TestSegmentCorruption(t *testing.T) {
 	g2 := gi2.(*graphStore)
 	defer g2.Close()
 
-	err = g2.LoadFromSegment(segPath, nil)
+	err = g2.LoadFromSegment(segPath)
 	if err == nil {
 		t.Fatal("expected CRC error on corrupted segment")
 	}

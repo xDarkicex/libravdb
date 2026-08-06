@@ -1,6 +1,8 @@
 package libravdb
 
 import (
+	"time"
+
 	"github.com/xDarkicex/libravdb/internal/graph"
 )
 
@@ -16,6 +18,7 @@ type Graph interface {
 
 	// Edge queries.
 	Neighbors(nodeID uint64) ([]Edge, error)
+	NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error)
 	Degree(nodeID uint64) (int, error)
 	InboundNeighbors(nodeID uint64) ([]Edge, error)
 	InboundDegree(nodeID uint64) (int, error)
@@ -32,12 +35,19 @@ type Graph interface {
 	GetFrontierBuf() (*graph.FrontierBuf, error)
 	PutFrontierBuf(f *graph.FrontierBuf)
 
-	// Vertex label registry (MVP: in-memory only, not persisted).
+	// Vertex label registry. Labels are WAL-backed when the graph is attached
+	// to a collection, and replayed when that collection is reopened.
 	RegisterVertexLabel(nodeID uint64, label string)
 	GetLabelNodes(label string) []uint64
 
 	// Lifecycle.
 	Stats() graph.GraphStats
+	GraphCentrality(nodeID uint64) float64
+	CentralityAtLSN(nodeID uint64, snapshotLSN uint64) float64
+	// RecordPageRankPublication publishes maintenance metadata for a derived
+	// PageRank vector. It does not compute PageRank; callers should invoke this
+	// after atomically publishing their own vector.
+	RecordPageRankPublication(snapshotLSN uint64, duration time.Duration)
 	Close() error
 }
 

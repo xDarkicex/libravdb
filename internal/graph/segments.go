@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/xDarkicex/libravdb/internal/storage/wal"
 	"github.com/xDarkicex/memory"
 )
 
@@ -163,13 +162,10 @@ func (g *graphStore) FlushToSegment(path string) error {
 }
 
 // LoadFromSegment mmaps a segment file and populates the graph, then triggers WAL replay.
-func (g *graphStore) LoadFromSegment(path string, w *wal.WAL) error {
+func (g *graphStore) LoadFromSegment(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if w != nil {
-				return ReplayWAL(w, g)
-			}
 			return nil
 		}
 		return err
@@ -301,12 +297,6 @@ func (g *graphStore) LoadFromSegment(path string, w *wal.WAL) error {
 
 	// Rebuild reverse index
 	g.rebuildReverseIndex()
-
-	if w != nil {
-		if err := ReplayWAL(w, g); err != nil {
-			return fmt.Errorf("WAL replay failed: %w", err)
-		}
-	}
 
 	return nil
 }

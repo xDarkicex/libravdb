@@ -185,6 +185,17 @@ func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 // Search adapts the search results from HNSW to interface types
 func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
 	hnswResults, err := w.index.Search(ctx, query, k, filter)
+	return adaptHNSWSearchResults(hnswResults, err)
+}
+
+// SearchWithEf exposes HNSW's per-query breadth without expanding the common
+// Index interface for backends that do not use ef.
+func (w *hnswWrapper) SearchWithEf(ctx context.Context, query []float32, k, ef int, filter GraphFilter) ([]*SearchResult, error) {
+	hnswResults, err := w.index.SearchWithEf(ctx, query, k, ef, filter)
+	return adaptHNSWSearchResults(hnswResults, err)
+}
+
+func adaptHNSWSearchResults(hnswResults []*hnsw.SearchResult, err error) ([]*SearchResult, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -872,6 +883,12 @@ func (w *btreeWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) 
 func (w *btreeWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
 	// B-tree is an ordered index, not a vector index. Range scans use cursor directly.
 	return nil, nil
+}
+
+// Get performs a point lookup by record ID. Returns the ordinal, version,
+// and graph node ID. Returns an error if the key does not exist.
+func (w *btreeWrapper) Get(ctx context.Context, id string) (ordinal, version uint32, graphNodeID uint64, err error) {
+	return w.index.Get(ctx, id)
 }
 
 func (w *btreeWrapper) Delete(ctx context.Context, id string) error {

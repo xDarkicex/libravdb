@@ -107,6 +107,11 @@ storage outside the timed region so graph topology cost is not confused with
 the required owned-vector copy. Results are workload and hardware dependent;
 use the commands below on deployment hardware.
 
+New collections use the production bounded-recall HNSW profile
+`M=32, efConstruction=200, efSearch=200`. For a deliberate latency/recall
+tradeoff, opt into `WithFastHNSW()` rather than accidentally inheriting a
+throughput-oriented `M=16, efSearch=50` configuration.
+
 ### HNSW Construction And Search
 
 The primary scale fixture contains 50,000 deduplicated LongMemEval messages and

@@ -37,15 +37,21 @@ var EdgeKindRegistry = struct {
 }
 
 // RegisterEdgeKind assigns a kind number to an edge type name.
-// Kind 0 is reserved (treated as "no filter"). Returns false on conflict.
+// Kind 0 is reserved (treated as "no filter").
+//
+// Idempotent: re-registering the same (name, kind) pair returns true.
+// Returns false when the kind number is 0, when the name is already
+// mapped to a different kind number, or when the kind number is already
+// claimed by a different name.
 func RegisterEdgeKind(name string, kind uint8) bool {
 	if kind == 0 {
 		return false
 	}
-	if _, exists := EdgeKindRegistry.byName[name]; exists {
-		return false
+	if existing, ok := EdgeKindRegistry.byName[name]; ok {
+		return existing == kind
 	}
-	if _, exists := EdgeKindRegistry.byKind[kind]; exists {
+	if _, ok := EdgeKindRegistry.byKind[kind]; ok {
+		// kind number already claimed by a different name — hard conflict.
 		return false
 	}
 	EdgeKindRegistry.byName[name] = kind

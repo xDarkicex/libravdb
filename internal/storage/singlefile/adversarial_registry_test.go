@@ -519,8 +519,8 @@ func TestAdversarialGraphNodeID_LegacyV2Migration(t *testing.T) {
 	if len(snapshotChunk) == 0 {
 		t.Fatalf("Snapshot chunk is empty")
 	}
-	if snapshotChunk[0] != 3 { // codecVersion == 3
-		t.Errorf("Expected migrated snapshot to be codec V3, got %d", snapshotChunk[0])
+	if snapshotChunk[0] != 4 { // snapshotCodecVersion == 4
+		t.Errorf("Expected migrated snapshot to be snapshot codec v4, got %d", snapshotChunk[0])
 	}
 }
 

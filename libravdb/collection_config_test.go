@@ -1,6 +1,7 @@
 package libravdb
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
@@ -9,6 +10,40 @@ import (
 	"github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 )
+
+func TestDefaultHNSWUsesProductionRecallProfile(t *testing.T) {
+	db, err := Open(WithStoragePath(":memory:production_hnsw_defaults"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	collection, err := db.CreateCollection(context.Background(), "production_defaults")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := collection.Config()
+	if config.M != ProductionHNSWM || config.EfConstruction != ProductionHNSWEfConstruction || config.EfSearch != ProductionHNSWEfSearch {
+		t.Fatalf("default HNSW = M=%d efConstruction=%d efSearch=%d, want production profile M=%d efConstruction=%d efSearch=%d",
+			config.M, config.EfConstruction, config.EfSearch,
+			ProductionHNSWM, ProductionHNSWEfConstruction, ProductionHNSWEfSearch)
+	}
+}
+
+func TestHNSWProfilesAreExplicit(t *testing.T) {
+	config := &CollectionConfig{}
+	if err := WithProductionHNSW()(config); err != nil {
+		t.Fatal(err)
+	}
+	if config.M != 32 || config.EfConstruction != 200 || config.EfSearch != 200 {
+		t.Fatalf("production profile = %+v", config)
+	}
+	if err := WithFastHNSW()(config); err != nil {
+		t.Fatal(err)
+	}
+	if config.M != 16 || config.EfConstruction != 100 || config.EfSearch != 50 {
+		t.Fatalf("fast profile = %+v", config)
+	}
+}
 
 func TestCollectionConfigValidation(t *testing.T) {
 	tests := []struct {

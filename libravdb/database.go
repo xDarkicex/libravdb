@@ -39,8 +39,12 @@ type Database struct {
 	scratchPool   *sync.Pool
 	catalog       *catalog.Catalog
 	quantRegistry *quant.Registry
-	mu            sync.RWMutex
-	closed        bool
+	// Bounded in-memory query feedback for future calibration aggregation.
+	costModelStats *costModelStats
+	activeSnaps    activeSnapshots
+	temporalCache  *temporalIndexCache
+	mu             sync.RWMutex
+	closed         bool
 }
 
 // Config holds database-wide configuration
@@ -55,6 +59,8 @@ type Config struct {
 	MetricsEnabled       bool
 	TracingEnabled       bool
 	Durability           DurabilityMode
+	Temporal             TemporalConfig
+	TemporalANN          TemporalANNConfig
 	maxWritesExplicit    bool
 	writeQueueExplicit   bool
 }
@@ -70,6 +76,15 @@ const (
 	// write may still be lost after power failure or kernel crash.
 	DurabilityUnsafeNoSync
 )
+
+// WithTemporalANNCache enables the optional temporal ANN cache with byte/entry limits.
+func WithTemporalANNCache(maxBytes int64, maxEntries int) Option {
+	return func(c *Config) error {
+		c.TemporalANN.MaxBytes = maxBytes
+		c.TemporalANN.MaxEntries = maxEntries
+		return nil
+	}
+}
 
 // Open opens a Database at the configured path, creating it if necessary.
 func Open(opts ...Option) (*Database, error) {
@@ -140,13 +155,14 @@ func Open(opts ...Option) (*Database, error) {
 	}
 
 	db := &Database{
-		collections:   make(map[string]*Collection),
-		storage:       storageEngine,
-		bridge:        bridge,
-		metrics:       metrics,
-		config:        config,
-		logger:        config.Logger,
-		quantRegistry: quant.NewRegistry(),
+		collections:    make(map[string]*Collection),
+		storage:        storageEngine,
+		bridge:         bridge,
+		metrics:        metrics,
+		config:         config,
+		logger:         config.Logger,
+		quantRegistry:  quant.NewRegistry(),
+		costModelStats: newCostModelStats(2048),
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
 				arena, err := memory.NewArena(1024*1024, 64)
@@ -157,9 +173,9 @@ func Open(opts ...Option) (*Database, error) {
 			},
 		},
 	}
-	
+
 	// Load catalog from storage engine if it was persisted in a previous session.
-	// Falls back to an empty catalog for fresh databases.
+	// Falls back to the sidecar file, then to an empty catalog for fresh databases.
 	if data, ok := db.storage.(interface{ CatalogData() []byte }); ok {
 		if catData := data.CatalogData(); len(catData) > 0 {
 			if cat, err := catalog.Load(catData, db.quantRegistry); err == nil {
@@ -210,7 +226,54 @@ func Open(opts ...Option) (*Database, error) {
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
 
+	// Wire graph WAL: if the engine supports graph edge persistence, wire it
+	// to every collection's graph so Txn.Commit() writes durable edge records.
+	if walWriter, ok := storageEngine.(storage.GraphWALWriter); ok {
+		for _, col := range db.collections {
+			db.wireGraphWAL(col, walWriter)
+		}
+		// Wire recovery: register every graph-enabled collection as a
+		// recovery target so committed graph edge WAL frames route to the
+		// correct per-collection graph.
+		for _, col := range db.collections {
+			if g := col.GetGraph(); g != nil {
+				if target, ok := g.(storage.GraphRecoveryTarget); ok {
+					storageEngine.SetGraphRecoveryTarget(col.name, target)
+				}
+			}
+		}
+
+	}
+
+	// Initialize temporal ANN cache if configured.
+	if db.config.TemporalANN.MaxBytes > 0 || db.config.TemporalANN.MaxEntries > 0 {
+		db.temporalCache = newTemporalIndexCache(db, db.config.TemporalANN.MaxBytes, db.config.TemporalANN.MaxEntries)
+	}
+
 	return db, nil
+}
+
+// wireGraphWAL sets the engine WAL writer on a collection's graph so edge
+// mutations are durably recorded.
+func (db *Database) wireGraphWAL(col *Collection, walWriter storage.GraphWALWriter) {
+	g := col.GetGraph()
+	if g == nil {
+		return
+	}
+	type walWirer interface {
+		SetWALWriter(w storage.GraphWALWriter)
+	}
+	if w, ok := g.(walWirer); ok {
+		w.SetWALWriter(walWriter)
+	}
+	// Ensure the graph knows its owning collection name so WAL frames
+	// carry the correct collection identity for per-collection recovery.
+	type collectionNamer interface {
+		SetCollectionName(name string)
+	}
+	if w, ok := g.(collectionNamer); ok {
+		w.SetCollectionName(col.name)
+	}
 }
 
 // SetLogger configures the database logger. It is safe to call concurrently.
@@ -242,6 +305,9 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 		return nil, fmt.Errorf("failed to create collection: %w", err)
 	}
 	collection.db = db
+	if g := collection.GetGraph(); g != nil {
+		collection.SetGraph(g)
+	}
 	if err := db.configureAsyncIndex(collection); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to configure asynchronous index: %w", err),
@@ -252,6 +318,12 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 
 	db.collections[name] = collection
 	db.registerCollectionInCatalog(name, collection.config)
+
+	// Wire graph WAL for newly created collection.
+	if walWriter, ok := db.storage.(storage.GraphWALWriter); ok {
+		db.wireGraphWAL(collection, walWriter)
+	}
+
 	return collection, nil
 }
 
@@ -260,12 +332,22 @@ func (db *Database) CreateCollection(ctx context.Context, name string, opts ...C
 // Caller must hold db.mu.
 func (db *Database) registerCollectionInCatalog(name string, config *CollectionConfig) {
 	builder := catalog.NewBuilderFrom(db.catalog)
-	columns := []catalog.ColumnInfo{{Name: "id", Type: catalog.TypeString}}
+	// "id" is always the primary key and non-null.
+	columns := []catalog.ColumnInfo{{
+		Name:  "id",
+		Type:  catalog.TypeString,
+		Flags: catalog.ColFlagPrimaryKey | catalog.ColFlagNotNull,
+	}}
 	if config != nil && config.MetadataSchema != nil {
 		for fieldName, fieldType := range config.MetadataSchema {
+			var flags uint16
+			if config.ColumnConstraints != nil {
+				flags = config.ColumnConstraints[fieldName]
+			}
 			columns = append(columns, catalog.ColumnInfo{
-				Name: fieldName,
-				Type: metadataFieldToCatalogType(fieldType),
+				Name:  fieldName,
+				Type:  metadataFieldToCatalogType(fieldType),
+				Flags: flags,
 			})
 		}
 	}
@@ -275,6 +357,12 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 	// and pgvector operators bind against it in SQL.
 	if config != nil && config.Dimension > 0 {
 		builder.AddVectorIndex("vector", uint32(config.Dimension), uint8(config.Metric))
+	}
+	// Register foreign key constraints in the catalog.
+	if config != nil {
+		for _, fk := range config.ForeignKeys {
+			builder.AddForeignKey(fk)
+		}
 	}
 	data := builder.Build()
 	cat, err := catalog.Load(data, db.quantRegistry)
@@ -473,6 +561,20 @@ func (db *Database) GetCollection(name string) (*Collection, error) {
 	db.collections[name] = collection
 
 	return collection, nil
+}
+
+// firstGraphCollection returns the first collection that has an attached graph,
+// or nil if none exists. Used for SQL GRAPH_EDGES operations that need a graph
+// but don't specify a collection name explicitly.
+func (db *Database) firstGraphCollection() *Collection {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	for _, col := range db.collections {
+		if col.GetGraph() != nil {
+			return col
+		}
+	}
+	return nil
 }
 
 // ListCollections returns the names of all collections as a best-effort
@@ -827,7 +929,17 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 	db.mu.Lock()
 	for name, collection := range loadedCollections {
 		db.collections[name] = collection
-		db.registerCollectionInCatalog(name, collection.config)
+		// The persisted catalog is authoritative for SQL schema metadata. A
+		// storage collection config contains physical index settings but does
+		// not carry relational columns, composite PK order, or FK definitions;
+		// rebuilding the catalog here would silently erase those definitions
+		// on every reopen. Register only legacy collections that have no table
+		// entry yet.
+		if db.catalog == nil {
+			db.registerCollectionInCatalog(name, collection.config)
+		} else if _, err := db.catalog.GetTable(catalog.HashIdentifier(name)); err != nil {
+			db.registerCollectionInCatalog(name, collection.config)
+		}
 	}
 	db.mu.Unlock()
 	if bridge != nil {
@@ -958,6 +1070,10 @@ func (db *Database) Close() error {
 		}
 	}
 
+	// Close temporal ANN cache before storage.
+	if db.temporalCache != nil {
+		db.temporalCache.close()
+	}
 	// Close storage
 	if err := db.storage.Close(); err != nil {
 		errors = append(errors, err)
@@ -1018,6 +1134,13 @@ func (db *Database) Drop(ctx context.Context) error {
 
 	if db.closed {
 		return ErrDatabaseClosed
+	}
+
+	// Close temporal ANN cache before collections to release HNSW index
+	// pages, which hold ShardedFreeList slots tracked by the memory package's
+	// shared PID controller.
+	if db.temporalCache != nil {
+		db.temporalCache.close()
 	}
 
 	// Close all collections safely

@@ -190,6 +190,64 @@ func TestHybridDispatch_IterativeOperator(t *testing.T) {
 	}
 }
 
+func TestIterativeOperatorUsesOneTraversalAndUpdatesValid(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:iterative_single_traversal"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	col, err := db.CreateCollection(ctx, "iterative_single", WithDimension(4), WithMetadataSchema(map[string]FieldType{"cat": IntField}), WithIndexedFields("cat"))
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	for i := 0; i < 500; i++ {
+		cat := int64(0)
+		if i%5 == 0 {
+			cat = 1
+		}
+		if err := col.Insert(ctx, idStr(i), []float32{float32(i) / 500, 0.1, 0.2, 0.3}, map[string]interface{}{"cat": cat}); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	plan := &optimizer.PhysicalPlan{
+		CollectionName:     "iterative_single",
+		Kind:               optimizer.QueryKindKNN,
+		HasVectorSearch:    true,
+		HasRelationalQuery: true,
+		Predicates:         []optimizer.RelationalPredicate{{Column: "cat", Operator: 12, Value: []byte("1")}},
+		QueryVector:        []float32{0.5, 0.5, 0.1, 0.2},
+		Limit:              10,
+		RecallContract:     optimizer.RecallBounded,
+	}
+	exec := newExecutor(db)
+	metrics := &QueryMetrics{EstConjunctionCandidates: 100}
+	results, err := exec.executeIterativeANNThenFilter(ctx, plan, metrics, &hybridConstraints{})
+	if err != nil {
+		t.Fatalf("iterative execute: %v", err)
+	}
+	if len(results.Results) != 10 {
+		t.Fatalf("iterative results = %d, want 10", len(results.Results))
+	}
+	if metrics.FilterValidHits < 10 {
+		t.Fatalf("FilterValidHits = %d, want at least 10", metrics.FilterValidHits)
+	}
+	if metrics.ANNBatches != 1 {
+		t.Fatalf("ANNBatches = %d, want one shared traversal", metrics.ANNBatches)
+	}
+	for _, result := range results.Results {
+		record, err := col.Get(ctx, result.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.Metadata["cat"] != int64(1) {
+			t.Fatalf("result %s has category %v", result.ID, record.Metadata["cat"])
+		}
+	}
+}
+
 // TestHybridDispatch_BinomialStart verifies the Chernoff-bound start size
 // computation produces reasonable m* values.
 func TestHybridDispatch_BinomialStart(t *testing.T) {
@@ -247,9 +305,9 @@ func TestHybridDispatch_IsHybridQuery(t *testing.T) {
 
 	// Hybrid: vector + graph → hybrid.
 	planGraph := &optimizer.PhysicalPlan{
-		HasVectorSearch:    true,
-		HasGraphTraversal:  true,
-		Kind:               optimizer.QueryKindKNN,
+		HasVectorSearch:   true,
+		HasGraphTraversal: true,
+		Kind:              optimizer.QueryKindKNN,
 	}
 	if !isHybridQuery(planGraph) {
 		t.Error("vector + graph should be hybrid")
@@ -366,15 +424,15 @@ func TestM3b2_RecallExactBlocksTransitions(t *testing.T) {
 	// The RecallExact contract forces ExactCandidateScan.
 	exec := newExecutor(db)
 	plan := &optimizer.PhysicalPlan{
-		CollectionName:    "recall_block",
-		CollectionOID:     100,
-		Kind:              optimizer.QueryKindKNN,
-		HasVectorSearch:   true,
+		CollectionName:     "recall_block",
+		CollectionOID:      100,
+		Kind:               optimizer.QueryKindKNN,
+		HasVectorSearch:    true,
 		HasRelationalQuery: true,
-		Predicates:        []optimizer.RelationalPredicate{{Column: "cat", Operator: 12, Value: []byte("1")}},
-		QueryVector:       []float32{0.5, 0.5, 0.1, 0.2},
-		Limit:             10,
-		RecallContract:    optimizer.RecallExact,
+		Predicates:         []optimizer.RelationalPredicate{{Column: "cat", Operator: 12, Value: []byte("1")}},
+		QueryVector:        []float32{0.5, 0.5, 0.1, 0.2},
+		Limit:              10,
+		RecallContract:     optimizer.RecallExact,
 	}
 	results, err := exec.Execute(ctx, plan)
 	if err != nil {
@@ -414,7 +472,7 @@ func TestM3b2_HysteresisNoFlap(t *testing.T) {
 // TestM3b2_InFilterBitmapCorrectness verifies the ordinalBitmap implements
 // the GraphFilter interface correctly.
 func TestM3b2_InFilterBitmapCorrectness(t *testing.T) {
-	bm := &ordinalBitmap{allowed: map[uint32]bool{1: true, 5: true, 100: true}}
+	bm := &ordinalBitmap{membership: &mapMembership{m: map[uint32]bool{1: true, 5: true, 100: true}}}
 	if !bm.Test(1) {
 		t.Error("ordinal 1 should be allowed")
 	}
@@ -427,21 +485,51 @@ func TestM3b2_InFilterBitmapCorrectness(t *testing.T) {
 	if bm.Test(0) {
 		t.Error("ordinal 0 should be rejected (not in map)")
 	}
+
+	sharded := &ordinalBitmap{
+		membership: &mapMembership{m: map[uint32]bool{1: true}},
+		byMembership: []ordinalMembership{
+			&mapMembership{m: map[uint32]bool{1: true}},
+			&mapMembership{m: map[uint32]bool{}},
+		},
+	}
+	if !sharded.ForShard(0).Test(1) {
+		t.Error("ordinal 1 should be allowed in shard 0")
+	}
+	if sharded.ForShard(1).Test(1) {
+		t.Error("ordinal 1 from shard 0 must not authorize shard 1 ordinal 1")
+	}
+	thresholded := &thresholdGraphFilter{base: sharded, threshold: 0.5}
+	if thresholded.ForShard(1).Test(1) {
+		t.Error("threshold wrapper must preserve shard-local filtering")
+	}
 }
 
-// TestM3b2_DispatchPredicateHonesty verifies the dispatch predicate no
-// longer claims FilteredANN support just because EdgeKind != 0.
-func TestM3b2_DispatchPredicateHonesty(t *testing.T) {
-	// Graph-only plan (no relational predicates) → hasFilteredANN = false.
-	plan := &optimizer.PhysicalPlan{
-		HasRelationalQuery: false,
-		HasGraphTraversal:  true,
-		GraphEdges:         []optimizer.GraphEdgePlan{{EdgeKind: 1, Direction: 1, QuantMin: 1, QuantMax: 1}},
-		Kind:               optimizer.QueryKindKNN,
+func TestScoreAndSelectTopKNormalizesCosineVectors(t *testing.T) {
+	col := &Collection{config: &CollectionConfig{Metric: CosineDistance}}
+	results := scoreAndSelectTopK(col, []Record{
+		{ID: "large-off-axis", Vector: []float32{100, 100}},
+		{ID: "aligned", Vector: []float32{1, 0}},
+	}, []float32{1, 0}, 1)
+	if len(results.Results) != 1 || results.Results[0].ID != "aligned" {
+		t.Fatalf("cosine top-1 = %#v, want aligned", results.Results)
 	}
-	hasFilteredANN := plan.HasRelationalQuery && len(plan.Predicates) > 0 && plan.Kind == optimizer.QueryKindKNN
-	if hasFilteredANN {
-		t.Error("graph-only plan should NOT claim FilteredANN support")
+}
+
+// TestM3b2_DispatchPredicateHonesty verifies FilteredANN is offered only when
+// a vector query has a scalar or materializable graph bitmap.
+func TestM3b2_DispatchPredicateHonesty(t *testing.T) {
+	// Vector + graph can use the graph candidate bitmap.
+	plan := &optimizer.PhysicalPlan{
+		HasVectorSearch:   true,
+		HasGraphTraversal: true,
+		GraphEdges:        []optimizer.GraphEdgePlan{{EdgeKind: 1, Direction: 1, QuantMin: 1, QuantMax: 1}},
+		Kind:              optimizer.QueryKindGraph,
+	}
+	hasFilteredANN := (plan.HasVectorSearch || plan.Kind == optimizer.QueryKindKNN) &&
+		((plan.HasRelationalQuery && len(plan.Predicates) > 0) || plan.HasGraphTraversal)
+	if !hasFilteredANN {
+		t.Error("vector+graph plan should claim FilteredANN support")
 	}
 
 	// Relational + vector plan → hasFilteredANN = true.
@@ -450,7 +538,8 @@ func TestM3b2_DispatchPredicateHonesty(t *testing.T) {
 		Predicates:         []optimizer.RelationalPredicate{{}},
 		Kind:               optimizer.QueryKindKNN,
 	}
-	hasFilteredANN2 := plan2.HasRelationalQuery && len(plan2.Predicates) > 0 && plan2.Kind == optimizer.QueryKindKNN
+	hasFilteredANN2 := (plan2.HasVectorSearch || plan2.Kind == optimizer.QueryKindKNN) &&
+		((plan2.HasRelationalQuery && len(plan2.Predicates) > 0) || plan2.HasGraphTraversal)
 	if !hasFilteredANN2 {
 		t.Error("relational+vector plan SHOULD claim FilteredANN support")
 	}
@@ -491,7 +580,7 @@ func TestM3b2_IterativeYieldAbort(t *testing.T) {
 		CollectionOID:      100,
 		Kind:               optimizer.QueryKindKNN,
 		HasVectorSearch:    true,
-		HasRelationalQuery:  true,
+		HasRelationalQuery: true,
 		Predicates:         []optimizer.RelationalPredicate{{Column: "cat", Operator: 12, Value: []byte("1")}},
 		QueryVector:        []float32{0.5, 0.5, 0.1, 0.2},
 		Limit:              10,
@@ -502,4 +591,132 @@ func TestM3b2_IterativeYieldAbort(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	t.Logf("yield test results: %d rows", len(results.Results))
+}
+
+// TestHybridGraphConstraintsAllOperators proves that MATCH is an authoritative
+// constraint for exact, filtered-ANN, and iterative hybrid execution. The
+// nearest scalar-matching record is deliberately outside the graph, while a
+// graph-reachable record deliberately fails the scalar predicate.
+func TestHybridGraphConstraintsAllOperators(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:hybrid_graph_constraints"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	gr, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatalf("NewGraph: %v", err)
+	}
+	defer gr.Close()
+
+	col, err := db.CreateCollection(ctx, "hybrid_graph", WithDimension(4), WithGraph(gr), WithMetadataSchema(map[string]FieldType{"cat": IntField}))
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+
+	records := []struct {
+		id  string
+		vec []float32
+		cat int64
+	}{
+		{id: "seed", vec: []float32{0, 1, 0, 0}, cat: 0},
+		{id: "allowed", vec: []float32{0.8, 0.2, 0, 0}, cat: 1},
+		{id: "reachable-wrong-scalar", vec: []float32{0.95, 0.05, 0, 0}, cat: 0},
+		{id: "outside-nearest", vec: []float32{1, 0, 0, 0}, cat: 1},
+	}
+	for _, rec := range records {
+		if err := col.Insert(ctx, rec.id, normalize(rec.vec), map[string]interface{}{"cat": rec.cat}); err != nil {
+			t.Fatalf("insert %s: %v", rec.id, err)
+		}
+	}
+
+	seedID, err := db.GetNodeID(ctx, "hybrid_graph", "seed")
+	if err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	allowedID, err := db.GetNodeID(ctx, "hybrid_graph", "allowed")
+	if err != nil {
+		t.Fatalf("allowed node: %v", err)
+	}
+	wrongScalarID, err := db.GetNodeID(ctx, "hybrid_graph", "reachable-wrong-scalar")
+	if err != nil {
+		t.Fatalf("wrong-scalar node: %v", err)
+	}
+
+	txn := gr.BeginTxn()
+	if err := gr.AddEdge(txn, seedID, allowedID, 1, 0); err != nil {
+		t.Fatalf("seed->allowed: %v", err)
+	}
+	if err := gr.AddEdge(txn, seedID, wrongScalarID, 1, 0); err != nil {
+		t.Fatalf("seed->wrong-scalar: %v", err)
+	}
+	gr.RegisterVertexLabel(seedID, "Service")
+
+	basePlan := optimizer.PhysicalPlan{
+		CollectionName:     "hybrid_graph",
+		Kind:               optimizer.QueryKindKNN,
+		HasVectorSearch:    true,
+		HasGraphTraversal:  true,
+		HasExplicitSeed:    true,
+		ExplicitSeedID:     seedID,
+		GraphEdges:         []optimizer.GraphEdgePlan{{Direction: 1}},
+		MaxHops:            1,
+		HasRelationalQuery: true,
+		Predicates:         []optimizer.RelationalPredicate{{Column: "cat", Operator: 12, Value: []byte("1")}},
+		QueryVector:        []float32{1, 0, 0, 0},
+		Limit:              1,
+		RecallContract:     optimizer.RecallExact,
+	}
+
+	assertOnlyAllowed := func(t *testing.T, results *SearchResults, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		got := make([]string, 0, len(results.Results))
+		for _, result := range results.Results {
+			got = append(got, result.ID)
+		}
+		if len(got) != 1 || got[0] != "allowed" {
+			t.Fatalf("result IDs = %v, want [allowed]", got)
+		}
+	}
+
+	exec := newExecutor(db)
+	t.Run("exact-dispatch", func(t *testing.T) {
+		results, err := exec.Execute(ctx, &basePlan)
+		assertOnlyAllowed(t, results, err)
+	})
+
+	t.Run("filtered-ann", func(t *testing.T) {
+		metrics := &QueryMetrics{EstConjunctionCandidates: 1}
+		constraints, err := exec.prepareHybridConstraints(ctx, &basePlan, metrics)
+		if err != nil {
+			t.Fatalf("prepare constraints: %v", err)
+		}
+		results, err := exec.executeFilteredANN(ctx, &basePlan, metrics, constraints)
+		assertOnlyAllowed(t, results, err)
+		if metrics.ActGraphCandidates != 2 || metrics.ActConjunctionCandidates != 1 {
+			t.Fatalf("candidate metrics graph=%d conjunction=%d, want 2 and 1", metrics.ActGraphCandidates, metrics.ActConjunctionCandidates)
+		}
+	})
+
+	t.Run("iterative", func(t *testing.T) {
+		metrics := &QueryMetrics{EstConjunctionCandidates: 1}
+		constraints, err := exec.prepareHybridConstraints(ctx, &basePlan, metrics)
+		if err != nil {
+			t.Fatalf("prepare constraints: %v", err)
+		}
+		results, err := exec.executeIterativeANNThenFilter(ctx, &basePlan, metrics, constraints)
+		assertOnlyAllowed(t, results, err)
+	})
+
+	// Exercise parser -> optimizer -> dispatcher as real SQL. The vector
+	// function is nested under AND so this also guards hybrid classification.
+	t.Run("sql-end-to-end", func(t *testing.T) {
+		results, err := db.Query(ctx, "SELECT id FROM GRAPH_TABLE(hybrid_graph MATCH (s:Service)-[e]->(x)) WHERE SIMILARITY(vector, '[1,0,0,0]') > 0 AND cat = 1 LIMIT 1")
+		assertOnlyAllowed(t, results, err)
+	})
 }

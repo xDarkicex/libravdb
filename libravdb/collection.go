@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/filter"
 	"github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/index"
@@ -44,11 +47,19 @@ type Collection struct {
 	insertHooks            []InsertHook
 	deleteHooks            []DeleteHook
 	asyncIndex             *asyncIndexQueue
+	metadataIndexMu        sync.Mutex
+	metadataIndex          map[string]map[string][]string
+	metadataIndexBuiltAt   uint64
+	metadataMutationEpoch  atomic.Uint64
+	costModel              *collectionCostModelState
 }
 
 // CollectionConfig holds collection-specific configuration
 type CollectionConfig struct {
 	MetadataSchema      MetadataSchema            `json:"metadata_schema,omitempty"`
+	ColumnConstraints   map[string]uint16         `json:"column_constraints,omitempty"` // column name -> ColFlag* bits
+	PrimaryKeyColumns   []string                  `json:"primary_key_columns,omitempty"`
+	ForeignKeys         []catalog.ForeignKeyInfo  `json:"foreign_keys,omitempty"` // FK constraints
 	MemoryConfig        *memory.MemoryConfig      `json:"memory_config,omitempty"`
 	Quantization        *quant.QuantizationConfig `json:"quantization,omitempty"`
 	RawVectorStore      string                    `json:"raw_vector_store,omitempty"`
@@ -112,6 +123,7 @@ func (c *Collection) Config() CollectionConfig {
 	config := *c.config
 	config.Graph = nil
 	config.IndexedFields = append([]string(nil), c.config.IndexedFields...)
+	config.PrimaryKeyColumns = append([]string(nil), c.config.PrimaryKeyColumns...)
 
 	if c.config.MetadataSchema != nil {
 		config.MetadataSchema = make(MetadataSchema, len(c.config.MetadataSchema))
@@ -140,11 +152,36 @@ func (c *Collection) Config() CollectionConfig {
 	return config
 }
 
-// SetGraph attaches a Graph interface to an existing collection.
+// SetGraph attaches a Graph interface to an existing collection. If the
+// database's storage engine supports graph edge durability, the WAL writer
+// is wired automatically so Txn.Commit() writes durable edge records.
 func (c *Collection) SetGraph(g Graph) {
 	c.mu.Lock()
 	c.graph = g
 	c.mu.Unlock()
+
+	if c.db != nil && g != nil {
+		// Wire WAL writer independently.
+		if w, ok := g.(interface {
+			SetWALWriter(w storage.GraphWALWriter)
+		}); ok {
+			if walWriter, ok := c.db.storage.(storage.GraphWALWriter); ok {
+				w.SetWALWriter(walWriter)
+			}
+		}
+		// Wire collection name independently.
+		if w, ok := g.(interface{ SetCollectionName(name string) }); ok {
+			w.SetCollectionName(c.name)
+		}
+		// Register as per-collection recovery target.
+		if setter, ok := c.db.storage.(interface {
+			SetGraphRecoveryTarget(collection string, target storage.GraphRecoveryTarget)
+		}); ok {
+			if target, ok := g.(storage.GraphRecoveryTarget); ok {
+				setter.SetGraphRecoveryTarget(c.name, target)
+			}
+		}
+	}
 }
 
 // GetIndex returns the collection's index, or nil if none is configured.
@@ -159,6 +196,28 @@ func (c *Collection) GetGraph() Graph {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.graph
+}
+
+// getOrdinal resolves an ID to its shard-local ordinal without hydrating a
+// vector or metadata payload. Storage engines that do not provide the narrow
+// lookup retain the compatible Collection.Get fallback.
+func (c *Collection) getOrdinal(ctx context.Context, id string) (uint32, error) {
+	type ordinalProvider interface {
+		GetOrdinal(context.Context, string) (uint32, error)
+	}
+	if c.shards != nil {
+		storage := c.getShard(id).storage
+		if provider, ok := storage.(ordinalProvider); ok {
+			return provider.GetOrdinal(ctx, id)
+		}
+	} else if provider, ok := c.storage.(ordinalProvider); ok {
+		return provider.GetOrdinal(ctx, id)
+	}
+	record, err := c.Get(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	return record.Ordinal, nil
 }
 
 func trainingIndexState(idx index.Index) (trainableIndex, bool) {
@@ -373,9 +432,9 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		Dimension:      768, // Default for common embeddings
 		Metric:         CosineDistance,
 		IndexType:      HNSW,
-		M:              32,
-		EfConstruction: 200,
-		EfSearch:       50,
+		M:              ProductionHNSWM,
+		EfConstruction: ProductionHNSWEfConstruction,
+		EfSearch:       ProductionHNSWEfSearch,
 		NClusters:      100,
 		NProbes:        10,
 		ML:             1.0 / math.Log(32.0),
@@ -471,6 +530,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		metrics:       metrics,
 		memoryManager: memManager,
 		graph:         config.Graph,
+		costModel:     newCollectionCostModelState(nil, 0),
 	}
 
 	// Initialize storage and index based on sharding mode
@@ -614,6 +674,7 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 		metrics:       metrics,
 		memoryManager: memManager,
 		graph:         config.Graph,
+		costModel:     newCollectionCostModelState(engineConfig.CostModelStats, engineConfig.DataLSN),
 	}
 
 	// Rebuild index from storage data (skipped if cached index was used).
@@ -699,11 +760,12 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 
 	// Create the collection and initialize shards
 	c := &Collection{
-		name:    name,
-		config:  config,
-		writes:  writes,
-		metrics: metrics,
-		graph:   config.Graph,
+		name:      name,
+		config:    config,
+		writes:    writes,
+		metrics:   metrics,
+		graph:     config.Graph,
+		costModel: newCollectionCostModelState(engineConfig.CostModelStats, engineConfig.DataLSN),
 	}
 
 	// Initialize shards from loaded storages
@@ -782,11 +844,27 @@ func (c *Collection) rebuildIndex(ctx context.Context) error {
 }
 
 // Insert adds or updates a vector in the collection
-func (c *Collection) Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+func (c *Collection) Insert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) (err error) {
+	defer func() {
+		if err == nil {
+			c.addToMetadataIndex(id, metadata)
+			c.markMetadataIndexDirty()
+		}
+	}()
 	// Preflight: validate dimension before acquiring write permit or mutex
 	if len(vector) != c.config.Dimension {
 		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 			len(vector), c.config.Dimension)
+	}
+
+	// Preflight: validate foreign key constraints.
+	if err := c.validateForeignKeys(ctx, id, metadata); err != nil {
+		return err
+	}
+
+	// Preflight: validate UNIQUE constraints.
+	if err := c.validateUniqueConstraints(ctx, id, metadata); err != nil {
+		return err
 	}
 
 	// Stage entry before acquiring lock (no shared state accessed yet)
@@ -960,7 +1038,12 @@ func (c *Collection) Insert(ctx context.Context, id string, vector []float32, me
 	return nil
 }
 
-func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEntry) error {
+func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEntry) (err error) {
+	defer func() {
+		if err == nil && len(entries) > 0 {
+			c.markMetadataIndexDirty()
+		}
+	}()
 	// Preflight: reject nil/empty batch before acquiring write permit
 	if len(entries) == 0 {
 		return nil
@@ -990,6 +1073,19 @@ func (c *Collection) insertBatch(ctx context.Context, entries []*index.VectorEnt
 				return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 					len(entry.Vector), dimension)
 			}
+		}
+	}
+
+	// Batch inserts use a lower-level storage path than Collection.Insert, so
+	// repeat the schema-constraint preflight here. Without this check SQL
+	// INSERT (which is intentionally batched) could bypass FK and UNIQUE
+	// enforcement while direct Go inserts correctly rejected the same row.
+	for _, entry := range entries {
+		if err := c.validateForeignKeys(ctx, entry.ID, entry.Metadata); err != nil {
+			return err
+		}
+		if err := c.validateUniqueConstraints(ctx, entry.ID, entry.Metadata); err != nil {
+			return err
 		}
 	}
 
@@ -1181,7 +1277,52 @@ func (c *Collection) rollbackBatchIndex(ctx context.Context, ids []string) {
 }
 
 // Update modifies an existing vector in the collection
-func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+func (c *Collection) Update(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) (err error) {
+	// Resolve the complete post-update metadata first. Constraint checks must
+	// see unchanged FK columns as well as columns supplied by this partial
+	// UPDATE, and ON UPDATE actions need the old and new parent tuple.
+	existing, getErr := c.Get(ctx, id)
+	if getErr != nil {
+		return getErr
+	}
+	oldMetadata := cloneMetadata(existing.Metadata)
+	newMetadata := cloneMetadata(oldMetadata)
+	for k, v := range metadata {
+		if newMetadata == nil {
+			newMetadata = make(map[string]interface{})
+		}
+		newMetadata[k] = v
+	}
+
+	// Preflight: validate foreign key constraints with new values.
+	if err := c.validateForeignKeys(ctx, id, newMetadata); err != nil {
+		return err
+	}
+
+	// Preflight: validate UNIQUE constraints with new values.
+	if err := c.validateUniqueConstraints(ctx, id, newMetadata); err != nil {
+		return err
+	}
+
+	var updateCascades []cascadeOp
+	updateCascades, err = c.collectUpdateCascades(ctx, id, id, oldMetadata, newMetadata)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			if oldMetadata != nil {
+				c.removeFromMetadataIndex(id, oldMetadata)
+			}
+			c.addToMetadataIndex(id, newMetadata)
+			c.markMetadataIndexDirty()
+			for _, op := range updateCascades {
+				c.executeCascadeMutation(ctx, op)
+			}
+		}
+	}()
+
+	// Fetch existing record early for ON UPDATE cascade check.
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -1282,11 +1423,20 @@ func (c *Collection) updateNonSharded(ctx context.Context, id string, vector []f
 		c.metrics.VectorUpdates.Inc()
 	}
 
+	// Incrementally update metadata posting index.
+	c.removeFromMetadataIndex(id, existingEntry.Metadata)
+	c.addToMetadataIndex(id, updatedEntry.Metadata)
+
 	return nil
 }
 
 // Upsert writes a record regardless of whether it exists, replacing if it does.
-func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) error {
+func (c *Collection) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]interface{}) (err error) {
+	defer func() {
+		if err == nil {
+			c.markMetadataIndexDirty()
+		}
+	}()
 	if len(vector) != c.config.Dimension {
 		return fmt.Errorf("vector dimension %d does not match collection dimension %d",
 			len(vector), c.config.Dimension)
@@ -1517,7 +1667,27 @@ func (c *Collection) upsertSharded(ctx context.Context, id string, vector []floa
 }
 
 // Delete removes a vector from the collection
-func (c *Collection) Delete(ctx context.Context, id string) error {
+func (c *Collection) Delete(ctx context.Context, id string) (err error) {
+	var oldMetadata map[string]interface{}
+	var cascadeDeletes []cascadeOp
+	defer func() {
+		if err == nil {
+			c.removeFromMetadataIndex(id, oldMetadata)
+			c.markMetadataIndexDirty()
+			// Execute cascading deletes after the parent is removed.
+			for _, op := range cascadeDeletes {
+				c.executeCascadeMutation(ctx, op)
+			}
+		}
+	}()
+
+	// Preflight: check FK references (RESTRICT rejection + CASCADE collection).
+	cascades, err := c.checkDeleteFKReferences(ctx, id)
+	if err != nil {
+		return err
+	}
+	cascadeDeletes = cascades
+
 	release, err := c.acquireWrite(ctx)
 	if err != nil {
 		return err
@@ -1553,6 +1723,7 @@ func (c *Collection) Delete(ctx context.Context, id string) error {
 		var hasEntry bool
 		if err == nil {
 			hasEntry = true
+			oldMetadata = entry.Metadata
 		} else if !isNotFoundError(err) {
 			return fmt.Errorf("failed to get vector for deletion: %w", err)
 		}
@@ -1710,6 +1881,15 @@ func isNotFoundError(err error) bool {
 
 // InsertBatch inserts multiple vectors using the public collection API.
 func (c *Collection) InsertBatch(ctx context.Context, entries []VectorEntry) error {
+	// Preflight: validate FK and UNIQUE constraints for all entries.
+	for _, entry := range entries {
+		if err := c.validateForeignKeys(ctx, entry.ID, entry.Metadata); err != nil {
+			return err
+		}
+		if err := c.validateUniqueConstraints(ctx, entry.ID, entry.Metadata); err != nil {
+			return err
+		}
+	}
 	indexEntries := make([]*index.VectorEntry, 0, len(entries))
 	for _, entry := range entries {
 		indexEntries = append(indexEntries, &index.VectorEntry{
@@ -1824,11 +2004,676 @@ func (c *Collection) ListAll(ctx context.Context) ([]Record, error) {
 	return records, nil
 }
 
+// validateUniqueConstraints checks that values for columns with the UNIQUE
+// flag don't already exist in other records. Uses unsafe.Pointer for direct
+// catalog column access, matching the codebase convention for zero-copy reads.
+func (c *Collection) validateUniqueConstraints(ctx context.Context, id string, metadata map[string]interface{}) error {
+	if c.db == nil || c.db.catalog == nil || metadata == nil {
+		return nil
+	}
+	tableHash := catalog.HashIdentifier(c.name)
+	tbl, err := c.db.catalog.GetTable(tableHash)
+	if err != nil {
+		return nil
+	}
+	data := c.db.catalog.Data()
+	colSize := uint32(unsafe.Sizeof(catalog.ColumnDef{}))
+	for i := uint32(0); i < tbl.ColumnsCount; i++ {
+		col := (*catalog.ColumnDef)(unsafe.Pointer(&data[tbl.ColumnsOffset+i*colSize]))
+		if col.Flags&catalog.ColFlagUnique == 0 {
+			continue
+		}
+		for key, val := range metadata {
+			if catalog.HashIdentifier(key) != col.NameHash {
+				continue
+			}
+			valStr := recordMetaToString(val)
+			existing, err := c.ListByMetadata(ctx, key, val)
+			if err != nil {
+				continue
+			}
+			for _, rec := range existing {
+				if rec.ID != id {
+					return fmt.Errorf(
+						"UNIQUE constraint violation: value %q already exists in column %q",
+						valStr, key)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Collection) markMetadataIndexDirty() {
+	if c != nil && c.config != nil && len(c.config.IndexedFields) > 0 {
+		c.metadataMutationEpoch.Add(1)
+	}
+	if c != nil && c.costModel != nil {
+		c.costModel.markDirty()
+	}
+}
+
+// validateForeignKeys checks FK column values against parent tables.
+func (c *Collection) validateForeignKeys(ctx context.Context, id string, metadata map[string]interface{}) error {
+	if c.db == nil || c.db.catalog == nil {
+		return nil
+	}
+	tableHash := catalog.HashIdentifier(c.name)
+	groups := c.db.catalog.ForeignKeyGroupsForTable(tableHash)
+	if len(groups) == 0 {
+		return nil
+	}
+
+	c.db.mu.RLock()
+	nameByHash := make(map[uint64]string, len(c.db.collections))
+	for name := range c.db.collections {
+		nameByHash[catalog.HashIdentifier(name)] = name
+	}
+	c.db.mu.RUnlock()
+	for _, group := range groups {
+		// A composite FK is nullable as a unit: if any component is NULL,
+		// the constraint is not checked unless that component is NOT NULL.
+		sourceValues := make([]string, len(group.Pairs))
+		null := false
+		for i, fk := range group.Pairs {
+			sourceValues[i] = fkValueFromRecord(id, metadata, fk.SourceColHash)
+			if sourceValues[i] == "" {
+				null = true
+				if c.isFKColumnNotNull(fk) {
+					return fmt.Errorf("NOT NULL constraint violation: column with foreign key must not be null")
+				}
+			}
+		}
+		if null {
+			continue
+		}
+		targetName := nameByHash[group.TargetTableHash]
+		if targetName == "" {
+			// Check system tables (GRAPH_NODES, etc.)
+			if len(group.Pairs) != 1 {
+				return fmt.Errorf("foreign key violation: system table %q does not support composite references", targetName)
+			}
+			if err := c.checkFKTargetSystemTable(ctx, group.Pairs[0], sourceValues[0]); err != nil {
+				return err
+			}
+			continue
+		}
+
+		parent, err := c.db.GetCollection(targetName)
+		if err != nil {
+			return fmt.Errorf("foreign key: target table %q not found", targetName)
+		}
+
+		if !c.parentHasTuple(ctx, parent, group.Pairs, sourceValues) {
+			return fmt.Errorf("foreign key violation: referenced value does not exist in %s", targetName)
+		}
+	}
+	return nil
+}
+
+func fkValueFromRecord(id string, metadata map[string]interface{}, hash uint64) string {
+	if hash == catalog.HashIdentifier("id") {
+		return id
+	}
+	return fkValueFromMeta(metadata, hash)
+}
+
+func recordValueByHash(r Record, hash uint64) string {
+	if hash == catalog.HashIdentifier("id") {
+		return r.ID
+	}
+	return fkValueFromMeta(r.Metadata, hash)
+}
+
+func (c *Collection) parentHasTuple(ctx context.Context, parent *Collection, pairs []*catalog.ForeignKeyDef, values []string) bool {
+	records, err := parent.ListAll(ctx)
+	if err != nil {
+		return false
+	}
+	for _, record := range records {
+		match := true
+		for i, pair := range pairs {
+			if i >= len(values) || recordValueByHash(record, pair.TargetColHash) != values[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// isFKColumnNotNull returns true if the FK's source column has a NOT NULL
+// constraint in the catalog.
+func (c *Collection) isFKColumnNotNull(fk *catalog.ForeignKeyDef) bool {
+	if c.db == nil || c.db.catalog == nil {
+		return false
+	}
+	tgt, err := c.db.catalog.GetTable(fk.SourceTableHash)
+	if err != nil {
+		return false
+	}
+	col, err := c.db.catalog.GetColumn(tgt, fk.SourceColHash)
+	if err != nil {
+		return false
+	}
+	return col.Flags&catalog.ColFlagNotNull != 0
+}
+
+// checkFKTargetSystemTable validates an FK reference to a system table
+// (GRAPHS_NODES, etc.) using the appropriate virtual lookup.
+func (c *Collection) checkFKTargetSystemTable(ctx context.Context, fk *catalog.ForeignKeyDef, fkValue string) error {
+	if fk.TargetTableHash != catalog.HashIdentifier("GRAPH_NODES") {
+		return nil // unknown system table — skip (validated at DDL time)
+	}
+	nodeID, err := strconv.ParseUint(fkValue, 10, 64)
+	if err != nil {
+		return fmt.Errorf(
+			"foreign key violation: GRAPH_NODES.id must be a valid graph node ID, got %q", fkValue)
+	}
+	if c.db == nil {
+		return nil
+	}
+	if _, _, err := c.db.ResolveNodeID(ctx, nodeID); err != nil {
+		return fmt.Errorf(
+			"foreign key violation: graph node %d does not exist", nodeID)
+	}
+	return nil
+}
+
+func (c *Collection) checkFKTargetByID(ctx context.Context, parent *Collection, fkValue, targetName string) error {
+	idx := parent.GetIndex()
+	if idx == nil {
+		return fmt.Errorf("foreign key: parent table %q has no index", targetName)
+	}
+	if getter, ok := idx.(interface {
+		Get(context.Context, string) (uint32, uint32, uint64, error)
+	}); ok {
+		if _, _, _, err := getter.Get(ctx, fkValue); err != nil {
+			return fmt.Errorf(
+				"foreign key violation: value %q does not exist in %s(id)",
+				fkValue, targetName)
+		}
+	}
+	return nil
+}
+
+func (c *Collection) checkFKTargetByMetadata(ctx context.Context, parent *Collection, fk *catalog.ForeignKeyDef, fkValue, targetName string) error {
+	targetCol := "?"
+	cfg := parent.Config()
+	if cfg.MetadataSchema != nil {
+		for name := range cfg.MetadataSchema {
+			if catalog.HashIdentifier(name) == fk.TargetColHash {
+				targetCol = name
+				break
+			}
+		}
+	}
+	records, err := parent.ListByMetadata(ctx, targetCol, fkValue)
+	if err != nil || len(records) == 0 {
+		return fmt.Errorf(
+			"foreign key violation: value %q does not exist in %s(%s)",
+			fkValue, targetName, targetCol)
+	}
+	return nil
+}
+
+// cascadeOp describes a cascading mutation to execute after the parent
+// record has been removed or updated.
+type cascadeOp struct {
+	collectionName string
+	recordID       string
+	newFKValue     string // for ON UPDATE CASCADE: the new FK column value
+	sourceCol      string // for ON UPDATE CASCADE: the FK column name to update
+}
+
+// collectUpdateCascades checks for ON UPDATE RESTRICT violations and
+// collects ON UPDATE CASCADE targets when a parent record's FK-referenced
+// column values change.
+func (c *Collection) collectUpdateCascades(ctx context.Context, oldID, newID string, oldMetadata, newMetadata map[string]interface{}) ([]cascadeOp, error) {
+	if c.db == nil || c.db.catalog == nil {
+		return nil, nil
+	}
+	tableHash := catalog.HashIdentifier(c.name)
+	fks := c.db.catalog.ForeignKeysToTable(tableHash)
+	if len(fks) == 0 {
+		return nil, nil
+	}
+
+	// Check if any FK-referenced column actually changed.
+	changed := false
+	for _, fk := range fks {
+		// Only columns that maps to the FK's target col can trigger cascades.
+		oldVal := fkValueFromRecord(oldID, oldMetadata, fk.TargetColHash)
+		newVal := fkValueFromRecord(newID, newMetadata, fk.TargetColHash)
+		if oldVal != newVal && newVal != "" {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil, nil
+	}
+
+	c.db.mu.RLock()
+	nameByHash := make(map[uint64]string, len(c.db.collections))
+	for name := range c.db.collections {
+		nameByHash[catalog.HashIdentifier(name)] = name
+	}
+	c.db.mu.RUnlock()
+
+	var cascades []cascadeOp
+	for _, fk := range fks {
+		if fk.OnUpdate != catalog.OnDeleteCascade && fk.OnUpdate != catalog.OnDeleteRestrict {
+			continue
+		}
+		childName := nameByHash[fk.SourceTableHash]
+		if childName == "" {
+			continue
+		}
+		child, err := c.db.GetCollection(childName)
+		if err != nil {
+			continue
+		}
+
+		// Find child rows referencing the old value.
+		oldVal := fkValueFromRecord(oldID, oldMetadata, fk.TargetColHash)
+		newVal := fkValueFromRecord(newID, newMetadata, fk.TargetColHash)
+		if oldVal == "" || newVal == "" || oldVal == newVal {
+			continue
+		}
+
+		srcColName := resolveFKSourceCol(child, fk.SourceColHash)
+		var matchingIDs []string
+		if fk.SourceColHash == catalog.HashIdentifier("id") {
+			idx := child.GetIndex()
+			if idx != nil {
+				if getter, ok := idx.(interface {
+					Get(context.Context, string) (uint32, uint32, uint64, error)
+				}); ok {
+					if _, _, _, err := getter.Get(ctx, oldID); err == nil {
+						matchingIDs = append(matchingIDs, oldID)
+					}
+				}
+			}
+		} else if srcColName != "" {
+			recs, _ := child.ListByMetadata(ctx, srcColName, oldVal)
+			for _, r := range recs {
+				matchingIDs = append(matchingIDs, r.ID)
+			}
+		}
+
+		switch fk.OnUpdate {
+		case catalog.OnDeleteCascade:
+			for _, childID := range matchingIDs {
+				cascades = append(cascades, cascadeOp{
+					collectionName: childName,
+					recordID:       childID,
+					newFKValue:     newVal,
+					sourceCol:      srcColName,
+				})
+			}
+		case catalog.OnDeleteRestrict, catalog.OnDeleteNoAction:
+			if len(matchingIDs) > 0 {
+				return nil, fmt.Errorf(
+					"foreign key violation: cannot update %s in %s because %d row(s) in %s reference it",
+					oldID, c.name, len(matchingIDs), childName)
+			}
+		}
+	}
+	return cascades, nil
+}
+
+// fkValueFromMeta extracts a string value from metadata matching the given column hash.
+func fkValueFromMeta(meta map[string]interface{}, colHash uint64) string {
+	if meta == nil {
+		return ""
+	}
+	for k, v := range meta {
+		if catalog.HashIdentifier(k) == colHash {
+			return recordMetaToString(v)
+		}
+	}
+	return ""
+}
+
+// checkDeleteFKReferences validates that deleting the given record does not
+// violate any RESTRICT foreign keys, and collects CASCADE targets.
+func (c *Collection) checkDeleteFKReferences(ctx context.Context, id string) ([]cascadeOp, error) {
+	if c.db == nil || c.db.catalog == nil {
+		return nil, nil
+	}
+	tableHash := catalog.HashIdentifier(c.name)
+	groups := c.db.catalog.ForeignKeyGroupsToTable(tableHash)
+	if len(groups) == 0 {
+		return nil, nil
+	}
+	parentRecord, err := c.Get(ctx, id)
+	if err != nil {
+		return nil, nil
+	}
+
+	c.db.mu.RLock()
+	nameByHash := make(map[uint64]string, len(c.db.collections))
+	for name := range c.db.collections {
+		nameByHash[catalog.HashIdentifier(name)] = name
+	}
+	c.db.mu.RUnlock()
+
+	var cascades []cascadeOp
+	for _, group := range groups {
+		childName := nameByHash[group.SourceTableHash]
+		if childName == "" {
+			continue // child table not loaded
+		}
+
+		child, err := c.db.GetCollection(childName)
+		if err != nil {
+			continue
+		}
+
+		parentValues := make([]string, len(group.Pairs))
+		for i, pair := range group.Pairs {
+			parentValues[i] = recordValueByHash(parentRecord, pair.TargetColHash)
+		}
+		var matchingIDs []string
+		childRecords, listErr := child.ListAll(ctx)
+		if listErr != nil {
+			continue
+		}
+		for _, record := range childRecords {
+			match := true
+			null := false
+			for i, pair := range group.Pairs {
+				value := recordValueByHash(record, pair.SourceColHash)
+				if value == "" {
+					null = true
+					break
+				}
+				if value != parentValues[i] {
+					match = false
+					break
+				}
+			}
+			if match && !null {
+				matchingIDs = append(matchingIDs, record.ID)
+			}
+		}
+
+		switch group.OnDelete {
+		case catalog.OnDeleteCascade:
+			for _, childID := range matchingIDs {
+				cascades = append(cascades, cascadeOp{
+					collectionName: childName,
+					recordID:       childID,
+				})
+			}
+		case catalog.OnDeleteRestrict, catalog.OnDeleteNoAction:
+			if len(matchingIDs) > 0 {
+				return nil, fmt.Errorf(
+					"foreign key violation: cannot delete %s from %s because %d row(s) in %s reference it",
+					id, c.name, len(matchingIDs), childName)
+			}
+		}
+	}
+	return cascades, nil
+}
+
+// resolveFKSourceCol resolves a source column hash in the child collection
+// to its metadata key name.
+func resolveFKSourceCol(child *Collection, colHash uint64) string {
+	cfg := child.Config()
+	if cfg.MetadataSchema != nil {
+		for name := range cfg.MetadataSchema {
+			if catalog.HashIdentifier(name) == colHash {
+				return name
+			}
+		}
+	}
+	for _, field := range cfg.IndexedFields {
+		if catalog.HashIdentifier(field) == colHash {
+			return field
+		}
+	}
+	return ""
+}
+
+// executeCascadeMutation executes a cascading delete or update on a child record.
+func (c *Collection) executeCascadeMutation(ctx context.Context, op cascadeOp) {
+	child, err := c.db.GetCollection(op.collectionName)
+	if err != nil {
+		return
+	}
+	if op.newFKValue != "" {
+		// ON UPDATE CASCADE: update the child's FK column value.
+		_ = child.Update(ctx, op.recordID, nil,
+			map[string]interface{}{op.sourceCol: op.newFKValue})
+	} else {
+		// ON DELETE CASCADE: remove the child.
+		_ = child.Delete(ctx, op.recordID)
+	}
+}
+
+// initMetadataIndexLocked ensures the metadata index maps are allocated.
+func (c *Collection) initMetadataIndexLocked() {
+	if c.metadataIndex != nil {
+		return
+	}
+	c.metadataIndex = make(map[string]map[string][]string, len(c.config.IndexedFields))
+	for _, field := range c.config.IndexedFields {
+		c.metadataIndex[field] = make(map[string][]string)
+	}
+}
+
+// addToMetadataIndex adds a record's indexed field values to the posting
+// lists. Caller must have already successfully committed the record to
+// storage. Safe for concurrent callers via metadataIndexMu.
+func (c *Collection) addToMetadataIndex(id string, metadata map[string]interface{}) {
+	if c.config == nil || len(c.config.IndexedFields) == 0 || metadata == nil {
+		return
+	}
+	c.metadataIndexMu.Lock()
+	defer c.metadataIndexMu.Unlock()
+	c.initMetadataIndexLocked()
+	for _, field := range c.config.IndexedFields {
+		value, ok := metadata[field]
+		if !ok {
+			continue
+		}
+		fieldIdx := c.metadataIndex[field]
+		for _, key := range metadataPostingKeys(value) {
+			fieldIdx[key] = append(fieldIdx[key], id)
+		}
+	}
+	epoch := c.metadataMutationEpoch.Load()
+	c.metadataIndexBuiltAt = epoch
+}
+
+// removeFromMetadataIndex removes a record's indexed field values from the
+// posting lists. Safe for concurrent callers via metadataIndexMu.
+func (c *Collection) removeFromMetadataIndex(id string, metadata map[string]interface{}) {
+	if c.metadataIndex == nil || c.config == nil || len(c.config.IndexedFields) == 0 || metadata == nil {
+		return
+	}
+	c.metadataIndexMu.Lock()
+	defer c.metadataIndexMu.Unlock()
+	for _, field := range c.config.IndexedFields {
+		value, ok := metadata[field]
+		if !ok {
+			continue
+		}
+		fieldIdx := c.metadataIndex[field]
+		for _, key := range metadataPostingKeys(value) {
+			ids := fieldIdx[key]
+			for i, existing := range ids {
+				if existing == id {
+					fieldIdx[key] = append(ids[:i], ids[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+	epoch := c.metadataMutationEpoch.Load()
+	c.metadataIndexBuiltAt = epoch
+}
+
+func (c *Collection) hasIndexedMetadataField(field string) bool {
+	if c == nil || c.config == nil {
+		return false
+	}
+	for _, indexed := range c.config.IndexedFields {
+		if indexed == field {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupIndexedMetadata resolves one equality predicate through the
+// collection's configured metadata posting lists. The lists are rebuilt
+// lazily after a mutation, so steady-state filtered queries do not scan every
+// vector or copy every vector payload just to construct an ordinal bitmap.
+func (c *Collection) lookupIndexedMetadata(ctx context.Context, field string, value interface{}) ([]Record, bool, error) {
+	if !c.hasIndexedMetadataField(field) {
+		return nil, false, nil
+	}
+
+	c.metadataIndexMu.Lock()
+	epoch := c.metadataMutationEpoch.Load()
+	if c.metadataIndex == nil || c.metadataIndexBuiltAt != epoch {
+		if err := c.rebuildMetadataIndexLocked(ctx, epoch); err != nil {
+			c.metadataIndexMu.Unlock()
+			return nil, true, err
+		}
+	}
+	ids := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, key := range metadataPostingKeys(value) {
+		for _, id := range c.metadataIndex[field][key] {
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	c.metadataIndexMu.Unlock()
+
+	records := make([]Record, 0, len(ids))
+	for _, id := range ids {
+		record, err := c.Get(ctx, id)
+		if err != nil {
+			// A concurrent delete can invalidate a posting after the snapshot.
+			// Skipping it preserves correctness; the mutation epoch forces the
+			// next lookup to rebuild the posting lists.
+			if isNotFoundError(err) || errors.Is(err, ErrRecordNotFound) {
+				continue
+			}
+			return nil, true, err
+		}
+		records = append(records, record)
+	}
+	return records, true, nil
+}
+
+func (c *Collection) rebuildMetadataIndexLocked(ctx context.Context, epoch uint64) error {
+	postings := make(map[string]map[string][]string, len(c.config.IndexedFields))
+	for _, field := range c.config.IndexedFields {
+		postings[field] = make(map[string][]string)
+	}
+
+	add := func(entry *index.VectorEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for field, values := range postings {
+			value, ok := entry.Metadata[field]
+			if !ok {
+				continue
+			}
+			for _, key := range metadataPostingKeys(value) {
+				values[key] = append(values[key], entry.ID)
+			}
+		}
+		return nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return ErrCollectionClosed
+	}
+	if c.shards != nil {
+		for i := range c.shards {
+			if err := c.shards[i].storage.Iterate(ctx, add); err != nil {
+				return fmt.Errorf("build metadata index for shard %d: %w", i, err)
+			}
+		}
+	} else if err := c.storage.Iterate(ctx, add); err != nil {
+		return fmt.Errorf("build metadata index: %w", err)
+	}
+
+	c.metadataIndex = postings
+	c.metadataIndexBuiltAt = epoch
+	return nil
+}
+
+// metadataPostingKeys deliberately includes the SQL text-comparison key and,
+// for numeric values, the cross-type key used by EqualityFilter. Candidate
+// enumeration may be a superset; the authoritative predicate check removes
+// false positives, while this prevents an index-induced false negative.
+func metadataPostingKeys(value interface{}) []string {
+	keys := []string{"text:" + recordMetaToString(value)}
+	if numeric, ok := metadataNumericValue(value); ok {
+		keys = append(keys, "number:"+strconv.FormatFloat(numeric, 'g', -1, 64))
+	}
+	return keys
+}
+
+func metadataNumericValue(value interface{}) (float64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed), true
+	case int8:
+		return float64(typed), true
+	case int16:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint8:
+		return float64(typed), true
+	case uint16:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case float32:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	default:
+		return 0, false
+	}
+}
+
 // ListByMetadata returns records where the given metadata field equals the provided value.
 func (c *Collection) ListByMetadata(ctx context.Context, field string, value interface{}) ([]Record, error) {
-	records, err := c.ListAll(ctx)
+	records, indexed, err := c.lookupIndexedMetadata(ctx, field, value)
 	if err != nil {
 		return nil, err
+	}
+	if !indexed {
+		records, err = c.ListAll(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	filtered, err := filter.NewEqualityFilter(field, value).Apply(ctx, filterEntriesFromRecords(records))
@@ -1902,6 +2747,12 @@ func (c *Collection) Search(ctx context.Context, vector []float32, k int) (*Sear
 
 // SearchWithGraphFilter finds the k most similar vectors, applying an optional graph bitset filter.
 func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32, k int, filter GraphFilter) (*SearchResults, error) {
+	return c.searchWithGraphFilterAndEf(ctx, vector, k, 0, filter)
+}
+
+// searchWithGraphFilterAndEf applies a per-query HNSW breadth when supported.
+// Other index backends retain their normal Search behavior.
+func (c *Collection) searchWithGraphFilterAndEf(ctx context.Context, vector []float32, k, ef int, filter GraphFilter) (*SearchResults, error) {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1958,7 +2809,11 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 				defer wg.Done()
 				// Each shard only needs its local top-k; the parent merges all shard results.
 				shardK := k
-				results, err := shardIndexes[shardIdx].Search(ctx, indexVector, shardK, indexFilter)
+				shardFilter := indexFilter
+				if factory, ok := filter.(interface{ ForShard(int) GraphFilter }); ok {
+					shardFilter = factory.ForShard(shardIdx)
+				}
+				results, err := searchIndexWithEf(shardIndexes[shardIdx], ctx, indexVector, shardK, ef, shardFilter)
 				resultsCh <- shardResult{results: results, err: err, shardIdx: shardIdx}
 			}(i)
 		}
@@ -1968,7 +2823,7 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results, err := idx.Search(ctx, indexVector, k, indexFilter)
+			results, err := searchIndexWithEf(idx, ctx, indexVector, k, ef, indexFilter)
 			resultsCh <- shardResult{results: results, err: err, shardIdx: -1}
 		}()
 	}
@@ -2105,6 +2960,17 @@ func (c *Collection) SearchWithGraphFilter(ctx context.Context, vector []float32
 		Took:    time.Since(start),
 		Total:   len(publicResults),
 	}, nil
+}
+
+func searchIndexWithEf(idx index.Index, ctx context.Context, query []float32, k, ef int, filter index.GraphFilter) ([]*index.SearchResult, error) {
+	if ef > 0 {
+		if searchable, ok := idx.(interface {
+			SearchWithEf(context.Context, []float32, int, int, index.GraphFilter) ([]*index.SearchResult, error)
+		}); ok {
+			return searchable.SearchWithEf(ctx, query, k, ef, filter)
+		}
+	}
+	return idx.Search(ctx, query, k, filter)
 }
 
 type searchResultMinHeap []*SearchResult
@@ -2704,6 +3570,14 @@ func (c *Collection) Close() error {
 	}
 	if mutationState := c.mutationState.Swap(nil); mutationState != nil {
 		mutationState.close()
+	}
+
+	// Close attached graph so its memory pools release background goroutines.
+	if c.graph != nil {
+		if err := c.graph.Close(); err != nil {
+			errors = append(errors, fmt.Errorf("graph close: %w", err))
+		}
+		c.graph = nil
 	}
 
 	c.closed = true

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/xDarkicex/libravdb/internal/graph"
+	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
 // TestSQL_GraphLabelSeedAndKindFilter verifies the M1 graph pattern
@@ -56,9 +57,16 @@ func TestSQL_GraphLabelSeedAndKindFilter(t *testing.T) {
 	svc, api, doc := nid("svc1"), nid("api1"), nid("doc1")
 	t.Logf("nodeIDs: svc1=%d api1=%d doc1=%d", svc, api, doc)
 
-	// Register edge kinds (idempotent).
-	graph.RegisterEdgeKind("DEPENDS_ON", 1)
-	graph.RegisterEdgeKind("DOCUMENTED_BY", 2)
+	// Register edge kinds. Use high kind numbers to avoid collisions
+	// with the global per-process registry shared across test suites.
+	// Use unique kind numbers to avoid global registry collisions with
+	// other test suites that also register edge kinds.
+	if !graph.RegisterEdgeKind("DEPENDS_ON", 71) {
+		t.Fatalf("RegisterEdgeKind DEPENDS_ON=71 failed: kind already claimed")
+	}
+	if !graph.RegisterEdgeKind("DOCUMENTED_BY", 72) {
+		t.Fatalf("RegisterEdgeKind DOCUMENTED_BY=72 failed: kind already claimed")
+	}
 
 	// Add typed edges: svc1 -DEPENDS_ON-> api1, api1 -DOCUMENTED_BY-> doc1.
 	g := col.GetGraph()
@@ -66,10 +74,10 @@ func TestSQL_GraphLabelSeedAndKindFilter(t *testing.T) {
 		t.Fatalf("no graph on collection")
 	}
 	txn := g.BeginTxn()
-	if err := g.AddEdge(txn, svc, api, 1.0, 1); err != nil {
+	if err := g.AddEdge(txn, svc, api, 1.0, 71); err != nil {
 		t.Fatalf("edge svc->api: %v", err)
 	}
-	if err := g.AddEdge(txn, api, doc, 1.0, 2); err != nil {
+	if err := g.AddEdge(txn, api, doc, 1.0, 72); err != nil {
 		t.Fatalf("edge api->doc: %v", err)
 	}
 
@@ -106,5 +114,64 @@ func TestSQL_GraphLabelSeedAndKindFilter(t *testing.T) {
 	}
 	if ids["doc1"] {
 		t.Errorf("kind-filter: doc1 should NOT be reachable via DEPENDS_ON only, got %v", ids)
+	}
+}
+
+// A LIMIT on a graph query is a result-projection limit, never a traversal
+// limit. Otherwise a later graph match could not safely be vector-ranked.
+func TestGraphLimitCompletesBoundedTraversalBeforeProjection(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:graph_complete_limit"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gr, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gr.Close()
+	col, err := db.CreateCollection(ctx, "graph_limit", WithDimension(2), WithGraph(gr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"seed", "first", "late"} {
+		if err := col.Insert(ctx, id, []float32{0, 0}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed, err := db.GetNodeID(ctx, "graph_limit", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := db.GetNodeID(ctx, "graph_limit", "first")
+	late, _ := db.GetNodeID(ctx, "graph_limit", "late")
+	txn := gr.BeginTxn()
+	if err := gr.AddEdge(txn, seed, first, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := gr.AddEdge(txn, seed, late, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	before := gr.Stats().BFSNodesVisited
+	plan := &optimizer.PhysicalPlan{
+		CollectionName:    "graph_limit",
+		Kind:              optimizer.QueryKindGraph,
+		HasGraphTraversal: true,
+		HasExplicitSeed:   true,
+		ExplicitSeedID:    seed,
+		GraphEdges:        []optimizer.GraphEdgePlan{{Direction: 1, QuantMin: 1, QuantMax: 1}},
+		MaxHops:           1,
+		Limit:             1,
+	}
+	results, err := newExecutor(db).Execute(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results.Results) != 1 {
+		t.Fatalf("projected rows = %d, want 1", len(results.Results))
+	}
+	if visited := gr.Stats().BFSNodesVisited - before; visited < 3 {
+		t.Fatalf("BFS visited %d nodes with LIMIT 1, want seed plus both bounded matches", visited)
 	}
 }

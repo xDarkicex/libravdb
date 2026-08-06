@@ -15,7 +15,8 @@ const (
 	SystemTableOIDMax = 99 // reserved OID ceiling; user tables start at 100
 
 	// System table OIDs
-	sysOIDPgClass = 1
+	sysOIDPgClass    = 1
+	sysOIDGraphNodes = 2
 
 	// pg_class column OIDs
 	sysColOIDOID          = 10
@@ -23,6 +24,11 @@ const (
 	sysColOIDRelnamespace = 12
 	sysColOIDRelkind      = 13
 	sysColOIDReltuples    = 14
+
+	// GRAPH_NODES column OIDs
+	sysColOIDGNID         = 20
+	sysColOIDGNCollection = 21
+	sysColOIDGNRecordID   = 22
 )
 
 // SystemTableInfo holds the pre-built catalog definitions for a system table.
@@ -39,9 +45,9 @@ var systemTables = func() map[uint32]*SystemTableInfo {
 	// pg_class: one row per real user table
 	pgClass := &SystemTableInfo{
 		Table: TableDef{
-			OID:           sysOIDPgClass,
-			NameHash:      hashString("pg_class"),
-			ColumnsCount:  5,
+			OID:          sysOIDPgClass,
+			NameHash:     hashString("pg_class"),
+			ColumnsCount: 5,
 		},
 		Columns: make(map[uint64]*ColumnDef),
 	}
@@ -62,6 +68,27 @@ var systemTables = func() map[uint32]*SystemTableInfo {
 	}
 	m[sysOIDPgClass] = pgClass
 
+	// GRAPH_NODES: virtual table exposing graph node identity.
+	// Node IDs (uint64) use TypeInt; the 64-bit value fits in Go's int.
+	graphNodes := &SystemTableInfo{
+		Table: TableDef{
+			OID:          sysOIDGraphNodes,
+			NameHash:     hashString("GRAPH_NODES"),
+			ColumnsCount: 3,
+		},
+		Columns: make(map[uint64]*ColumnDef),
+	}
+	graphNodes.Columns[hashString("id")] = &ColumnDef{
+		OID: sysColOIDGNID, NameHash: hashString("id"), Type: TypeInt,
+	}
+	graphNodes.Columns[hashString("collection")] = &ColumnDef{
+		OID: sysColOIDGNCollection, NameHash: hashString("collection"), Type: TypeString,
+	}
+	graphNodes.Columns[hashString("record_id")] = &ColumnDef{
+		OID: sysColOIDGNRecordID, NameHash: hashString("record_id"), Type: TypeString,
+	}
+	m[sysOIDGraphNodes] = graphNodes
+
 	return m
 }()
 
@@ -70,6 +97,7 @@ var systemTables = func() map[uint32]*SystemTableInfo {
 var systemTableByName = func() map[uint64]uint32 {
 	m := make(map[uint64]uint32, len(systemTables))
 	m[hashString("pg_class")] = sysOIDPgClass
+	m[hashString("graph_nodes")] = sysOIDGraphNodes
 	return m
 }()
 

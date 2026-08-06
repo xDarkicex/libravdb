@@ -59,9 +59,14 @@ func TestSQL_JoinMatchGraphJoin(t *testing.T) {
 	}
 	svc1, svc2, api1, api2, doc1, doc2 := nid("svc1"), nid("svc2"), nid("api1"), nid("api2"), nid("doc1"), nid("doc2")
 
-	// Register edge kinds (idempotent).
-	graph.RegisterEdgeKind("DEPENDS_ON", 1)
-	graph.RegisterEdgeKind("DOCUMENTED_BY", 2)
+	// Register edge kinds. Use high kind numbers to avoid collisions
+	// with the global per-process registry shared across test suites.
+	if !graph.RegisterEdgeKind("DEPENDS_ON", 71) {
+		t.Fatalf("RegisterEdgeKind DEPENDS_ON=71 failed: kind already claimed")
+	}
+	if !graph.RegisterEdgeKind("DOCUMENTED_BY", 72) {
+		t.Fatalf("RegisterEdgeKind DOCUMENTED_BY=72 failed: kind already claimed")
+	}
 
 	g := col.GetGraph()
 	if g == nil {
@@ -69,17 +74,17 @@ func TestSQL_JoinMatchGraphJoin(t *testing.T) {
 	}
 	txn := g.BeginTxn()
 	// svc1 -DEPENDS_ON-> api1 -DOCUMENTED_BY-> doc1
-	if err := g.AddEdge(txn, svc1, api1, 1.0, 1); err != nil {
+	if err := g.AddEdge(txn, svc1, api1, 1.0, 71); err != nil {
 		t.Fatalf("edge svc1->api1: %v", err)
 	}
-	if err := g.AddEdge(txn, api1, doc1, 1.0, 2); err != nil {
+	if err := g.AddEdge(txn, api1, doc1, 1.0, 72); err != nil {
 		t.Fatalf("edge api1->doc1: %v", err)
 	}
 	// svc2 -DEPENDS_ON-> api2 (separate chain) -DOCUMENTED_BY-> doc2
-	if err := g.AddEdge(txn, svc2, api2, 1.0, 1); err != nil {
+	if err := g.AddEdge(txn, svc2, api2, 1.0, 71); err != nil {
 		t.Fatalf("edge svc2->api2: %v", err)
 	}
-	if err := g.AddEdge(txn, api2, doc2, 1.0, 2); err != nil {
+	if err := g.AddEdge(txn, api2, doc2, 1.0, 72); err != nil {
 		t.Fatalf("edge api2->doc2: %v", err)
 	}
 

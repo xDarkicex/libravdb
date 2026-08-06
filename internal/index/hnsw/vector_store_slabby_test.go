@@ -46,6 +46,9 @@ func TestSlabbyRawVectorStoreRoundTrip(t *testing.T) {
 			}
 		}
 	}
+	if got := len(store.segments); got < 3 {
+		t.Fatalf("segment count = %d, want at least 3 after growing beyond capacity 2", got)
+	}
 
 	if store.sfl.Stats().SlabCount < 1 {
 		t.Fatalf("expected slabby store to have allocated slabs, got %d", store.sfl.Stats().SlabCount)

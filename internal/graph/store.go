@@ -5,50 +5,533 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/xDarkicex/libravdb/internal/storage/wal"
+	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/memory"
 )
 
+// StagedGraphOpKind classifies the mutation type in the ordered operation log.
+// Ordered replay must process operations in original append order; grouping by
+// kind is not semantically correct because edge add/remove sequences are observable.
+type StagedGraphOpKind uint8
+
+const (
+	StagedGraphEdgeAdd    StagedGraphOpKind = iota
+	StagedGraphEdgeRemove
+	StagedGraphNodeDrop
+)
+
+// StagedGraphOp records a single graph mutation with sufficient detail for
+// ordered savepoint rollback replay. Every AddEdge / RemoveEdge / DropNodeEdges
+// call appends exactly one ordered op so the sequence is losslessly restorable.
+type StagedGraphOp struct {
+	Kind       StagedGraphOpKind
+	Collection string
+	Src        uint64
+	Tgt        uint64
+	EdgeKind   uint8
+	Weight     float32
+	NodeID     uint64
+}
+
 // Txn is a minimal transaction context for graph operations.
 type Txn struct {
-	ID      uint64
-	wal     *wal.WAL
-	records []*wal.Entry
-	store   *graphStore
+	ID        uint64
+	walWriter storage.GraphWALWriter
+	store     *graphStore
+	adds      []storage.GraphEdgeOp
+	removes   []storage.GraphEdgeOp
+	nodeDrops []storage.GraphNodeDropOp
+	closed    bool
+
+	// orderedOps records every mutation in append order for savepoint rollback
+	// replay. It is the canonical ordered history; the add/remove/nodeDrop slices
+	// are derived from it and must remain consistent.
+	orderedOps []StagedGraphOp
+
+	// epochLSN is the snapshot LSN for read isolation. When >0, NeighborsOverlay
+	// and InboundNeighborsOverlay read from NeighborsAtLSN(nodeID, epochLSN)
+	// instead of the live graph. Set by epoch transactions at BeginEpochTx time.
+	epochLSN uint64
+
+	// collection is the collection name owning this graph transaction.
+	// Set by EpochTx.GraphTxn for epoch transactions. Used to include
+	// collection identity in WAL graph edge frames for per-collection recovery.
+	collection string
 }
 
-// AppendRecord accumulates a WAL record in the transaction.
-func (t *Txn) AppendRecord(entry *wal.Entry) {
-	t.records = append(t.records, entry)
-}
-
-// Commit flushes all accumulated records to the WAL, including a commit marker.
+// Commit flushes all accumulated edge mutations through the unified batch
+// system and waits for the durable WAL commit LSN before publishing topology
+// and stamping temporal edge intervals.
+//
+// When epochLSN > 0 (epoch snapshot isolation), Commit uses batch-clone: each
+// affected node's page chain is cloned once, all staged edges for that node
+// are applied to the clone, and the index is atomically swapped via HashMap.Put.
+// This eliminates spinlock contention and provides write-write safety for
+// concurrent epoch sessions.
 func (t *Txn) Commit(ctx context.Context) error {
-	if t.wal == nil {
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	t.closed = true
+
+	// ── Direct path (all transactions) ──
+	// NOTE: CoW batch-clone (commitCow) is disabled until it routes
+	// through the unified WAL transaction path for durable replay.
+	// Epoch graph commits currently use the standard applyCommittedOps
+	// path, which is WAL-durable and recovery-safe.
+	if t.walWriter == nil {
+		return t.store.applyCommittedOps(t.adds, t.removes, t.nodeDrops)
+	}
+	store := t.store
+	adds := t.adds
+	removes := t.removes
+	nodeDrops := t.nodeDrops
+	_, err := t.walWriter.AppendGraphEdges(ctx, adds, removes, nodeDrops, func(lsn uint64) {
+		if err := store.applyCommittedOps(adds, removes, nodeDrops); err == nil {
+			store.recordEdgeCommitLSN(lsn, adds, removes, nodeDrops)
+		}
+	})
+	return err
+}
+
+// commitCow performs batch-clone commit for epoch transactions.
+// Staged edges are grouped by affected node, each node's page chain is
+// cloned once, all edges are applied to the clone, and the index is
+// atomically swapped.
+func (t *Txn) commitCow() error {
+	g := t.store
+	if len(t.nodeDrops) > 0 {
+		// Handle node drops through the existing path for now.
+		return g.applyCommittedOps(t.adds, t.removes, t.nodeDrops)
+	}
+
+	// Phase A: Group staged adds/removes by affected node.
+	// forwardAdds: edges to add to forward index (keyed by src node)
+	// reverseAdds: edges to add to reverse index (keyed by tgt node)
+	type edgeWithKind struct {
+		tgt   uint64
+		kind  uint8
+		weight float32
+	}
+	forwardAdds := make(map[uint64][]Edge)
+	reverseAdds := make(map[uint64][]Edge)
+	forwardRemoves := make(map[uint64][]edgeWithKind)
+
+	for _, op := range t.adds {
+		fEdge := Edge{Target: op.Tgt, Weight: op.Weight}
+		fEdge.SetKind(op.Kind)
+		forwardAdds[op.Src] = append(forwardAdds[op.Src], fEdge)
+
+		rEdge := Edge{Target: op.Src, Weight: op.Weight}
+		rEdge.SetKind(op.Kind)
+		reverseAdds[op.Tgt] = append(reverseAdds[op.Tgt], rEdge)
+	}
+	for _, op := range t.removes {
+		forwardRemoves[op.Src] = append(forwardRemoves[op.Src], edgeWithKind{op.Tgt, op.Kind, 0})
+	}
+
+	// Phase B: Clone page chains and apply edges.
+	cowPages := make(map[uint64]*EdgeTablePage)
+	cowReverse := make(map[uint64]*EdgeTablePage)
+
+	for nodeID, edges := range forwardAdds {
+		shard := int(nodeID % uint64(g.cfg.PageShards))
+		oldPage := g.index.Lookup(nodeID)
+		var page *EdgeTablePage
+		if oldPage != nil {
+			var err error
+			page, err = g.clonePageChain(oldPage, g.pagePools[0], shard)
+			if err != nil {
+				return fmt.Errorf("clone forward page for node %d: %w", nodeID, err)
+			}
+		} else {
+			// First edge for this node: allocate a fresh page.
+			page = g.newPage(g.pagePools[0], shard)
+		}
+		for _, e := range edges {
+			g.writeEdgeToClonedPage(page, e)
+		}
+		cowPages[nodeID] = page
+	}
+
+	for nodeID, edges := range reverseAdds {
+		shard := int(nodeID % uint64(g.cfg.PageShards))
+		oldPage := g.reverse.locator.Lookup(nodeID)
+		var page *EdgeTablePage
+		if oldPage != nil {
+			var err error
+			page, err = g.clonePageChain(oldPage, g.reverse.pool, shard)
+			if err != nil {
+				return fmt.Errorf("clone reverse page for node %d: %w", nodeID, err)
+			}
+		} else {
+			page = g.newPage(g.reverse.pool, shard)
+		}
+		for _, e := range edges {
+			g.writeEdgeToClonedPage(page, e)
+		}
+		cowReverse[nodeID] = page
+	}
+
+	// Phase C: Atomic index swap.
+	for nodeID, newPage := range cowPages {
+		oldPage := g.index.Lookup(nodeID)
+		g.index.Insert(nodeID, newPage)
+		if oldPage != nil {
+			g.retirePageChain(nodeID, g.index, g.pagePools[0])
+			// Re-insert new page after retirement cleared it.
+			g.index.Insert(nodeID, newPage)
+		}
+	}
+	for nodeID, newPage := range cowReverse {
+		g.reverse.locator.Insert(nodeID, newPage)
+	}
+
+	// Phase D: Record temporal edge intervals for LSN-based queries.
+	if g.walWriter != nil {
+		commitLSN := g.globalStamp.Load() // approximate; real LSN would come from WAL
+		g.recordEdgeCommitLSN(uint64(commitLSN), t.adds, t.removes, t.nodeDrops)
+	}
+
+	t.adds = nil
+	t.removes = nil
+	t.nodeDrops = nil
+	return nil
+}
+
+// writeEdgeToClonedPage appends an edge to a cloned page chain.
+// The clone is a full deep copy registered in g.pageReg, so overflow
+// chain traversal works via g.pageReg.Get(cloned.Header.Overflow).
+// No spinlock — the clone is private to this goroutine.
+func (g *graphStore) writeEdgeToClonedPage(page *EdgeTablePage, edge Edge) {
+	totalCount := page.Header.Count
+	if totalCount < 8 {
+		page.Inline[totalCount] = edge
+		page.Header.Count++
+		return
+	}
+
+	currPage := page
+	edgesToSkip := totalCount
+	for edgesToSkip >= 250 {
+		if currPage.Header.Overflow == 0 {
+			return
+		}
+		currPage = g.pageReg.Get(currPage.Header.Overflow)
+		if currPage == nil {
+			return
+		}
+		edgesToSkip -= 250
+	}
+
+	if edgesToSkip < 8 {
+		currPage.Inline[edgesToSkip] = edge
+	} else {
+		idx := edgesToSkip - 8
+		if idx < 242 {
+			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
+			extra[idx] = edge
+		}
+	}
+	page.Header.Count++
+}
+
+// Rollback discards all staged graph mutations. Since graph operations are
+// published only by Commit, rollback never appends WAL frames and never
+// changes the live topology.
+func (t *Txn) Rollback() error {
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	t.adds = nil
+	t.removes = nil
+	t.nodeDrops = nil
+	t.closed = true
+	return nil
+}
+
+// SetEpochLSN pins the read snapshot for this transaction. When >0,
+// NeighborsOverlay and InboundNeighborsOverlay read from the LSN-filtered
+// temporal view instead of the live graph. Zero means live reads.
+func (t *Txn) SetEpochLSN(lsn uint64) {
+	if t != nil {
+		t.epochLSN = lsn
+	}
+}
+
+// SetCollection sets the owning collection name for this graph transaction.
+func (t *Txn) SetCollection(name string) {
+	if t != nil {
+		t.collection = name
+	}
+}
+
+// StagedOps returns the accumulated edge operations for combined atomic
+// commit with record operations through the storage engine.
+func (t *Txn) StagedOps() (adds, removes []storage.GraphEdgeOp, nodeDrops []storage.GraphNodeDropOp) {
+	if t == nil {
+		return nil, nil, nil
+	}
+	return t.adds, t.removes, t.nodeDrops
+}
+
+// OrderedStagedOps returns an immutable copy of the canonical ordered mutation
+// log. Savepoint rollback replays the prefix up to the saved position, preserving
+// original append order — edge add/remove/drop sequences are semantically
+// observable and must never be replayed grouped by kind.
+func (t *Txn) OrderedStagedOps() []StagedGraphOp {
+	if t == nil {
 		return nil
 	}
-	commitRec := &WALTxnCommitRecord{TxnID: t.ID}
-	entry := &wal.Entry{
-		Operation: wal.OpTxnCommit,
-		Data:      SerializeWALTxnCommitRecord(commitRec),
+	out := make([]StagedGraphOp, len(t.orderedOps))
+	copy(out, t.orderedOps)
+	return out
+}
+
+// RemapNodeIDs replaces provisional node IDs in staged operations with
+// their committed counterparts. Called after record commit assigns permanent
+// node IDs to provisionally-staged records within an epoch transaction.
+func (t *Txn) RemapNodeIDs(mapping map[uint64]uint64) {
+	if t == nil {
+		return
 	}
-	t.records = append(t.records, entry)
-	return t.wal.AppendBatch(ctx, t.records)
+	for i := range t.adds {
+		if repl, ok := mapping[t.adds[i].Src]; ok {
+			t.adds[i].Src = repl
+		}
+		if repl, ok := mapping[t.adds[i].Tgt]; ok {
+			t.adds[i].Tgt = repl
+		}
+	}
+	for i := range t.removes {
+		if repl, ok := mapping[t.removes[i].Src]; ok {
+			t.removes[i].Src = repl
+		}
+		if repl, ok := mapping[t.removes[i].Tgt]; ok {
+			t.removes[i].Tgt = repl
+		}
+	}
+	// nodeDrops don't reference other nodes, just the dropped node itself.
+	for i := range t.nodeDrops {
+		drop := &t.nodeDrops[i]
+		if repl, ok := mapping[drop.NodeID]; ok {
+			drop.NodeID = repl
+		}
+	}
+}
+
+// ApplyInMemory publishes staged graph operations to the in-memory
+// topology. Called after the storage engine has durably committed the
+// combined record+graph WAL transaction.
+func (t *Txn) ApplyInMemory() error {
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	t.closed = true
+	return t.store.applyCommittedOps(t.adds, t.removes, t.nodeDrops)
 }
 
 // AddEdge adds a directed edge to the graph within this transaction.
 func (t *Txn) AddEdge(src, tgt uint64, weight float32, kind uint8) error {
-	return t.store.AddEdge(t, src, tgt, weight, kind)
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	t.adds = append(t.adds, storage.GraphEdgeOp{Collection: t.collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind})
+	t.orderedOps = append(t.orderedOps, StagedGraphOp{
+		Kind: StagedGraphEdgeAdd, Collection: t.collection,
+		Src: src, Tgt: tgt, EdgeKind: kind, Weight: weight,
+	})
+	return nil
 }
 
 // RemoveEdge removes a directed edge from the graph within this transaction.
+//
+// Ordered log invariant: every call appends exactly one entry so savepoint
+// positions remain stable. When the edge exists in staged adds, it is removed
+// from the adds slice (cancelling the staged add) but a StagedGraphEdgeRemove
+// is still appended to orderedOps. During replay, the fresh Txn's RemoveEdge
+// will find the replayed AddEdge in its own staged adds and cancel it identically.
 func (t *Txn) RemoveEdge(src, tgt uint64, kind uint8) error {
-	return t.store.RemoveEdge(t, src, tgt, kind)
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	// Always record the ordered op first — append-only invariant.
+	t.orderedOps = append(t.orderedOps, StagedGraphOp{
+		Kind: StagedGraphEdgeRemove, Collection: t.collection,
+		Src: src, Tgt: tgt, EdgeKind: kind,
+	})
+
+	// If the edge was staged as an add in this same transaction, cancel it
+	// by removing from adds. The overlay will then fall through to the base
+	// (or remaining staged ops) for this edge.
+	for i := range t.adds {
+		if t.adds[i].Src == src && t.adds[i].Tgt == tgt && t.adds[i].Kind == kind {
+			t.adds = append(t.adds[:i], t.adds[i+1:]...)
+			return nil
+		}
+	}
+
+	// Edge is not in staged adds — must exist in the base graph.
+	if _, err := t.store.edge(src, tgt, kind); err != nil {
+		return err
+	}
+	t.removes = append(t.removes, storage.GraphEdgeOp{Collection: t.collection, Src: src, Tgt: tgt, Kind: kind})
+	return nil
 }
+
+// DropNodeEdges removes all edges incident to a node.
+func (t *Txn) DropNodeEdges(nodeID uint64) error {
+	if t == nil || t.closed {
+		return fmt.Errorf("graph transaction is closed")
+	}
+	t.nodeDrops = append(t.nodeDrops, storage.GraphNodeDropOp{Collection: t.collection, NodeID: nodeID})
+	t.orderedOps = append(t.orderedOps, StagedGraphOp{
+		Kind: StagedGraphNodeDrop, Collection: t.collection, NodeID: nodeID,
+	})
+	return nil
+}
+
+// NeighborsOverlay returns the live neighbors plus this transaction's staged
+// edge changes. It is the primitive used by epoch read-your-writes traversal;
+// it never publishes or WAL-logs the staged operations.
+//
+// When epochLSN > 0, the base neighbor set is read from the LSN-filtered
+// temporal view (NeighborsAtLSN) instead of the live graph. This provides
+// snapshot isolation: concurrent commits from other sessions at higher LSNs
+// are invisible within this transaction.
+func (t *Txn) NeighborsOverlay(nodeID uint64) ([]Edge, error) {
+	if t == nil || t.closed {
+		return nil, fmt.Errorf("graph transaction is closed")
+	}
+	var base []Edge
+	var err error
+	if t.epochLSN > 0 {
+		base, err = t.store.NeighborsAtLSN(nodeID, t.epochLSN)
+	} else {
+		base, err = t.store.Neighbors(nodeID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, op := range t.removes {
+		if op.Src != nodeID {
+			continue
+		}
+		for i := range base {
+			if base[i].Target == op.Tgt && base[i].GetKind() == op.Kind {
+				base = append(base[:i], base[i+1:]...)
+				break
+			}
+		}
+	}
+	for _, op := range t.adds {
+		if op.Src != nodeID {
+			continue
+		}
+		base = append(base, Edge{Target: op.Tgt, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
+	}
+	return base, nil
+}
+
+// InboundNeighborsAtLSN returns inbound edges (v→nodeID) visible at snapshotLSN.
+// Combines live inbound edges with temporal-only edges visible at the snapshot.
+func (g *graphStore) InboundNeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error) {
+	liveEdges, err := g.InboundNeighbors(nodeID)
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build result: live edges visible at snapshot + temporal-only inbound edges.
+	seen := make(map[edgeTemporalKey]bool)
+	var result []Edge
+
+	// Pass 1: include live inbound edges visible at snapshot.
+	for _, e := range liveEdges {
+		// Inbound: edge goes from e.Target → nodeID.
+		key := edgeTemporalKey{Src: e.Target, Tgt: nodeID, Kind: e.GetKind()}
+		state, ok := g.temporalEdges[key]
+		if !ok {
+			result = append(result, e)
+			seen[key] = true
+			continue
+		}
+		visible := false
+		for i := len(state.Versions) - 1; i >= 0; i-- {
+			if state.Versions[i].BeginLSN <= snapshotLSN &&
+				(state.Versions[i].EndLSN == 0 || snapshotLSN < state.Versions[i].EndLSN) {
+				visible = true
+				break
+			}
+		}
+		if visible {
+			result = append(result, e)
+			seen[key] = true
+		}
+	}
+
+	// Pass 2: add temporal-only inbound edges visible at snapshot.
+	if g.temporalEdges != nil {
+		for key, state := range g.temporalEdges {
+			if key.Tgt != nodeID || seen[key] {
+				continue
+			}
+			for i := len(state.Versions) - 1; i >= 0; i-- {
+				v := state.Versions[i]
+				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+					e := Edge{Target: key.Src, Weight: v.Weight}
+					e.SetKind(key.Kind)
+					result = append(result, e)
+					break
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// InboundNeighborsOverlay is the inbound counterpart of NeighborsOverlay.
+func (t *Txn) InboundNeighborsOverlay(nodeID uint64) ([]Edge, error) {
+	if t == nil || t.closed {
+		return nil, fmt.Errorf("graph transaction is closed")
+	}
+	var base []Edge
+	var err error
+	if t.epochLSN > 0 {
+		base, err = t.store.InboundNeighborsAtLSN(nodeID, t.epochLSN)
+	} else {
+		base, err = t.store.InboundNeighbors(nodeID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, op := range t.removes {
+		if op.Tgt != nodeID {
+			continue
+		}
+		for i := range base {
+			if base[i].Target == op.Src && base[i].GetKind() == op.Kind {
+				base = append(base[:i], base[i+1:]...)
+				break
+			}
+		}
+	}
+	for _, op := range t.adds {
+		if op.Tgt == nodeID {
+			base = append(base, Edge{Target: op.Src, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
+		}
+	}
+	return base, nil
+}
+
+// InboundNeighborsAtLSN is now on the Graph interface for epoch inbound queries.
+// It delegates to the store-level implementation above.
 
 // Graph provides edge storage and traversal operations
 type Graph interface {
@@ -57,6 +540,7 @@ type Graph interface {
 	RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *Txn, nodeID uint64) error
 	Neighbors(nodeID uint64) ([]Edge, error)
+	NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error)
 	Degree(nodeID uint64) (int, error)
 	InboundNeighbors(nodeID uint64) ([]Edge, error)
 	InboundDegree(nodeID uint64) (int, error)
@@ -70,6 +554,9 @@ type Graph interface {
 	GetFrontierBuf() (*FrontierBuf, error)
 	PutFrontierBuf(f *FrontierBuf)
 	Stats() GraphStats
+	GraphCentrality(nodeID uint64) float64
+	CentralityAtLSN(nodeID uint64, snapshotLSN uint64) float64
+	RecordPageRankPublication(snapshotLSN uint64, duration time.Duration)
 
 	// Vertex label registry (MVP: in-memory only, not persisted).
 	RegisterVertexLabel(nodeID uint64, label string)
@@ -93,11 +580,42 @@ type graphStore struct {
 	metrics        storeMetrics
 	lastFlushedGen uint32
 	nextTxnID      atomic.Uint64
-	wal            *wal.WAL
+	walWriter      storage.GraphWALWriter
 
 	// MVP node label registry: in-memory only, not persisted.
 	// Used for label-scan seeding in graph queries.
 	labelToNodes map[string][]uint64 // label → node IDs
+
+	// Temporal edge index: tracks LSN-based visibility for edges.
+	// Protected by temporalMu for concurrent access from WAL callbacks
+	// and graph queries.
+	temporalMu    sync.Mutex
+	temporalEdges map[edgeTemporalKey]*edgeTemporalState
+
+	// collectionName is the owning collection for WAL frame identity.
+	collectionName string
+}
+
+// edgeTemporalKey uniquely identifies a directed edge for temporal tracking.
+type edgeTemporalKey struct {
+	Src  uint64
+	Tgt  uint64
+	Kind uint8
+}
+
+// edgeTemporalVersion is one visibility interval for an edge.
+// The version is visible for snapshot LSNs S where BeginLSN <= S < EndLSN
+// (EndLSN == 0 means still live). Versions in a chain are ordered by BeginLSN
+// and never overlap.
+type edgeTemporalVersion struct {
+	BeginLSN uint64
+	EndLSN   uint64 // 0 = currently live
+	Weight   float32
+}
+
+// edgeTemporalState holds the ordered version chain for one edge identity.
+type edgeTemporalState struct {
+	Versions []edgeTemporalVersion // ascending BeginLSN, non-overlapping
 }
 
 // NewGraph initializes the Graph store with off-heap allocators.
@@ -511,10 +1029,237 @@ retry:
 // BeginTxn starts a new graph transaction.
 func (g *graphStore) BeginTxn() *Txn {
 	return &Txn{
-		ID:    g.nextTxnID.Add(1),
-		wal:   g.wal,
-		store: g,
+		ID:         g.nextTxnID.Add(1),
+		walWriter:  g.walWriter,
+		store:      g,
+		collection: g.collectionName,
 	}
+}
+
+// SetWALWriter wires the storage engine's WAL writer to the graph so
+// Txn.Commit() durably records edge mutations.
+func (g *graphStore) SetWALWriter(w storage.GraphWALWriter) {
+	g.walWriter = w
+}
+
+// SetCollectionName stores the owning collection name. Called by
+// Collection.SetGraph so that Txn.AddEdge/Txn.RemoveEdge propagate
+// the collection identity into WAL frames for per-collection recovery.
+func (g *graphStore) SetCollectionName(name string) {
+	g.collectionName = name
+}
+
+// ── Temporal edge visibility ──────────────────────────────────────────
+
+// recordEdgeCommitLSN stamps one committed graph transaction. The operation
+// lists are deliberately transaction-local: a storage flush can coalesce
+// independently submitted graph transactions, so a graph-wide pending queue
+// cannot safely be associated with one commit LSN.
+func (g *graphStore) recordEdgeCommitLSN(lsn uint64, adds, removes []storage.GraphEdgeOp, nodeDrops []storage.GraphNodeDropOp) {
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	if g.temporalEdges == nil {
+		g.temporalEdges = make(map[edgeTemporalKey]*edgeTemporalState)
+	}
+	for _, add := range adds {
+		key := edgeTemporalKey{Src: add.Src, Tgt: add.Tgt, Kind: add.Kind}
+		state, ok := g.temporalEdges[key]
+		if !ok {
+			state = &edgeTemporalState{}
+			g.temporalEdges[key] = state
+		}
+		// Close any currently live version at this LSN, then append a new one.
+		for i := range state.Versions {
+			if state.Versions[i].EndLSN == 0 {
+				state.Versions[i].EndLSN = lsn
+			}
+		}
+		state.Versions = append(state.Versions, edgeTemporalVersion{
+			BeginLSN: lsn, EndLSN: 0, Weight: add.Weight,
+		})
+	}
+	for _, remove := range removes {
+		key := edgeTemporalKey{Src: remove.Src, Tgt: remove.Tgt, Kind: remove.Kind}
+		if state, ok := g.temporalEdges[key]; ok {
+			for i := range state.Versions {
+				if state.Versions[i].EndLSN == 0 {
+					state.Versions[i].EndLSN = lsn
+				}
+			}
+		}
+	}
+	for _, drop := range nodeDrops {
+		nid := drop.NodeID
+		for key, state := range g.temporalEdges {
+			if key.Src != nid && key.Tgt != nid {
+				continue
+			}
+			for i := range state.Versions {
+				if state.Versions[i].EndLSN == 0 {
+					state.Versions[i].EndLSN = lsn
+				}
+			}
+		}
+	}
+}
+
+// RecordEdgeAddLSN is used during WAL replay to directly register an edge
+// add at a known LSN without going through the pending queue.
+func (g *graphStore) RecordEdgeAddLSN(src, tgt uint64, weight float32, kind uint8, lsn uint64) {
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	if g.temporalEdges == nil {
+		g.temporalEdges = make(map[edgeTemporalKey]*edgeTemporalState)
+	}
+	key := edgeTemporalKey{Src: src, Tgt: tgt, Kind: kind}
+	state, ok := g.temporalEdges[key]
+	if !ok {
+		state = &edgeTemporalState{}
+		g.temporalEdges[key] = state
+	}
+	// Close any live version, append new one.
+	for i := range state.Versions {
+		if state.Versions[i].EndLSN == 0 {
+			state.Versions[i].EndLSN = lsn
+		}
+	}
+	state.Versions = append(state.Versions, edgeTemporalVersion{
+		BeginLSN: lsn, EndLSN: 0, Weight: weight,
+	})
+}
+
+// RecordEdgeRemoveLSN is the replay counterpart of RecordEdgeAddLSN.
+func (g *graphStore) RecordEdgeRemoveLSN(src, tgt uint64, kind uint8, lsn uint64) {
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	if g.temporalEdges == nil {
+		g.temporalEdges = make(map[edgeTemporalKey]*edgeTemporalState)
+	}
+	key := edgeTemporalKey{Src: src, Tgt: tgt, Kind: kind}
+	if state, ok := g.temporalEdges[key]; ok {
+		for i := range state.Versions {
+			if state.Versions[i].EndLSN == 0 {
+				state.Versions[i].EndLSN = lsn
+			}
+		}
+	}
+}
+
+// NeighborsAtLSN returns edges from nodeID that are visible at snapshotLSN.
+// It combines live edges with temporal-only edges (no longer live) that were
+// visible at the snapshot. Pre-temporal edges (no temporal state) are always
+// included. Temporal edges are filtered by version chain visibility.
+func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error) {
+	liveEdges, err := g.Neighbors(nodeID)
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build result set: start with live edges, remove those not visible
+	// at snapshot, add temporal-only edges that were visible.
+	seen := make(map[edgeTemporalKey]bool)
+	var result []Edge
+
+	// Pass 1: include live edges visible at snapshot.
+	for _, e := range liveEdges {
+		key := edgeTemporalKey{Src: nodeID, Tgt: e.Target, Kind: e.GetKind()}
+		state, ok := g.temporalEdges[key]
+		if !ok {
+			result = append(result, e)
+			seen[key] = true
+			continue
+		}
+		visible := false
+		for i := len(state.Versions) - 1; i >= 0; i-- {
+			if state.Versions[i].BeginLSN <= snapshotLSN &&
+				(state.Versions[i].EndLSN == 0 || snapshotLSN < state.Versions[i].EndLSN) {
+				visible = true
+				break
+			}
+		}
+		if visible {
+			result = append(result, e)
+			seen[key] = true
+		}
+	}
+
+	// Pass 2: add temporal-only edges (no longer live but visible at snapshot).
+	if g.temporalEdges != nil {
+		for key, state := range g.temporalEdges {
+			if key.Src != nodeID || seen[key] {
+				continue
+			}
+			for i := len(state.Versions) - 1; i >= 0; i-- {
+				v := state.Versions[i]
+				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+					e := Edge{Target: key.Tgt, Weight: v.Weight}
+					e.SetKind(key.Kind)
+					result = append(result, e)
+					break
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// clonePageChain deep-copies a page and its entire overflow chain.
+// The clone is allocated from the given pool and registered in the page
+// registry. The spinlock is reset (private page, no concurrent writers).
+// Shallow copy of the page body is safe: Inline[8]Edge is value-typed and
+// Padding[3872]byte has no pointers. Only Header.Overflow (uint32 slot ID)
+// needs updating for cloned overflow pages.
+func (g *graphStore) clonePageChain(head *EdgeTablePage, pool *memory.ShardedFreeList, shard int) (*EdgeTablePage, error) {
+	if head == nil {
+		return nil, nil
+	}
+
+	_, slotBytes, err := g.allocatePageSlot(pool, shard)
+	if err != nil {
+		return nil, err
+	}
+	g.metrics.pagesAllocated.Add(1)
+
+	cloned := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
+	*cloned = *head // shallow copy entire 4096 bytes
+	cloned.Header.Mutex = 0
+	cloned.Header.PageSlot = g.pageReg.Register(cloned)
+
+	// Clone overflow chain recursively.
+	if head.Header.Overflow != 0 {
+		overflow := g.pageReg.Get(head.Header.Overflow)
+		clonedOverflow, err := g.clonePageChain(overflow, pool, shard)
+		if err != nil {
+			g.pageReg.Unregister(cloned.Header.PageSlot)
+			pool.Deallocate(slotBytes)
+			g.metrics.pagesAllocated.Add(^uint64(0)) // decrement
+			return nil, err
+		}
+		cloned.Header.Overflow = clonedOverflow.Header.PageSlot
+	}
+
+	return cloned, nil
+}
+
+// newPage allocates and initializes a fresh edge table page.
+func (g *graphStore) newPage(pool *memory.ShardedFreeList, shard int) *EdgeTablePage {
+	_, slotBytes, err := g.allocatePageSlot(pool, shard)
+	if err != nil {
+		return nil
+	}
+	g.metrics.pagesAllocated.Add(1)
+	page := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
+	page.Header.Count = 0
+	page.Header.InlineCap = 8
+	page.Header.Overflow = 0
+	page.Header.Generation = 0
+	page.Header.Mutex = 0
+	page.Header.HyalineSlot = uint16(shard)
+	page.Header.LayoutTag = LayoutV2
+	page.Header.PageSlot = g.pageReg.Register(page)
+	return page
 }
 
 func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList) {
@@ -582,24 +1327,105 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 		return err
 	}
 
-	if txn != nil {
-		record := &WALEdgeAddRecord{
-			TxnID:  txn.ID,
-			From:   src,
-			To:     tgt,
-			Weight: weight,
-			Stamp:  stamp,
-			Kind:   kind,
-		}
-		txn.AppendRecord(&wal.Entry{
-			Operation: wal.OpEdgeAdd,
-			Timestamp: uint64(time.Now().UnixNano()),
-			Data:      SerializeWALEdgeAddRecord(record),
-		})
-	}
-
 	g.metrics.edgesAdded.Add(1)
 	return nil
+}
+
+// addEdgeInternal performs the in-memory edge insertion without Txn validation
+// or WAL recording. Used by ReplayEdgeAdd during recovery when the WAL frame
+// is already committed.
+func (g *graphStore) addEdgeInternal(txn *Txn, src, tgt uint64, weight float32, kind uint8) error {
+	stamp := g.globalStamp.Add(1)
+	return g.AddEdgeWithStamp(txn, src, tgt, weight, kind, stamp)
+}
+
+// removeEdgeInternal performs the in-memory edge removal without Txn validation
+// or WAL recording. Used by ReplayEdgeRemove during recovery.
+func (g *graphStore) removeEdgeInternal(txn *Txn, src, tgt uint64, kind uint8) error {
+	return g.RemoveEdge(txn, src, tgt, kind)
+}
+
+// dropNodeEdgesInternal performs the in-memory node drop without Txn validation
+// or WAL recording. Used by ReplayNodeEdgeDrop during recovery.
+func (g *graphStore) dropNodeEdgesInternal(txn *Txn, nodeID uint64) error {
+	return g.DropNodeEdges(txn, nodeID)
+}
+
+// ReplayEdgeAdd replays a committed edge-add from the WAL during recovery.
+func (g *graphStore) ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, commitLSN uint64) error {
+	if err := g.addEdgeInternal(nil, src, tgt, weight, kind); err != nil {
+		return err
+	}
+	g.RecordEdgeAddLSN(src, tgt, weight, kind, commitLSN)
+	return nil
+}
+
+// ReplayEdgeRemove replays a committed edge-remove from the WAL during recovery.
+func (g *graphStore) ReplayEdgeRemove(src, tgt uint64, kind uint8, commitLSN uint64) error {
+	if err := g.removeEdgeInternal(nil, src, tgt, kind); err != nil {
+		return err
+	}
+	g.RecordEdgeRemoveLSN(src, tgt, kind, commitLSN)
+	return nil
+}
+
+// ReplayNodeEdgeDrop replays a committed node-edge-drop from the WAL during recovery.
+func (g *graphStore) ReplayNodeEdgeDrop(nodeID uint64, commitLSN uint64) error {
+	if err := g.dropNodeEdgesInternal(nil, nodeID); err != nil {
+		return err
+	}
+	g.recordEdgeCommitLSN(commitLSN, nil, nil, []storage.GraphNodeDropOp{{NodeID: nodeID}})
+	return nil
+}
+
+func (g *graphStore) ReplayVertexLabel(nodeID uint64, label string, _ uint64) error {
+	g.registerVertexLabel(nodeID, label)
+	return nil
+}
+
+func (g *graphStore) applyCommittedOps(adds, removes []storage.GraphEdgeOp, nodeDrops []storage.GraphNodeDropOp) error {
+	for _, add := range adds {
+		if err := g.addEdgeInternal(nil, add.Src, add.Tgt, add.Weight, add.Kind); err != nil {
+			return err
+		}
+	}
+	for _, remove := range removes {
+		if err := g.removeEdgeInternal(nil, remove.Src, remove.Tgt, remove.Kind); err != nil {
+			return err
+		}
+	}
+	for _, drop := range nodeDrops {
+		if err := g.dropNodeEdgesInternal(nil, drop.NodeID); err != nil {
+			return err
+		}
+	}
+	if len(adds) > 0 || len(removes) > 0 || len(nodeDrops) > 0 {
+		g.metrics.mutationGeneration.Add(1)
+	}
+	return nil
+}
+
+// RecordPageRankPublication records an atomically published derived PageRank
+// vector. The computation itself is intentionally separate from graph writes;
+// controllers can use Stats to decide when to run it.
+func (g *graphStore) RecordPageRankPublication(snapshotLSN uint64, duration time.Duration) {
+	g.metrics.lastPageRankGeneration.Store(g.metrics.mutationGeneration.Load())
+	g.metrics.lastPageRankLSN.Store(snapshotLSN)
+	g.metrics.pageRankDuration.Store(duration.Nanoseconds())
+	g.metrics.pageRankAvailable.Store(true)
+}
+
+func (g *graphStore) edge(src, tgt uint64, kind uint8) (Edge, error) {
+	edges, err := g.Neighbors(src)
+	if err != nil {
+		return Edge{}, err
+	}
+	for _, edge := range edges {
+		if edge.Target == tgt && edge.GetKind() == kind {
+			return edge, nil
+		}
+	}
+	return Edge{}, ErrEdgeNotFound
 }
 
 func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
@@ -640,20 +1466,6 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 		return err
 	}
 
-	if txn != nil {
-		record := &WALEdgeRemoveRecord{
-			TxnID: txn.ID,
-			From:  src,
-			To:    tgt,
-			Kind:  kind,
-		}
-		txn.AppendRecord(&wal.Entry{
-			Operation: wal.OpEdgeRemove,
-			Timestamp: uint64(time.Now().UnixNano()),
-			Data:      SerializeWALEdgeRemoveRecord(record),
-		})
-	}
-
 	g.metrics.edgesRemoved.Add(1)
 	return nil
 }
@@ -683,18 +1495,6 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 	g.retirePageChain(nodeID, g.index, g.pagePools[0])
 	g.retirePageChain(nodeID, g.reverse.locator, g.reverse.pool)
 
-	if txn != nil {
-		record := &WALNodeEdgeDropRecord{
-			TxnID:  txn.ID,
-			NodeID: nodeID,
-		}
-		txn.AppendRecord(&wal.Entry{
-			Operation: wal.OpNodeEdgeDrop,
-			Timestamp: uint64(time.Now().UnixNano()),
-			Data:      SerializeWALNodeEdgeDropRecord(record),
-		})
-	}
-
 	return firstErr
 }
 
@@ -712,6 +1512,72 @@ func (g *graphStore) Degree(nodeID uint64) (int, error) {
 
 func (g *graphStore) InboundDegree(nodeID uint64) (int, error) {
 	return g.degreeFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+}
+
+// GraphCentrality returns normalized inbound degree centrality for nodeID.
+// Computed as inbound_degree(node) / max_inbound_degree in the graph.
+// Returns 0.0 for zero-degree nodes and empty graphs.
+func (g *graphStore) GraphCentrality(nodeID uint64) float64 {
+	deg, err := g.InboundDegree(nodeID)
+	if err != nil || deg == 0 {
+		return 0.0
+	}
+	stats := g.Stats()
+	if stats.EdgesAdded == 0 {
+		return 0.0
+	}
+	// Use total edges as normalization factor (approximation of max degree).
+	maxDeg := 0
+	g.ForEachEdge(func(src, tgt uint64, e Edge) bool {
+		if d, _ := g.InboundDegree(tgt); d > maxDeg {
+			maxDeg = d
+		}
+		return true
+	})
+	if maxDeg == 0 {
+		return 0.0
+	}
+	return float64(deg) / float64(maxDeg)
+}
+
+// CentralityAtLSN returns normalized inbound degree centrality for nodeID at
+// the given snapshot LSN, using only edges visible at that LSN. Scans the
+// temporal edge index to count inbound edges and find the maximum.
+func (g *graphStore) CentralityAtLSN(nodeID uint64, snapshotLSN uint64) float64 {
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+
+	if g.temporalEdges == nil {
+		return 0.0
+	}
+	inbound := 0
+	inboundByNode := make(map[uint64]int)
+	for key, state := range g.temporalEdges {
+		visible := false
+		for i := len(state.Versions) - 1; i >= 0; i-- {
+			v := state.Versions[i]
+			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+				visible = true
+				break
+			}
+		}
+		if visible {
+			inboundByNode[key.Tgt]++
+			if key.Tgt == nodeID {
+				inbound++
+			}
+		}
+	}
+	maxInbound := 0
+	for _, c := range inboundByNode {
+		if c > maxInbound {
+			maxInbound = c
+		}
+	}
+	if maxInbound == 0 {
+		return 0.0
+	}
+	return float64(inbound) / float64(maxInbound)
 }
 
 func (g *graphStore) ForEachEdge(fn func(src, tgt uint64, edge Edge) bool) {
@@ -836,7 +1702,9 @@ func (g *graphStore) Close() error {
 		err1 = g.edgePool.Free()
 	}
 	if len(g.pagePools) > 0 {
-		for _, p := range g.pagePools { p.Free() }
+		for _, p := range g.pagePools {
+			p.Free()
+		}
 	}
 	if g.bitsetPool != nil {
 		err3 = g.bitsetPool.Free()
@@ -882,6 +1750,13 @@ func (g *graphStore) rebuildReverseIndex() {
 // in-memory only and is not persisted. It is an MVP feature for label-scan
 // seeding in graph queries.
 func (g *graphStore) RegisterVertexLabel(nodeID uint64, label string) {
+	g.registerVertexLabel(nodeID, label)
+	if writer, ok := g.walWriter.(storage.GraphLabelWALWriter); ok {
+		_ = writer.AppendGraphLabel(context.Background(), nodeID, label, nil)
+	}
+}
+
+func (g *graphStore) registerVertexLabel(nodeID uint64, label string) {
 	if g.labelToNodes == nil {
 		g.labelToNodes = make(map[string][]uint64)
 	}

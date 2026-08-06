@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -26,16 +27,27 @@ type Portal struct {
 	ResultFmt []int16  // 0=text, 1=binary
 }
 
-// connState holds the extended query protocol state for a single connection.
+// connState holds the extended query protocol state for a single connection
+// and the optional active epoch transaction.
 type connState struct {
 	prepared map[string]*PreparedStmt
 	portals  map[string]*Portal
+	epoch    *libravdb.EpochTx // active epoch transaction, nil if none
 }
 
 func newConnState() *connState {
 	return &connState{
 		prepared: make(map[string]*PreparedStmt),
 		portals:  make(map[string]*Portal),
+	}
+}
+
+// rollbackEpoch silently discards any active epoch. Called on connection close
+// and error cleanup to ensure no staged mutations leak across connections.
+func (s *connState) rollbackEpoch() {
+	if s.epoch != nil {
+		_ = s.epoch.Rollback(context.Background())
+		s.epoch = nil
 	}
 }
 
@@ -52,7 +64,7 @@ func handleExtendedMessage(rw io.ReadWriter, db *libravdb.Database, state *connS
 	case msgExecute:
 		return true, handleExecute(rw, db, state, payload)
 	case msgSync:
-		return true, handleSync(rw)
+		return true, handleSync(rw, state)
 	case msgClose:
 		return true, handleClose(state, payload)
 	case msgFlush:
@@ -97,10 +109,12 @@ func handleParse(w io.Writer, state *connState, payload []byte) error {
 	return WriteMessage(w, msgParseComplete, nil)
 }
 
-// countParams returns the highest $N placeholder index in a query
-// (0 if none). Used for ParameterDescription.
+// countParams returns the number of positional parameters required by a
+// query. PostgreSQL clients normally use $N; the @name form is accepted as a
+// convenience for LLM-generated SQL and is bound in encounter order.
 func countParams(query string) int {
 	max := 0
+	named := 0
 	inStr := false
 	for i := 0; i < len(query); i++ {
 		c := query[i]
@@ -120,9 +134,30 @@ func countParams(query string) int {
 			if n > max {
 				max = n
 			}
+			i = j - 1
+			continue
+		}
+		if !inStr && c == '@' && i+1 < len(query) && isParamIdentStart(query[i+1]) {
+			j := i + 2
+			for j < len(query) && isParamIdentPart(query[j]) {
+				j++
+			}
+			named++
+			i = j - 1
 		}
 	}
+	if named > max {
+		max = named
+	}
 	return max
+}
+
+func isParamIdentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isParamIdentPart(c byte) bool {
+	return isParamIdentStart(c) || (c >= '0' && c <= '9')
 }
 
 // handleBind binds parameter values to a prepared statement, creating a portal.
@@ -286,7 +321,62 @@ func handleExecute(w io.Writer, db *libravdb.Database, state *connState, payload
 		return sendExtendedQueryResult(w, results, columns)
 	}
 
-	results, err := db.Query(ctx, query)
+	// Transaction controls are connection state. Apply them to the
+	// connection-owned epoch and return only CommandComplete; ReadyForQuery is
+	// emitted by Sync for the extended protocol.
+	if stmt, ok, _ := parsePgwireTransactionControl(query); ok {
+		var err error
+		switch stmt.Kind {
+		case parser.TransactionBeginEpoch:
+			if state.epoch != nil {
+				return sendError(w, "ERROR", fmt.Errorf("a transaction is already in progress"))
+			}
+			state.epoch, err = db.BeginEpochTx(ctx)
+		case parser.TransactionCommit:
+			if state.epoch == nil {
+				return sendError(w, "ERROR", fmt.Errorf("no transaction in progress"))
+			}
+			err = state.epoch.Commit(ctx)
+			if err == nil {
+				state.epoch = nil
+			}
+		case parser.TransactionRollback:
+			if state.epoch == nil {
+				return sendError(w, "ERROR", fmt.Errorf("no transaction in progress"))
+			}
+			err = state.epoch.Rollback(ctx)
+			if err == nil {
+				state.epoch = nil
+			}
+		case parser.TransactionSavepoint:
+			if state.epoch == nil {
+				return sendError(w, "ERROR", fmt.Errorf("savepoint is only valid inside an epoch transaction"))
+			}
+			err = state.epoch.Savepoint(stmt.SavepointName)
+		case parser.TransactionRollbackToSavepoint:
+			if state.epoch == nil {
+				return sendError(w, "ERROR", fmt.Errorf("savepoint is only valid inside an epoch transaction"))
+			}
+			err = state.epoch.RollbackTo(stmt.SavepointName)
+		case parser.TransactionReleaseSavepoint:
+			if state.epoch == nil {
+				return sendError(w, "ERROR", fmt.Errorf("savepoint is only valid inside an epoch transaction"))
+			}
+			err = state.epoch.ReleaseSavepoint(stmt.SavepointName)
+		}
+		if err != nil {
+			return sendError(w, "ERROR", err)
+		}
+		return sendCommandComplete(w, transactionCommandTag(stmt.Kind))
+	}
+
+	var results *libravdb.SearchResults
+	var err error
+	if state.epoch != nil {
+		results, err = state.epoch.Query(ctx, query, nil)
+	} else {
+		results, err = db.Query(ctx, query)
+	}
 	if err != nil {
 		return sendError(w, "ERROR", err)
 	}
@@ -294,13 +384,15 @@ func handleExecute(w io.Writer, db *libravdb.Database, state *connState, payload
 	return sendExtendedQueryResult(w, results, inferColumns(results))
 }
 
-// substituteParams replaces $N placeholders in a query with quoted, escaped
-// string literals from the bound parameter values. Single-quoted string
-// literals in the original query are skipped so $ inside them stays literal.
+// substituteParams replaces $N placeholders and @name placeholders in a
+// query with quoted, escaped string literals from bound parameter values.
+// Named @ parameters are bound in encounter order. Single-quoted string
+// literals are skipped so parameter-looking text inside strings is preserved.
 func substituteParams(query string, params [][]byte) (string, error) {
 	var sb strings.Builder
 	sb.Grow(len(query) + 16*len(params))
 	inStr := false
+	namedIndex := 0
 	for i := 0; i < len(query); i++ {
 		c := query[i]
 		if c == '\'' {
@@ -326,14 +418,33 @@ func substituteParams(query string, params [][]byte) (string, error) {
 			i = j - 1
 			continue
 		}
+		if !inStr && c == '@' && i+1 < len(query) && isParamIdentStart(query[i+1]) {
+			j := i + 2
+			for j < len(query) && isParamIdentPart(query[j]) {
+				j++
+			}
+			if namedIndex >= len(params) {
+				return "", fmt.Errorf("named parameter @%s out of range (bound %d)", query[i+1:j], len(params))
+			}
+			sb.WriteByte('\'')
+			sb.WriteString(strings.ReplaceAll(string(params[namedIndex]), "'", "''"))
+			sb.WriteByte('\'')
+			namedIndex++
+			i = j - 1
+			continue
+		}
 		sb.WriteByte(c)
 	}
 	return sb.String(), nil
 }
 
 // handleSync sends ReadyForQuery, completing a transaction boundary.
-func handleSync(w io.Writer) error {
-	return WriteMessage(w, msgReadyForQuery, []byte{'I'})
+func handleSync(w io.Writer, state *connState) error {
+	status := byte('I')
+	if state != nil && state.epoch != nil {
+		status = 'T'
+	}
+	return WriteMessage(w, msgReadyForQuery, []byte{status})
 }
 
 // handleClose closes a prepared statement or portal.

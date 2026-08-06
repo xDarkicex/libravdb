@@ -156,8 +156,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Extended query protocol state
+	// Extended query protocol state and optional epoch transaction.
 	state := newConnState()
+	// Rollback any active epoch on connection close.
+	defer state.rollbackEpoch()
 
 	// Arena-backed buffer pool for zero-heap message I/O
 	arena, err := newConnArena()
@@ -195,7 +197,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 					return
 				}
 			} else {
-				if err := handleQuery(conn, s.db, query); err != nil {
+				if err := handleQuery(conn, s.db, state, query); err != nil {
 					return
 				}
 			}

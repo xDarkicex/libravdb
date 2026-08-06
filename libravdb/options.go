@@ -5,8 +5,18 @@ import (
 	"math"
 	"time"
 
+	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
+)
+
+// Production HNSW defaults target bounded-recall production search for
+// single-vector embeddings such as Nomic v1.5. They intentionally favor
+// recall over the lowest possible query latency.
+const (
+	ProductionHNSWM              = 32
+	ProductionHNSWEfConstruction = 200
+	ProductionHNSWEfSearch       = 200
 )
 
 // Option represents a database configuration option
@@ -116,6 +126,41 @@ func WithMetadataOnly() CollectionOption {
 	}
 }
 
+// WithColumnConstraints sets per-column constraint flags (NOT NULL, PRIMARY KEY)
+// for the catalog. Only the "id" column can be declared PRIMARY KEY.
+func WithColumnConstraints(constraints map[string]uint16) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if c.ColumnConstraints == nil {
+			c.ColumnConstraints = make(map[string]uint16, len(constraints))
+		}
+		for k, v := range constraints {
+			c.ColumnConstraints[k] = v
+		}
+		return nil
+	}
+}
+
+// WithPrimaryKeyColumns records the ordered columns that form a table-level
+// primary key. The physical collection key is derived from these values by
+// the SQL executor; the order is significant and is preserved exactly.
+func WithPrimaryKeyColumns(columns ...string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if len(columns) == 0 {
+			return fmt.Errorf("primary key requires at least one column")
+		}
+		c.PrimaryKeyColumns = append(c.PrimaryKeyColumns[:0], columns...)
+		return nil
+	}
+}
+
+// WithForeignKeys registers foreign key constraints for the collection catalog.
+func WithForeignKeys(fks []catalog.ForeignKeyInfo) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.ForeignKeys = append(c.ForeignKeys, fks...)
+		return nil
+	}
+}
+
 func WithDimension(dim int) CollectionOption {
 	return func(c *CollectionConfig) error {
 		if dim <= 0 {
@@ -147,6 +192,20 @@ func WithHNSW(m, efConstruction, efSearch int) CollectionOption {
 		c.ML = 1.0 / math.Log(float64(m))
 		return nil
 	}
+}
+
+// WithProductionHNSW applies LibraVDB's production bounded-recall profile.
+// It is also the profile used by a collection created without an explicit
+// WithHNSW option.
+func WithProductionHNSW() CollectionOption {
+	return WithHNSW(ProductionHNSWM, ProductionHNSWEfConstruction, ProductionHNSWEfSearch)
+}
+
+// WithFastHNSW applies an explicit throughput-oriented profile. It is useful
+// for recommendation or cache workloads, but callers should validate recall
+// on their data before using it for accuracy-sensitive retrieval.
+func WithFastHNSW() CollectionOption {
+	return WithHNSW(16, 100, 50)
 }
 
 // WithRawVectorStoreMemory keeps raw vector payloads in the default in-memory store.

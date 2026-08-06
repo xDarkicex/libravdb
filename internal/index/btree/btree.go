@@ -185,7 +185,15 @@ func (t *BTree) Insert(ctx context.Context, key, value []byte) error {
 	rootID := t.rootID.Load()
 	root := t.pageReg.get(rootID)
 	if root == nil {
-		return errTreeClosed
+		// Tree was emptied by deleting the last entry.  Rebuild a fresh
+		// root so the insertion can proceed.
+		var err error
+		root, _, err = allocPage(t, t.pageReg, P_LEAF, 0)
+		if err != nil {
+			return err
+		}
+		t.rootID.Store(root.Header.PageSlot)
+		rootID = root.Header.PageSlot
 	}
 
 	txn := &writeTxn{

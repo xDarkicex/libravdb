@@ -48,9 +48,36 @@ const (
 	recordTypeTxAbort          = uint16(3)
 	recordTypeCollectionCreate = uint16(10)
 	recordTypeCollectionDelete = uint16(11)
+	recordTypeCollectionStats  = uint16(12)
 	recordTypeRecordPut        = uint16(20)
 	recordTypeRecordDelete     = uint16(21)
+	recordTypeGraphEdgeAdd     = uint16(22)
+	recordTypeGraphEdgeRemove  = uint16(23)
+	recordTypeGraphNodeDrop    = uint16(24)
+	recordTypeCommitTimestamp  = uint16(25) // commit LSN → UTC timestamp mapping
+	recordTypeGraphVertexLabel = uint16(26)
 )
+
+// ReserveGraphNodeIDs reserves n sequential graph node IDs atomically.
+func (e *Engine) ReserveGraphNodeIDs(ctx context.Context, n int) (uint64, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return 0, fmt.Errorf("database is closed")
+	}
+	first := e.state.NextGraphNodeID
+	e.state.NextGraphNodeID += uint64(n)
+	e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+	return first, nil
+}
+
+// testCommitFailpoint is a test-only hook injected by epoch atomicity tests.
+// When non-nil, CommitTx calls it after building all WAL frames but before
+// appending the commit marker.
+var testCommitFailpoint func() error
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -111,17 +138,17 @@ type fileHeader struct {
 }
 
 type metaPage struct {
-	PageNumber      uint64
-	Magic           uint32
-	MetaEpoch       uint64
-	RootCatalog     uint64
-	RootFreelist    uint64
-	LastAppliedLSN  uint64
-	PageCount       uint64
-	CollectionCount uint64
-	SnapshotOffset  uint64
-	SnapshotLength  uint64
-	IndexOffset     uint64 // byte offset of index chunk (0 = no index persisted)
+	PageNumber             uint64
+	Magic                  uint32
+	MetaEpoch              uint64
+	RootCatalog            uint64
+	RootFreelist           uint64
+	LastAppliedLSN         uint64
+	PageCount              uint64
+	CollectionCount        uint64
+	SnapshotOffset         uint64
+	SnapshotLength         uint64
+	IndexOffset            uint64 // byte offset of index chunk (0 = no index persisted)
 	IndexLength            uint64 // payload length of index chunk
 	IndexChecksum          uint32 // CRC32 of entire indexBlock payload
 	CommunityOffset        uint64 // byte offset of community chunk
@@ -168,6 +195,11 @@ type persistedState struct {
 
 type persistedCollection struct {
 	Records map[string]*recordValue `json:"records"`
+	// HistoricalVersions stores retained record snapshots keyed by record ID.
+	// Versions are appended in LSN order; the most recent version with
+	// endLSN == 0 is the live one (mirrored in Records). Older versions are
+	// retained for temporal queries and never mutated in place.
+	HistoricalVersions map[string][]recordVersion `json:"historical_versions,omitempty"`
 	// vectorSFLs is an append-only chain of bounded fixed-capacity allocators.
 	// ShardedFreeList intentionally precomputes capacity-proportional metadata;
 	// a single database-sized instance therefore should not be used as a
@@ -196,6 +228,18 @@ type recordValue struct {
 	Ordinal     uint32                 `json:"ordinal"`
 	GraphNodeID uint64                 `json:"graph_node_id"`
 	Deleted     bool                   `json:"deleted"`
+}
+
+// recordVersion is a retained historical snapshot of a record's vector and
+// metadata at a specific LSN interval. The version is visible for snapshot
+// LSNs S where beginLSN <= S < endLSN (endLSN == 0 means still live).
+// Historical versions are append-only and never mutated in place.
+type recordVersion struct {
+	Metadata map[string]interface{} `json:"metadata"`
+	Vector   []float32              `json:"vector"`
+	BeginLSN uint64                 `json:"begin_lsn"`
+	EndLSN   uint64                 `json:"end_lsn"` // 0 = live until overridden
+	Ordinal  uint32                 `json:"ordinal"`
 }
 
 type collectionCreatePayload struct {
@@ -291,6 +335,7 @@ type Engine struct {
 	cancel        context.CancelFunc
 	file          *os.File
 	catalogData   []byte // persisted catalog binary, written to page 3 at checkpoint
+	catalogDirty  bool   // set when catalog data changes and needs persistence
 	walWriteArena *memory.Arena
 	walRequests   *walRequestPool
 	state         *persistedState
@@ -356,9 +401,137 @@ type Engine struct {
 	batchQueueOwnedHook func()
 	dirty               bool // completion channels for foreground flushes
 	collectionsByID     map[uint64]string
-	
+
+	// Graph edge batch queue — coalesces multiple Txn.Commit() calls into
+	// one WAL transaction, amortizing lock acquisition and fsync cost.
+	graphEdgeMu      sync.Mutex
+	pendingAdds      []storage.GraphEdgeOp
+	pendingRemoves   []storage.GraphEdgeOp
+	pendingNodeDrops []storage.GraphNodeDropOp
+
 	pendingCommunityChunk    []byte
 	pendingCommunityChecksum uint32
+
+	// graphRecoveryTargets maps collection name → graph recovery target.
+	// Wired before WAL replay so committed graph edge frames are routed
+	// to the correct collection's in-memory graph.
+	graphRecoveryTargets map[string]storage.GraphRecoveryTarget
+	// deferredGraphFrames buffers graph edge WAL frames encountered during
+	// replay when no target is registered for their collection. They are
+	// applied when SetGraphRecoveryTarget is later called for that collection.
+	deferredGraphFrames []deferredGraphFrame
+
+	// commitCatalog is the durable timestamp→LSN index, rebuilt from WAL
+	// replay on every open. Entries are ordered by LSN. Populated during
+	// replayWAL and appended to on every subsequent syncWALLocked.
+	commitCatalog []commitEntry
+	// oldestRetainedLSN is the earliest LSN whose commit timestamp is still
+	// available. Future WAL compaction advances this boundary. Zero means
+	// no entries have been evicted yet.
+	oldestRetainedLSN uint64
+
+	// Pending commit timestamp buffers set by makeTxCommitFrame and consumed
+	// by recordPendingCommitLocked after WAL sync succeeds.
+	pendingCommitLSN uint64
+	pendingCommitTS  int64
+
+	// graphTemporalLSN is called after each graph edge WAL transaction is
+	// synced, passing the commit LSN so the graph can stamp pending edges.
+	graphTemporalLSN func(lsn uint64)
+}
+
+// SetGraphTemporalLSNCallback sets a callback invoked after each graph edge
+// WAL sync with the commit LSN. Used for temporal edge visibility tracking.
+func (e *Engine) SetGraphTemporalLSNCallback(fn func(lsn uint64)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.graphTemporalLSN = fn
+}
+
+// CompactTemporalHistory prunes record/vector historical versions and graph
+// edge temporal state up to (but not including) retainLSN. Versions with
+// EndLSN <= retainLSN and entirely before the boundary are removed.
+// The commit catalog is compacted to match.
+func (e *Engine) CompactTemporalHistory(retainLSN uint64) (uint64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	prunedRecords := 0
+	prunedEdges := 0
+
+	// Prune record historical versions.
+	for _, col := range e.state.Collections {
+		if col == nil || col.Deleted || col.HistoricalVersions == nil {
+			continue
+		}
+		for id, versions := range col.HistoricalVersions {
+			kept := versions[:0]
+			for _, v := range versions {
+				// Keep version if it may be visible at or after retainLSN.
+				// Visible when: BeginLSN <= S < EndLSN. Keep if EndLSN == 0
+				// or EndLSN > retainLSN.
+				if v.EndLSN == 0 || v.EndLSN > retainLSN {
+					kept = append(kept, v)
+				}
+			}
+			if len(kept) == 0 {
+				delete(col.HistoricalVersions, id)
+				prunedRecords += len(versions)
+			} else if len(kept) < len(versions) {
+				col.HistoricalVersions[id] = kept
+				prunedRecords += len(versions) - len(kept)
+			}
+		}
+	}
+
+	// Compact commit catalog: keep entries needed to resolve timestamps
+	// at/after retainLSN.
+	newCatalog := e.commitCatalog[:0]
+	for _, entry := range e.commitCatalog {
+		if entry.LSN >= retainLSN || len(newCatalog) == 0 {
+			newCatalog = append(newCatalog, entry)
+		}
+	}
+	e.commitCatalog = newCatalog
+
+	// Advance the retention boundary.
+	if retainLSN > e.oldestRetainedLSN {
+		e.oldestRetainedLSN = retainLSN
+	}
+
+	_ = prunedRecords
+	_ = prunedEdges
+	return e.oldestRetainedLSN, nil
+}
+
+// OldestRetained returns the earliest timestamp and LSN still available.
+func (e *Engine) OldestRetained() (time.Time, uint64, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.commitCatalog) == 0 {
+		return time.Time{}, 0, ErrNoCommits
+	}
+	entry := e.commitCatalog[0]
+	if e.oldestRetainedLSN > 0 && entry.LSN < e.oldestRetainedLSN {
+		for _, c := range e.commitCatalog {
+			if c.LSN >= e.oldestRetainedLSN {
+				entry = c
+				break
+			}
+		}
+	}
+	return time.Unix(0, entry.Timestamp).UTC(), entry.LSN, nil
+}
+
+// commitEntry is one entry in the durable commit catalog.
+type commitEntry struct {
+	LSN       uint64
+	Timestamp int64 // UTC unix nano
+}
+
+type deferredGraphFrame struct {
+	record    walRecord
+	commitLSN uint64
 }
 
 // newNodeAssignment records a freshly allocated GraphNodeID together
@@ -372,7 +545,8 @@ type newNodeAssignment struct {
 	ordinal      uint32
 }
 
-// batchEntry holds a buffered record pending WAL flush.
+// batchEntry holds a buffered record pending WAL flush. It may also carry
+// graph edge operations that share the same commit LSN as the records.
 type batchEntry struct {
 	collection string
 	entry      *index.VectorEntry
@@ -382,8 +556,6 @@ type batchEntry struct {
 	walBytes   uint64
 	encodedOne encodedPayload
 	// encoded holds pre-encoded recordPut payloads, 1:1 with entries.
-	// When set, flushBatch passes these to WAL framing to avoid
-	// re-encoding under e.mu.Lock().
 	encoded []encodedPayload
 	// assignedNodeIDs holds GraphNodeIDs assigned during WAL framing,
 	// indexed 1:1 with entries (by count()). Written back to caller's
@@ -393,6 +565,14 @@ type batchEntry struct {
 	// entries that received a fresh GraphNodeID. The reserved pointers are
 	// committed (reverseDir.commitEntry) after sync succeeds.
 	newNodeAssignments []newNodeAssignment
+	// Graph operations that share this batch's commit LSN. Staged graph
+	// mutations are published only after the WAL transaction syncs.
+	graphAdds      []storage.GraphEdgeOp
+	graphRemoves   []storage.GraphEdgeOp
+	graphNodeDrops []storage.GraphNodeDropOp
+	// graphCommitTarget is called after sync with the shared commit LSN to
+	// publish staged graph mutations and temporal edge intervals.
+	graphCommitTarget func(lsn uint64)
 }
 
 func (b *batchEntry) count() int {
@@ -1472,6 +1652,10 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 			if err := e.applyCommittedFrames(frames, touchedCollections, deltaProvider); err != nil {
 				return err
 			}
+			// Rebuild commit catalog: extract timestamp from TxCommit payload.
+			if payload, ok := decodeTxCommitPayload(record.Payload); ok {
+				e.recordCommitLocked(record.Header.LSN, payload.Timestamp)
+			}
 			e.replayedTxs++
 			if record.Header.LSN > e.lastLSN.Load() {
 				e.lastLSN.Store(record.Header.LSN)
@@ -1541,6 +1725,7 @@ func (e *Engine) applyCommittedFrames(
 	touchedCollections map[string]struct{},
 	deltaProvider IncrementalIndexRecoveryProvider,
 ) error {
+	commitLSN := frames[len(frames)-1].Header.LSN
 	for _, record := range frames {
 		switch record.Header.RecordType {
 		case recordTypeCollectionCreate:
@@ -1583,6 +1768,12 @@ func (e *Engine) applyCommittedFrames(
 				continue
 			}
 			deltaProvider.DiscardIndex(payload.Name)
+		case recordTypeCollectionStats:
+			payload, err := decodeCollectionStatsPayloadBinary(record.Payload)
+			if err != nil {
+				return err
+			}
+			e.applyCollectionCostModelStats(payload.Name, payload.Stats)
 		case recordTypeRecordPut:
 			payload, err := decodeRecordPutPayloadBinary(record.Payload)
 			if err != nil {
@@ -1646,9 +1837,33 @@ func (e *Engine) applyCommittedFrames(
 				return fmt.Errorf("replay index delete %s/%s at LSN %d: %w", payload.Collection, payload.ID, record.Header.LSN, err)
 			}
 			e.replayedIndexDeletes++
+		case recordTypeGraphEdgeAdd:
+			if err := e.replayGraphEdgeAdd(record, commitLSN); err != nil {
+				return err
+			}
+		case recordTypeGraphEdgeRemove:
+			if err := e.replayGraphEdgeRemove(record, commitLSN); err != nil {
+				return err
+			}
+		case recordTypeGraphNodeDrop:
+			if err := e.replayGraphNodeDrop(record, commitLSN); err != nil {
+				return err
+			}
+		case recordTypeGraphVertexLabel:
+			if err := e.replayGraphVertexLabel(record, commitLSN); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func (e *Engine) applyCollectionCostModelStats(name string, stats []byte) {
+	collection := e.state.Collections[name]
+	if collection == nil || collection.Deleted {
+		return
+	}
+	collection.Config.CostModelStats = append(collection.Config.CostModelStats[:0], stats...)
 }
 
 func (e *Engine) applyCreateCollection(name string, config storage.CollectionConfig, lsn uint64) {
@@ -1870,6 +2085,10 @@ func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32,
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found during replay", collectionName)
 	}
+	// Base-row mutations invalidate optimizer statistics. The payload is cleared
+	// in the same replay path, so recovered databases cannot use a snapshot
+	// known to predate a committed write.
+	collection.Config.CostModelStats = nil
 	current := collection.Records[id]
 	if current == nil {
 		current = &recordValue{
@@ -1883,6 +2102,21 @@ func (e *Engine) applyRecordPutFields(collectionName, id string, ordinal uint32,
 		current.Deleted = false
 		collection.LiveCount++
 	} else {
+		// Archive the current version as a historical snapshot before
+		// overwriting. The historical version is visible for LSNs
+		// [current.CreatedLSN, lsn).
+		archived := recordVersion{
+			Metadata: current.Metadata,
+			Vector:   cloneVector(current.Vector),
+			BeginLSN: current.CreatedLSN,
+			EndLSN:   lsn,
+			Ordinal:  current.Ordinal,
+		}
+		if collection.HistoricalVersions == nil {
+			collection.HistoricalVersions = make(map[string][]recordVersion)
+		}
+		collection.HistoricalVersions[id] = append(collection.HistoricalVersions[id], archived)
+		current.CreatedLSN = lsn
 		current.Version++
 	}
 	if next := ordinal + 1; next > collection.NextOrdinal {
@@ -1972,18 +2206,158 @@ func ensureRecordCapacity(collection *persistedCollection, additional int) {
 	collection.Records = make(map[string]*recordValue, additional)
 }
 
+// cloneVector returns a defensive copy of v suitable for archival.
+func cloneVector(v []float32) []float32 {
+	if len(v) == 0 {
+		return nil
+	}
+	c := make([]float32, len(v))
+	copy(c, v)
+	return c
+}
+
+// GetRecordAtLSN returns the record version visible at the given snapshot LSN.
+func (e *Engine) GetRecordAtLSN(collectionName, id string, snapshotLSN uint64) (*storage.TemporalRecord, error) {
+	tr, err := e.getRecordAtLSN(collectionName, id, snapshotLSN)
+	if err != nil || tr == nil {
+		return nil, err
+	}
+	return &storage.TemporalRecord{
+		ID: tr.ID, Vector: tr.Vector, Metadata: tr.Metadata,
+		Ordinal: tr.Ordinal, Version: tr.Version,
+	}, nil
+}
+
+// ListVisibleAtLSN iterates all records visible at snapshotLSN.
+func (e *Engine) ListVisibleAtLSN(collectionName string, snapshotLSN uint64, fn func(*storage.TemporalRecord) bool) error {
+	return e.listVisibleAtLSN(collectionName, snapshotLSN, func(tr *temporalRecord) bool {
+		return fn(&storage.TemporalRecord{
+			ID: tr.ID, Vector: tr.Vector, Metadata: tr.Metadata,
+			Ordinal: tr.Ordinal, Version: tr.Version,
+		})
+	})
+}
+
+// temporalRecord is the engine-internal historical record type.
+type temporalRecord struct {
+	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
+	Ordinal  uint32
+	Version  uint64
+}
+
+// getRecordAtLSN returns the record version visible at the given snapshot LSN.
+func (e *Engine) getRecordAtLSN(collectionName, id string, snapshotLSN uint64) (*temporalRecord, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	collection := e.state.Collections[collectionName]
+	if collection == nil || collection.Deleted {
+		return nil, fmt.Errorf("collection %s not found", collectionName)
+	}
+	if snapshotLSN < e.oldestRetainedLSN {
+		return nil, fmt.Errorf("%w: LSN %d < oldest retained %d", ErrRetentionExpired, snapshotLSN, e.oldestRetainedLSN)
+	}
+
+	// Check historical versions first (most recent matching wins).
+	if versions, ok := collection.HistoricalVersions[id]; ok {
+		for i := len(versions) - 1; i >= 0; i-- {
+			v := &versions[i]
+			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+				return &temporalRecord{
+					ID: id, Vector: v.Vector, Metadata: v.Metadata,
+					Ordinal: v.Ordinal, Version: uint64(i + 1),
+				}, nil
+			}
+		}
+	}
+
+	// Check current (live) version.
+	current := collection.Records[id]
+	if current != nil && !current.Deleted && current.CreatedLSN <= snapshotLSN {
+		return &temporalRecord{
+			ID: id, Vector: current.Vector, Metadata: current.Metadata,
+			Ordinal: current.Ordinal, Version: current.Version,
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// listVisibleAtLSN iterates all records visible at snapshotLSN.
+func (e *Engine) listVisibleAtLSN(collectionName string, snapshotLSN uint64, fn func(*temporalRecord) bool) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	collection := e.state.Collections[collectionName]
+	if collection == nil || collection.Deleted {
+		return fmt.Errorf("collection %s not found", collectionName)
+	}
+	if snapshotLSN < e.oldestRetainedLSN {
+		return fmt.Errorf("%w: LSN %d < oldest retained %d", ErrRetentionExpired, snapshotLSN, e.oldestRetainedLSN)
+	}
+
+	for id, current := range collection.Records {
+		found := false
+		if versions, ok := collection.HistoricalVersions[id]; ok {
+			for i := len(versions) - 1; i >= 0; i-- {
+				v := &versions[i]
+				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+					if !fn(&temporalRecord{
+						ID: id, Vector: v.Vector, Metadata: v.Metadata,
+						Ordinal: v.Ordinal, Version: uint64(i + 1),
+					}) {
+						return nil
+					}
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			continue
+		}
+		if current != nil && !current.Deleted && current.CreatedLSN <= snapshotLSN {
+			if !fn(&temporalRecord{
+				ID: id, Vector: current.Vector, Metadata: current.Metadata,
+				Ordinal: current.Ordinal, Version: current.Version,
+			}) {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	collection := e.state.Collections[collectionName]
 	if collection == nil || collection.Deleted {
 		return
 	}
+	collection.Config.CostModelStats = nil
 	current := collection.Records[id]
 	if current == nil || current.Deleted {
 		return
 	}
+	// Archive the current version before marking deleted. The vector slot
+	// is NOT freed — temporal queries at prior LSNs still need it.
+	archived := recordVersion{
+		Metadata: current.Metadata,
+		Vector:   cloneVector(current.Vector),
+		BeginLSN: current.CreatedLSN,
+		EndLSN:   lsn,
+		Ordinal:  current.Ordinal,
+	}
+	if collection.HistoricalVersions == nil {
+		collection.HistoricalVersions = make(map[string][]recordVersion)
+	}
+	collection.HistoricalVersions[id] = append(collection.HistoricalVersions[id], archived)
 	current.Deleted = true
 	current.UpdatedLSN = lsn
-	collection.freeVectorSlot(current.Ordinal)
+	// Clear live vector reference but retain slot for historical reads.
+	current.Vector = nil
+	current.Metadata = nil
 	if collection.LiveCount > 0 {
 		collection.LiveCount--
 	}
@@ -1992,8 +2366,6 @@ func (e *Engine) applyRecordDelete(collectionName, id string, lsn uint64) {
 	}
 	if e.reverseDir != nil && current.GraphNodeID != 0 {
 		if err := e.reverseDir.tombstone(current.GraphNodeID); err != nil {
-			// Tombstone error is non-fatal for the delete path; the WAL is
-			// already synced. Log and continue.
 			_ = err
 		}
 	}
@@ -2183,10 +2555,297 @@ func (e *Engine) SetPendingCommunityState(chunk []byte, checksum uint32) {
 	e.dirty = true
 }
 
-func (e *Engine) checkpointLocked() error {
-	if !e.dirty {
+// replayGraphEdgeAdd routes a committed edge-add WAL frame to the correct
+// collection graph. If no target is registered for the collection, the frame
+// is deferred for later replay.
+func (e *Engine) replayGraphEdgeAdd(record walRecord, commitLSN uint64) error {
+	payload, err := decodeGraphEdgeAddPayload(record.Payload)
+	if err != nil {
+		return fmt.Errorf("decode graph edge add at LSN %d: %w", record.Header.LSN, err)
+	}
+	target := e.graphRecoveryTargets[payload.Collection]
+	if target == nil {
+		e.deferredGraphFrames = append(e.deferredGraphFrames, deferredGraphFrame{record: record, commitLSN: commitLSN})
 		return nil
 	}
+	if err := target.ReplayEdgeAdd(payload.Src, payload.Tgt, payload.Weight, payload.Kind, commitLSN); err != nil {
+		return fmt.Errorf("replay edge add %d->%d (collection %q) at LSN %d: %w", payload.Src, payload.Tgt, payload.Collection, record.Header.LSN, err)
+	}
+	return nil
+}
+
+func (e *Engine) replayGraphEdgeRemove(record walRecord, commitLSN uint64) error {
+	payload, err := decodeGraphEdgeRemovePayload(record.Payload)
+	if err != nil {
+		return fmt.Errorf("decode graph edge remove at LSN %d: %w", record.Header.LSN, err)
+	}
+	target := e.graphRecoveryTargets[payload.Collection]
+	if target == nil {
+		e.deferredGraphFrames = append(e.deferredGraphFrames, deferredGraphFrame{record: record, commitLSN: commitLSN})
+		return nil
+	}
+	if err := target.ReplayEdgeRemove(payload.Src, payload.Tgt, payload.Kind, commitLSN); err != nil {
+		return fmt.Errorf("replay edge remove %d->%d (collection %q) at LSN %d: %w", payload.Src, payload.Tgt, payload.Collection, record.Header.LSN, err)
+	}
+	return nil
+}
+
+func (e *Engine) replayGraphNodeDrop(record walRecord, commitLSN uint64) error {
+	payload, err := decodeGraphNodeDropPayload(record.Payload)
+	if err != nil {
+		return fmt.Errorf("decode graph node drop at LSN %d: %w", record.Header.LSN, err)
+	}
+	target := e.graphRecoveryTargets[payload.Collection]
+	if target == nil {
+		e.deferredGraphFrames = append(e.deferredGraphFrames, deferredGraphFrame{record: record, commitLSN: commitLSN})
+		return nil
+	}
+	if err := target.ReplayNodeEdgeDrop(payload.NodeID, commitLSN); err != nil {
+		return fmt.Errorf("replay node drop %d (collection %q) at LSN %d: %w", payload.NodeID, payload.Collection, record.Header.LSN, err)
+	}
+	return nil
+}
+
+func (e *Engine) replayGraphVertexLabel(record walRecord, commitLSN uint64) error {
+	payload, err := decodeGraphVertexLabelPayload(record.Payload)
+	if err != nil {
+		return fmt.Errorf("decode graph vertex label at LSN %d: %w", record.Header.LSN, err)
+	}
+	// Vertex labels have no collection — route to first available target.
+	for _, target := range e.graphRecoveryTargets {
+		return target.ReplayVertexLabel(payload.NodeID, payload.Label, commitLSN)
+	}
+	e.deferredGraphFrames = append(e.deferredGraphFrames, deferredGraphFrame{record: record, commitLSN: commitLSN})
+	return nil
+}
+
+// SetGraphRecoveryTarget wires a collection's graph as the replay target
+// for committed graph edge WAL records. Deferred frames for this collection
+// are replayed; frames that fail replay are retained and the engine is
+// marked unhealthy.
+func (e *Engine) SetGraphRecoveryTarget(collection string, target storage.GraphRecoveryTarget) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.graphRecoveryTargets == nil {
+		e.graphRecoveryTargets = make(map[string]storage.GraphRecoveryTarget)
+	}
+	e.graphRecoveryTargets[collection] = target
+
+	// Replay deferred frames for this collection.
+	// Frames that fail replay are retained and the engine transitions to
+	// a failed state so the caller cannot silently ignore replay corruption.
+	var remaining []deferredGraphFrame
+	var replayErr error
+	for _, deferred := range e.deferredGraphFrames {
+		record := deferred.record
+		keep := true
+		switch record.Header.RecordType {
+		case recordTypeGraphEdgeAdd:
+			if payload, err := decodeGraphEdgeAddPayload(record.Payload); err == nil && payload.Collection == collection {
+				if err := target.ReplayEdgeAdd(payload.Src, payload.Tgt, payload.Weight, payload.Kind, deferred.commitLSN); err != nil {
+					replayErr = fmt.Errorf("deferred edge add replay LSN %d: %w", deferred.commitLSN, err)
+				} else {
+					keep = false
+				}
+			}
+		case recordTypeGraphEdgeRemove:
+			if payload, err := decodeGraphEdgeRemovePayload(record.Payload); err == nil && payload.Collection == collection {
+				if err := target.ReplayEdgeRemove(payload.Src, payload.Tgt, payload.Kind, deferred.commitLSN); err != nil {
+					replayErr = fmt.Errorf("deferred edge remove replay LSN %d: %w", deferred.commitLSN, err)
+				} else {
+					keep = false
+				}
+			}
+		case recordTypeGraphNodeDrop:
+			if payload, err := decodeGraphNodeDropPayload(record.Payload); err == nil && payload.Collection == collection {
+				if err := target.ReplayNodeEdgeDrop(payload.NodeID, deferred.commitLSN); err != nil {
+					replayErr = fmt.Errorf("deferred node drop replay LSN %d: %w", deferred.commitLSN, err)
+				} else {
+					keep = false
+				}
+			}
+		case recordTypeGraphVertexLabel:
+			if payload, err := decodeGraphVertexLabelPayload(record.Payload); err == nil {
+				if err := target.ReplayVertexLabel(payload.NodeID, payload.Label, deferred.commitLSN); err != nil {
+					replayErr = fmt.Errorf("deferred vertex label replay LSN %d: %w", deferred.commitLSN, err)
+				} else {
+					keep = false
+				}
+			}
+		}
+		if keep {
+			remaining = append(remaining, deferred)
+		}
+	}
+	e.deferredGraphFrames = remaining
+	if replayErr != nil {
+		e.status.Store(int32(storage.StatusFailed))
+		e.recoveryErr.Store(replayErr)
+	}
+}
+
+// AppendGraphLabel writes one committed label assignment. Labels are rare and
+// use a dedicated synchronous WAL transaction so RegisterVertexLabel remains
+// source-compatible while being restart-safe.
+func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label string, onCommit func(uint64)) error {
+	if label == "" {
+		return fmt.Errorf("graph label must not be empty")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
+	txID, beginLSN := e.nextTxID(), e.nextLSN()
+	opLSN, commitLSN := e.nextLSN(), e.nextLSN()
+	payload := encodeGraphVertexLabelPayload(graphVertexLabelPayload{NodeID: nodeID, Label: label})
+	frames := []walRecord{newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()), newFrame(recordTypeGraphVertexLabel, opLSN, txID, beginLSN, payload), e.makeTxCommitFrame(commitLSN, txID, opLSN)}
+	if _, err := e.appendTransactionLocked(frames); err != nil {
+		releaseDetachedPayload(payload.bytes, payload.encoder)
+		return err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return err
+	}
+	e.recordPendingCommitLocked()
+	if onCommit != nil {
+		onCommit(commitLSN)
+	}
+	return nil
+}
+
+// AppendGraphEdges submits graph edge operations into the unified batch
+// system. The ops share a commit LSN with any concurrent record writes in
+// the same flush. It waits for that flush so Graph Txn.Commit has a real
+// commit boundary: a following graph transaction cannot be coalesced at the
+// same LSN and erase the first transaction's historical visibility interval.
+// onCommit is invoked after WAL sync with the durable commit LSN.
+func (e *Engine) AppendGraphEdges(ctx context.Context, adds, removes []storage.GraphEdgeOp, nodeDrops []storage.GraphNodeDropOp, onCommit func(lsn uint64)) (uint64, error) {
+	if len(adds) == 0 && len(removes) == 0 && len(nodeDrops) == 0 {
+		return 0, nil
+	}
+	if err := e.writesAvailable(); err != nil {
+		return 0, err
+	}
+	if e.closed.Load() {
+		return 0, fmt.Errorf("database is closed")
+	}
+	// Graph operations use the same request/flush completion mechanism as
+	// record writes. A graph transaction is not considered committed until its
+	// callback has received the WAL commit LSN.
+	request, err := e.admitBatch(batchEntry{
+		graphAdds:         adds,
+		graphRemoves:      removes,
+		graphNodeDrops:    nodeDrops,
+		graphCommitTarget: onCommit,
+	}, 0)
+	if err != nil {
+		return 0, err
+	}
+	durable, err := e.waitForWALFlush(ctx, request)
+	if err != nil {
+		return 0, err
+	}
+	return durable.CommitLSN, nil
+}
+
+// flushPendingGraphEdgesLocked drains the graph edge batch queue and writes
+// one WAL transaction for all queued ops. Returns the commit LSN. Caller must
+// hold e.mu.
+func (e *Engine) flushPendingGraphEdgesLocked() (uint64, error) {
+	e.graphEdgeMu.Lock()
+	adds := e.pendingAdds
+	removes := e.pendingRemoves
+	nodeDrops := e.pendingNodeDrops
+	e.pendingAdds = nil
+	e.pendingRemoves = nil
+	e.pendingNodeDrops = nil
+	e.graphEdgeMu.Unlock()
+
+	if len(adds) == 0 && len(removes) == 0 && len(nodeDrops) == 0 {
+		return 0, nil
+	}
+
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	frameCount := 2 + len(adds) + len(removes) + len(nodeDrops)
+	frames := make([]walRecord, frameCount)
+	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
+	prevLSN := beginLSN
+	fi := 1
+
+	for _, op := range adds {
+		l := e.nextLSN()
+		payload := encodeGraphEdgeAddPayload(graphEdgeAddPayload{
+			Collection: op.Collection, Src: op.Src, Tgt: op.Tgt, Weight: op.Weight, Kind: op.Kind,
+		})
+		frames[fi] = newFrame(recordTypeGraphEdgeAdd, l, txID, prevLSN, payload)
+		prevLSN = l
+		fi++
+	}
+	for _, op := range removes {
+		l := e.nextLSN()
+		payload := encodeGraphEdgeRemovePayload(graphEdgeRemovePayload{
+			Collection: op.Collection, Src: op.Src, Tgt: op.Tgt, Kind: op.Kind,
+		})
+		frames[fi] = newFrame(recordTypeGraphEdgeRemove, l, txID, prevLSN, payload)
+		prevLSN = l
+		fi++
+	}
+	for _, drop := range nodeDrops {
+		l := e.nextLSN()
+		payload := encodeGraphNodeDropPayload(graphNodeDropPayload{Collection: drop.Collection, NodeID: drop.NodeID})
+		frames[fi] = newFrame(recordTypeGraphNodeDrop, l, txID, prevLSN, payload)
+		prevLSN = l
+		fi++
+	}
+
+	commitLSN := e.nextLSN()
+	frames[fi] = e.makeTxCommitFrame(commitLSN, txID, prevLSN)
+
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return 0, err
+	}
+	e.walBytes += written
+	e.walTransactions++
+	return commitLSN, nil
+}
+
+// ensureFileExtendsPastReservedLocked ensures the file is large enough that
+// chunk appends (which use SeekEnd) don't land inside pages 0-3 (header,
+// metapages, catalog). Without this, a snapshot chunk could be overwritten
+// by the fixed-location catalog page write at offset 3*pageSize.
+func (e *Engine) ensureFileExtendsPastReservedLocked() error {
+	stat, err := e.file.Stat()
+	if err != nil {
+		return err
+	}
+	minSize := int64(4 * pageSize) // header + 2 metapages + catalog = 4 pages
+	if stat.Size() < minSize {
+		// Extend the file with zeros so that SeekEnd returns >= minSize.
+		zero := make([]byte, pageSize)
+		if _, err := e.file.WriteAt(zero, minSize-pageSize); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) checkpointLocked() error {
+	if !e.dirty && !e.catalogDirty {
+		return nil
+	}
+
+	// Ensure the file extends past the reserved pages (0-3) so that
+	// appended chunks don't collide with the fixed-location catalog
+	// page at offset 3*pageSize.
+	e.ensureFileExtendsPastReservedLocked()
+
 	// STEP 1: write snapshot chunk
 	snapshot, err := encodeStateBinary(e.state)
 	if err != nil {
@@ -2300,6 +2959,7 @@ func (e *Engine) checkpointLocked() error {
 		if err := e.checkpointWriteAtLocked(3*pageSize, catalogPage); err != nil {
 			return fmt.Errorf("write catalog page: %w", err)
 		}
+		e.catalogDirty = false
 	}
 
 	// STEP 5: write header (publishes the new metapage as authoritative)
@@ -3339,6 +3999,128 @@ func releaseDetachedPayload(payload []byte, enc *util.BinaryEncoder) {
 	util.ReleaseBinaryEncoder(enc)
 }
 
+// pendingCommitTS buffers the timestamp of the next TxCommit frame. It is
+// set by makeTxCommitFrame and consumed by recordPendingCommitLocked after
+// the WAL sync succeeds. This avoids recording non-durable commits.
+var _ = func() int { return 0 } // suppress unused warning for the field reference below
+
+// makeTxCommitFrame creates a TxCommit WAL frame with the current UTC
+// timestamp embedded in the payload. The timestamp is clamped to never
+// decrease: if the wall clock moves backward or the previous pending
+// timestamp is higher, the maximum is used. The timestamp is buffered in
+// pendingCommitLSN/TS; the caller must invoke recordPendingCommitLocked after
+// syncWALLocked succeeds. Caller must hold e.mu.
+func (e *Engine) makeTxCommitFrame(commitLSN, txID, prevLSN uint64) walRecord {
+	now := time.Now().UTC().UnixNano()
+	// Clamp to previous entry if clock moved backward.
+	if len(e.commitCatalog) > 0 {
+		if prev := e.commitCatalog[len(e.commitCatalog)-1].Timestamp; now < prev {
+			now = prev
+		}
+	}
+	// Clamp to pending timestamp from an earlier frame in the same batch.
+	if e.pendingCommitTS != 0 && now < e.pendingCommitTS {
+		now = e.pendingCommitTS
+	}
+	e.pendingCommitTS = now
+	e.pendingCommitLSN = commitLSN
+	payload := encodeTxCommitPayload(txCommitPayload{Timestamp: now})
+	return newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, payload)
+}
+
+// recordPendingCommitLocked publishes the buffered commit timestamp to the
+// in-memory catalog. Must be called after syncWALLocked succeeds.
+func (e *Engine) recordPendingCommitLocked() {
+	if e.pendingCommitLSN != 0 {
+		e.commitCatalog = append(e.commitCatalog, commitEntry{
+			LSN: e.pendingCommitLSN, Timestamp: e.pendingCommitTS,
+		})
+		e.pendingCommitLSN = 0
+		e.pendingCommitTS = 0
+	}
+}
+
+// recordCommitLocked appends a pre-resolved commit entry to the in-memory
+// catalog. Used during WAL replay where the timestamp is decoded from the
+// frame rather than captured live.
+func (e *Engine) recordCommitLocked(lsn uint64, ts int64) {
+	e.commitCatalog = append(e.commitCatalog, commitEntry{LSN: lsn, Timestamp: ts})
+}
+
+// commitTimestampForLSN returns the UTC timestamp for a committed LSN by
+// binary-searching the catalog. Returns (0, false) if the LSN is not found.
+func (e *Engine) commitTimestampForLSN(lsn uint64) (int64, bool) {
+	for i := len(e.commitCatalog) - 1; i >= 0; i-- {
+		if e.commitCatalog[i].LSN == lsn {
+			return e.commitCatalog[i].Timestamp, true
+		}
+	}
+	return 0, false
+}
+
+// ResolveTimestamp returns the latest committed LSN whose commit timestamp
+// is <= t, and that timestamp. If t is before the earliest retained commit,
+// ErrRetentionExpired is returned. If t is after the latest commit, the
+// latest commit is returned.
+func (e *Engine) ResolveTimestamp(t time.Time) (uint64, time.Time, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.commitCatalog) == 0 {
+		return 0, time.Time{}, ErrNoCommits
+	}
+
+	target := t.UTC().UnixNano()
+	first := e.commitCatalog[0]
+
+	// Before the earliest retained commit.
+	if e.oldestRetainedLSN > 0 && first.LSN < e.oldestRetainedLSN {
+		// Scan forward to the first retained entry.
+		for _, entry := range e.commitCatalog {
+			if entry.LSN >= e.oldestRetainedLSN {
+				first = entry
+				break
+			}
+		}
+	}
+	if target < first.Timestamp {
+		return 0, time.Time{}, fmt.Errorf("%w: requested %s, oldest retained %s",
+			ErrRetentionExpired, t.UTC().Format(time.RFC3339Nano),
+			time.Unix(0, first.Timestamp).UTC().Format(time.RFC3339Nano))
+	}
+
+	// Binary search: find the rightmost entry with Timestamp <= target.
+	lo, hi := 0, len(e.commitCatalog)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if e.commitCatalog[mid].Timestamp <= target {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	entry := e.commitCatalog[lo]
+	return entry.LSN, time.Unix(0, entry.Timestamp).UTC(), nil
+}
+
+// ResolveLSN returns the commit timestamp for an exact LSN.
+func (e *Engine) ResolveLSN(lsn uint64) (time.Time, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	ts, ok := e.commitTimestampForLSN(lsn)
+	if !ok {
+		return time.Time{}, fmt.Errorf("%w: LSN %d", ErrUnknownLSN, lsn)
+	}
+	return time.Unix(0, ts).UTC(), nil
+}
+
+var (
+	ErrNoCommits        = fmt.Errorf("no commits in catalog")
+	ErrRetentionExpired = fmt.Errorf("retention expired")
+	ErrUnknownLSN       = fmt.Errorf("unknown LSN")
+)
+
 func (e *Engine) createCollection(name string, config storage.CollectionConfig) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -3364,7 +4146,7 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeCollectionCreate, opLSN, txID, beginLSN, payload),
-		newFrame(recordTypeTxCommit, commitLSN, txID, opLSN, emptyPayload()),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
@@ -3377,6 +4159,7 @@ func (e *Engine) createCollection(name string, config storage.CollectionConfig) 
 		e.disableWrites()
 		return err
 	}
+	e.recordPendingCommitLocked()
 	e.applyCreateCollection(name, config, opLSN)
 	e.collections[name] = &Collection{engine: e, name: name}
 	e.markDirtyLocked(written, 1)
@@ -3509,9 +4292,18 @@ func (e *Engine) flushBatch() error {
 		e.batchBuffer.mu.Unlock()
 	}()
 
-	// Nothing to flush and no one waiting
+	// Nothing to flush and no one waiting — unless graph edges are queued.
 	if len(entries) == 0 && len(pendingFlushes) == 0 {
-		return nil
+		hasGraphEdges := false
+		for i := range entries {
+			if len(entries[i].graphAdds)+len(entries[i].graphRemoves)+len(entries[i].graphNodeDrops) > 0 {
+				hasGraphEdges = true
+				break
+			}
+		}
+		if !hasGraphEdges {
+			return nil
+		}
 	}
 
 	// Acquire engine lock for state modifications
@@ -3593,6 +4385,16 @@ func (e *Engine) flushBatch() error {
 		atomic.StoreInt32(&e.batchBuffer.flushSignalPending, 0)
 		return err
 	}
+	e.recordPendingCommitLocked()
+	// Publish staged graph mutations AFTER durable sync. Each batch's
+	// graphCommitTarget receives the shared commit LSN so temporal edge
+	// intervals are stamped correctly.
+	for i := range entries {
+		if entries[i].graphCommitTarget != nil && entries[i].commitLSN != 0 {
+			entries[i].graphCommitTarget(entries[i].commitLSN)
+		}
+	}
+
 	// Sync succeeded — now commit GraphNodeID state: advance counter,
 	// publish reverse-directory mappings, and write IDs back to caller entries.
 	for start := 0; start < len(entries); {
@@ -3677,9 +4479,22 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 	if len(batches) == 0 {
 		return 0, 0, 0, nil
 	}
-	collection := e.state.Collections[batches[0].collection]
-	if collection == nil || collection.Deleted {
-		return 0, 0, 0, fmt.Errorf("collection %s not found", batches[0].collection)
+	hasRecords := false
+	for i := range batches {
+		if batches[i].count() > 0 {
+			hasRecords = true
+			break
+		}
+	}
+
+	var collection *persistedCollection
+	if hasRecords {
+		collection = e.state.Collections[batches[0].collection]
+		if collection == nil || collection.Deleted {
+			return 0, 0, 0, fmt.Errorf("collection %s not found", batches[0].collection)
+		}
+	} else {
+		collection = e.state.Collections[batches[0].collection]
 	}
 
 	entryCount := 0
@@ -3698,9 +4513,15 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 	}
 	ensureRecordCapacity(collection, entryCount)
 
+	// Count graph edge ops in this batch run.
+	graphFrameCount := 0
+	for i := range batches {
+		graphFrameCount += len(batches[i].graphAdds) + len(batches[i].graphRemoves) + len(batches[i].graphNodeDrops)
+	}
+
 	txID := e.nextTxID()
 	beginLSN := e.nextLSN()
-	frames := make([]walRecord, entryCount+2)
+	frames := make([]walRecord, entryCount+graphFrameCount+2)
 	frames[0] = newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload())
 	prevLSN := beginLSN
 	frameIndex := 1
@@ -3810,8 +4631,32 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 			frameIndex++
 		}
 	}
+	// Insert graph edge frames into the same WAL transaction.
+	for i := range batches {
+		for _, op := range batches[i].graphAdds {
+			lsn := e.nextLSN()
+			payload := encodeGraphEdgeAddPayload(graphEdgeAddPayload{Collection: op.Collection, Src: op.Src, Tgt: op.Tgt, Weight: op.Weight, Kind: op.Kind})
+			frames[frameIndex] = newFrame(recordTypeGraphEdgeAdd, lsn, txID, prevLSN, payload)
+			prevLSN = lsn
+			frameIndex++
+		}
+		for _, op := range batches[i].graphRemoves {
+			lsn := e.nextLSN()
+			payload := encodeGraphEdgeRemovePayload(graphEdgeRemovePayload{Collection: op.Collection, Src: op.Src, Tgt: op.Tgt, Kind: op.Kind})
+			frames[frameIndex] = newFrame(recordTypeGraphEdgeRemove, lsn, txID, prevLSN, payload)
+			prevLSN = lsn
+			frameIndex++
+		}
+		for _, drop := range batches[i].graphNodeDrops {
+			lsn := e.nextLSN()
+			payload := encodeGraphNodeDropPayload(graphNodeDropPayload{Collection: drop.Collection, NodeID: drop.NodeID})
+			frames[frameIndex] = newFrame(recordTypeGraphNodeDrop, lsn, txID, prevLSN, payload)
+			prevLSN = lsn
+			frameIndex++
+		}
+	}
 	commitLSN := e.nextLSN()
-	frames[frameIndex] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
+	frames[frameIndex] = e.makeTxCommitFrame(commitLSN, txID, prevLSN)
 
 	written, err := e.appendTransactionLocked(frames)
 	for i := range batches {
@@ -3952,7 +4797,7 @@ func (e *Engine) deleteRecord(name, id string) error {
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeRecordDelete, opLSN, txID, beginLSN, payload),
-		newFrame(recordTypeTxCommit, commitLSN, txID, opLSN, emptyPayload()),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
@@ -3965,6 +4810,7 @@ func (e *Engine) deleteRecord(name, id string) error {
 		e.disableWrites()
 		return err
 	}
+	e.recordPendingCommitLocked()
 	e.applyRecordDelete(name, id, opLSN)
 	e.markDirtyLocked(written, 1)
 	return e.maybeCheckpointLocked()
@@ -3990,6 +4836,11 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// Graph edge operations are prepared as-is (no ordinal assignment).
+		if op.Type >= storage.TxOperationGraphEdgeAdd {
+			prepared[i] = op
+			continue
+		}
 		collection := e.state.Collections[op.Collection]
 		if collection == nil || collection.Deleted {
 			return nil, fmt.Errorf("collection %s not found", op.Collection)
@@ -4004,6 +4855,7 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 			Metadata:           cloneMetadata(op.Metadata),
 			ExpectedVersion:    op.ExpectedVersion,
 			HasExpectedVersion: op.HasExpectedVersion,
+			GraphNodeID:        op.GraphNodeID,
 		}
 
 		if op.Type != storage.TxOperationPut {
@@ -4073,7 +4925,9 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 			var graphNodeID uint64
 
 			mapKey := recordKey{collection: op.Collection, id: op.ID}
-			if assigned, ok := assignedIDs[mapKey]; ok {
+			if op.GraphNodeID != 0 {
+				graphNodeID = op.GraphNodeID
+			} else if assigned, ok := assignedIDs[mapKey]; ok {
 				graphNodeID = assigned
 			} else if current != nil && !current.Deleted && current.GraphNodeID != 0 {
 				graphNodeID = current.GraphNodeID
@@ -4108,6 +4962,25 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 				return err
 			}
 			frames[i+1] = newFrame(recordTypeRecordDelete, lsn, txID, prevLSN, payload)
+		case storage.TxOperationGraphEdgeAdd:
+			payload := encodeGraphEdgeAddPayload(graphEdgeAddPayload{
+				Collection: op.Collection,
+				Src:        op.EdgeSrc,
+				Tgt:        op.EdgeTgt,
+				Weight:     op.EdgeWeight,
+				Kind:       op.EdgeKind,
+			})
+			frames[i+1] = newFrame(recordTypeGraphEdgeAdd, lsn, txID, prevLSN, payload)
+		case storage.TxOperationGraphEdgeRemove:
+			payload := encodeGraphEdgeRemovePayload(graphEdgeRemovePayload{
+				Collection: op.Collection, Src: op.EdgeSrc, Tgt: op.EdgeTgt, Kind: op.EdgeKind,
+			})
+			frames[i+1] = newFrame(recordTypeGraphEdgeRemove, lsn, txID, prevLSN, payload)
+		case storage.TxOperationGraphNodeDrop:
+			payload := encodeGraphNodeDropPayload(graphNodeDropPayload{
+				Collection: op.Collection, NodeID: op.EdgeSrc,
+			})
+			frames[i+1] = newFrame(recordTypeGraphNodeDrop, lsn, txID, prevLSN, payload)
 		default:
 			return fmt.Errorf("unsupported transaction operation type %d", op.Type)
 		}
@@ -4125,7 +4998,14 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 	}
 
 	commitLSN := e.nextLSN()
-	frames[len(frames)-1] = newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, emptyPayload())
+	frames[len(frames)-1] = e.makeTxCommitFrame(commitLSN, txID, prevLSN)
+
+	// Test-only failpoint: if set, return an error after building frames
+	// but before writing the commit marker. Used by epoch atomicity tests.
+	if testCommitFailpoint != nil {
+		return testCommitFailpoint()
+	}
+
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
 		if isAmbiguousWriteError(err) {
@@ -4139,6 +5019,7 @@ func (e *Engine) CommitTx(ctx context.Context, ops []storage.TxOperation) error 
 		e.disableWrites()
 		return err
 	}
+	e.recordPendingCommitLocked()
 
 	if numAllocated > 0 {
 		e.state.NextGraphNodeID += numAllocated
@@ -4239,15 +5120,109 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *stor
 		return nil, nil, err
 	}
 	configCopy := persisted.Config
+	// DataLSN is a live watermark, not a persisted configuration field. The
+	// optimizer compares it with the watermark embedded in its statistics to
+	// reject stats produced before a committed row mutation.
+	configCopy.DataLSN = persisted.UpdatedLSN
 	return collection, &configCopy, nil
+}
+
+// SetCollectionCostModelStats durably replaces the opaque, versioned
+// optimizer-statistics payload for one collection. It is deliberately a WAL
+// transaction rather than an in-place config mutation so a crash can never
+// leave a snapshot and its statistics generation disagreeing.
+func (e *Engine) SetCollectionCostModelStats(ctx context.Context, name string, stats []byte) error {
+	_, err := e.setCollectionCostModelStats(ctx, name, stats, nil)
+	return err
+}
+
+// SetCollectionCostModelStatsIfDataLSN publishes statistics only when no base
+// row mutation occurred since expectedDataLSN. This is the atomic handoff used
+// by AnalyzeCollection after it scans the collection.
+func (e *Engine) SetCollectionCostModelStatsIfDataLSN(ctx context.Context, name string, expectedDataLSN uint64, stats []byte) (bool, error) {
+	return e.setCollectionCostModelStats(ctx, name, stats, &expectedDataLSN)
+}
+
+func (e *Engine) setCollectionCostModelStats(ctx context.Context, name string, stats []byte, expectedDataLSN *uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.writesAvailable(); err != nil {
+		return false, err
+	}
+	if e.closed.Load() {
+		return false, fmt.Errorf("database is closed")
+	}
+	collection := e.state.Collections[name]
+	if collection == nil || collection.Deleted {
+		return false, fmt.Errorf("collection %s not found", name)
+	}
+	if expectedDataLSN != nil && collection.UpdatedLSN != *expectedDataLSN {
+		return false, nil
+	}
+	payload, err := encodeCollectionStatsPayloadBinary(collectionStatsPayload{
+		Name:  name,
+		Stats: append([]byte(nil), stats...),
+	})
+	if err != nil {
+		return false, err
+	}
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
+	frames := []walRecord{
+		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
+		newFrame(recordTypeCollectionStats, opLSN, txID, beginLSN, payload),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
+	}
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return false, err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return false, err
+	}
+	e.recordPendingCommitLocked()
+	e.applyCollectionCostModelStats(name, stats)
+	e.markDirtyLocked(written, 1)
+	if err := e.maybeCheckpointLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CollectionDataLSN returns the latest committed base-row mutation LSN.
+// Statistics writes intentionally do not advance this data watermark.
+func (e *Engine) CollectionDataLSN(name string) (uint64, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed.Load() {
+		return 0, fmt.Errorf("database is closed")
+	}
+	collection := e.state.Collections[name]
+	if collection == nil || collection.Deleted {
+		return 0, fmt.Errorf("collection %s not found", name)
+	}
+	return collection.UpdatedLSN, nil
 }
 
 // ListCollections returns live persisted collections.
 // SetCatalogData stores catalog bytes to be persisted at the next checkpoint.
 // Called by the Database layer when the catalog is updated.
+// Marks the engine dirty so that the catalog page is written during the next
+// checkpoint and survives Close/Reopen.
 func (e *Engine) SetCatalogData(data []byte) {
 	e.mu.Lock()
 	e.catalogData = data
+	e.catalogDirty = true
+	e.markDirtyLocked(0, 0) // ensure checkpoint fires before close
 	e.mu.Unlock()
 }
 
@@ -4324,7 +5299,7 @@ func (e *Engine) DeleteCollection(name string) error {
 	frames := []walRecord{
 		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
 		newFrame(recordTypeCollectionDelete, opLSN, txID, beginLSN, payload),
-		newFrame(recordTypeTxCommit, commitLSN, txID, opLSN, emptyPayload()),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
 	}
 	written, err := e.appendTransactionLocked(frames)
 	if err != nil {
@@ -4337,6 +5312,7 @@ func (e *Engine) DeleteCollection(name string) error {
 		e.disableWrites()
 		return err
 	}
+	e.recordPendingCommitLocked()
 	e.applyDeleteCollection(name, opLSN)
 	if collectionObj := e.collections[name]; collectionObj != nil {
 		collectionObj.closed.Store(true)
@@ -4359,6 +5335,20 @@ func (e *Engine) Close() error {
 	if e.closed.Load() {
 		return nil
 	}
+
+	// Force a checkpoint so schema changes (catalog) and collection
+	// state survive Close/Reopen.  The index provider is temporarily
+	// detached because it holds a reference to database-level state
+	// that is locked by our caller; the index rebuilds on recovery.
+	if e.dirty || e.catalogDirty {
+		savedProvider := e.indexProvider
+		e.indexProvider = nil // skip index serialization (rebuilt on recovery)
+		if err := e.checkpointLocked(); err != nil {
+			// Best-effort: WAL replay will recover on next Open.
+		}
+		e.indexProvider = savedProvider
+	}
+
 	// Free all off-heap vector storage. Individual slot deallocation is
 	// unnecessary: Free() releases all mmap'd slabs at once.
 	for _, collection := range e.state.Collections {
@@ -4597,6 +5587,27 @@ func (c *Collection) Get(ctx context.Context, id string) (*index.VectorEntry, er
 	entry := cloneEntry(record)
 	entry.ID = id
 	return entry, nil
+}
+
+// GetOrdinal resolves an ID to its local collection ordinal without cloning
+// its vector or metadata. It is intentionally a narrow optional fast path for
+// query-time candidate bitmap construction.
+func (c *Collection) GetOrdinal(ctx context.Context, id string) (uint32, error) {
+	_ = ctx
+	c.engine.mu.RLock()
+	defer c.engine.mu.RUnlock()
+	if c.closed.Load() || c.engine.closed.Load() {
+		return 0, fmt.Errorf("collection %s is closed", c.name)
+	}
+	persisted := c.engine.state.Collections[c.name]
+	if persisted == nil || persisted.Deleted {
+		return 0, fmt.Errorf("collection %s not found", c.name)
+	}
+	record := persisted.Records[id]
+	if record == nil || record.Deleted {
+		return 0, fmt.Errorf("entry %s not found", id)
+	}
+	return record.Ordinal, nil
 }
 
 func (c *Collection) Exists(ctx context.Context, id string) (bool, error) {

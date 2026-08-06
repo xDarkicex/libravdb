@@ -12,9 +12,16 @@ const (
 	codecVersion byte = 3 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
+const snapshotCodecVersion byte = 4 // v4: adds historical record versions
+
 type encodedPayload struct {
 	encoder *util.BinaryEncoder
 	bytes   []byte
+}
+
+type collectionStatsPayload struct {
+	Name  string
+	Stats []byte
 }
 
 func emptyPayload() encodedPayload {
@@ -32,7 +39,7 @@ func detachPayload(enc *util.BinaryEncoder) encodedPayload {
 func encodeStateBinary(state *persistedState) ([]byte, error) {
 	enc := util.AcquireBinaryEncoder(estimateStateSize(state))
 	defer util.ReleaseBinaryEncoder(enc)
-	enc.WriteByte(codecVersion)
+	enc.WriteByte(snapshotCodecVersion)
 	enc.WriteUint64(state.NextCollectionID)
 	enc.WriteUint64(state.NextGraphNodeID)
 	names := make([]string, 0, len(state.Collections))
@@ -57,8 +64,8 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 	if err != nil {
 		return nil, err
 	}
-	if version < 1 || version > codecVersion {
-		return nil, fmt.Errorf("unsupported snapshot codec version %d", version)
+	if version < 1 || version > snapshotCodecVersion {
+		return nil, fmt.Errorf("unsupported snapshot codec version %d (max %d)", version, snapshotCodecVersion)
 	}
 	nextCollectionID, err := dec.ReadUint64()
 	if err != nil {
@@ -139,6 +146,30 @@ func decodeCollectionDeletePayloadBinary(data []byte) (collectionDeletePayload, 
 		return collectionDeletePayload{}, err
 	}
 	return collectionDeletePayload{Name: name}, nil
+}
+
+func encodeCollectionStatsPayloadBinary(payload collectionStatsPayload) (encodedPayload, error) {
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(payload.Name) + 4 + len(payload.Stats))
+	enc.WriteByte(codecVersion)
+	enc.WriteString(payload.Name)
+	enc.WriteBytes(payload.Stats)
+	return detachPayload(enc), nil
+}
+
+func decodeCollectionStatsPayloadBinary(data []byte) (collectionStatsPayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return collectionStatsPayload{}, err
+	}
+	name, err := dec.ReadString()
+	if err != nil {
+		return collectionStatsPayload{}, err
+	}
+	stats, err := dec.ReadBytes()
+	if err != nil {
+		return collectionStatsPayload{}, err
+	}
+	return collectionStatsPayload{Name: name, Stats: stats}, nil
 }
 
 func encodeRecordPutPayloadBinary(payload recordPutPayload) (encodedPayload, error) {
@@ -227,6 +258,188 @@ func decodeRecordDeletePayloadBinary(data []byte) (recordDeletePayload, error) {
 	return recordDeletePayload{Collection: collection, ID: id}, nil
 }
 
+// ── Graph edge WAL codec ──────────────────────────────────────────────────
+
+type graphEdgeAddPayload struct {
+	Collection string
+	Src        uint64
+	Tgt        uint64
+	Weight     float32
+	Kind       uint8
+}
+
+type graphEdgeRemovePayload struct {
+	Collection string
+	Src        uint64
+	Tgt        uint64
+	Kind       uint8
+}
+
+type graphNodeDropPayload struct {
+	Collection string
+	NodeID     uint64
+}
+
+type graphVertexLabelPayload struct {
+	NodeID uint64
+	Label  string
+}
+
+func encodeGraphVertexLabelPayload(p graphVertexLabelPayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 8 + 4 + len(p.Label))
+	enc.WriteByte(codecVersion)
+	enc.WriteUint64(p.NodeID)
+	enc.WriteString(p.Label)
+	return detachPayload(enc)
+}
+func decodeGraphVertexLabelPayload(data []byte) (graphVertexLabelPayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return graphVertexLabelPayload{}, err
+	}
+	nodeID, err := dec.ReadUint64()
+	if err != nil {
+		return graphVertexLabelPayload{}, err
+	}
+	label, err := dec.ReadString()
+	if err != nil {
+		return graphVertexLabelPayload{}, err
+	}
+	return graphVertexLabelPayload{NodeID: nodeID, Label: label}, nil
+}
+
+func encodeGraphEdgeAddPayload(p graphEdgeAddPayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Collection) + 8 + 8 + 4 + 1)
+	enc.WriteByte(codecVersion)
+	enc.WriteString(p.Collection)
+	enc.WriteUint64(p.Src)
+	enc.WriteUint64(p.Tgt)
+	enc.WriteFloat32(p.Weight)
+	enc.WriteByte(p.Kind)
+	return detachPayload(enc)
+}
+
+func decodeGraphEdgeAddPayload(data []byte) (graphEdgeAddPayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	collection, err := dec.ReadString()
+	if err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	src, err := dec.ReadUint64()
+	if err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	tgt, err := dec.ReadUint64()
+	if err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	weight, err := dec.ReadFloat32()
+	if err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	kind, err := dec.ReadByte()
+	if err != nil {
+		return graphEdgeAddPayload{}, err
+	}
+	return graphEdgeAddPayload{Collection: collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind}, nil
+}
+
+func encodeGraphEdgeRemovePayload(p graphEdgeRemovePayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Collection) + 8 + 8 + 1)
+	enc.WriteByte(codecVersion)
+	enc.WriteString(p.Collection)
+	enc.WriteUint64(p.Src)
+	enc.WriteUint64(p.Tgt)
+	enc.WriteByte(p.Kind)
+	return detachPayload(enc)
+}
+
+func decodeGraphEdgeRemovePayload(data []byte) (graphEdgeRemovePayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return graphEdgeRemovePayload{}, err
+	}
+	collection, err := dec.ReadString()
+	if err != nil {
+		return graphEdgeRemovePayload{}, err
+	}
+	src, err := dec.ReadUint64()
+	if err != nil {
+		return graphEdgeRemovePayload{}, err
+	}
+	tgt, err := dec.ReadUint64()
+	if err != nil {
+		return graphEdgeRemovePayload{}, err
+	}
+	kind, err := dec.ReadByte()
+	if err != nil {
+		return graphEdgeRemovePayload{}, err
+	}
+	return graphEdgeRemovePayload{Collection: collection, Src: src, Tgt: tgt, Kind: kind}, nil
+}
+
+func encodeGraphNodeDropPayload(p graphNodeDropPayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Collection) + 8)
+	enc.WriteByte(codecVersion)
+	enc.WriteString(p.Collection)
+	enc.WriteUint64(p.NodeID)
+	return detachPayload(enc)
+}
+
+func decodeGraphNodeDropPayload(data []byte) (graphNodeDropPayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return graphNodeDropPayload{}, err
+	}
+	collection, err := dec.ReadString()
+	if err != nil {
+		return graphNodeDropPayload{}, err
+	}
+	nodeID, err := dec.ReadUint64()
+	if err != nil {
+		return graphNodeDropPayload{}, err
+	}
+	return graphNodeDropPayload{Collection: collection, NodeID: nodeID}, nil
+}
+
+// ── Commit timestamp catalog codec ────────────────────────────────────────
+
+// txCommitPayload is embedded in every TxCommit WAL frame. Timestamp is UTC
+// unix nano; 0 means pre-temporal (replayed from a database written before
+// the commit catalog existed).
+type txCommitPayload struct {
+	Timestamp int64
+}
+
+func encodeTxCommitPayload(p txCommitPayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 8)
+	enc.WriteByte(codecVersion)
+	enc.WriteUint64(uint64(p.Timestamp))
+	return detachPayload(enc)
+}
+
+func decodeTxCommitPayload(data []byte) (txCommitPayload, bool) {
+	if len(data) == 0 {
+		return txCommitPayload{}, false
+	}
+	dec := &util.BinaryDecoder{Data: data}
+	version, err := dec.ReadByte()
+	if err != nil {
+		return txCommitPayload{}, false
+	}
+	if version != codecVersion {
+		return txCommitPayload{}, false
+	}
+	ts, err := dec.ReadUint64()
+	if err != nil {
+		return txCommitPayload{}, false
+	}
+	return txCommitPayload{Timestamp: int64(ts)}, true
+}
+
 func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionConfig) error {
 	enc.WriteUint32(uint32(config.Dimension))
 	enc.WriteUint32(uint32(config.Metric))
@@ -239,14 +452,17 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 	enc.WriteString(config.RawVectorStore)
 	enc.WriteUint32(uint32(config.RawStoreCap))
 	if config.Version >= 2 {
-		// Calculate size of optional fields (NClusters, NProbes, IDMapCapacity)
-		optSize := uint32(4 + 4 + 4)
+		// The optional block is length-prefixed so older readers can skip fields
+		// they do not understand. CostModelStats is intentionally opaque to the
+		// storage layer and is encoded as one length-prefixed optional field.
+		optSize := uint32(4 + 4 + 4 + 4 + len(config.CostModelStats))
 		enc.WriteUint32(optSize)
 	}
 	enc.WriteUint32(uint32(config.NClusters))
 	enc.WriteUint32(uint32(config.NProbes))
 	if config.Version >= 2 {
 		enc.WriteUint32(uint32(config.IDMapCapacity))
+		enc.WriteBytes(config.CostModelStats)
 	}
 	return nil
 }
@@ -281,6 +497,30 @@ func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) e
 			return err
 		}
 	}
+	// Historical versions (snapshot codec v4+).
+	numHistorical := uint32(len(collection.HistoricalVersions))
+	enc.WriteUint32(numHistorical)
+	if numHistorical > 0 {
+		histIDs := make([]string, 0, len(collection.HistoricalVersions))
+		for id := range collection.HistoricalVersions {
+			histIDs = append(histIDs, id)
+		}
+		sort.Strings(histIDs)
+		for _, id := range histIDs {
+			versions := collection.HistoricalVersions[id]
+			enc.WriteString(id)
+			enc.WriteUint32(uint32(len(versions)))
+			for _, v := range versions {
+				enc.WriteUint64(v.BeginLSN)
+				enc.WriteUint64(v.EndLSN)
+				enc.WriteUint32(v.Ordinal)
+				enc.WriteVector(v.Vector)
+				if err := enc.WriteMetadata(v.Metadata); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -310,7 +550,7 @@ func estimateCollectionSize(collection *persistedCollection) int {
 func estimateCollectionConfigSize(config storage.CollectionConfig) int {
 	size := 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4 + 4 + 4
 	if config.Version >= 2 {
-		size += 4 // length prefix
+		size += 4 + 4 + len(config.CostModelStats) // block length + stats bytes length + payload
 	}
 	return size
 }
@@ -368,6 +608,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	var nClusters uint32
 	var nProbes uint32
 	var idMapCapacity uint32
+	var costModelStats []byte
 
 	if version >= 2 {
 		if dec.Off+4 <= len(dec.Data) {
@@ -393,9 +634,19 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 					return storage.CollectionConfig{}, err
 				}
 			}
-			// Skip any trailing unknown optional fields based on the length prefix
-			if optSize > 12 {
-				dec.Off += int(optSize) - 12
+			if optSize >= 16 && dec.Off+4 <= len(dec.Data) {
+				costModelStats, err = dec.ReadBytes()
+				if err != nil {
+					return storage.CollectionConfig{}, err
+				}
+			}
+			// Skip any trailing unknown optional fields based on the length prefix.
+			consumed := 12
+			if optSize >= 16 {
+				consumed += 4 + len(costModelStats)
+			}
+			if int(optSize) > consumed {
+				dec.Off += int(optSize) - consumed
 			}
 		}
 	} else {
@@ -428,6 +679,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 		RawVectorStore: rawVectorStore,
 		RawStoreCap:    int(rawStoreCap),
 		IDMapCapacity:  int(idMapCapacity),
+		CostModelStats: costModelStats,
 	}, nil
 }
 
@@ -530,6 +782,54 @@ func readCollection(dec *util.BinaryDecoder, snapshotVersion byte) (*persistedCo
 	for recordID, record := range records {
 		if !record.Deleted {
 			ensureOrdinalSlot(collection, record.Ordinal, recordID)
+		}
+	}
+	// Historical versions (snapshot codec v4+).
+	if snapshotVersion >= snapshotCodecVersion {
+		numHistorical, err := dec.ReadUint32()
+		if err != nil {
+			return nil, err
+		}
+		if numHistorical > 0 {
+			collection.HistoricalVersions = make(map[string][]recordVersion, numHistorical)
+			for i := uint32(0); i < numHistorical; i++ {
+				recID, err := dec.ReadString()
+				if err != nil {
+					return nil, err
+				}
+				versionCount, err := dec.ReadUint32()
+				if err != nil {
+					return nil, err
+				}
+				versions := make([]recordVersion, versionCount)
+				for j := uint32(0); j < versionCount; j++ {
+					beginLSN, err := dec.ReadUint64()
+					if err != nil {
+						return nil, err
+					}
+					endLSN, err := dec.ReadUint64()
+					if err != nil {
+						return nil, err
+					}
+					ordinal, err := dec.ReadUint32()
+					if err != nil {
+						return nil, err
+					}
+					vector, err := dec.ReadVector()
+					if err != nil {
+						return nil, err
+					}
+					metadata, err := dec.ReadMetadata()
+					if err != nil {
+						return nil, err
+					}
+					versions[j] = recordVersion{
+						BeginLSN: beginLSN, EndLSN: endLSN, Ordinal: ordinal,
+						Vector: vector, Metadata: metadata,
+					}
+				}
+				collection.HistoricalVersions[recID] = versions
+			}
 		}
 	}
 	return collection, nil
