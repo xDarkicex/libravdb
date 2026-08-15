@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xDarkicex/libraVDB/libravdb"
+	"github.com/xDarkicex/libravdb/libravdb"
 )
 
 func main() {
