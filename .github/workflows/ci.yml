@@ -102,6 +102,9 @@ jobs:
         with:
           go-version: 1.25.x
 
+      - name: Resolve published lexer module
+        run: go mod edit -dropreplace=github.com/xDarkicex/lexer
+
       - name: Run govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
