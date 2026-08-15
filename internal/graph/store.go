@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -20,7 +21,7 @@ import (
 type StagedGraphOpKind uint8
 
 const (
-	StagedGraphEdgeAdd    StagedGraphOpKind = iota
+	StagedGraphEdgeAdd StagedGraphOpKind = iota
 	StagedGraphEdgeRemove
 	StagedGraphNodeDrop
 )
@@ -35,6 +36,7 @@ type StagedGraphOp struct {
 	Tgt        uint64
 	EdgeKind   uint8
 	Weight     float32
+	Properties []byte
 	NodeID     uint64
 }
 
@@ -114,22 +116,27 @@ func (t *Txn) commitCow() error {
 	// forwardAdds: edges to add to forward index (keyed by src node)
 	// reverseAdds: edges to add to reverse index (keyed by tgt node)
 	type edgeWithKind struct {
-		tgt   uint64
-		kind  uint8
+		tgt    uint64
+		kind   uint8
 		weight float32
 	}
-	forwardAdds := make(map[uint64][]Edge)
-	reverseAdds := make(map[uint64][]Edge)
+	type edgeWithProperties struct {
+		Edge
+		Properties []byte
+	}
+	forwardAdds := make(map[uint64][]edgeWithProperties)
+	reverseAdds := make(map[uint64][]edgeWithProperties)
 	forwardRemoves := make(map[uint64][]edgeWithKind)
 
 	for _, op := range t.adds {
 		fEdge := Edge{Target: op.Tgt, Weight: op.Weight}
 		fEdge.SetKind(op.Kind)
-		forwardAdds[op.Src] = append(forwardAdds[op.Src], fEdge)
+		fEdge.PropertyRef = 0
+		forwardAdds[op.Src] = append(forwardAdds[op.Src], edgeWithProperties{Edge: fEdge, Properties: op.Properties})
 
 		rEdge := Edge{Target: op.Src, Weight: op.Weight}
 		rEdge.SetKind(op.Kind)
-		reverseAdds[op.Tgt] = append(reverseAdds[op.Tgt], rEdge)
+		reverseAdds[op.Tgt] = append(reverseAdds[op.Tgt], edgeWithProperties{Edge: rEdge, Properties: op.Properties})
 	}
 	for _, op := range t.removes {
 		forwardRemoves[op.Src] = append(forwardRemoves[op.Src], edgeWithKind{op.Tgt, op.Kind, 0})
@@ -154,7 +161,9 @@ func (t *Txn) commitCow() error {
 			page = g.newPage(g.pagePools[0], shard)
 		}
 		for _, e := range edges {
-			g.writeEdgeToClonedPage(page, e)
+			if err := g.writeEdgeToClonedPage(page, e.Edge, e.Properties, g.pagePools[0], shard); err != nil {
+				return fmt.Errorf("write forward edge properties for node %d: %w", nodeID, err)
+			}
 		}
 		cowPages[nodeID] = page
 	}
@@ -173,7 +182,9 @@ func (t *Txn) commitCow() error {
 			page = g.newPage(g.reverse.pool, shard)
 		}
 		for _, e := range edges {
-			g.writeEdgeToClonedPage(page, e)
+			if err := g.writeEdgeToClonedPage(page, e.Edge, e.Properties, g.reverse.pool, shard); err != nil {
+				return fmt.Errorf("write reverse edge properties for node %d: %w", nodeID, err)
+			}
 		}
 		cowReverse[nodeID] = page
 	}
@@ -181,12 +192,16 @@ func (t *Txn) commitCow() error {
 	// Phase C: Atomic index swap.
 	for nodeID, newPage := range cowPages {
 		oldPage := g.index.Lookup(nodeID)
-		g.index.Insert(nodeID, newPage)
 		if oldPage != nil {
-			g.retirePageChain(nodeID, g.index, g.pagePools[0])
-			// Re-insert new page after retirement cleared it.
-			g.index.Insert(nodeID, newPage)
+			// Retire the old chain before publishing the replacement. Looking up
+			// the node after publishing would otherwise retire the new page.
+			g.index.Delete(nodeID)
+			g.index.Insert(nodeID, oldPage)
+			if err := g.retirePageChain(nodeID, g.index, g.pagePools[0]); err != nil {
+				return err
+			}
 		}
+		g.index.Insert(nodeID, newPage)
 	}
 	for nodeID, newPage := range cowReverse {
 		g.reverse.locator.Insert(nodeID, newPage)
@@ -208,37 +223,45 @@ func (t *Txn) commitCow() error {
 // The clone is a full deep copy registered in g.pageReg, so overflow
 // chain traversal works via g.pageReg.Get(cloned.Header.Overflow).
 // No spinlock — the clone is private to this goroutine.
-func (g *graphStore) writeEdgeToClonedPage(page *EdgeTablePage, edge Edge) {
+func (g *graphStore) writeEdgeToClonedPage(page *EdgeTablePage, edge Edge, properties []byte, pool *memory.ShardedFreeList, shard int) error {
+	if len(properties) > 0 {
+		ref, err := g.appendPropertyBytes(page, properties, pool, shard)
+		if err != nil {
+			return err
+		}
+		edge.PropertyRef = ref
+	}
 	totalCount := page.Header.Count
-	if totalCount < 8 {
+	if totalCount < EdgePageInlineCapacity {
 		page.Inline[totalCount] = edge
 		page.Header.Count++
-		return
+		return nil
 	}
 
 	currPage := page
 	edgesToSkip := totalCount
-	for edgesToSkip >= 250 {
+	for edgesToSkip >= EdgePageCapacity {
 		if currPage.Header.Overflow == 0 {
-			return
+			return fmt.Errorf("edge page chain is missing overflow page")
 		}
 		currPage = g.pageReg.Get(currPage.Header.Overflow)
 		if currPage == nil {
-			return
+			return fmt.Errorf("edge page chain references missing overflow page")
 		}
-		edgesToSkip -= 250
+		edgesToSkip -= EdgePageCapacity
 	}
 
-	if edgesToSkip < 8 {
+	if edgesToSkip < EdgePageInlineCapacity {
 		currPage.Inline[edgesToSkip] = edge
 	} else {
-		idx := edgesToSkip - 8
-		if idx < 242 {
-			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
+		idx := edgesToSkip - EdgePageInlineCapacity
+		if idx < EdgePageOverflowCapacity {
+			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
 			extra[idx] = edge
 		}
 	}
 	page.Header.Count++
+	return nil
 }
 
 // Rollback discards all staged graph mutations. Since graph operations are
@@ -329,22 +352,68 @@ func (t *Txn) RemapNodeIDs(mapping map[uint64]uint64) {
 // topology. Called after the storage engine has durably committed the
 // combined record+graph WAL transaction.
 func (t *Txn) ApplyInMemory() error {
+	return t.applyInMemory(0)
+}
+
+// ApplyInMemoryAtLSN publishes staged graph operations and records their
+// exact durable transaction boundary for temporal graph visibility. This is
+// used by combined record+graph commits after the storage WAL commit marker
+// has reached stable storage.
+func (t *Txn) ApplyInMemoryAtLSN(lsn uint64) error {
+	if lsn == 0 {
+		return fmt.Errorf("graph commit LSN must be non-zero")
+	}
+	return t.applyInMemory(lsn)
+}
+
+func (t *Txn) applyInMemory(lsn uint64) error {
 	if t == nil || t.closed {
 		return fmt.Errorf("graph transaction is closed")
 	}
 	t.closed = true
-	return t.store.applyCommittedOps(t.adds, t.removes, t.nodeDrops)
+	if err := t.store.applyCommittedOps(t.adds, t.removes, t.nodeDrops); err != nil {
+		return err
+	}
+	if lsn != 0 {
+		t.store.recordEdgeCommitLSN(lsn, t.adds, t.removes, t.nodeDrops)
+	}
+	return nil
 }
 
 // AddEdge adds a directed edge to the graph within this transaction.
 func (t *Txn) AddEdge(src, tgt uint64, weight float32, kind uint8) error {
+	return t.AddEdgeWithPropertiesJSON(src, tgt, weight, kind, nil)
+}
+
+// AddEdgeWithProperties adds an edge with a Go property object. The object is
+// normalized into the versioned JSON envelope before it enters the staged/WAL
+// operation, so callers cannot mutate committed bytes through a retained map.
+func (t *Txn) AddEdgeWithProperties(src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error {
+	encoded, err := EncodeEdgeProperties(properties)
+	if err != nil {
+		return err
+	}
+	return t.AddEdgeWithPropertiesJSON(src, tgt, weight, kind, encoded)
+}
+
+// AddEdgeWithPropertiesJSON is the internal/native byte-oriented mutation
+// seam. Input may be a JSON object or an already normalized property envelope.
+func (t *Txn) AddEdgeWithPropertiesJSON(src, tgt uint64, weight float32, kind uint8, properties []byte) error {
 	if t == nil || t.closed {
 		return fmt.Errorf("graph transaction is closed")
 	}
-	t.adds = append(t.adds, storage.GraphEdgeOp{Collection: t.collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind})
+	if len(properties) > 0 && properties[0] != EdgePropertyEncodingVersion {
+		var err error
+		properties, err = NormalizeEdgeProperties(properties)
+		if err != nil {
+			return err
+		}
+	}
+	properties = append([]byte(nil), properties...)
+	t.adds = append(t.adds, storage.GraphEdgeOp{Collection: t.collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind, Properties: properties})
 	t.orderedOps = append(t.orderedOps, StagedGraphOp{
 		Kind: StagedGraphEdgeAdd, Collection: t.collection,
-		Src: src, Tgt: tgt, EdgeKind: kind, Weight: weight,
+		Src: src, Tgt: tgt, EdgeKind: kind, Weight: weight, Properties: append([]byte(nil), properties...),
 	})
 	return nil
 }
@@ -438,6 +507,44 @@ func (t *Txn) NeighborsOverlay(nodeID uint64) ([]Edge, error) {
 	return base, nil
 }
 
+// NeighborsOverlayWithProperties is the property-aware epoch overlay used by
+// MATCH traversal. Staged properties are copied into the returned views and
+// are never backed by caller-owned memory.
+func (t *Txn) NeighborsOverlayWithProperties(nodeID uint64) ([]EdgeView, error) {
+	if t == nil || t.closed {
+		return nil, fmt.Errorf("graph transaction is closed")
+	}
+	var base []EdgeView
+	var err error
+	if t.epochLSN > 0 {
+		base, err = t.store.NeighborsAtLSNWithProperties(nodeID, t.epochLSN)
+	} else {
+		base, err = t.store.NeighborsWithProperties(nodeID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, op := range t.removes {
+		if op.Src != nodeID {
+			continue
+		}
+		for i := range base {
+			if base[i].Edge.Target == op.Tgt && base[i].Edge.GetKind() == op.Kind {
+				base = append(base[:i], base[i+1:]...)
+				break
+			}
+		}
+	}
+	for _, op := range t.adds {
+		if op.Src != nodeID {
+			continue
+		}
+		e := Edge{Target: op.Tgt, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
+		base = append(base, EdgeView{Edge: e, Properties: append([]byte(nil), op.Properties...)})
+	}
+	return base, nil
+}
+
 // InboundNeighborsAtLSN returns inbound edges (v→nodeID) visible at snapshotLSN.
 // Combines live inbound edges with temporal-only edges visible at the snapshot.
 func (g *graphStore) InboundNeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error) {
@@ -496,6 +603,48 @@ func (g *graphStore) InboundNeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([
 	return result, nil
 }
 
+func (g *graphStore) InboundNeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
+	liveEdges, err := g.InboundNeighborsWithProperties(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	g.temporalMu.Lock()
+	defer g.temporalMu.Unlock()
+	seen := make(map[edgeTemporalKey]bool)
+	var result []EdgeView
+	for _, view := range liveEdges {
+		key := edgeTemporalKey{Src: view.Edge.Target, Tgt: nodeID, Kind: view.Edge.GetKind()}
+		state, ok := g.temporalEdges[key]
+		if !ok {
+			result = append(result, view)
+			seen[key] = true
+			continue
+		}
+		for i := len(state.Versions) - 1; i >= 0; i-- {
+			v := state.Versions[i]
+			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+				result = append(result, view)
+				seen[key] = true
+				break
+			}
+		}
+	}
+	for key, state := range g.temporalEdges {
+		if key.Tgt != nodeID || seen[key] {
+			continue
+		}
+		for i := len(state.Versions) - 1; i >= 0; i-- {
+			v := state.Versions[i]
+			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
+				e := Edge{Target: key.Src, Weight: v.Weight, Stamp: uint32(key.Kind) << 24}
+				result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
 // InboundNeighborsOverlay is the inbound counterpart of NeighborsOverlay.
 func (t *Txn) InboundNeighborsOverlay(nodeID uint64) ([]Edge, error) {
 	if t == nil || t.closed {
@@ -530,6 +679,41 @@ func (t *Txn) InboundNeighborsOverlay(nodeID uint64) ([]Edge, error) {
 	return base, nil
 }
 
+func (t *Txn) InboundNeighborsOverlayWithProperties(nodeID uint64) ([]EdgeView, error) {
+	if t == nil || t.closed {
+		return nil, fmt.Errorf("graph transaction is closed")
+	}
+	var base []EdgeView
+	var err error
+	if t.epochLSN > 0 {
+		base, err = t.store.InboundNeighborsAtLSNWithProperties(nodeID, t.epochLSN)
+	} else {
+		base, err = t.store.InboundNeighborsWithProperties(nodeID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, op := range t.removes {
+		if op.Tgt != nodeID {
+			continue
+		}
+		for i := range base {
+			if base[i].Edge.Target == op.Src && base[i].Edge.GetKind() == op.Kind {
+				base = append(base[:i], base[i+1:]...)
+				break
+			}
+		}
+	}
+	for _, op := range t.adds {
+		if op.Tgt != nodeID {
+			continue
+		}
+		e := Edge{Target: op.Src, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
+		base = append(base, EdgeView{Edge: e, Properties: append([]byte(nil), op.Properties...)})
+	}
+	return base, nil
+}
+
 // InboundNeighborsAtLSN is now on the Graph interface for epoch inbound queries.
 // It delegates to the store-level implementation above.
 
@@ -537,12 +721,16 @@ func (t *Txn) InboundNeighborsOverlay(nodeID uint64) ([]Edge, error) {
 type Graph interface {
 	BeginTxn() *Txn
 	AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uint8) error
+	AddEdgeWithProperties(txn *Txn, src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error
 	RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *Txn, nodeID uint64) error
 	Neighbors(nodeID uint64) ([]Edge, error)
+	NeighborsWithProperties(nodeID uint64) ([]EdgeView, error)
 	NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error)
+	NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error)
 	Degree(nodeID uint64) (int, error)
 	InboundNeighbors(nodeID uint64) ([]Edge, error)
+	InboundNeighborsWithProperties(nodeID uint64) ([]EdgeView, error)
 	InboundDegree(nodeID uint64) (int, error)
 	NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error)
 	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
@@ -569,10 +757,16 @@ type graphStore struct {
 	cfg            GraphConfig
 	edgePool       *memory.ShardedFreeList
 	pagePools      []*memory.ShardedFreeList // segmented
+	pagePoolsMu    sync.RWMutex
+	writeMu        sync.Mutex
 	pageSegments   map[*EdgeTablePage]int
+	pageOwners     map[*EdgeTablePage]*memory.ShardedFreeList
+	propertyOwners map[*EdgePropertyPage]*memory.ShardedFreeList
+	ownersMu       sync.RWMutex
 	bitsetPool     *memory.ShardedFreeList
 	frontierPool   *memory.ShardedFreeList
 	pageReg        *PageRegistry
+	propertyReg    *PropertyPageRegistry
 	index          *EdgeTableIndex
 	reverse        *ReverseIndex
 	manifest       *DBManifest
@@ -608,9 +802,10 @@ type edgeTemporalKey struct {
 // (EndLSN == 0 means still live). Versions in a chain are ordered by BeginLSN
 // and never overlap.
 type edgeTemporalVersion struct {
-	BeginLSN uint64
-	EndLSN   uint64 // 0 = currently live
-	Weight   float32
+	BeginLSN   uint64
+	EndLSN     uint64 // 0 = currently live
+	Weight     float32
+	Properties []byte
 }
 
 // edgeTemporalState holds the ordered version chain for one edge identity.
@@ -680,17 +875,20 @@ func NewGraph(cfg GraphConfig) (Graph, error) {
 	}
 
 	return &graphStore{
-		cfg:          cfg,
-		edgePool:     edgePool,
-		pagePools:    []*memory.ShardedFreeList{pagePool0},
-		pageSegments: make(map[*EdgeTablePage]int),
-		bitsetPool:   bitsetPool,
-		frontierPool: frontierPool,
-		pageReg:      NewPageRegistry(),
-		index:        NewEdgeTableIndex(1024),
-		reverse:      revIdx,
-		manifest:     NewDBManifest(),
-		labelToNodes: make(map[string][]uint64),
+		cfg:            cfg,
+		edgePool:       edgePool,
+		pagePools:      []*memory.ShardedFreeList{pagePool0},
+		pageSegments:   make(map[*EdgeTablePage]int),
+		pageOwners:     make(map[*EdgeTablePage]*memory.ShardedFreeList),
+		propertyOwners: make(map[*EdgePropertyPage]*memory.ShardedFreeList),
+		bitsetPool:     bitsetPool,
+		frontierPool:   frontierPool,
+		pageReg:        NewPageRegistry(),
+		propertyReg:    NewPropertyPageRegistry(),
+		index:          NewEdgeTableIndex(1024),
+		reverse:        revIdx,
+		manifest:       NewDBManifest(),
+		labelToNodes:   make(map[string][]uint64),
 	}, nil
 }
 
@@ -741,14 +939,21 @@ func unlockPage(m *uint64) {
 // For non-segmented pools (reverse index), it falls through to pool.Allocate().
 func (g *graphStore) allocatePageSlot(pool *memory.ShardedFreeList, shard int) (*memory.ShardedFreeList, []byte, error) {
 	// Only segment the forward page pool; reverse pool is standalone.
-	if pool != g.pagePools[0] {
+	g.pagePoolsMu.RLock()
+	isForward := len(g.pagePools) > 0 && pool == g.pagePools[0]
+	g.pagePoolsMu.RUnlock()
+	if !isForward {
 		slot, err := pool.Allocate()
 		return pool, slot, err
 	}
+
+	// Pool growth and the slice append are serialized with readers. Readers
+	// hold pagePoolsMu.RLock while entering every live pool, so a page cannot be
+	// published from a newly-created segment outside their protection set.
+	g.pagePoolsMu.Lock()
+	defer g.pagePoolsMu.Unlock()
 	for i := len(g.pagePools) - 1; i >= 0; i-- {
-		g.pagePools[i].HyalineEnter(shard)
 		slot, err := g.pagePools[i].Allocate()
-		g.pagePools[i].HyalineLeave(shard)
 		if err == nil {
 			return g.pagePools[i], slot, nil
 		}
@@ -767,168 +972,167 @@ func (g *graphStore) allocatePageSlot(pool *memory.ShardedFreeList, shard int) (
 		return nil, nil, err
 	}
 	g.pagePools = append(g.pagePools, newPool)
-	newPool.HyalineEnter(shard)
 	slot, err := newPool.Allocate()
-	newPool.HyalineLeave(shard)
 	if err != nil {
+		_ = newPool.Free()
+		g.pagePools = g.pagePools[:len(g.pagePools)-1]
 		return nil, nil, err
 	}
 	return newPool, slot, nil
 }
 
-func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
+func (g *graphStore) appendEdgeToTable(nodeID uint64, edge Edge, properties []byte, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
 	shard := nodeID % uint64(g.cfg.PageShards)
-	pool.HyalineEnter(int(shard))
-	defer pool.HyalineLeave(int(shard))
+	return g.withHyalineWrite(pool, int(shard), func() error {
 
-	page := index.Lookup(nodeID)
+		page := index.Lookup(nodeID)
 
-	if page == nil {
-		_, slotBytes, err := g.allocatePageSlot(pool, int(shard))
-		if err != nil {
-			// Memory exhaustion handling: attempt GC and retry
-			runtime.GC()
-			_, slotBytes, err = g.allocatePageSlot(pool, int(shard))
+		if page == nil {
+			actualPool, slotBytes, err := g.allocatePageSlot(pool, int(shard))
 			if err != nil {
+				// Memory exhaustion handling: attempt GC and retry
+				runtime.GC()
+				actualPool, slotBytes, err = g.allocatePageSlot(pool, int(shard))
+				if err != nil {
+					return err
+				}
+			}
+			g.metrics.pagesAllocated.Add(1)
+			// The user data area starts at offset 64.
+			page = (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
+
+			page.Header.Count = 0
+			page.Header.InlineCap = EdgePageInlineCapacity
+			page.Header.Overflow = 0
+			page.Header.PropertyRoot = 0
+			page.Header.Generation = 0
+			page.Header.Mutex = 0
+			page.Header.HyalineSlot = uint16(shard)
+			page.Header.LayoutTag = LayoutV3
+
+			g.rememberPageOwner(page, actualPool)
+			page.Header.PageSlot = g.pageReg.Register(page)
+
+			actualPage, loaded := index.InsertIfAbsent(nodeID, page)
+			if loaded {
+				// Another thread concurrently created the page.
+				g.pageReg.Unregister(page.Header.PageSlot)
+				g.forgetPageOwner(page)
+				if err := actualPool.Deallocate(slotBytes); err != nil {
+					return err
+				}
+				g.metrics.pagesAllocated.Add(^uint64(0))
+				page = actualPage
+			}
+		}
+
+		if !tryLockPage(&page.Header.Mutex) {
+			return ErrConcurrentModification
+		}
+
+		totalCount := page.Header.Count
+		if len(properties) > 0 {
+			ref, err := g.appendPropertyBytes(page, properties, pool, int(shard))
+			if err != nil {
+				unlockPage(&page.Header.Mutex)
 				return err
 			}
+			edge.PropertyRef = ref
 		}
-		g.metrics.pagesAllocated.Add(1)
-		// The user data area starts at offset 64.
-		page = (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
-
-		page.Header.Count = 0
-		page.Header.InlineCap = 8
-		page.Header.Overflow = 0
-		page.Header.Generation = 0
-		page.Header.Mutex = 0
-		page.Header.HyalineSlot = uint16(shard)
-		page.Header.LayoutTag = LayoutV2
-
-		page.Header.PageSlot = g.pageReg.Register(page)
-
-		actualPage, loaded := index.InsertIfAbsent(nodeID, page)
-		if loaded {
-			// Another thread concurrently created the page.
-			g.pageReg.Unregister(page.Header.PageSlot)
-			pool.Deallocate(slotBytes)
-			if pool == g.pagePools[0] {
-				// Decrement by 1 using two's complement for atomic Add
-				g.metrics.pagesAllocated.Add(^uint64(0))
-			}
-			page = actualPage
-		}
-	}
-
-	if !tryLockPage(&page.Header.Mutex) {
-		return ErrConcurrentModification
-	}
-
-	totalCount := page.Header.Count
-	if totalCount < 8 {
-		page.Inline[totalCount] = edge
-	} else {
-		currPage := page
-		edgesToSkip := totalCount
-
-		for edgesToSkip >= 250 {
-			if currPage.Header.Overflow == 0 {
-				_, slotBytes, err := g.allocatePageSlot(pool, int(shard))
-				if err != nil {
-					// Memory exhaustion handling: attempt GC and retry
-					runtime.GC()
-					slotBytes, err = pool.Allocate()
-					if err != nil {
-						unlockPage(&page.Header.Mutex)
-						return err
-					}
-				}
-				g.metrics.pagesAllocated.Add(1)
-				g.metrics.overfullPages.Add(1)
-				newPage := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
-				newPage.Header.Overflow = 0
-				newPage.Header.LayoutTag = LayoutV2
-
-				newSlot := g.pageReg.Register(newPage)
-				currPage.Header.Overflow = newSlot
-			}
-			currPage = g.pageReg.Get(currPage.Header.Overflow)
-			edgesToSkip -= 250
-		}
-
-		if edgesToSkip < 8 {
-			currPage.Inline[edgesToSkip] = edge
+		if totalCount < EdgePageInlineCapacity {
+			page.Inline[totalCount] = edge
 		} else {
-			idx := edgesToSkip - 8
-			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
-			extra[idx] = edge
+			currPage := page
+			edgesToSkip := totalCount
+
+			for edgesToSkip >= EdgePageCapacity {
+				if currPage.Header.Overflow == 0 {
+					actualPool, slotBytes, err := g.allocatePageSlot(pool, int(shard))
+					if err != nil {
+						// Memory exhaustion handling: attempt GC and retry
+						runtime.GC()
+						actualPool, slotBytes, err = g.allocatePageSlot(pool, int(shard))
+						if err != nil {
+							unlockPage(&page.Header.Mutex)
+							return err
+						}
+					}
+					g.metrics.pagesAllocated.Add(1)
+					g.metrics.overfullPages.Add(1)
+					newPage := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
+					newPage.Header.Overflow = 0
+					newPage.Header.PropertyRoot = 0
+					newPage.Header.Count = 0
+					newPage.Header.InlineCap = EdgePageInlineCapacity
+					newPage.Header.LayoutTag = LayoutV3
+
+					g.rememberPageOwner(newPage, actualPool)
+					newSlot := g.pageReg.Register(newPage)
+					currPage.Header.Overflow = newSlot
+				}
+				currPage = g.pageReg.Get(currPage.Header.Overflow)
+				edgesToSkip -= EdgePageCapacity
+			}
+
+			if edgesToSkip < EdgePageInlineCapacity {
+				currPage.Inline[edgesToSkip] = edge
+			} else {
+				idx := edgesToSkip - EdgePageInlineCapacity
+				extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
+				extra[idx] = edge
+			}
 		}
-	}
 
-	page.Header.Count++
+		page.Header.Count++
 
-	atomic.AddUint32(&page.Header.Generation, 1)
-	unlockPage(&page.Header.Mutex)
+		atomic.AddUint32(&page.Header.Generation, 1)
+		unlockPage(&page.Header.Mutex)
 
-	return nil
+		return nil
+	})
 }
 
 func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, kindToRemove uint8, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
 	shard := nodeID % uint64(g.cfg.PageShards)
-	pool.HyalineEnter(int(shard))
-	defer pool.HyalineLeave(int(shard))
+	return g.withHyalineWrite(pool, int(shard), func() error {
 
-	page := index.Lookup(nodeID)
-	if page == nil {
-		return ErrEdgeNotFound
-	}
-
-	// page already set
-
-	if !tryLockPage(&page.Header.Mutex) {
-		return ErrConcurrentModification
-	}
-	defer unlockPage(&page.Header.Mutex)
-
-	totalCount := page.Header.Count
-	if totalCount == 0 {
-		return ErrEdgeNotFound
-	}
-
-	var targetEdgePtr *Edge
-	var lastEdgePtr *Edge
-	var prevToLastPage *EdgeTablePage
-	var lastPage *EdgeTablePage = page
-
-	currPage := page
-	remaining := totalCount
-
-	for currPage != nil && remaining > 0 {
-		pageCount := remaining
-		if pageCount > 250 {
-			pageCount = 250
+		page := index.Lookup(nodeID)
+		if page == nil {
+			return ErrEdgeNotFound
 		}
 
-		inlineLimit := pageCount
-		if inlineLimit > 8 {
-			inlineLimit = 8
+		// page already set
+
+		if !tryLockPage(&page.Header.Mutex) {
+			return ErrConcurrentModification
 		}
-		for i := uint16(0); i < inlineLimit; i++ {
-			edge := &currPage.Inline[i]
-			if targetEdgePtr == nil && edge.Target == targetToRemove && edge.GetKind() == kindToRemove {
-				targetEdgePtr = edge
+		defer unlockPage(&page.Header.Mutex)
+
+		totalCount := page.Header.Count
+		if totalCount == 0 {
+			return ErrEdgeNotFound
+		}
+
+		var targetEdgePtr *Edge
+		var lastEdgePtr *Edge
+		var prevToLastPage *EdgeTablePage
+		var lastPage *EdgeTablePage = page
+
+		currPage := page
+		remaining := totalCount
+
+		for currPage != nil && remaining > 0 {
+			pageCount := remaining
+			if pageCount > EdgePageCapacity {
+				pageCount = EdgePageCapacity
 			}
-			if remaining == 1 {
-				lastEdgePtr = edge
-			}
-			remaining--
-		}
 
-		if pageCount > 8 {
-			extraCount := pageCount - 8
-			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
-			for i := uint16(0); i < extraCount; i++ {
-				edge := &extra[i]
+			inlineLimit := pageCount
+			if inlineLimit > 8 {
+				inlineLimit = 8
+			}
+			for i := uint16(0); i < inlineLimit; i++ {
+				edge := &currPage.Inline[i]
 				if targetEdgePtr == nil && edge.Target == targetToRemove && edge.GetKind() == kindToRemove {
 					targetEdgePtr = edge
 				}
@@ -937,50 +1141,74 @@ func (g *graphStore) removeEdgeFromTable(nodeID uint64, targetToRemove uint64, k
 				}
 				remaining--
 			}
-		}
 
-		if remaining > 0 {
-			if currPage.Header.Overflow != 0 {
-				prevToLastPage = currPage
-				currPage = g.pageReg.Get(currPage.Header.Overflow)
-				lastPage = currPage
+			if pageCount > EdgePageInlineCapacity {
+				extraCount := pageCount - EdgePageInlineCapacity
+				extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
+				for i := uint16(0); i < extraCount; i++ {
+					edge := &extra[i]
+					if targetEdgePtr == nil && edge.Target == targetToRemove && edge.GetKind() == kindToRemove {
+						targetEdgePtr = edge
+					}
+					if remaining == 1 {
+						lastEdgePtr = edge
+					}
+					remaining--
+				}
+			}
+
+			if remaining > 0 {
+				if currPage.Header.Overflow != 0 {
+					prevToLastPage = currPage
+					currPage = g.pageReg.Get(currPage.Header.Overflow)
+					lastPage = currPage
+				} else {
+					currPage = nil
+				}
 			} else {
 				currPage = nil
 			}
-		} else {
-			currPage = nil
 		}
-	}
 
-	if targetEdgePtr == nil {
-		return ErrEdgeNotFound
-	}
-
-	*targetEdgePtr = *lastEdgePtr
-
-	page.Header.Count--
-	atomic.AddUint32(&page.Header.Generation, 1)
-
-	if totalCount > 250 && (totalCount-1)%250 == 0 {
-		if prevToLastPage != nil {
-			prevToLastPage.Header.Overflow = 0
-			slotBytes := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(lastPage), -64)), 4096)
-			pool.Retire(slotBytes)
+		if targetEdgePtr == nil {
+			return ErrEdgeNotFound
 		}
-	}
-	return nil
+
+		*targetEdgePtr = *lastEdgePtr
+
+		page.Header.Count--
+		atomic.AddUint32(&page.Header.Generation, 1)
+
+		if totalCount > EdgePageCapacity && (totalCount-1)%EdgePageCapacity == 0 {
+			if prevToLastPage != nil {
+				prevToLastPage.Header.Overflow = 0
+				slotBytes := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(lastPage), -64)), 4096)
+				owner := g.forgetPageOwner(lastPage)
+				g.pageReg.Unregister(lastPage.Header.PageSlot)
+				if owner == nil {
+					return fmt.Errorf("graph: missing owner for overflow page %d", lastPage.Header.PageSlot)
+				}
+				if err := owner.Retire(slotBytes); err != nil {
+					return fmt.Errorf("retire overflow page %d: %w", lastPage.Header.PageSlot, err)
+				}
+			}
+		}
+		return nil
+	})
 }
 
 func (g *graphStore) neighborsFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, numShards int) ([]Edge, error) {
 	shard := nodeID % uint64(numShards)
 
 retry:
-	pool.HyalineEnter(int(shard))
+	guard, err := g.enterHyaline(pool, int(shard))
+	if err != nil {
+		return nil, err
+	}
 
 	page := index.Lookup(nodeID)
 	if page == nil {
-		pool.HyalineLeave(int(shard))
-		return []Edge{}, nil
+		return []Edge{}, guard.leave()
 	}
 
 	// page already set
@@ -994,17 +1222,17 @@ retry:
 
 	for currPage != nil && remaining > 0 {
 		pageCount := remaining
-		if pageCount > 250 {
-			pageCount = 250
+		if pageCount > EdgePageCapacity {
+			pageCount = EdgePageCapacity
 		}
 
-		if pageCount <= 8 {
+		if pageCount <= EdgePageInlineCapacity {
 			edges = append(edges, currPage.Inline[:pageCount]...)
 			remaining -= pageCount
 		} else {
-			edges = append(edges, currPage.Inline[:8]...)
-			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), 242)
-			extraCount := pageCount - 8
+			edges = append(edges, currPage.Inline[:EdgePageInlineCapacity]...)
+			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
+			extraCount := pageCount - EdgePageInlineCapacity
 			edges = append(edges, extra[:extraCount]...)
 			remaining -= pageCount
 		}
@@ -1018,12 +1246,74 @@ retry:
 	}
 
 	if atomic.LoadUint32(&page.Header.Generation) != gen {
-		pool.HyalineLeave(int(shard))
+		if err := guard.leave(); err != nil {
+			return nil, err
+		}
 		goto retry
 	}
 
-	pool.HyalineLeave(int(shard))
-	return edges, nil
+	return edges, guard.leave()
+}
+
+func (g *graphStore) neighborsWithPropertiesFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, numShards int) ([]EdgeView, error) {
+	shard := nodeID % uint64(numShards)
+	payload := func(edge Edge) ([]byte, error) {
+		return g.propertyBytes(edge.PropertyRef)
+	}
+
+retry:
+	guard, err := g.enterHyaline(pool, int(shard))
+	if err != nil {
+		return nil, err
+	}
+	page := index.Lookup(nodeID)
+	if page == nil {
+		return []EdgeView{}, guard.leave()
+	}
+	gen := atomic.LoadUint32(&page.Header.Generation)
+	views := make([]EdgeView, 0, page.Header.Count)
+	currPage := page
+	remaining := page.Header.Count
+	for currPage != nil && remaining > 0 {
+		pageCount := remaining
+		if pageCount > EdgePageCapacity {
+			pageCount = EdgePageCapacity
+		}
+		inlineCount := pageCount
+		if inlineCount > EdgePageInlineCapacity {
+			inlineCount = EdgePageInlineCapacity
+		}
+		for i := 0; i < int(inlineCount); i++ {
+			props, err := payload(currPage.Inline[i])
+			if err != nil {
+				return nil, errors.Join(err, guard.leave())
+			}
+			views = append(views, EdgeView{Edge: currPage.Inline[i], Properties: props})
+		}
+		if pageCount > EdgePageInlineCapacity {
+			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
+			for i := 0; i < int(pageCount-EdgePageInlineCapacity); i++ {
+				props, err := payload(extra[i])
+				if err != nil {
+					return nil, errors.Join(err, guard.leave())
+				}
+				views = append(views, EdgeView{Edge: extra[i], Properties: props})
+			}
+		}
+		remaining -= pageCount
+		if currPage.Header.Overflow == 0 {
+			currPage = nil
+		} else {
+			currPage = g.pageReg.Get(currPage.Header.Overflow)
+		}
+	}
+	if atomic.LoadUint32(&page.Header.Generation) != gen {
+		if err := guard.leave(); err != nil {
+			return nil, err
+		}
+		goto retry
+	}
+	return views, guard.leave()
 }
 
 // BeginTxn starts a new graph transaction.
@@ -1075,7 +1365,7 @@ func (g *graphStore) recordEdgeCommitLSN(lsn uint64, adds, removes []storage.Gra
 			}
 		}
 		state.Versions = append(state.Versions, edgeTemporalVersion{
-			BeginLSN: lsn, EndLSN: 0, Weight: add.Weight,
+			BeginLSN: lsn, EndLSN: 0, Weight: add.Weight, Properties: append([]byte(nil), add.Properties...),
 		})
 	}
 	for _, remove := range removes {
@@ -1105,7 +1395,7 @@ func (g *graphStore) recordEdgeCommitLSN(lsn uint64, adds, removes []storage.Gra
 
 // RecordEdgeAddLSN is used during WAL replay to directly register an edge
 // add at a known LSN without going through the pending queue.
-func (g *graphStore) RecordEdgeAddLSN(src, tgt uint64, weight float32, kind uint8, lsn uint64) {
+func (g *graphStore) RecordEdgeAddLSN(src, tgt uint64, weight float32, kind uint8, properties []byte, lsn uint64) {
 	g.temporalMu.Lock()
 	defer g.temporalMu.Unlock()
 	if g.temporalEdges == nil {
@@ -1124,7 +1414,7 @@ func (g *graphStore) RecordEdgeAddLSN(src, tgt uint64, weight float32, kind uint
 		}
 	}
 	state.Versions = append(state.Versions, edgeTemporalVersion{
-		BeginLSN: lsn, EndLSN: 0, Weight: weight,
+		BeginLSN: lsn, EndLSN: 0, Weight: weight, Properties: append([]byte(nil), properties...),
 	})
 }
 
@@ -1150,7 +1440,19 @@ func (g *graphStore) RecordEdgeRemoveLSN(src, tgt uint64, kind uint8, lsn uint64
 // visible at the snapshot. Pre-temporal edges (no temporal state) are always
 // included. Temporal edges are filtered by version chain visibility.
 func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error) {
-	liveEdges, err := g.Neighbors(nodeID)
+	views, err := g.NeighborsAtLSNWithProperties(nodeID, snapshotLSN)
+	if err != nil {
+		return nil, err
+	}
+	edges := make([]Edge, len(views))
+	for i := range views {
+		edges[i] = views[i].Edge
+	}
+	return edges, nil
+}
+
+func (g *graphStore) NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
+	liveEdges, err := g.NeighborsWithProperties(nodeID)
 	g.temporalMu.Lock()
 	defer g.temporalMu.Unlock()
 	if err != nil {
@@ -1160,14 +1462,15 @@ func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, 
 	// Build result set: start with live edges, remove those not visible
 	// at snapshot, add temporal-only edges that were visible.
 	seen := make(map[edgeTemporalKey]bool)
-	var result []Edge
+	var result []EdgeView
 
 	// Pass 1: include live edges visible at snapshot.
-	for _, e := range liveEdges {
+	for _, view := range liveEdges {
+		e := view.Edge
 		key := edgeTemporalKey{Src: nodeID, Tgt: e.Target, Kind: e.GetKind()}
 		state, ok := g.temporalEdges[key]
 		if !ok {
-			result = append(result, e)
+			result = append(result, view)
 			seen[key] = true
 			continue
 		}
@@ -1180,7 +1483,7 @@ func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, 
 			}
 		}
 		if visible {
-			result = append(result, e)
+			result = append(result, view)
 			seen[key] = true
 		}
 	}
@@ -1196,7 +1499,7 @@ func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, 
 				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
 					e := Edge{Target: key.Tgt, Weight: v.Weight}
 					e.SetKind(key.Kind)
-					result = append(result, e)
+					result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
 					break
 				}
 			}
@@ -1208,15 +1511,15 @@ func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, 
 // clonePageChain deep-copies a page and its entire overflow chain.
 // The clone is allocated from the given pool and registered in the page
 // registry. The spinlock is reset (private page, no concurrent writers).
-// Shallow copy of the page body is safe: Inline[8]Edge is value-typed and
-// Padding[3872]byte has no pointers. Only Header.Overflow (uint32 slot ID)
-// needs updating for cloned overflow pages.
+// The edge/property page chains are both deep-copied. Property references use
+// a logical offset plus a page-chain root, so cloned edges are rewritten to
+// the cloned property root before publication.
 func (g *graphStore) clonePageChain(head *EdgeTablePage, pool *memory.ShardedFreeList, shard int) (*EdgeTablePage, error) {
 	if head == nil {
 		return nil, nil
 	}
 
-	_, slotBytes, err := g.allocatePageSlot(pool, shard)
+	actualPool, slotBytes, err := g.allocatePageSlot(pool, shard)
 	if err != nil {
 		return nil, err
 	}
@@ -1225,7 +1528,23 @@ func (g *graphStore) clonePageChain(head *EdgeTablePage, pool *memory.ShardedFre
 	cloned := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
 	*cloned = *head // shallow copy entire 4096 bytes
 	cloned.Header.Mutex = 0
+	g.rememberPageOwner(cloned, actualPool)
 	cloned.Header.PageSlot = g.pageReg.Register(cloned)
+	oldPropertyRoot := head.Header.PropertyRoot
+	if oldPropertyRoot != 0 {
+		newPropertyRoot, err := g.clonePropertyChain(oldPropertyRoot, pool, shard)
+		if err != nil {
+			g.pageReg.Unregister(cloned.Header.PageSlot)
+			g.forgetPageOwner(cloned)
+			if deallocErr := actualPool.Deallocate(slotBytes); deallocErr != nil {
+				return nil, errors.Join(err, deallocErr)
+			}
+			g.metrics.pagesAllocated.Add(^uint64(0))
+			return nil, err
+		}
+		cloned.Header.PropertyRoot = newPropertyRoot
+		g.rewritePropertyRefs(cloned, oldPropertyRoot, newPropertyRoot)
+	}
 
 	// Clone overflow chain recursively.
 	if head.Header.Overflow != 0 {
@@ -1233,7 +1552,10 @@ func (g *graphStore) clonePageChain(head *EdgeTablePage, pool *memory.ShardedFre
 		clonedOverflow, err := g.clonePageChain(overflow, pool, shard)
 		if err != nil {
 			g.pageReg.Unregister(cloned.Header.PageSlot)
-			pool.Deallocate(slotBytes)
+			g.forgetPageOwner(cloned)
+			if deallocErr := actualPool.Deallocate(slotBytes); deallocErr != nil {
+				return nil, errors.Join(err, deallocErr)
+			}
 			g.metrics.pagesAllocated.Add(^uint64(0)) // decrement
 			return nil, err
 		}
@@ -1245,54 +1567,68 @@ func (g *graphStore) clonePageChain(head *EdgeTablePage, pool *memory.ShardedFre
 
 // newPage allocates and initializes a fresh edge table page.
 func (g *graphStore) newPage(pool *memory.ShardedFreeList, shard int) *EdgeTablePage {
-	_, slotBytes, err := g.allocatePageSlot(pool, shard)
+	actualPool, slotBytes, err := g.allocatePageSlot(pool, shard)
 	if err != nil {
 		return nil
 	}
 	g.metrics.pagesAllocated.Add(1)
 	page := (*EdgeTablePage)(unsafe.Pointer(&slotBytes[64]))
 	page.Header.Count = 0
-	page.Header.InlineCap = 8
+	page.Header.InlineCap = EdgePageInlineCapacity
 	page.Header.Overflow = 0
+	page.Header.PropertyRoot = 0
 	page.Header.Generation = 0
 	page.Header.Mutex = 0
 	page.Header.HyalineSlot = uint16(shard)
-	page.Header.LayoutTag = LayoutV2
+	page.Header.LayoutTag = LayoutV3
+	g.rememberPageOwner(page, actualPool)
 	page.Header.PageSlot = g.pageReg.Register(page)
 	return page
 }
 
-func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList) {
-	page := index.Lookup(nodeID)
-	if page == nil {
-		return
-	}
-
-	index.Delete(nodeID)
-
-	// page already set
-
-	if !tryLockPage(&page.Header.Mutex) {
-		// retirePageChain is internal cleanup, if we fail to lock, we just skip it or retry
-		// But let's just spin in a fallback loop for cleanup since it must complete
-		for !tryLockPage(&page.Header.Mutex) {
-			time.Sleep(time.Millisecond)
+func (g *graphStore) retirePageChain(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList) error {
+	shard := int(nodeID % uint64(g.cfg.PageShards))
+	return g.withHyalineWrite(pool, shard, func() error {
+		page := index.Lookup(nodeID)
+		if page == nil {
+			return nil
 		}
-	}
-	defer unlockPage(&page.Header.Mutex)
 
-	currPage := page
-	for currPage != nil {
-		nextSlot := currPage.Header.Overflow
-		slotBytes := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(currPage), -64)), 4096)
-		pool.Retire(slotBytes)
+		index.Delete(nodeID)
 
-		if nextSlot != 0 {
-			currPage = g.pageReg.Get(nextSlot)
-		} else {
-			currPage = nil
+		if !tryLockPage(&page.Header.Mutex) {
+			// Cleanup must complete before the chain is detached. The Hyaline
+			// interval protects readers; this lock serializes concurrent writers.
+			for !tryLockPage(&page.Header.Mutex) {
+				time.Sleep(time.Millisecond)
+			}
 		}
-	}
+		defer unlockPage(&page.Header.Mutex)
+
+		currPage := page
+		for currPage != nil {
+			nextSlot := currPage.Header.Overflow
+			propertyRoot := currPage.Header.PropertyRoot
+			nextPage := g.pageReg.Get(nextSlot)
+			g.pageReg.Unregister(currPage.Header.PageSlot)
+			owner := g.forgetPageOwner(currPage)
+			if owner == nil {
+				return fmt.Errorf("missing owner for page %d", currPage.Header.PageSlot)
+			}
+			slotBytes := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(currPage), -64)), 4096)
+			if err := owner.Retire(slotBytes); err != nil {
+				return fmt.Errorf("retire page %d: %w", currPage.Header.PageSlot, err)
+			}
+			if propertyRoot != 0 {
+				if err := g.retirePropertyChain(propertyRoot); err != nil {
+					return err
+				}
+			}
+
+			currPage = nextPage
+		}
+		return nil
+	})
 }
 
 func (g *graphStore) AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uint8) error {
@@ -1303,12 +1639,23 @@ func (g *graphStore) AddEdge(txn *Txn, src, tgt uint64, weight float32, kind uin
 	return g.AddEdgeWithStamp(txn, src, tgt, weight, kind, stamp)
 }
 
+func (g *graphStore) AddEdgeWithProperties(txn *Txn, src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error {
+	if txn == nil {
+		return ErrNoTransaction
+	}
+	return txn.AddEdgeWithProperties(src, tgt, weight, kind, properties)
+}
+
 func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32, kind uint8, stamp uint32) error {
+	return g.AddEdgeWithStampAndProperties(txn, src, tgt, weight, kind, stamp, nil)
+}
+
+func (g *graphStore) AddEdgeWithStampAndProperties(txn *Txn, src, tgt uint64, weight float32, kind uint8, stamp uint32, properties []byte) error {
 	fEdge := Edge{Target: tgt, Weight: weight}
 	fEdge.SetStamp(stamp)
 	fEdge.SetKind(kind)
 	err := retryOp(func() error {
-		return g.appendEdgeToTable(src, fEdge, g.index, g.pagePools[0])
+		return g.appendEdgeToTable(src, fEdge, properties, g.index, g.pagePools[0])
 	})
 	if err != nil {
 		return err
@@ -1318,7 +1665,7 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 	rEdge.SetStamp(stamp)
 	rEdge.SetKind(kind)
 	err = retryOp(func() error {
-		return g.appendEdgeToTable(tgt, rEdge, g.reverse.locator, g.reverse.pool)
+		return g.appendEdgeToTable(tgt, rEdge, properties, g.reverse.locator, g.reverse.pool)
 	})
 	if err != nil {
 		_ = retryOp(func() error {
@@ -1334,9 +1681,9 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 // addEdgeInternal performs the in-memory edge insertion without Txn validation
 // or WAL recording. Used by ReplayEdgeAdd during recovery when the WAL frame
 // is already committed.
-func (g *graphStore) addEdgeInternal(txn *Txn, src, tgt uint64, weight float32, kind uint8) error {
+func (g *graphStore) addEdgeInternal(txn *Txn, src, tgt uint64, weight float32, kind uint8, properties []byte) error {
 	stamp := g.globalStamp.Add(1)
-	return g.AddEdgeWithStamp(txn, src, tgt, weight, kind, stamp)
+	return g.AddEdgeWithStampAndProperties(txn, src, tgt, weight, kind, stamp, properties)
 }
 
 // removeEdgeInternal performs the in-memory edge removal without Txn validation
@@ -1352,11 +1699,11 @@ func (g *graphStore) dropNodeEdgesInternal(txn *Txn, nodeID uint64) error {
 }
 
 // ReplayEdgeAdd replays a committed edge-add from the WAL during recovery.
-func (g *graphStore) ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, commitLSN uint64) error {
-	if err := g.addEdgeInternal(nil, src, tgt, weight, kind); err != nil {
+func (g *graphStore) ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, properties []byte, commitLSN uint64) error {
+	if err := g.addEdgeInternal(nil, src, tgt, weight, kind, properties); err != nil {
 		return err
 	}
-	g.RecordEdgeAddLSN(src, tgt, weight, kind, commitLSN)
+	g.RecordEdgeAddLSN(src, tgt, weight, kind, properties, commitLSN)
 	return nil
 }
 
@@ -1385,7 +1732,7 @@ func (g *graphStore) ReplayVertexLabel(nodeID uint64, label string, _ uint64) er
 
 func (g *graphStore) applyCommittedOps(adds, removes []storage.GraphEdgeOp, nodeDrops []storage.GraphNodeDropOp) error {
 	for _, add := range adds {
-		if err := g.addEdgeInternal(nil, add.Src, add.Tgt, add.Weight, add.Kind); err != nil {
+		if err := g.addEdgeInternal(nil, add.Src, add.Tgt, add.Weight, add.Kind, add.Properties); err != nil {
 			return err
 		}
 	}
@@ -1432,11 +1779,13 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 	edges, _ := g.Neighbors(src)
 	var weight float32
 	var stamp uint32
+	var properties []byte
 	var found bool
 	for _, e := range edges {
 		if e.Target == tgt && e.GetKind() == kind {
 			weight = e.Weight
 			stamp = e.GetStamp()
+			properties, _ = g.propertyBytes(e.PropertyRef)
 			found = true
 			break
 		}
@@ -1461,7 +1810,7 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 		fEdge.SetStamp(stamp)
 		fEdge.SetKind(kind)
 		_ = retryOp(func() error {
-			return g.appendEdgeToTable(src, fEdge, g.index, g.pagePools[0])
+			return g.appendEdgeToTable(src, fEdge, properties, g.index, g.pagePools[0])
 		})
 		return err
 	}
@@ -1472,7 +1821,10 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 
 func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 	var firstErr error
-	inboundEdges, _ := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	inboundEdges, err := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return err
+	}
 	for _, edge := range inboundEdges {
 		err := retryOp(func() error {
 			return g.removeEdgeFromTable(edge.Target, nodeID, edge.GetKind(), g.index, g.pagePools[0])
@@ -1482,8 +1834,12 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 		}
 	}
 
-	outboundEdges, _ := g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
-	for _, edge := range outboundEdges {
+	outboundEdges, err := g.NeighborsWithProperties(nodeID)
+	if err != nil {
+		return err
+	}
+	for _, view := range outboundEdges {
+		edge := view.Edge
 		err := retryOp(func() error {
 			return g.removeEdgeFromTable(edge.Target, nodeID, edge.GetKind(), g.reverse.locator, g.reverse.pool)
 		})
@@ -1492,8 +1848,12 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 		}
 	}
 
-	g.retirePageChain(nodeID, g.index, g.pagePools[0])
-	g.retirePageChain(nodeID, g.reverse.locator, g.reverse.pool)
+	if err := g.retirePageChain(nodeID, g.index, g.pagePools[0]); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := g.retirePageChain(nodeID, g.reverse.locator, g.reverse.pool); err != nil && firstErr == nil {
+		firstErr = err
+	}
 
 	return firstErr
 }
@@ -1502,8 +1862,16 @@ func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
 	return g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
 }
 
+func (g *graphStore) NeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
+	return g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+}
+
 func (g *graphStore) InboundNeighbors(nodeID uint64) ([]Edge, error) {
 	return g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+}
+
+func (g *graphStore) InboundNeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
+	return g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 }
 
 func (g *graphStore) Degree(nodeID uint64) (int, error) {
@@ -1603,12 +1971,14 @@ func (g *graphStore) degreeFromTable(nodeID uint64, index *EdgeTableIndex, pool 
 	shard := nodeID % uint64(shards)
 
 retry:
-	pool.HyalineEnter(int(shard))
+	guard, err := g.enterHyaline(pool, int(shard))
+	if err != nil {
+		return 0, err
+	}
 
 	page := index.Lookup(nodeID)
 	if page == nil {
-		pool.HyalineLeave(int(shard))
-		return 0, nil
+		return 0, guard.leave()
 	}
 
 	// page already set
@@ -1616,12 +1986,13 @@ retry:
 	count := int(page.Header.Count)
 
 	if atomic.LoadUint32(&page.Header.Generation) != gen {
-		pool.HyalineLeave(int(shard))
+		if err := guard.leave(); err != nil {
+			return 0, err
+		}
 		goto retry
 	}
 
-	pool.HyalineLeave(int(shard))
-	return count, nil
+	return count, guard.leave()
 }
 
 func (g *graphStore) NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error) {
@@ -1641,8 +2012,16 @@ func (g *graphStore) NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error
 
 func (g *graphStore) Stats() GraphStats {
 	stats := g.metrics.get()
+	g.pagePoolsMu.RLock()
+	var pageAllocated uint64
+	for _, pool := range g.pagePools {
+		if pool != nil {
+			pageAllocated += pool.Stats().Allocated
+		}
+	}
+	g.pagePoolsMu.RUnlock()
 	stats.OffHeapMemory = g.edgePool.Stats().Allocated +
-		g.pagePools[0].Stats().Allocated +
+		pageAllocated +
 		g.bitsetPool.Stats().Allocated +
 		g.frontierPool.Stats().Allocated
 	return stats
@@ -1663,13 +2042,11 @@ func (g *graphStore) PutBitset(b *Bitset) {
 	if b == nil || b.slot == nil {
 		return
 	}
-	// We can Retire the slot when we're done
-	// Normally if the buffer was used in a read-only way, we can Deallocate,
-	// but Retire is safer if it's managed via Hyaline.
-	// Actually, these pools are purely for temporary caller buffers,
-	// so we can use Retire or just Deallocate if it's strictly local to the caller.
-	// For ShardedFreeList, we just Retire it.
-	g.bitsetPool.Retire(b.slot)
+	// These buffers are caller-owned scratch space. No shared reader can retain
+	// a pointer after the BFS call returns, so ordinary Deallocate is the
+	// correct lifecycle and avoids putting short-lived buffers through Hyaline.
+	_ = g.bitsetPool.Deallocate(b.slot)
+	b.slot = nil
 }
 
 func (g *graphStore) GetFrontierBuf() (*FrontierBuf, error) {
@@ -1687,10 +2064,20 @@ func (g *graphStore) PutFrontierBuf(f *FrontierBuf) {
 	if f == nil || f.slot == nil {
 		return
 	}
-	g.frontierPool.Retire(f.slot)
+	_ = g.frontierPool.Deallocate(f.slot)
+	f.slot = nil
 }
 
 func (g *graphStore) Close() error {
+	// Stop new graph writers, then wait for every reader's Hyaline interval
+	// before unmapping the indexes or freeing any page pool. Readers hold
+	// pagePoolsMu.RLock for their complete raw-pointer traversal, including
+	// reverse-index reads, so this lock establishes the teardown barrier.
+	g.writeMu.Lock()
+	defer g.writeMu.Unlock()
+	g.pagePoolsMu.Lock()
+	defer g.pagePoolsMu.Unlock()
+
 	var indexErr, err1, err2, err3, err4 error
 	if g.index != nil {
 		indexErr = g.index.Close()
@@ -1701,10 +2088,10 @@ func (g *graphStore) Close() error {
 	if g.edgePool != nil {
 		err1 = g.edgePool.Free()
 	}
-	if len(g.pagePools) > 0 {
-		for _, p := range g.pagePools {
-			p.Free()
-		}
+	pagePools := g.pagePools
+	g.pagePools = nil
+	for _, p := range pagePools {
+		p.Free()
 	}
 	if g.bitsetPool != nil {
 		err3 = g.bitsetPool.Free()
@@ -1736,12 +2123,13 @@ func (g *graphStore) Close() error {
 
 func (g *graphStore) rebuildReverseIndex() {
 	g.index.Iterate(func(nodeID uint64) {
-		edges, _ := g.Neighbors(nodeID)
-		for _, e := range edges {
+		views, _ := g.NeighborsWithProperties(nodeID)
+		for _, view := range views {
+			e := view.Edge
 			rEdge := Edge{Target: nodeID, Weight: e.Weight}
 			rEdge.SetStamp(e.GetStamp())
 			rEdge.SetKind(e.GetKind())
-			_ = g.appendEdgeToTable(e.Target, rEdge, g.reverse.locator, g.reverse.pool)
+			_ = g.appendEdgeToTable(e.Target, rEdge, view.Properties, g.reverse.locator, g.reverse.pool)
 		}
 	})
 }

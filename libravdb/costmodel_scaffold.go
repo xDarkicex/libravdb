@@ -209,7 +209,7 @@ func (e *Executor) hybridCardinalityEstimate(plan *optimizer.PhysicalPlan, corpu
 			if predicate.Operator == 12 && statistics != nil { // KindEquals
 				fieldStats, knownField := statistics.Fields[predicate.Column]
 				if knownField && statistics.RowCount > 0 {
-					if count, heavyHitter := fieldStats.TopValues["text:"+string(predicate.Value)]; heavyHitter {
+					if count, heavyHitter := fieldStats.TopValues["text:"+string(predicate.PredicateValue().Bytes())]; heavyHitter {
 						scalarSel *= float64(count) / float64(statistics.RowCount)
 						estimate.source = "analyzed_collection_statistics"
 						estimate.confidence = 0.90

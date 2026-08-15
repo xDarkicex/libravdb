@@ -78,3 +78,59 @@ func (r *PageRegistry) Unregister(id uint32) {
 	delete(shard.pages, id)
 	shard.Unlock()
 }
+
+// PropertyPageRegistry is the page-chain registry for node-owned edge
+// property bytes. It is separate from PageRegistry because the same allocator
+// slot can contain either an EdgeTablePage or an EdgePropertyPage.
+type PropertyPageRegistry struct {
+	nextID atomic.Uint32
+	shards [64]*propertyRegistryShard
+}
+
+type propertyRegistryShard struct {
+	sync.RWMutex
+	pages map[uint32]uintptr
+}
+
+func NewPropertyPageRegistry() *PropertyPageRegistry {
+	r := &PropertyPageRegistry{}
+	r.nextID.Store(1)
+	for i := 0; i < 64; i++ {
+		r.shards[i] = &propertyRegistryShard{pages: make(map[uint32]uintptr)}
+	}
+	return r
+}
+
+func (r *PropertyPageRegistry) Register(page *EdgePropertyPage) uint32 {
+	id := r.nextID.Add(1)
+	shard := r.shards[id%64]
+	shard.Lock()
+	shard.pages[id] = uintptr(unsafe.Pointer(page))
+	shard.Unlock()
+	return id
+}
+
+//go:nocheckptr
+func (r *PropertyPageRegistry) Get(id uint32) *EdgePropertyPage {
+	if id == 0 {
+		return nil
+	}
+	shard := r.shards[id%64]
+	shard.RLock()
+	ptr := shard.pages[id]
+	shard.RUnlock()
+	if ptr == 0 {
+		return nil
+	}
+	return (*EdgePropertyPage)(unsafe.Pointer(ptr))
+}
+
+func (r *PropertyPageRegistry) Unregister(id uint32) {
+	if id == 0 {
+		return
+	}
+	shard := r.shards[id%64]
+	shard.Lock()
+	delete(shard.pages, id)
+	shard.Unlock()
+}

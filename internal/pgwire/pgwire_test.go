@@ -70,8 +70,8 @@ func TestServerStartupAndQuery(t *testing.T) {
 		t.Fatalf("sendStartupPacket: %v", err)
 	}
 
-	// 5. Read server responses: AuthOK, ParameterStatus x3, BackendKeyData, ReadyForQuery
-	for i := 0; i < 6; i++ {
+	// 5. Read server responses: AuthOK, ParameterStatus x4, BackendKeyData, ReadyForQuery
+	for i := 0; i < 7; i++ {
 		msgType, _, err := ReadMessage(conn)
 		if err != nil {
 			t.Fatalf("expected server message %d: %v", i, err)
@@ -219,8 +219,8 @@ func TestExtendedQueryProtocol(t *testing.T) {
 	if err := sendStartupPacket(conn, "test", "test"); err != nil {
 		t.Fatalf("sendStartupPacket: %v", err)
 	}
-	// Drain startup responses (AuthOK, ParameterStatus x3, BackendKeyData, ReadyForQuery)
-	for i := 0; i < 6; i++ {
+	// Drain startup responses (AuthOK, ParameterStatus x4, BackendKeyData, ReadyForQuery)
+	for i := 0; i < 7; i++ {
 		if _, _, err := ReadMessage(conn); err != nil {
 			t.Fatalf("startup message %d: %v", i, err)
 		}
@@ -258,20 +258,21 @@ func TestExtendedQueryProtocol(t *testing.T) {
 	}
 	t.Log("Bind → BindComplete ✓")
 
-	// Describe portal
+	// Describe portal — a bound portal reports the statement's RowDescription.
 	descPayload := []byte{'P', 0} // describe portal ""
 	if err := WriteMessage(conn, msgDescribe, descPayload); err != nil {
 		t.Fatalf("Write Describe: %v", err)
 	}
 
-	msgType, _, err = ReadMessage(conn)
+	msgType, payload, err := ReadMessage(conn)
 	if err != nil {
 		t.Fatalf("Read Describe response: %v", err)
 	}
-	if msgType != msgNoData {
-		t.Fatalf("expected NoData (n), got %c", msgType)
+	if msgType != msgRowDescription {
+		t.Fatalf("expected RowDescription (T) after Describe(portal), got %c", msgType)
 	}
-	t.Log("Describe → NoData ✓")
+	cols := decodeRowDescription(t, payload)
+	t.Logf("Describe → RowDescription with %d columns: %+v", len(cols), cols)
 
 	// Execute portal
 	execPayload := append([]byte{0}, 0, 0, 0, 0) // portal "" + maxRows=0
@@ -519,30 +520,27 @@ func TestComputeLeiden_ExtendedQuery(t *testing.T) {
 	sendBind(t, conn, "", "", nil, nil, 0)
 	assertMessageType(t, conn, '2', "BindComplete")
 
-	// Describe portal — before Execute, a freshly-bound portal returns NoData.
+	// Describe portal — a bound portal reports the statement's RowDescription.
 	sendDescribe(t, conn, 'P', "")
-	assertMessageType(t, conn, 'n', "NoData after Describe(before Execute)")
-
-	// Execute.
-	sendExecute(t, conn, "", 0)
-
-	// Read RowDescription.
 	msgType, payload, err := ReadMessage(conn)
 	if err != nil {
-		t.Fatalf("expected RowDescription after Execute: %v", err)
+		t.Fatalf("expected RowDescription after Describe(portal): %v", err)
 	}
 	if msgType != 'T' {
-		t.Fatalf("extended: expected RowDescription ('T') after Execute, got '%c'", msgType)
+		t.Fatalf("extended: expected RowDescription ('T') after Describe(portal), got '%c'", msgType)
 	}
 	cols := decodeRowDescription(t, payload)
 	if len(cols) != 7 {
-		t.Fatalf("extended: expected 7 columns, got %d", len(cols))
+		t.Fatalf("extended: Describe(portal) expected 7 columns, got %d", len(cols))
 	}
 	if cols[0].Name != "node_id" || cols[0].TypeOID != OIDInt8 {
-		t.Errorf("extended col[0]: want node_id/OIDInt8, got %q/%d", cols[0].Name, cols[0].TypeOID)
+		t.Errorf("extended Describe col[0]: want node_id/OIDInt8, got %q/%d", cols[0].Name, cols[0].TypeOID)
 	}
 
-	// Read DataRows until CommandComplete.
+	// Execute follows a portal Describe. The RowDescription was already sent;
+	// PostgreSQL emits DataRow/CommandComplete here without a duplicate T.
+	sendExecute(t, conn, "", 0)
+
 	rows := readDataRowsUntilComplete(t, conn)
 	if len(rows) == 0 {
 		t.Fatal("extended: expected DataRows")
@@ -679,14 +677,24 @@ func startTestServer(t *testing.T, db *libravdb.Database) *Server {
 		errCh <- srv.Serve(ctx)
 	}()
 
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 500; i++ {
+		select {
+		case err := <-errCh:
+			t.Fatalf("server did not start: %v", err)
+		default:
+		}
 		if srv.Addr() != "" {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if srv.Addr() == "" {
-		t.Fatal("server did not start")
+		select {
+		case err := <-errCh:
+			t.Fatalf("server did not start: %v", err)
+		default:
+			t.Fatal("server did not start")
+		}
 	}
 	return srv
 }
@@ -705,8 +713,8 @@ func doTestStartup(t *testing.T, conn net.Conn) {
 	if err := sendStartupPacket(conn, "test", "test"); err != nil {
 		t.Fatalf("startup: %v", err)
 	}
-	// AuthOK + 3×ParameterStatus + BackendKeyData + ReadyForQuery = 6 messages.
-	for i := 0; i < 6; i++ {
+	// AuthOK + 4×ParameterStatus + BackendKeyData + ReadyForQuery = 7 messages.
+	for i := 0; i < 7; i++ {
 		msgType, _, err := ReadMessage(conn)
 		if err != nil {
 			t.Fatalf("startup msg %d: %v", i, err)
@@ -787,11 +795,6 @@ func decodeRowDescription(t *testing.T, payload []byte) []ColumnMeta {
 	return cols
 }
 
-func readAllDataRows(t *testing.T, conn net.Conn) [][]string {
-	t.Helper()
-	return readDataRowsUntilComplete(t, conn)
-}
-
 func readDataRowsUntilComplete(t *testing.T, conn net.Conn) [][]string {
 	t.Helper()
 	var rows [][]string
@@ -828,16 +831,18 @@ func decodeDataRow(t *testing.T, payload []byte) []string {
 		if off+4 > len(payload) {
 			t.Fatal("DataRow truncated")
 		}
-		colLen := int(binary.BigEndian.Uint32(payload[off:]))
+		// Read as int32: -1 (0xFFFFFFFF) means SQL NULL.
+		colLen := int32(binary.BigEndian.Uint32(payload[off:]))
 		off += 4
 		if colLen == -1 {
-			vals[i] = "" // NULL
+			vals[i] = "" // NULL — represented as empty string in this legacy helper
 		} else {
-			if off+colLen > len(payload) {
+			cl := int(colLen)
+			if off+cl > len(payload) {
 				t.Fatal("DataRow column truncated")
 			}
-			vals[i] = string(payload[off : off+colLen])
-			off += colLen
+			vals[i] = string(payload[off : off+cl])
+			off += cl
 		}
 	}
 	return vals
@@ -888,8 +893,9 @@ func sendBind(t *testing.T, conn net.Conn, portal, stmtName string, paramFormats
 	buf = append(buf, stmtName...)
 	buf = append(buf, 0)
 	// Number of param format codes.
-	binary.BigEndian.PutUint16(append(buf, 0, 0)[len(buf):], numParams)
-	buf = buf[:len(buf)+2]
+	off := len(buf)
+	buf = append(buf, 0, 0)
+	binary.BigEndian.PutUint16(buf[off:], numParams)
 	// Param format codes (0=text for each).
 	for i := uint16(0); i < numParams; i++ {
 		buf = append(buf, 0, 0)

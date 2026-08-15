@@ -597,8 +597,8 @@ func TestLeidenExecute_FullPipeline(t *testing.T) {
 	s1 := h.insertLabeled("alpha", "roots")
 	t1 := h.insertLabeled("beta", "leaves")
 	t2 := h.insert("gamma")
-	h.addEdge(s1, t1, 30)
-	h.addEdge(s1, t2, 30)
+	h.addEdge(s1, t1, 50)
+	h.addEdge(s1, t2, 50)
 
 	epoch, _ := h.db.BeginEpochTx(context.Background())
 	defer epoch.Rollback(context.Background())

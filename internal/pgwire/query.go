@@ -5,184 +5,184 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
-	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
 // handleQuery processes a Simple Query ('Q') message.
 func handleQuery(rw io.ReadWriter, db *libravdb.Database, state *connState, query string) error {
-	// ── Transaction control: intercept before system functions ──
+	if handled, err := handleSQLPrepareExecute(rw, db, state, query); handled {
+		return err
+	}
+	if handled, err := handleConnectionReset(rw, state, query); handled {
+		return err
+	}
+	if handled, err := handleServerCursorSimple(rw, state, query); handled {
+		return err
+	}
 	trimmed := strings.TrimSpace(strings.TrimRight(query, ";"))
-	upper := strings.ToUpper(trimmed)
-
-	if strings.HasPrefix(upper, "BEGIN EPOCH") {
-		if state.epoch != nil {
-			return sendError(rw, "ERROR", fmt.Errorf("a transaction is already in progress"))
+	if trimmed == "" {
+		if err := WriteMessage(rw, msgEmptyQuery, nil); err != nil {
+			return err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		epoch, err := db.BeginEpochTx(ctx)
+		return sendReadyForQuery(rw, state.readyStatus())
+	}
+	if handled, err := handleSQLDeallocate(rw, state, trimmed); handled {
+		return err
+	}
+	if stmt, ok, _ := parsePgwireTransactionControl(trimmed); ok {
+		if state.txStatus() == transactionFailed && !isTransactionCleanupKind(stmt.Kind) {
+			return sendSimpleError(rw, state, errCurrentTransactionAborted)
+		}
+		return handleSimpleTransaction(rw, db, state, stmt)
+	}
+
+	if state.txStatus() == transactionFailed {
+		return sendSimpleError(rw, state, errCurrentTransactionAborted)
+	}
+	if handled, commandTag, err := applySessionSettingSQL(state, query); handled {
 		if err != nil {
-			return sendError(rw, "ERROR", fmt.Errorf("BEGIN EPOCH TRANSACTION: %w", err))
+			return sendSimpleError(rw, state, err)
 		}
-		state.epoch = epoch
-		if err := sendCommandComplete(rw, "BEGIN"); err != nil {
+		if err := sendCommandComplete(rw, commandTag); err != nil {
 			return err
 		}
-		return sendReadyForQuery(rw, 'T') // 'T' = in transaction block
+		return sendReadyForQuery(rw, state.readyStatus())
 	}
-
-	// Savepoint controls are parsed by the shared SQL parser and applied to
-	// this connection's epoch. They must be handled before the normal query
-	// path because savepoints are session state, not data statements.
-	if stmt, ok, err := parsePgwireTransactionControl(query); ok && isPgwireSavepointKind(stmt.Kind) {
+	if results, columns, handled, err := handleAsyncpgJITQuery(query, &state.config, nil); handled {
 		if err != nil {
-			return sendError(rw, "ERROR", err)
+			return sendSimpleError(rw, state, err)
 		}
-		if state.epoch == nil {
-			return sendError(rw, "ERROR", fmt.Errorf("savepoint is only valid inside an epoch transaction"))
-		}
-		switch stmt.Kind {
-		case parser.TransactionSavepoint:
-			err = state.epoch.Savepoint(stmt.SavepointName)
-		case parser.TransactionRollbackToSavepoint:
-			err = state.epoch.RollbackTo(stmt.SavepointName)
-		case parser.TransactionReleaseSavepoint:
-			err = state.epoch.ReleaseSavepoint(stmt.SavepointName)
-		}
+		return sendQueryResultWithStatus(rw, results, columns, state.readyStatus())
+	}
+	if results, columns, handled, err := handleSetConfigFunction(query, &state.config, nil); handled {
 		if err != nil {
-			return sendError(rw, "ERROR", err)
+			return sendSimpleError(rw, state, err)
 		}
-		if err := sendCommandComplete(rw, transactionCommandTag(stmt.Kind)); err != nil {
-			return err
-		}
-		return sendReadyForQuery(rw, 'T')
+		return sendQueryResultWithStatus(rw, results, columns, state.readyStatus())
 	}
 
-	if upper == "COMMIT" || upper == "COMMIT TRANSACTION" {
-		if state.epoch == nil {
-			return sendError(rw, "ERROR", fmt.Errorf("no transaction in progress"))
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := state.epoch.Commit(ctx); err != nil {
-			state.epoch = nil
-			return sendError(rw, "ERROR", fmt.Errorf("COMMIT: %w", err))
-		}
-		state.epoch = nil
-		if err := sendCommandComplete(rw, "COMMIT"); err != nil {
-			return err
-		}
-		return sendReadyForQuery(rw, 'I') // 'I' = idle
-	}
+	// Rewrite pg_catalog. schema prefix so the parser can resolve system tables
+	// (pg_class, pg_attribute, pg_type, pg_namespace) as bare identifiers.
+	query = rewritePgCatalogQuery(query)
 
-	if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" {
-		if state.epoch == nil {
-			return sendError(rw, "ERROR", fmt.Errorf("no transaction in progress"))
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := state.epoch.Rollback(ctx); err != nil {
-			return sendError(rw, "ERROR", fmt.Errorf("ROLLBACK: %w", err))
-		}
-		state.epoch = nil
-		if err := sendCommandComplete(rw, "ROLLBACK"); err != nil {
-			return err
-		}
-		return sendReadyForQuery(rw, 'I')
-	}
-
-	// Check for system function / pg_catalog interception before normal query path
+	// Check for system function interception before normal query path.
 	if results, columns, handled := interceptSystemQuery(query, db); handled {
-		return sendQueryResult(rw, results, columns)
+		return sendQueryResultWithStatus(rw, results, columns, state.readyStatus())
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := state.statementContext(context.Background())
 	defer cancel()
 
 	// If an epoch is active, route through it for read-your-writes.
 	if state.epoch != nil {
-		results, err := state.epoch.Query(ctx, query, nil)
+		results, err := state.epoch.QueryWithSessionConfig(ctx, query, nil, &state.config)
 		if err != nil {
-			if serr := sendError(rw, "ERROR", err); serr != nil {
-				return serr
-			}
-			return sendReadyForQuery(rw, 'T')
+			return sendSimpleError(rw, state, err)
 		}
-		return sendQueryResult(rw, results, inferColumns(results))
+		return sendQueryResultWithStatus(rw, results, inferColumns(results), state.readyStatus())
 	}
 
-	results, err := db.Query(ctx, query)
+	results, err := db.QueryWithSessionConfig(ctx, query, nil, &state.config)
 	if err != nil {
-		if serr := sendError(rw, "ERROR", err); serr != nil {
-			return serr
+		return sendSimpleError(rw, state, err)
+	}
+
+	// Simple-query clients (notably psycopg2 and asyncpg for DDL) require a
+	// CommandComplete for a non-empty statement that produces no row stream.
+	// EmptyQueryResponse is reserved for an actually empty query string.
+	if results == nil || results.Results == nil {
+		if isRowProducingSQL(query) {
+			if _, columns, describeErr := describeStatement(db, query, 0); describeErr == nil && len(columns) > 0 {
+				if err := sendRowDescription(rw, columns); err != nil {
+					return err
+				}
+			}
 		}
-		// Simple Query protocol: an ErrorResponse must still be followed by
-		// ReadyForQuery to close the cycle. Without it, clients block forever.
-		return sendReadyForQuery(rw, 'I')
+		tag := commandTagForSQL(query, resultTotal(results))
+		if err := sendCommandComplete(rw, tag); err != nil {
+			return err
+		}
+		return sendReadyForQuery(rw, state.readyStatus())
 	}
 
-	return sendQueryResult(rw, results, inferColumns(results))
+	return sendQueryResultWithStatus(rw, results, inferColumns(results), state.readyStatus())
 }
 
-// parsePgwireTransactionControl recognizes savepoint statements using the
-// shared lexer/parser. Normal SQL parse failures are returned as unhandled so
-// the existing query path can produce its normal error response.
-func parsePgwireTransactionControl(sql string) (parser.TransactionStmt, bool, error) {
-	var doc parser.QueryDoc
-	if err := parser.Parse([]byte(sql), &doc); err != nil {
-		return parser.TransactionStmt{}, false, nil
+// handleConnectionReset accepts the standard multi-statement reset batch used
+// by asyncpg pools. These commands are connection state cleanup, not user SQL
+// relations: they must produce one normal simple-query response stream and a
+// single final ReadyForQuery after the batch.
+func handleConnectionReset(rw io.ReadWriter, state *connState, query string) (bool, error) {
+	parts := strings.Split(query, ";")
+	commands := make([]string, 0, len(parts))
+	for _, part := range parts {
+		command := strings.TrimSpace(part)
+		if command != "" {
+			commands = append(commands, command)
+		}
 	}
-	if len(doc.TransactionStmts) != 1 {
-		return parser.TransactionStmt{}, false, nil
+	if len(commands) == 0 {
+		return false, nil
 	}
-	stmt := doc.TransactionStmts[0]
-	switch stmt.Kind {
-	case parser.TransactionBeginEpoch, parser.TransactionCommit, parser.TransactionRollback,
-		parser.TransactionSavepoint, parser.TransactionRollbackToSavepoint, parser.TransactionReleaseSavepoint:
-		return stmt, true, nil
-	default:
-		return parser.TransactionStmt{}, false, nil
+	for _, command := range commands {
+		upper := strings.ToUpper(command)
+		switch upper {
+		case "SELECT PG_ADVISORY_UNLOCK_ALL()":
+			results := &libravdb.SearchResults{
+				Results: []*libravdb.SearchResult{{ID: "true", Score: 1, Metadata: map[string]interface{}{"pg_advisory_unlock_all": true}}},
+				Total:   1,
+			}
+			if err := sendResults(rw, results, []ColumnMeta{{Name: "pg_advisory_unlock_all", TypeOID: OIDBool}}); err != nil {
+				return true, err
+			}
+			if err := sendCommandComplete(rw, "SELECT 1"); err != nil {
+				return true, err
+			}
+		case "CLOSE ALL":
+			if err := sendCommandComplete(rw, "CLOSE CURSOR"); err != nil {
+				return true, err
+			}
+		case "UNLISTEN *":
+			if err := sendCommandComplete(rw, "UNLISTEN"); err != nil {
+				return true, err
+			}
+		case "RESET ALL", "DISCARD ALL":
+			if state != nil {
+				state.config = libravdb.DefaultSessionConfig()
+			}
+			if err := sendCommandComplete(rw, "RESET"); err != nil {
+				return true, err
+			}
+		default:
+			return false, nil
+		}
 	}
+	return true, sendReadyForQuery(rw, state.readyStatus())
 }
 
-func transactionCommandTag(kind parser.TransactionKind) string {
-	switch kind {
-	case parser.TransactionBeginEpoch:
-		return "BEGIN"
-	case parser.TransactionCommit:
-		return "COMMIT"
-	case parser.TransactionRollback:
-		return "ROLLBACK"
-	case parser.TransactionSavepoint:
-		return "SAVEPOINT"
-	case parser.TransactionRollbackToSavepoint:
-		return "ROLLBACK"
-	case parser.TransactionReleaseSavepoint:
-		return "RELEASE"
-	default:
-		return "TRANSACTION"
+func resultTotal(results *libravdb.SearchResults) int {
+	if results == nil {
+		return 0
 	}
-}
-
-func isPgwireSavepointKind(kind parser.TransactionKind) bool {
-	switch kind {
-	case parser.TransactionSavepoint, parser.TransactionRollbackToSavepoint, parser.TransactionReleaseSavepoint:
-		return true
-	default:
-		return false
-	}
+	return results.Total
 }
 
 // sendQueryResult sends a complete query result: RowDescription, DataRows, CommandComplete, ReadyForQuery.
 func sendQueryResult(rw io.Writer, results *libravdb.SearchResults, columns []ColumnMeta) error {
+	return sendQueryResultWithStatus(rw, results, columns, 'I')
+}
+
+// sendQueryResultWithStatus is the simple-protocol result path with an
+// explicit transaction status. Simple Query must report that an active epoch
+// remains open after a successful read; the default wrapper preserves the
+// historical idle behavior for callers outside a transaction.
+func sendQueryResultWithStatus(rw io.Writer, results *libravdb.SearchResults, columns []ColumnMeta, status byte) error {
 	if results == nil || results.Results == nil {
 		if err := WriteMessage(rw, msgEmptyQuery, nil); err != nil {
 			return err
 		}
-		return sendReadyForQuery(rw, 'I')
+		return sendReadyForQuery(rw, status)
 	}
 
 	if err := sendResults(rw, results, columns); err != nil {
@@ -199,7 +199,7 @@ func sendQueryResult(rw io.Writer, results *libravdb.SearchResults, columns []Co
 		return err
 	}
 
-	return sendReadyForQuery(rw, 'I')
+	return sendReadyForQuery(rw, status)
 }
 
 // sendExtendedQueryResult sends an extended-protocol query result:
@@ -209,11 +209,15 @@ func sendQueryResult(rw io.Writer, results *libravdb.SearchResults, columns []Co
 // the next message cycle (pgx reads the stale Z and breaks out of its
 // readloop before ParseComplete/ParameterDescription arrive).
 func sendExtendedQueryResult(rw io.Writer, results *libravdb.SearchResults, columns []ColumnMeta) error {
+	return sendExtendedQueryResultWithFormats(rw, results, columns, nil)
+}
+
+func sendExtendedQueryResultWithFormats(rw io.Writer, results *libravdb.SearchResults, columns []ColumnMeta, formats []int16) error {
 	if results == nil || results.Results == nil {
 		return WriteMessage(rw, msgEmptyQuery, nil)
 	}
 
-	if err := sendResults(rw, results, columns); err != nil {
+	if err := sendResultsWithFormats(rw, results, columns, formats); err != nil {
 		return fmt.Errorf("sending results: %w", err)
 	}
 
@@ -232,8 +236,15 @@ func sendExtendedQueryResult(rw io.Writer, results *libravdb.SearchResults, colu
 func inferColumns(results *libravdb.SearchResults) []ColumnMeta {
 	if results != nil && len(results.Columns) > 0 {
 		cols := make([]ColumnMeta, 0, len(results.Columns))
-		for _, name := range results.Columns {
-			cols = append(cols, ColumnMeta{Name: name, TypeOID: columnOIDFor(results, name)})
+		for i, name := range results.Columns {
+			oid := uint32(0)
+			if i < len(results.ColumnTypes) && results.ColumnTypes[i] != 0 {
+				oid = catalogTypeToOID(results.ColumnTypes[i])
+			}
+			if oid == 0 {
+				oid = columnOIDFor(results, name)
+			}
+			cols = append(cols, ColumnMeta{Name: name, TypeOID: oid})
 		}
 		return cols
 	}
@@ -254,9 +265,29 @@ func columnOIDFor(results *libravdb.SearchResults, name string) uint32 {
 	// Standard built-in columns.
 	switch name {
 	case "id", "ID":
+		// Ordinary record IDs are textual, but GRAPH_NODES materializes its
+		// durable numeric identity in metadata. Inspect it when no catalog
+		// type metadata was provided.
+		for _, r := range results.Results {
+			if r == nil || r.Metadata == nil {
+				continue
+			}
+			value, ok := r.Metadata[name]
+			if !ok {
+				value = r.Metadata["id"]
+			}
+			switch value.(type) {
+			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+				return OIDInt8
+			}
+		}
 		return OIDText
-	case "score", "SCORE", "version", "VERSION":
+	case "score", "SCORE":
 		return OIDFloat8
+	case "version", "VERSION", "begin_lsn", "BEGIN_LSN", "end_lsn", "END_LSN":
+		return OIDInt8
+	case "version_start", "VERSION_START", "version_end", "VERSION_END":
+		return OIDTimestamptz
 	case "ordinal", "ORDINAL":
 		return OIDInt8
 
@@ -301,11 +332,52 @@ func columnOIDFor(results *libravdb.SearchResults, name string) uint32 {
 			return OIDFloat8
 		case bool:
 			return OIDBool
+		case []string:
+			return OIDTextArray
+		case []int:
+			return OIDInt8Array
+		case []int64:
+			return OIDInt8Array
+		case []int32:
+			return OIDInt4Array
+		case []float32:
+			return OIDFloat4Array
+		case []float64:
+			return OIDFloat8Array
+		case []bool:
+			return OIDBoolArray
+		case []interface{}:
+			return arrayElementOID(s)
+		case map[string]interface{}, map[string]string:
+			return OIDJSONB
 		default:
 			return OIDText
 		}
 	}
 	return OIDText
+}
+
+func arrayElementOID(values []interface{}) uint32 {
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		switch value.(type) {
+		case string:
+			return OIDTextArray
+		case int, int8, int16, int64, uint, uint8, uint16, uint32, uint64:
+			return OIDInt8Array
+		case int32:
+			return OIDInt4Array
+		case float32:
+			return OIDFloat4Array
+		case float64:
+			return OIDFloat8Array
+		case bool:
+			return OIDBoolArray
+		}
+	}
+	return OIDTextArray
 }
 
 func isIntString(s string) bool {

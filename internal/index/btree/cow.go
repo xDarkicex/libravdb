@@ -20,7 +20,7 @@ type writeTxn struct {
 // Pattern: LMDB mdb_page_copy (line 2934) — copies only used bytes, not free space.
 // The copy is NOT registered in pageReg until commit (avoiding double registration).
 func (txn *writeTxn) copyPage(src *BTreePage) *BTreePage {
-	_, _, slot, _ := txn.tree.allocateSlot()
+	pool, _, slot, _ := txn.tree.allocateSlot()
 	dst := (*BTreePage)(unsafe.Pointer(&slot[UserDataOffset]))
 
 	srcData := src.pageData()
@@ -36,6 +36,7 @@ func (txn *writeTxn) copyPage(src *BTreePage) *BTreePage {
 	dst.Header.PageSlot = src.Header.PageSlot // preserve original slot for dirty lookup during txn
 	dst.Header.Generation = src.Header.Generation + 1
 	dst.Header.HyalineSlot = src.Header.HyalineSlot
+	txn.tree.pageOwners[dst] = pool
 
 	// Track: original → copy (mdb_page_dirty pattern).
 	// The original page memory will be retired, but the slot ID is reused by the copy.
@@ -56,11 +57,12 @@ func (txn *writeTxn) allocatePage(flags uint16) (*BTreePage, uint32) {
 			return page, id
 		}
 	}
-	_, segIdx, slot, _ := txn.tree.allocateSlot()
+	pool, segIdx, slot, _ := txn.tree.allocateSlot()
 	page := (*BTreePage)(unsafe.Pointer(&slot[UserDataOffset]))
 	id := txn.tree.pageReg.register(page)
 	page.initPage(flags, id, 0)
 	txn.tree.pageSegments[id] = uint8(segIdx)
+	txn.tree.pageOwners[page] = pool
 	return page, id
 }
 
@@ -71,7 +73,8 @@ func (txn *writeTxn) commit() {
 		old := txn.tree.pageReg.get(origID)
 		txn.tree.pageReg.replace(origID, dirty)
 		if old != nil {
-			txn.tree.retireSlot(origID)
+			txn.tree.retirePage(old)
+			delete(txn.tree.pageSegments, origID)
 		}
 	}
 
@@ -93,7 +96,7 @@ func (txn *writeTxn) commit() {
 func (txn *writeTxn) abort() {
 	// Free dirty copies — never published, no readers can see them
 	for _, dirty := range txn.dirtyPages {
-		txn.tree.deallocateSlot(dirty.Header.PageSlot)
+		txn.tree.deallocatePage(dirty)
 	}
 	// Loose pages are still valid originals — keep them registered
 }
@@ -164,11 +167,14 @@ func (txn *writeTxn) splitLeaf(page *BTreePage, insertIdx int, key, value []byte
 	}
 
 	rightPage, rightID := txn.allocatePage(P_LEAF)
+	leftSibling := left.Header.LeftSibling
+	rightSibling := left.Header.RightSibling
 
 	all := collectLeafKVs(page, insertIdx, key, value)
 	splitPoint := len(all) / 2
 
 	left.resetPage(P_LEAF)
+	left.Header.LeftSibling = leftSibling
 	for i := 0; i < splitPoint; i++ {
 		insertCell(left, i, all[i].key, all[i].value, 0)
 	}
@@ -177,9 +183,20 @@ func (txn *writeTxn) splitLeaf(page *BTreePage, insertIdx int, key, value []byte
 		insertCell(rightPage, i-splitPoint, all[i].key, all[i].value, 0)
 	}
 
-	rightPage.Header.RightSibling = left.Header.RightSibling
+	rightPage.Header.RightSibling = rightSibling
 	left.Header.RightSibling = rightID
 	rightPage.Header.LeftSibling = left.Header.PageSlot
+
+	// The old right neighbor used to point back to left. Keep the doubly
+	// linked leaf chain coherent after inserting right between them. The
+	// neighbor is copied through the same COW transaction so readers never
+	// observe an in-place mutation of a published page.
+	if rightSibling != 0 {
+		if neighbor := txn.tree.pageReg.get(rightSibling); neighbor != nil {
+			neighborDirty := ensureDirty(txn, neighbor)
+			neighborDirty.Header.LeftSibling = rightID
+		}
+	}
 
 	return rightID, rightPage.HighKey(), nil
 }
@@ -196,6 +213,8 @@ func (txn *writeTxn) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, 
 	}
 
 	rightPage, rightID := txn.allocatePage(P_BRANCH)
+	leftSibling := left.Header.LeftSibling
+	rightSibling := left.Header.RightSibling
 
 	all := collectBranchEntries(page, insertIdx, sepKey, newChildID)
 	splitPoint := len(all) / 2
@@ -203,6 +222,7 @@ func (txn *writeTxn) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, 
 	promotedKey := cloneBytes(all[splitPoint].key)
 
 	left.resetPage(P_BRANCH)
+	left.Header.LeftSibling = leftSibling
 	left.Header.FirstChild = all[0].childID
 	for i := 0; i < splitPoint-1; i++ {
 		insertCell(left, i, all[i+1].key, nil, all[i+1].childID)
@@ -214,9 +234,15 @@ func (txn *writeTxn) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, 
 		insertCell(rightPage, i, all[splitPoint+1+i].key, nil, all[splitPoint+1+i].childID)
 	}
 
-	rightPage.Header.RightSibling = left.Header.RightSibling
+	rightPage.Header.RightSibling = rightSibling
 	left.Header.RightSibling = rightID
 	rightPage.Header.LeftSibling = left.Header.PageSlot
+	if rightSibling != 0 {
+		if neighbor := txn.tree.pageReg.get(rightSibling); neighbor != nil {
+			neighborDirty := ensureDirty(txn, neighbor)
+			neighborDirty.Header.LeftSibling = rightID
+		}
+	}
 
 	return rightID, promotedKey, nil
 }

@@ -23,6 +23,37 @@ func (db *Database) QueryWithParams(ctx context.Context, sql string, params Quer
 }
 
 func (db *Database) queryWithContext(ctx context.Context, sql string, params QueryParams) (*SearchResults, error) {
+	return db.queryWithBoundParams(ctx, sql, optimizer.NewParameterSet(params), params)
+}
+
+// QueryWithBoundParams is the native typed execution entry point used by
+// protocol adapters. The SQL source remains unchanged; decoded values are
+// resolved by AST parameter spans inside the optimizer.
+func (db *Database) QueryWithBoundParams(ctx context.Context, sql string, params *optimizer.ParameterSet) (*SearchResults, error) {
+	return db.queryWithBoundParams(ctx, sql, params, nil)
+}
+
+// QueryWithSessionConfig executes a query with connection-local settings.
+// Settings affect execution only and are never persisted in catalog/WAL state.
+func (db *Database) QueryWithSessionConfig(ctx context.Context, sql string, params QueryParams, config *SessionConfig) (*SearchResults, error) {
+	return db.queryWithSessionConfig(ctx, sql, params, config)
+}
+
+// QueryWithBoundParamsAndSessionConfig is the typed-parameter counterpart
+// used by protocol adapters that also carry per-connection SQL settings.
+func (db *Database) QueryWithBoundParamsAndSessionConfig(ctx context.Context, sql string, params *optimizer.ParameterSet, config *SessionConfig) (*SearchResults, error) {
+	return db.queryWithBoundParamsAndConfig(ctx, sql, params, nil, config)
+}
+
+func (db *Database) queryWithSessionConfig(ctx context.Context, sql string, params QueryParams, config *SessionConfig) (*SearchResults, error) {
+	return db.queryWithBoundParamsAndConfig(ctx, sql, optimizer.NewParameterSet(params), params, config)
+}
+
+func (db *Database) queryWithBoundParams(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams) (*SearchResults, error) {
+	return db.queryWithBoundParamsAndConfig(ctx, sql, boundParams, legacyParams, nil)
+}
+
+func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams, sessionConfig *SessionConfig) (*SearchResults, error) {
 	src := []byte(sql)
 
 	// 1 & 2. Lex & Parse
@@ -60,10 +91,85 @@ func (db *Database) queryWithContext(ctx context.Context, sql string, params Que
 	if standaloneLeiden && len(doc.ComputeLeidenStmts) > 0 {
 		return db.executeComputeLeiden(ctx, src, doc)
 	}
+	if len(doc.SessionSettingStmts) > 0 {
+		return nil, fmt.Errorf("SET/RESET requires a session; use Database.NewSQLSession or pgwire")
+	}
 
-	// CTE SELECT: WITH local_clusters AS (COMPUTE LEIDEN ...) SELECT ... JOIN ...
-	if len(doc.SelectStmts) > 0 && doc.SelectStmts[0].CTEsCount > 0 {
-		return db.executeLeidenCTE(ctx, src, doc, params)
+	// CTE SELECT: preserve the existing Leiden virtual relation path, while
+	// ordinary SELECT CTEs execute through an in-memory virtual relation.  No
+	// temporary collection or catalog/WAL mutation is involved.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && doc.SelectStmts[root].CTEsCount > 0 {
+		cte := doc.CTEs[doc.SelectStmts[root].CTEsStart]
+		if cte.Body.Kind == parser.NodeKindComputeLeidenStmt {
+			return db.executeLeidenCTE(ctx, src, doc, boundParams)
+		}
+		return db.executeGenericCTE(ctx, src, doc, boundParams, legacyParams, sessionConfig)
+	}
+	// VERSIONS OF ... BETWEEN TIMESTAMP ... is a virtual temporal relation;
+	// evaluate it with the query-local row engine so its historical tuples can
+	// participate in normal WHERE/ORDER/OFFSET/LIMIT projection semantics.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && selectHasTemporalRange(doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// JSON extraction and containment are evaluated by the query-local row
+	// engine so projected JSON values and nested predicates retain their
+	// document shape instead of being flattened into scalar catalog bytes.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasJSON(src, doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Window functions require a post-filter partition/order pass before the
+	// outer ORDER BY/LIMIT. Keep them in the query-local virtual evaluator so
+	// the physical relational plan cannot discard window scope.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasWindow(doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// ARRAY_AGG and STRING_AGG are ordinary PostgreSQL aggregate names but are
+	// intentionally parsed as FunctionExpr nodes (they are not lexer keywords).
+	// Route them through the query-local relation evaluator so grouped and
+	// nullable inputs retain their row values and the physical scalar planner
+	// cannot flatten the resulting array/string.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasCollectionAggregate(src, doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Ordered-set aggregates (PERCENTILE_CONT, PERCENTILE_DISC, MODE) use
+	// WITHIN GROUP ordering and are evaluated by the query-local relation path;
+	// the physical aggregate planner only handles ordinary aggregates.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasOrderedSetAggregate(doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Direct aggregates over bound parameters, such as MIN($threshold), need
+	// the row-aware virtual aggregate evaluator. The physical aggregate planner
+	// only sees catalog columns and otherwise drops MIN/MAX or treats SUM's
+	// parameter operand as a zero-valued scalar.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasParameterizedAggregate(src, doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Aggregate-derived scalar expressions such as SUM(alpha) / SUM(beta)
+	// require the grouped virtual evaluator so each aggregate operand is
+	// materialized before the enclosing arithmetic expression is evaluated.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasNestedAggregateProjection(doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// CASE and general casts are scalar SQL expressions.  They must be
+	// evaluated after the visible row has been materialized; the physical
+	// relational planner deliberately only projects catalog columns and would
+	// otherwise drop these expression nodes.  Keep this route query-local so
+	// staged/temporal rows and typed parameters retain their normal semantics.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && virtualSelectHasScalarExpressions(src, doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Derived tables are query-local virtual relations. Execute them through
+	// the same AST evaluator as correlated subqueries before catalog binding;
+	// a parenthesized SELECT has no physical catalog identity.
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && selectHasDerivedRelation(doc, &doc.SelectStmts[root]) {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
+	}
+	// Uncorrelated IN (SELECT ...) and EXISTS (SELECT ...) predicates are
+	// evaluated as virtual membership filters before the ordinary binder. This
+	// keeps subquery rows out of the catalog while retaining snapshot/epoch
+	// visibility through the recursive query path.
+	if len(doc.SubqueryExprs) > 0 && len(doc.SelectStmts) > 0 {
+		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
 	}
 
 	// Empty statement list is a valid no-op.
@@ -88,7 +194,13 @@ func (db *Database) queryWithContext(ctx context.Context, sql string, params Que
 
 	// 4. Optimize (AST -> Physical Plan)
 	opt := optimizer.NewOptimizer(cat)
-	plan, err := opt.OptimizeWithParams(doc, src, params)
+	var plan *optimizer.PhysicalPlan
+	var err error
+	if boundParams != nil {
+		plan, err = opt.OptimizeWithBoundParams(doc, src, boundParams)
+	} else {
+		plan, err = opt.OptimizeWithParams(doc, src, legacyParams)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("optimize error: %w", err)
 	}
@@ -180,7 +292,7 @@ func leidenRelationToSearchResults(rel *LeidenRelation) *SearchResults {
 // executeLeidenCTE executes a CTE SELECT: binds the CTE, executes the Leiden
 // plan, builds the local_clusters virtual relation, and performs the JOIN
 // against the outer FROM table.
-func (db *Database) executeLeidenCTE(ctx context.Context, src []byte, doc *parser.QueryDoc, params QueryParams) (*SearchResults, error) {
+func (db *Database) executeLeidenCTE(ctx context.Context, src []byte, doc *parser.QueryDoc, params *optimizer.ParameterSet) (*SearchResults, error) {
 	epoch := epochFromContext(ctx)
 	if epoch == nil {
 		return nil, fmt.Errorf("COMPUTE LEIDEN CTE requires an active epoch transaction")
@@ -208,6 +320,18 @@ func (db *Database) handleEpochTransactionStmts(ctx context.Context, epoch *Epoc
 		case parser.TransactionRollback:
 			if err := epoch.Rollback(ctx); err != nil {
 				return nil, fmt.Errorf("ROLLBACK: %w", err)
+			}
+		case parser.TransactionSavepoint:
+			if err := epoch.Savepoint(stmt.SavepointName); err != nil {
+				return nil, fmt.Errorf("SAVEPOINT: %w", err)
+			}
+		case parser.TransactionRollbackToSavepoint:
+			if err := epoch.RollbackTo(stmt.SavepointName); err != nil {
+				return nil, fmt.Errorf("ROLLBACK TO SAVEPOINT: %w", err)
+			}
+		case parser.TransactionReleaseSavepoint:
+			if err := epoch.ReleaseSavepoint(stmt.SavepointName); err != nil {
+				return nil, fmt.Errorf("RELEASE SAVEPOINT: %w", err)
 			}
 		}
 	}

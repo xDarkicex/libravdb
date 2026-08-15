@@ -1,8 +1,10 @@
 package catalog
 
 import (
+	"bytes"
 	"fmt"
 
+	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/lexer/parser"
 )
 
@@ -26,10 +28,23 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	// aliasScope maps qualifier name → TableDef for qualified identifiers
 	// (s.owner_id). Both the raw table name and any FROM alias resolve here.
 	aliasScope := make(map[uint64]*TableDef)
+	// virtualQualifiers are aliases supplied by set-returning functions such as
+	// jsonb_to_record. Their columns are defined by the runtime JSON object,
+	// not by a catalog table, so qualified references are marked as virtual
+	// columns and resolved by the query-local executor.
+	virtualQualifiers := make(map[uint64]struct{})
 
 	// 1. Resolve tables in FROM clauses and build scope stack.
 	for i := 0; i < len(doc.TableExprs); i++ {
 		t := &doc.TableExprs[i]
+		if t.IsDerived || t.IsFunction {
+			if t.IsFunction && t.AliasEnd > t.Alias {
+				virtualQualifiers[hashIdentifier(b.src, t.Alias, t.AliasEnd)] = struct{}{}
+			}
+			// Derived SELECTs are bound/executed by the virtual-relation path;
+			// they have no catalog table identity to resolve here.
+			continue
+		}
 		hash := hashIdentifier(b.src, t.Start, t.End)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
@@ -72,6 +87,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		gt.TableOID = def.OID
 		scope = append(scope, def)
 		aliasScope[hash] = def
+		if gt.MatchPath.Kind == parser.NodeKindMatchPath && gt.MatchPath.ID >= 0 && int(gt.MatchPath.ID) < len(doc.MatchPaths) {
+			mp := &doc.MatchPaths[gt.MatchPath.ID]
+			for n := int32(0); n < mp.PathNodesCount; n++ {
+				bindMatchEdgePredicate(doc, doc.Nodes[mp.PathNodesStart+n])
+			}
+		}
 	}
 
 	// 1a. Relational JOIN tables are part of the same SELECT scope.  Keeping
@@ -81,7 +102,10 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		stmt := &doc.SelectStmts[i]
 		for j := range stmt.Joins {
 			jc := &stmt.Joins[j]
-			if jc.MatchPath.Kind == parser.NodeKindMatchPath || jc.TableEnd <= jc.TableStart {
+			if jc.IsFunction || jc.MatchPath.Kind == parser.NodeKindMatchPath || jc.Derived.Kind == parser.NodeKindTableExpr || jc.TableEnd <= jc.TableStart {
+				if jc.IsFunction && jc.AliasEnd > jc.Alias {
+					virtualQualifiers[hashIdentifier(b.src, jc.Alias, jc.AliasEnd)] = struct{}{}
+				}
 				continue
 			}
 			hash := hashIdentifier(b.src, jc.TableStart, jc.TableEnd)
@@ -131,6 +155,10 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			// multi-relation graph catalog can replace this mapping per vertex.
 			for n := int32(0); n < mp.PathNodesCount; n++ {
 				ref := doc.Nodes[mp.PathNodesStart+n]
+				if ref.Kind == parser.NodeKindEdge {
+					bindMatchEdgePredicate(doc, ref)
+					continue
+				}
 				if ref.Kind != parser.NodeKindVertex {
 					continue
 				}
@@ -176,6 +204,10 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 				}
 				for n := int32(0); n < mp.PathNodesCount; n++ {
 					vertexRef := doc.Nodes[mp.PathNodesStart+n]
+					if vertexRef.Kind == parser.NodeKindEdge {
+						bindMatchEdgePredicate(doc, vertexRef)
+						continue
+					}
 					if vertexRef.Kind != parser.NodeKindVertex {
 						continue
 					}
@@ -193,6 +225,7 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	}
 
 	// 1b. Resolve CRUD statement tables.
+	graphEdgeDelete := false
 	for i := 0; i < len(doc.InsertStmts); i++ {
 		stmt := &doc.InsertStmts[i]
 		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
@@ -207,6 +240,11 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
+		// INSERT ... ON CONFLICT expressions may qualify the current
+		// row with the target table name (for example counters.value).
+		// DML tables are not part of FROM scope, so register this
+		// deterministic qualifier explicitly.
+		aliasScope[hash] = def
 	}
 	for i := 0; i < len(doc.UpdateStmts); i++ {
 		stmt := &doc.UpdateStmts[i]
@@ -221,9 +259,19 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
+		// DML predicates may qualify the target table, as PostgreSQL drivers
+		// commonly do for DELETE and some UPDATE statements.
+		aliasScope[hash] = def
 	}
 	for i := 0; i < len(doc.DeleteStmts); i++ {
 		stmt := &doc.DeleteStmts[i]
+		if bytes.EqualFold(b.src[stmt.TableStart:stmt.TableEnd], []byte("GRAPH_EDGES")) {
+			// GRAPH_EDGES is a virtual graph relation. Its edge predicates are
+			// resolved below against the graph-native source/type/target fields;
+			// it is intentionally absent from the ordinary catalog.
+			graphEdgeDelete = true
+			continue
+		}
 		hash := hashIdentifier(b.src, stmt.TableStart, stmt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
@@ -235,6 +283,7 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			return fmt.Errorf("table '%s' not found", name)
 		}
 		scope = append(scope, def)
+		aliasScope[hash] = def
 	}
 
 	// 2. Resolve identifiers (columns, vectors, graphs) deterministically using scope.
@@ -250,8 +299,62 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			}
 		}
 	}
+	// A set-returning JSON function contributes its alias as a virtual column
+	// rather than a catalog table. Mark that column resolved so the normal
+	// catalog pass does not reject `SELECT elem FROM jsonb_array_elements(...)`.
+	for i := range doc.TableExprs {
+		t := &doc.TableExprs[i]
+		if t.IsFunction && t.AliasEnd > t.Alias {
+			aliasSet[hashIdentifier(b.src, t.Alias, t.AliasEnd)] = struct{}{}
+			if t.Function.Kind == parser.NodeKindFunctionExpr && t.Function.ID >= 0 && int(t.Function.ID) < len(doc.FunctionExprs) {
+				fn := doc.FunctionExprs[t.Function.ID]
+				name := b.src[fn.NameStart:fn.NameEnd]
+				if bytes.EqualFold(name, []byte("json_each")) || bytes.EqualFold(name, []byte("jsonb_each")) || bytes.EqualFold(name, []byte("json_each_text")) || bytes.EqualFold(name, []byte("jsonb_each_text")) {
+					aliasSet[hashIdentifier([]byte("key"), 0, 3)] = struct{}{}
+					aliasSet[hashIdentifier([]byte("value"), 0, 5)] = struct{}{}
+				}
+			}
+		}
+	}
+	for i := range doc.SelectStmts {
+		for j := range doc.SelectStmts[i].Joins {
+			join := &doc.SelectStmts[i].Joins[j]
+			if join.IsFunction && join.AliasEnd > join.Alias {
+				aliasSet[hashIdentifier(b.src, join.Alias, join.AliasEnd)] = struct{}{}
+				if join.Function.Kind == parser.NodeKindFunctionExpr && join.Function.ID >= 0 && int(join.Function.ID) < len(doc.FunctionExprs) {
+					fn := doc.FunctionExprs[join.Function.ID]
+					name := b.src[fn.NameStart:fn.NameEnd]
+					if bytes.EqualFold(name, []byte("json_each")) || bytes.EqualFold(name, []byte("jsonb_each")) || bytes.EqualFold(name, []byte("json_each_text")) || bytes.EqualFold(name, []byte("jsonb_each_text")) {
+						aliasSet[hashIdentifier([]byte("key"), 0, 3)] = struct{}{}
+						aliasSet[hashIdentifier([]byte("value"), 0, 5)] = struct{}{}
+					}
+				}
+			}
+		}
+	}
 	for i := 0; i < len(doc.Identifiers); i++ {
 		id := &doc.Identifiers[i]
+
+		// Skip identifiers already resolved by the parser (e.g. TRUE, FALSE, NULL
+		// literals from DEFAULT clauses, or $param references).
+		if id.ResolvedKind != parser.ResolvedKindUnknown {
+			continue
+		}
+		if id.End <= uint32(len(b.src)) && id.End-id.Start >= 6 && bytes.EqualFold(b.src[id.Start:id.Start+6], []byte("array[")) {
+			id.ResolvedKind = parser.ResolvedKindLiteral
+			continue
+		}
+		// Boolean and NULL literals are lexed as identifiers by the shared
+		// scanner. Resolve them before catalog lookup so expressions inside
+		// JSON constructors (and ordinary predicates) remain literals through
+		// the pgwire bind path as well as the native virtual executor.
+		if bytes.EqualFold(b.src[id.Start:id.End], []byte("TRUE")) ||
+			bytes.EqualFold(b.src[id.Start:id.End], []byte("FALSE")) ||
+			bytes.EqualFold(b.src[id.Start:id.End], []byte("NULL")) {
+			id.ResolvedKind = parser.ResolvedKindLiteral
+			continue
+		}
+
 		hash := hashIdentifier(b.src, id.Start, id.End)
 
 		// ORDER BY alias: resolve against the SELECT list before catalog lookup.
@@ -262,12 +365,32 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 
 		resolved := false
 
+		if graphEdgeDelete && id.QualStart == 0 && isGraphEdgeColumn(b.src[id.Start:id.End]) {
+			id.ResolvedKind = parser.ResolvedKindColumn
+			resolved = true
+			continue
+		}
+
 		// Qualified identifier: s.owner_id resolves only against the qualifier's
 		// table (FROM alias or table name). No cross-table fallback.
 		if id.QualStart != 0 {
+			// PostgreSQL clients commonly quote the ON CONFLICT pseudo-row as
+			// "excluded"."column". Quoting makes it lex as an ordinary
+			// identifier instead of KindExcluded, but it still has the same
+			// conflict-expression meaning. Preserve the column span and mark it
+			// resolved before ordinary FROM-scope lookup.
+			if len(doc.InsertStmts) > 0 && bytes.EqualFold(b.src[id.QualStart:id.QualEnd], []byte("excluded")) {
+				id.ResolvedKind = parser.ResolvedKindExcluded
+				continue
+			}
 			qhash := hashIdentifier(b.src, id.QualStart, id.QualEnd)
 			tDef, ok := aliasScope[qhash]
 			if !ok {
+				if _, virtual := virtualQualifiers[qhash]; virtual {
+					id.ResolvedKind = parser.ResolvedKindColumn
+					resolved = true
+					continue
+				}
 				return fmt.Errorf("unknown qualifier '%s'", string(b.src[id.QualStart:id.QualEnd]))
 			}
 			var col *ColumnDef
@@ -358,8 +481,8 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			if resolved {
 				continue
 			}
-			// $param references are resolved at optimization time.
-			if b.src[id.Start] == '$' {
+			// Parameter references are resolved at optimization time.
+			if b.src[id.Start] == '$' || b.src[id.Start] == '@' {
 				id.ResolvedKind = parser.ResolvedKindColumn // treated as expression operand
 				resolved = true
 				continue
@@ -369,6 +492,45 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	}
 
 	return nil
+}
+
+func isGraphEdgeColumn(name []byte) bool {
+	return bytes.EqualFold(name, []byte("source")) ||
+		bytes.EqualFold(name, []byte("src")) ||
+		bytes.EqualFold(name, []byte("type")) ||
+		bytes.EqualFold(name, []byte("kind")) ||
+		bytes.EqualFold(name, []byte("edge_kind")) ||
+		bytes.EqualFold(name, []byte("target")) ||
+		bytes.EqualFold(name, []byte("tgt")) ||
+		bytes.EqualFold(name, []byte("weight"))
+}
+
+// bindMatchEdgePredicate reserves the identifier used by an edge-local WHERE
+// expression. Edge properties are not catalog columns; the graph planner
+// validates the property name and lowers it to a graph-native filter later.
+// Marking the left operand resolved here prevents the ordinary SQL scope pass
+// from treating an edge alias such as r in r.weight as a table qualifier.
+func bindMatchEdgePredicate(doc *parser.QueryDoc, edgeRef parser.NodeRef) {
+	if edgeRef.Kind != parser.NodeKindEdge || edgeRef.ID < 0 || int(edgeRef.ID) >= len(doc.Edges) {
+		return
+	}
+	edge := &doc.Edges[edgeRef.ID]
+	var bind func(parser.NodeRef)
+	bind = func(ref parser.NodeRef) {
+		if ref.Kind != parser.NodeKindBinaryExpr || ref.ID < 0 || int(ref.ID) >= len(doc.BinaryExprs) {
+			return
+		}
+		be := &doc.BinaryExprs[ref.ID]
+		if be.Operator == uint8(lexer.KindAnd) || be.Operator == uint8(lexer.KindOr) {
+			bind(be.Left)
+			bind(be.Right)
+			return
+		}
+		if be.Left.Kind == parser.NodeKindIdentifier && be.Left.ID >= 0 && int(be.Left.ID) < len(doc.Identifiers) {
+			doc.Identifiers[be.Left.ID].ResolvedKind = parser.ResolvedKindColumn
+		}
+	}
+	bind(edge.Predicate)
 }
 
 // hashIdentifier computes a case-insensitive FNV-1a hash directly from the source slice.

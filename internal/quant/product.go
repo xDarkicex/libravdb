@@ -3,8 +3,8 @@ package quant
 import (
 	"github.com/xDarkicex/memory"
 
-	"encoding/binary"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand"
@@ -14,15 +14,14 @@ import (
 
 // ProductQuantizer implements Product Quantization (PQ) algorithm
 type ProductQuantizer struct {
-	config        *QuantizationConfig
-	compressedSFL *memory.ShardedFreeList
-	centroids     [][][]float32
-	dimension     int
-	subspaces     int
-	subDim        int
-	memoryUsage   int64
-	mu            sync.RWMutex
-	trained       bool
+	config      *QuantizationConfig
+	centroids   [][][]float32
+	dimension   int
+	subspaces   int
+	subDim      int
+	memoryUsage int64
+	mu          sync.RWMutex
+	trained     bool
 }
 
 // CodeSize returns the byte length of a single compressed vector for
@@ -268,26 +267,6 @@ func (pq *ProductQuantizer) Configure(config *QuantizationConfig) error {
 	pq.config = config
 	pq.subspaces = config.Codebooks
 
-	bitsPerCode := config.Bits
-	totalBits := pq.subspaces * bitsPerCode
-	numBytes := (totalBits + 7) / 8
-
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		PoolSize:  64 * 1024 * 1024,
-		SlotSize:  uint64(48 + numBytes),
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 8,
-		Prealloc:  false,
-	}, 64, 16)
-	if err != nil {
-		return fmt.Errorf("failed to init compressedSFL: %w", err)
-	}
-
-	if pq.compressedSFL != nil {
-		pq.compressedSFL.Free()
-	}
-	pq.compressedSFL = sfl
-
 	return nil
 }
 
@@ -506,11 +485,7 @@ func (pq *ProductQuantizer) Compress(vector []float32) ([]byte, error) {
 	totalBits := pq.subspaces * bitsPerCode
 	numBytes := (totalBits + 7) / 8 // Round up to nearest byte
 
-	slot, err := pq.compressedSFL.Allocate()
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate compressed vector: %w", err)
-	}
-	compressed := slot[48 : 48+numBytes]
+	compressed := make([]byte, numBytes)
 	for i := range compressed {
 		compressed[i] = 0
 	}
@@ -839,10 +814,6 @@ func (pq *ProductQuantizer) Config() *QuantizationConfig {
 func (pq *ProductQuantizer) Close() error {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
-	if pq.compressedSFL != nil {
-		pq.compressedSFL.Free()
-		pq.compressedSFL = nil
-	}
 	return nil
 }
 

@@ -4,16 +4,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/xDarkicex/memory"
 )
 
-const SegmentVersion uint32 = 1
+const SegmentVersion uint32 = 2
+const LegacySegmentVersion uint32 = 1
 const SegmentHeaderSize = 32
 
 // SegmentHeader represents the 32-byte header of a segment file.
@@ -95,7 +96,7 @@ func (g *graphStore) FlushToSegment(path string) error {
 	var totalEdges uint64
 
 	for _, nodeID := range nodeIDs {
-		edges, err := g.Neighbors(nodeID)
+		edges, err := g.NeighborsWithProperties(nodeID)
 		if err != nil {
 			return err
 		}
@@ -115,12 +116,23 @@ func (g *graphStore) FlushToSegment(path string) error {
 		}
 		hashWriter.Write(buf)
 
-		if len(edges) > 0 {
-			edgesBytes := unsafe.Slice((*byte)(unsafe.Pointer(&edges[0])), len(edges)*int(unsafe.Sizeof(Edge{})))
-			if _, err = f.Write(edgesBytes); err != nil {
+		for _, view := range edges {
+			props := view.Properties
+			fixed := make([]byte, 20)
+			binary.LittleEndian.PutUint64(fixed[0:8], view.Edge.Target)
+			binary.LittleEndian.PutUint32(fixed[8:12], math.Float32bits(view.Edge.Weight))
+			binary.LittleEndian.PutUint32(fixed[12:16], view.Edge.Stamp)
+			binary.LittleEndian.PutUint32(fixed[16:20], uint32(len(props)))
+			if _, err = f.Write(fixed); err != nil {
 				return err
 			}
-			hashWriter.Write(edgesBytes)
+			hashWriter.Write(fixed)
+			if len(props) > 0 {
+				if _, err = f.Write(props); err != nil {
+					return err
+				}
+				hashWriter.Write(props)
+			}
 		}
 	}
 
@@ -192,7 +204,7 @@ func (g *graphStore) LoadFromSegment(path string) error {
 		return err
 	}
 
-	if header.Version != SegmentVersion {
+	if header.Version != LegacySegmentVersion && header.Version != SegmentVersion {
 		return fmt.Errorf("unsupported segment version: %d", header.Version)
 	}
 
@@ -269,24 +281,51 @@ func (g *graphStore) LoadFromSegment(path string) error {
 		edgeCount := binary.LittleEndian.Uint16(data[offset+8 : offset+10])
 		offset += 16
 
-		edgesBytesSize := int(edgeCount) * int(unsafe.Sizeof(Edge{}))
-		if offset+edgesBytesSize > len(data) {
-			return fmt.Errorf("unexpected EOF reading edges")
-		}
-
-		if edgeCount > 0 {
-			edges := unsafe.Slice((*Edge)(unsafe.Pointer(&data[offset])), edgeCount)
-			offset += edgesBytesSize
-
+		if header.Version == LegacySegmentVersion {
+			edgesBytesSize := int(edgeCount) * 16
+			if offset+edgesBytesSize > len(data) {
+				return fmt.Errorf("unexpected EOF reading legacy edges")
+			}
 			for j := 0; j < int(edgeCount); j++ {
-				stamp := edges[j].GetStamp()
+				legacyOffset := offset + j*16
+				edge := Edge{
+					Target: binary.LittleEndian.Uint64(data[legacyOffset : legacyOffset+8]),
+					Weight: math.Float32frombits(binary.LittleEndian.Uint32(data[legacyOffset+8 : legacyOffset+12])),
+					Stamp:  binary.LittleEndian.Uint32(data[legacyOffset+12 : legacyOffset+16]),
+				}
+				stamp := edge.GetStamp()
 				if stamp > maxStamp {
 					maxStamp = stamp
 				}
-				err := g.appendEdgeToTable(nodeID, edges[j], g.index, g.pagePools[0])
-				if err != nil {
+				if err := g.appendEdgeToTable(nodeID, edge, nil, g.index, g.pagePools[0]); err != nil {
 					return err
 				}
+			}
+			offset += edgesBytesSize
+			continue
+		}
+
+		for j := 0; j < int(edgeCount); j++ {
+			if offset+20 > len(data) {
+				return fmt.Errorf("unexpected EOF reading edge record")
+			}
+			edge := Edge{
+				Target: binary.LittleEndian.Uint64(data[offset : offset+8]),
+				Weight: math.Float32frombits(binary.LittleEndian.Uint32(data[offset+8 : offset+12])),
+				Stamp:  binary.LittleEndian.Uint32(data[offset+12 : offset+16]),
+			}
+			propertyLength := binary.LittleEndian.Uint32(data[offset+16 : offset+20])
+			offset += 20
+			if uint64(offset)+uint64(propertyLength) > uint64(len(data)) {
+				return fmt.Errorf("unexpected EOF reading edge properties")
+			}
+			props := append([]byte(nil), data[offset:offset+int(propertyLength)]...)
+			offset += int(propertyLength)
+			if edge.GetStamp() > maxStamp {
+				maxStamp = edge.GetStamp()
+			}
+			if err := g.appendEdgeToTable(nodeID, edge, props, g.index, g.pagePools[0]); err != nil {
+				return err
 			}
 		}
 	}

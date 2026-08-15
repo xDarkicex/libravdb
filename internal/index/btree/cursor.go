@@ -24,7 +24,14 @@ type cursorLevel struct {
 // Seek positions the cursor at the first key >= target.
 func (t *BTree) Seek(target []byte) *Cursor {
 	c := &Cursor{tree: t, stack: make([]cursorLevel, 0, 8)}
+	guard, err := t.enterRead()
+	if err != nil {
+		return c
+	}
 	c.descend(target)
+	if err := guard.leave(); err != nil {
+		c.valid = false
+	}
 	return c
 }
 
@@ -94,26 +101,65 @@ func (c *Cursor) Valid() bool { return c.valid }
 
 // Key returns the current key. Validates page pointer safety.
 func (c *Cursor) Key() []byte {
-	if !c.valid || !c.checkPage() {
+	if !c.valid {
 		return nil
 	}
-	return c.lastKey
+	guard, err := c.tree.enterRead()
+	if err != nil {
+		c.valid = false
+		return nil
+	}
+	valid := c.checkPage()
+	key := cloneBytes(c.lastKey)
+	if err := guard.leave(); err != nil {
+		c.valid = false
+		return nil
+	}
+	if !valid {
+		return nil
+	}
+	return key
 }
 
 // Value returns the current value. Validates page pointer safety first.
 func (c *Cursor) Value() []byte {
-	if !c.valid || !c.checkPage() || c.stack[len(c.stack)-1].index >= int(c.stack[len(c.stack)-1].page.Header.Count) {
+	if !c.valid {
+		return nil
+	}
+	guard, err := c.tree.enterRead()
+	if err != nil {
+		c.valid = false
+		return nil
+	}
+	if !c.checkPage() || c.stack[len(c.stack)-1].index >= int(c.stack[len(c.stack)-1].page.Header.Count) {
+		_ = guard.leave()
 		return nil
 	}
 	top := &c.stack[len(c.stack)-1]
-	return top.page.NodeAt(top.index).Value()
+	value := cloneBytes(top.page.NodeAt(top.index).Value())
+	if err := guard.leave(); err != nil {
+		c.valid = false
+		return nil
+	}
+	return value
 }
 
 // Next advances to the next key in order.
-func (c *Cursor) Next() bool {
+func (c *Cursor) Next() (ok bool) {
 	if !c.valid {
 		return false
 	}
+	guard, err := c.tree.enterRead()
+	if err != nil {
+		c.valid = false
+		return false
+	}
+	defer func() {
+		if err := guard.leave(); err != nil {
+			c.valid = false
+			ok = false
+		}
+	}()
 
 	top := &c.stack[len(c.stack)-1]
 
@@ -168,7 +214,14 @@ func (c *Cursor) checkPage() bool {
 // SeekLast positions the cursor at the largest key.
 func (t *BTree) SeekLast() *Cursor {
 	c := &Cursor{tree: t, stack: make([]cursorLevel, 0, 8)}
+	guard, err := t.enterRead()
+	if err != nil {
+		return c
+	}
 	c.descendLast()
+	if err := guard.leave(); err != nil {
+		c.valid = false
+	}
 	return c
 }
 
@@ -211,10 +264,21 @@ func (c *Cursor) descendLast() {
 }
 
 // Prev moves to the previous key in order.
-func (c *Cursor) Prev() bool {
+func (c *Cursor) Prev() (ok bool) {
 	if !c.valid {
 		return false
 	}
+	guard, err := c.tree.enterRead()
+	if err != nil {
+		c.valid = false
+		return false
+	}
+	defer func() {
+		if err := guard.leave(); err != nil {
+			c.valid = false
+			ok = false
+		}
+	}()
 
 	top := &c.stack[len(c.stack)-1]
 

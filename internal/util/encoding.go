@@ -35,7 +35,12 @@ const (
 	valueTypeInterfaceSlice
 	valueTypeMap
 	valueTypeBytes
+	valueTypeJSONNull
 )
+
+// JSONNull preserves the distinction between SQL NULL (a nil Go value) and
+// the JSON literal null stored inside a JSON/JSONB document.
+type JSONNull struct{}
 
 type BinaryEncoder struct {
 	Buf []byte
@@ -214,6 +219,8 @@ func (enc *BinaryEncoder) WriteValue(value interface{}) error {
 	switch typed := value.(type) {
 	case nil:
 		enc.WriteByte(valueTypeNil)
+	case JSONNull:
+		enc.WriteByte(valueTypeJSONNull)
 	case bool:
 		enc.WriteByte(valueTypeBool)
 		enc.WriteBool(typed)
@@ -290,6 +297,8 @@ func (enc *BinaryEncoder) WriteValue(value interface{}) error {
 func EstimateValueSize(value interface{}) int {
 	switch typed := value.(type) {
 	case nil:
+		return 1
+	case JSONNull:
 		return 1
 	case bool:
 		return 2
@@ -463,6 +472,8 @@ func (dec *BinaryDecoder) ReadValue() (interface{}, error) {
 	switch valueType {
 	case valueTypeNil:
 		return nil, nil
+	case valueTypeJSONNull:
+		return JSONNull{}, nil
 	case valueTypeBool:
 		return dec.ReadBool()
 	case valueTypeString:

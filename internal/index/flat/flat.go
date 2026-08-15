@@ -61,13 +61,14 @@ type PersistenceMetadata struct {
 
 // Index implements a flat (brute-force) vector index
 type Index struct {
-	quantizer  quant.Quantizer
-	config     *Config
-	idToIndex  map[string]int
-	vectorSFL  *memory.ShardedFreeList
-	vectors    []*VectorEntry
-	mu         sync.RWMutex
-	queryTiers [4]poolTier
+	quantizer      quant.Quantizer
+	config         *Config
+	idToIndex      map[string]int
+	vectorSFL      *memory.ShardedFreeList
+	vectorSlotSize int
+	vectors        []*VectorEntry
+	mu             sync.RWMutex
+	queryTiers     [4]poolTier
 }
 
 const vectorDataOffset = 48
@@ -78,9 +79,10 @@ func NewFlat(config *Config) (*Index, error) {
 		return nil, fmt.Errorf("dimension must be positive, got %d", config.Dimension)
 	}
 
+	vectorSlotSize := (vectorDataOffset + config.Dimension*4 + 63) &^ 63
 	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  256 * 1024 * 1024,
-		SlotSize:  uint64(vectorDataOffset + config.Dimension*4),
+		SlotSize:  uint64(vectorSlotSize),
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -90,10 +92,11 @@ func NewFlat(config *Config) (*Index, error) {
 	}
 
 	index := &Index{
-		config:    config,
-		vectors:   make([]*VectorEntry, 0),
-		idToIndex: make(map[string]int),
-		vectorSFL: sfl,
+		config:         config,
+		vectors:        make([]*VectorEntry, 0),
+		idToIndex:      make(map[string]int),
+		vectorSFL:      sfl,
+		vectorSlotSize: vectorSlotSize,
 		queryTiers: [4]poolTier{
 			{maxK: 16},
 			{maxK: 128},
@@ -836,6 +839,6 @@ func deepCloneValue(v interface{}) interface{} {
 func (idx *Index) releaseVector(v []float32) {
 	ptr := unsafe.Pointer(unsafe.SliceData(v))
 	basePtr := unsafe.Add(ptr, -vectorDataOffset)
-	slot := unsafe.Slice((*byte)(basePtr), int(vectorDataOffset+idx.config.Dimension*4))
+	slot := unsafe.Slice((*byte)(basePtr), idx.vectorSlotSize)
 	_ = idx.vectorSFL.Deallocate(slot)
 }

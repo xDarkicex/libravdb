@@ -3,16 +3,18 @@ package pgwire
 import "testing"
 
 func TestNamedAtParameterProtocolHelpers(t *testing.T) {
-	query := "SELECT VECTOR_DISTANCE(d.embedding, @query_vec) FROM documents d WHERE d.id = $2"
-	if got := countParams(query); got != 2 {
-		t.Fatalf("countParams=%d, want 2", got)
+	query := "SELECT VECTOR_DISTANCE(embedding, @query_vec) FROM documents"
+	if got := countParams(query); got != 1 {
+		t.Fatalf("countParams=%d, want 1", got)
 	}
-	bound, err := substituteParams(query, [][]byte{[]byte("[1,0,0]"), []byte("doc-2")})
-	if err != nil {
-		t.Fatalf("substituteParams: %v", err)
+	info := analyzeParams(query)
+	portal := &Portal{
+		Stmt:   &PreparedStmt{numPositional: info.numPositional, namedOrder: info.namedOrder},
+		Params: []ParamValue{{Value: []float32{1, 0, 0}}},
 	}
-	want := "SELECT VECTOR_DISTANCE(d.embedding, '[1,0,0]') FROM documents d WHERE d.id = 'doc-2'"
-	if bound != want {
-		t.Fatalf("substituted query=%q, want %q", bound, want)
+	params := buildQueryParams(portal)
+	vector, ok := params["query_vec"].([]float32)
+	if !ok || len(vector) != 3 || vector[0] != 1 {
+		t.Fatalf("native named parameter=%#v, want []float32{1, 0, 0}", params["query_vec"])
 	}
 }

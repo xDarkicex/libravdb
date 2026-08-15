@@ -51,7 +51,7 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 
 	bytesPerVector := dim * 4
 	slotSize := uint64(bytesPerVector + userDataOffset)
-	slotSize = (slotSize + 7) &^ 7
+	slotSize = (slotSize + 63) &^ 63
 	firstSegment, err := newSlabbyVectorSegment(slotSize, segmentCapacity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memory pool for slabby store: %w", err)

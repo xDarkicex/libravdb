@@ -136,6 +136,8 @@ type Index struct {
 	candidateMode     atomic.Uint32
 	provider          VectorProvider
 	quantizer         quant.Quantizer
+	compressedMu      sync.RWMutex
+	compressedKeep    map[uint32][]byte
 	rawVectorStore    RawVectorStore
 	idToIndex         *memory.TypedIDMap[Node]
 
@@ -149,13 +151,16 @@ type Index struct {
 	config                *Config
 	pqMmap                *internalmemory.MemoryMap
 	link0SFL              *memory.ShardedFreeList
+	link0SlotSize         int
 	ordinalToID           *segmentedStringArray
 	linkSFL               *memory.ShardedFreeList
+	linkSlotSize          int
 	neighborSelector      *NeighborSelector
 	useHeuristicPredicate bool
 	registryPool          *memory.Pool
 	scratchPool           *sync.Pool
 	nodeSFL               *memory.ShardedFreeList
+	nodeSlotSize          int
 	inFlightNodes         *inFlightRegistry // registry for concurrent insertions
 	repairCh              chan uint32
 	repairStop            chan struct{}
@@ -251,9 +256,10 @@ func NewHNSW(config *Config) (*Index, error) {
 	if slack < 4 {
 		slack = 4
 	}
+	linkSlotSize := alignedSFLSlotSize(uint64(SFLMetadataOverhead + (config.M+slack)*4))
 	linkSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(SFLMetadataOverhead + (config.M+slack)*4),
+		SlotSize:  linkSlotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -266,9 +272,10 @@ func NewHNSW(config *Config) (*Index, error) {
 	if slack0 < 4 {
 		slack0 = 4
 	}
+	link0SlotSize := alignedSFLSlotSize(uint64(SFLMetadataOverhead + (config.M*2+slack0)*4))
 	link0SFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(SFLMetadataOverhead + (config.M*2+slack0)*4),
+		SlotSize:  link0SlotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -278,9 +285,10 @@ func NewHNSW(config *Config) (*Index, error) {
 		return nil, fmt.Errorf("failed to create link0SFL: %w", err)
 	}
 
+	nodeSlotSize := alignedSFLSlotSize(uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(config.M))
 	nodeSFL, err := memory.NewShardedFreeList(memory.FreeListConfig{
 		PoolSize:  512 * 1024 * 1024,
-		SlotSize:  uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(config.M),
+		SlotSize:  nodeSlotSize,
 		SlabSize:  2 * 1024 * 1024,
 		SlabCount: 8,
 		Prealloc:  false,
@@ -354,12 +362,16 @@ func NewHNSW(config *Config) (*Index, error) {
 		useHeuristicPredicate: true,
 		distance:              distanceFunc,
 		provider:              config.Provider,
+		compressedKeep:        make(map[uint32][]byte),
 		idToIndex:             idToIndexMap,
 		ordinalToID:           ordinalToID,
 		trainingVectors:       nil,
 		linkSFL:               linkSFL,
 		link0SFL:              link0SFL,
+		linkSlotSize:          int(linkSlotSize),
+		link0SlotSize:         int(link0SlotSize),
 		nodeSFL:               nodeSFL,
+		nodeSlotSize:          int(nodeSlotSize),
 		registryPool:          registryPool,
 		inFlightNodes:         inFlight,
 		scratchPool:           scratchPool,
@@ -572,6 +584,7 @@ func (h *Index) insertSingleMetadata(ctx context.Context, entry *VectorEntry) (*
 			return nil, fmt.Errorf("failed to compress vector: %w", err)
 		}
 		node.CompressedVector = compressed
+		h.retainCompressedVector(node.Ordinal, compressed)
 	}
 
 	nodeID := node.Ordinal
@@ -1249,6 +1262,9 @@ func (h *Index) Close() error {
 	if h.reclamation != nil {
 		h.reclamation.drain(h)
 	}
+	h.compressedMu.Lock()
+	clear(h.compressedKeep)
+	h.compressedMu.Unlock()
 	for i := range h.searchScratches {
 		if arena := h.searchScratches[i].arena; arena != nil {
 			_ = arena.Free()
@@ -1988,14 +2004,36 @@ func (h *Index) releaseUnpublishedNode(node *Node) {
 	}
 	h.releaseUnpublishedVector(node)
 	h.freeNodeLinks(node)
+	h.releaseCompressedVector(node.Ordinal)
 	node.CompressedVector = nil
 	node.setVector(nil)
 	if h.nodeSFL == nil {
 		return
 	}
 	base := unsafe.Pointer(uintptr(unsafe.Pointer(node)) - SFLMetadataOverhead)
-	slotSize := int(uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(h.config.M))
-	_ = h.nodeSFL.Deallocate(unsafe.Slice((*byte)(base), slotSize))
+	_ = h.nodeSFL.Deallocate(unsafe.Slice((*byte)(base), h.nodeSlotSize))
+}
+
+// retainCompressedVector keeps a Go-managed compressed payload reachable while
+// the owning Node lives in off-heap storage. Go's collector cannot scan an
+// unsafe pointer stored inside that off-heap Node, so the index must retain the
+// slice header in a GC-visible map.
+func (h *Index) retainCompressedVector(ordinal uint32, compressed []byte) {
+	if h == nil || compressed == nil {
+		return
+	}
+	h.compressedMu.Lock()
+	h.compressedKeep[ordinal] = compressed
+	h.compressedMu.Unlock()
+}
+
+func (h *Index) releaseCompressedVector(ordinal uint32) {
+	if h == nil {
+		return
+	}
+	h.compressedMu.Lock()
+	delete(h.compressedKeep, ordinal)
+	h.compressedMu.Unlock()
 }
 
 func (h *Index) releaseUnpublishedVector(node *Node) {
@@ -2024,22 +2062,15 @@ func (h *Index) freeLinkArray(level int, ptr *uint32) {
 		return
 	}
 
-	capacity := levelMaxLinks(h.config.M, level)
-	slack := capacity / 4
-	if slack < 4 {
-		slack = 4
-	}
-	expectedCap := capacity + slack
-
 	basePtr := unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) - SFLMetadataOverhead)
 	if level == 0 {
 		if h.link0SFL != nil {
-			slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead)+expectedCap*4)
+			slot := unsafe.Slice((*byte)(basePtr), h.link0SlotSize)
 			_ = h.link0SFL.Deallocate(slot)
 		}
 	} else {
 		if h.linkSFL != nil {
-			slot := unsafe.Slice((*byte)(basePtr), int(SFLMetadataOverhead)+expectedCap*4)
+			slot := unsafe.Slice((*byte)(basePtr), h.linkSlotSize)
 			_ = h.linkSFL.Deallocate(slot)
 		}
 	}

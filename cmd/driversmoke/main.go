@@ -9,8 +9,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/xDarkicex/libravdb/internal/pgwire"
 	"github.com/xDarkicex/libravdb/libravdb"
+	"github.com/xDarkicex/libravdb/pgwire"
 )
 
 func main() {

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"errors"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 )
@@ -29,7 +30,14 @@ type CollectionConfig struct {
 	// The storage engine persists it but intentionally does not interpret it.
 	// DataLSN is populated on reads only and is never serialized as config.
 	CostModelStats []byte
-	DataLSN        uint64
+	// MetadataSchema contains application metadata field type codes. The
+	// storage layer treats the codes as opaque; the owning package interprets
+	// them when it rebuilds the public collection configuration.
+	MetadataSchema map[string]uint8
+	// IndexedFields contains the metadata fields whose derived posting lists
+	// should be used for equality lookups.
+	IndexedFields []string
+	DataLSN       uint64
 }
 
 // CostModelStatisticsStore is an optional persistence seam for optimizer
@@ -96,11 +104,11 @@ type WriteStatsProvider interface {
 type TxOperationType uint8
 
 const (
-	TxOperationPut       TxOperationType = iota // record insert/update
-	TxOperationDelete                           // record delete
-	TxOperationGraphEdgeAdd                     // graph edge add
-	TxOperationGraphEdgeRemove                  // graph edge remove
-	TxOperationGraphNodeDrop                    // graph node drop (all edges)
+	TxOperationPut             TxOperationType = iota // record insert/update
+	TxOperationDelete                                 // record delete
+	TxOperationGraphEdgeAdd                           // graph edge add
+	TxOperationGraphEdgeRemove                        // graph edge remove
+	TxOperationGraphNodeDrop                          // graph node drop (all edges)
 )
 
 // TxOperation represents one row-level or graph mutation in a transactional batch.
@@ -120,6 +128,9 @@ type TxOperation struct {
 	EdgeTgt    uint64
 	EdgeWeight float32
 	EdgeKind   uint8
+	// EdgeProperties is the versioned JSON property envelope attached to the
+	// node-owned edge record. Empty means no arbitrary properties.
+	EdgeProperties []byte
 }
 
 // TransactionalEngine extends Engine with atomic multi-collection commit support.
@@ -131,6 +142,23 @@ type TransactionalEngine interface {
 	// node IDs for remapping provisional graph edge references before
 	// the combined record+graph WAL commit.
 	ReserveGraphNodeIDs(ctx context.Context, n int) (uint64, error)
+}
+
+// CommitReceipt identifies the exact durable transaction boundary produced by
+// a successful WAL commit. It is intentionally separate from
+// TransactionalEngine so storage implementations that only support the
+// legacy error-only CommitTx method remain source-compatible.
+type CommitReceipt struct {
+	CommitLSN uint64
+}
+
+// DurableTransactionalEngine is the optional exact-receipt extension to
+// TransactionalEngine. LatestCommitLSN reads the persisted commit catalog
+// rather than the next allocated WAL sequence number.
+type DurableTransactionalEngine interface {
+	TransactionalEngine
+	CommitTxDurable(ctx context.Context, ops []TxOperation) (CommitReceipt, error)
+	LatestCommitLSN() (uint64, error)
 }
 
 // Collection defines the collection storage interface
@@ -186,6 +214,7 @@ type GraphEdgeOp struct {
 	Tgt        uint64
 	Weight     float32
 	Kind       uint8
+	Properties []byte
 }
 
 // GraphNodeDropOp is a collection-aware node-drop mutation. It carries the
@@ -213,7 +242,7 @@ type GraphLabelWALWriter interface {
 // operations during WAL recovery. These methods mutate the in-memory edge
 // table directly — the WAL frames are already committed.
 type GraphRecoveryTarget interface {
-	ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, commitLSN uint64) error
+	ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, properties []byte, commitLSN uint64) error
 	ReplayEdgeRemove(src, tgt uint64, kind uint8, commitLSN uint64) error
 	ReplayNodeEdgeDrop(nodeID uint64, commitLSN uint64) error
 	ReplayVertexLabel(nodeID uint64, label string, commitLSN uint64) error
@@ -229,9 +258,32 @@ type TemporalRecord struct {
 	Version  uint64
 }
 
+// TemporalVersion is one retained record version and its validity interval.
+// BeginTime is inclusive; EndTime is exclusive and zero for a still-live
+// version. The interval is derived from the durable commit catalog, not wall
+// clock observation at query time.
+type TemporalVersion struct {
+	Metadata  map[string]interface{}
+	ID        string
+	Vector    []float32
+	Ordinal   uint32
+	Version   uint64
+	BeginLSN  uint64
+	EndLSN    uint64
+	BeginTime time.Time
+	EndTime   time.Time
+}
+
 // TemporalReader is optionally implemented by storage engines that support
 // MVCC record visibility at historical snapshot LSNs.
 type TemporalReader interface {
 	GetRecordAtLSN(collectionName, id string, snapshotLSN uint64) (*TemporalRecord, error)
 	ListVisibleAtLSN(collectionName string, snapshotLSN uint64, fn func(*TemporalRecord) bool) error
+}
+
+// TemporalRangeReader enumerates retained versions whose validity intervals
+// overlap an inclusive LSN range. It is optional so alternate storage engines
+// can continue implementing point-in-time reads independently.
+type TemporalRangeReader interface {
+	ListVersionsBetween(collectionName string, startLSN, endLSN uint64, fn func(*TemporalVersion) bool) error
 }

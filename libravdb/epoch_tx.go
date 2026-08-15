@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/graph"
+	"github.com/xDarkicex/libravdb/internal/optimizer"
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
 
@@ -65,6 +66,7 @@ type EpochTx struct {
 type epochSavepoint struct {
 	name             string
 	recordLogLen     int               // len(recordTx.ops) at savepoint
+	graphDropLen     int               // len(recordTx.graphDrops) at savepoint
 	graphOpLen       map[string]int    // collection → len(txn.OrderedStagedOps()) at savepoint
 	provisionalNodes map[string]uint64 // snapshot of provisionalNodes
 	nextProvisional  uint64            // snapshot of nextProvisional
@@ -136,9 +138,14 @@ func (e *EpochTx) Savepoint(name string) error {
 	if !ok {
 		return fmt.Errorf("record transaction is not a *transaction")
 	}
+	recordTx.mu.Lock()
+	recordLogLen := len(recordTx.ops)
+	graphDropLen := len(recordTx.graphDrops)
+	recordTx.mu.Unlock()
 	sp := epochSavepoint{
 		name:             name,
-		recordLogLen:     len(recordTx.ops),
+		recordLogLen:     recordLogLen,
+		graphDropLen:     graphDropLen,
 		graphOpLen:       make(map[string]int, len(e.graphs)),
 		provisionalNodes: make(map[string]uint64, len(e.provisionalNodes)),
 		nextProvisional:  e.nextProvisional,
@@ -184,6 +191,9 @@ func (e *EpochTx) RollbackTo(name string) error {
 	if len(recordTx.ops) > sp.recordLogLen {
 		recordTx.ops = recordTx.ops[:sp.recordLogLen]
 	}
+	if len(recordTx.graphDrops) > sp.graphDropLen {
+		recordTx.graphDrops = recordTx.graphDrops[:sp.graphDropLen]
+	}
 	recordTx.mu.Unlock()
 
 	// Rebuild graph transactions: replay surviving ordered operations
@@ -221,7 +231,7 @@ func (e *EpochTx) RollbackTo(name string) error {
 		for _, op := range surviving {
 			switch op.Kind {
 			case graph.StagedGraphEdgeAdd:
-				if err := fresh.AddEdge(op.Src, op.Tgt, op.Weight, op.EdgeKind); err != nil {
+				if err := fresh.AddEdgeWithPropertiesJSON(op.Src, op.Tgt, op.Weight, op.EdgeKind, op.Properties); err != nil {
 					return err
 				}
 			case graph.StagedGraphEdgeRemove:
@@ -306,17 +316,21 @@ func (e *EpochTx) Insert(ctx context.Context, collection, id string, vector []fl
 	if err != nil {
 		return err
 	}
-	// Assign a provisional node ID so this staged record can be
-	// referenced by INSERT INTO GRAPH_EDGES within the same epoch.
+	epochCtx := e.Context(ctx)
+	if err := tx.Insert(epochCtx, collection, id, vector, metadata); err != nil {
+		return err
+	}
+	// Assign a provisional node ID only after staging succeeds so a failed
+	// insert cannot leave an endpoint visible in GRAPH_NODES or graph lookup.
 	e.mu.Lock()
 	key := collection + "\x00" + id
 	if _, exists := e.provisionalNodes[key]; !exists {
 		e.provisionalNodes[key] = e.nextProvisional
 		e.nextProvisional++
 	}
-	e.mu.Unlock()
 	e.generation++
-	return tx.Insert(ctx, collection, id, vector, metadata)
+	e.mu.Unlock()
+	return nil
 }
 
 // LookupNodeID resolves a record ID to a graph node ID within the epoch.
@@ -325,9 +339,23 @@ func (e *EpochTx) LookupNodeID(ctx context.Context, collection, id string) (uint
 	e.mu.Lock()
 	if nid, ok := e.provisionalNodes[collection+"\x00"+id]; ok {
 		e.mu.Unlock()
+		visible, err := e.recordVisible(ctx, collection, id)
+		if err != nil {
+			return 0, err
+		}
+		if !visible {
+			return 0, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
+		}
 		return nid, nil
 	}
 	e.mu.Unlock()
+	visible, err := e.recordVisible(ctx, collection, id)
+	if err != nil {
+		return 0, err
+	}
+	if !visible {
+		return 0, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
+	}
 	return e.db.GetNodeID(ctx, collection, id)
 }
 
@@ -342,13 +370,31 @@ func (e *EpochTx) ResolveNodeID(ctx context.Context, nodeID uint64) (string, str
 			// compositeKey is "collection\x00recordID"
 			parts := splitCompositeKey(compositeKey)
 			if len(parts) == 2 {
+				visible, err := e.recordVisible(ctx, parts[0], parts[1])
+				if err != nil {
+					return "", "", err
+				}
+				if !visible {
+					return "", "", fmt.Errorf("%w: %d", ErrRecordNotFound, nodeID)
+				}
 				return parts[0], parts[1], nil
 			}
 			return "", compositeKey, nil
 		}
 	}
 	e.mu.Unlock()
-	return e.db.ResolveNodeID(ctx, nodeID)
+	collection, id, err := e.db.ResolveNodeID(ctx, nodeID)
+	if err != nil {
+		return "", "", err
+	}
+	visible, err := e.recordVisible(ctx, collection, id)
+	if err != nil {
+		return "", "", err
+	}
+	if !visible {
+		return "", "", fmt.Errorf("%w: %d", ErrRecordNotFound, nodeID)
+	}
+	return collection, id, nil
 }
 
 // Update stages a vector record update in the epoch.
@@ -357,8 +403,41 @@ func (e *EpochTx) Update(ctx context.Context, collection, id string, vector []fl
 	if err != nil {
 		return err
 	}
+	epochCtx := e.Context(ctx)
+	if err := tx.Update(epochCtx, collection, id, vector, metadata); err != nil {
+		return err
+	}
+	e.mu.Lock()
 	e.generation++
-	return tx.Update(ctx, collection, id, vector, metadata)
+	e.mu.Unlock()
+	return nil
+}
+
+// Upsert stages an insert-or-replace mutation in the epoch overlay. SQL
+// ON CONFLICT execution uses this only after it has resolved a non-conflicting
+// proposed row; conflicting DO UPDATE paths use Update so unspecified columns
+// retain their existing values.
+func (e *EpochTx) Upsert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	tx, err := e.RecordTx()
+	if err != nil {
+		return err
+	}
+	_, durableNodeErr := e.db.GetNodeID(ctx, collection, id)
+	epochCtx := e.Context(ctx)
+	if err := tx.Upsert(epochCtx, collection, id, vector, metadata); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	key := collection + "\x00" + id
+	if durableNodeErr != nil {
+		if _, exists := e.provisionalNodes[key]; !exists {
+			e.provisionalNodes[key] = e.nextProvisional
+			e.nextProvisional++
+		}
+	}
+	e.generation++
+	e.mu.Unlock()
+	return nil
 }
 
 // Rename stages a primary-key migration inside the epoch overlay.
@@ -367,7 +446,8 @@ func (e *EpochTx) Rename(ctx context.Context, collection, oldID, newID string, v
 	if err != nil {
 		return err
 	}
-	if err := tx.Rename(ctx, collection, oldID, newID, vector, metadata); err != nil {
+	epochCtx := e.Context(ctx)
+	if err := tx.Rename(epochCtx, collection, oldID, newID, vector, metadata); err != nil {
 		return err
 	}
 	e.mu.Lock()
@@ -388,8 +468,95 @@ func (e *EpochTx) Delete(ctx context.Context, collection, id string) error {
 	if err != nil {
 		return err
 	}
+	// A provisional node has no live reverse-directory entry, so its staged
+	// graph edges must be dropped in the epoch overlay explicitly. Committed
+	// nodes are handled by transaction.delete's durable graph-drop operation.
+	e.mu.Lock()
+	key := collection + "\x00" + id
+	provisionalID, provisional := e.provisionalNodes[key]
+	e.mu.Unlock()
+	epochCtx := e.Context(ctx)
+	if err := tx.Delete(epochCtx, collection, id); err != nil {
+		return err
+	}
+	if provisional {
+		if err := e.DropGraphNodeEdges(collection, provisionalID); err != nil {
+			return err
+		}
+		e.mu.Lock()
+		delete(e.provisionalNodes, key)
+		e.mu.Unlock()
+	}
+	e.mu.Lock()
 	e.generation++
-	return tx.Delete(ctx, collection, id)
+	e.mu.Unlock()
+	return nil
+}
+
+// recordVisible reports whether a record is visible in the current epoch
+// branch without materializing the entire collection. It applies the pinned
+// snapshot first, then the ordered record mutations with last-write-wins
+// semantics. This is used to prevent stale GRAPH_NODES mappings from being
+// returned after an epoch-local delete or snapshot exclusion.
+func (e *EpochTx) recordVisible(ctx context.Context, collection, id string) (bool, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return false, ErrEpochClosed
+	}
+	recordTx, ok := e.record.(*transaction)
+	snapshotLSN := e.epochLSN
+	e.mu.Unlock()
+
+	col, err := e.db.GetCollection(collection)
+	if err != nil {
+		return false, err
+	}
+	visible := false
+	if snapshotLSN > 0 {
+		rec, err := col.GetAtLSN(ctx, id, snapshotLSN)
+		if err != nil {
+			return false, err
+		}
+		visible = rec != nil
+	} else {
+		_, err := col.Get(ctx, id)
+		visible = err == nil
+		if err != nil && !errors.Is(err, ErrRecordNotFound) {
+			return false, err
+		}
+	}
+	if !ok {
+		return visible, nil
+	}
+	recordTx.mu.Lock()
+	ops := append([]txMutation(nil), recordTx.ops...)
+	recordTx.mu.Unlock()
+	for _, op := range ops {
+		if op.collection != collection {
+			continue
+		}
+		switch op.kind {
+		case txMutationDelete:
+			if op.id == id {
+				visible = false
+			}
+		case txMutationInsert, txMutationUpsert:
+			if op.id == id {
+				visible = true
+			}
+		case txMutationUpdate:
+			// An update cannot create a record; retain the current state.
+		case txMutationRename:
+			if op.oldID == id {
+				visible = false
+			}
+			if op.id == id {
+				visible = true
+			}
+		}
+	}
+	return visible, nil
 }
 
 // Query executes a SQL statement against this epoch context. Graph traversal
@@ -402,6 +569,43 @@ func (e *EpochTx) Query(ctx context.Context, sql string, params QueryParams) (*S
 	}
 	e.mu.Unlock()
 	return e.db.queryWithContext(e.Context(ctx), sql, params)
+}
+
+// QueryWithSessionConfig executes SQL against the epoch snapshot with
+// connection-local settings applied to query-local execution.
+func (e *EpochTx) QueryWithSessionConfig(ctx context.Context, sql string, params QueryParams, config *SessionConfig) (*SearchResults, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, ErrEpochClosed
+	}
+	e.mu.Unlock()
+	return e.db.queryWithBoundParamsAndConfig(e.Context(ctx), sql, optimizer.NewParameterSet(params), params, config)
+}
+
+// QueryWithBoundParams executes SQL with values already decoded into the
+// native typed parameter set. It is used by pgwire extended execution so no
+// SQL text substitution or map/string normalization is required.
+func (e *EpochTx) QueryWithBoundParams(ctx context.Context, sql string, params *optimizer.ParameterSet) (*SearchResults, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, ErrEpochClosed
+	}
+	e.mu.Unlock()
+	return e.db.queryWithBoundParams(e.Context(ctx), sql, params, nil)
+}
+
+// QueryWithBoundParamsAndSessionConfig preserves epoch visibility while
+// applying the caller's connection-local execution settings.
+func (e *EpochTx) QueryWithBoundParamsAndSessionConfig(ctx context.Context, sql string, params *optimizer.ParameterSet, config *SessionConfig) (*SearchResults, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, ErrEpochClosed
+	}
+	e.mu.Unlock()
+	return e.db.queryWithBoundParamsAndConfig(e.Context(ctx), sql, params, nil, config)
 }
 
 // ListRecords returns the collection view with staged record mutations
@@ -504,11 +708,17 @@ func (e *EpochTx) GraphTxn(collection string) (*graph.Txn, error) {
 
 // AddGraphEdge stages a directed edge add within the epoch. Increments generation.
 func (e *EpochTx) AddGraphEdge(collection string, src, tgt uint64, weight float32, kind uint8) error {
+	return e.AddGraphEdgeWithPropertiesJSON(collection, src, tgt, weight, kind, nil)
+}
+
+// AddGraphEdgeWithPropertiesJSON stages an edge property envelope through the
+// same ordered epoch operation log as ordinary graph edges.
+func (e *EpochTx) AddGraphEdgeWithPropertiesJSON(collection string, src, tgt uint64, weight float32, kind uint8, properties []byte) error {
 	gtx, err := e.GraphTxn(collection)
 	if err != nil {
 		return err
 	}
-	if err := gtx.AddEdge(src, tgt, weight, kind); err != nil {
+	if err := gtx.AddEdgeWithPropertiesJSON(src, tgt, weight, kind, properties); err != nil {
 		return err
 	}
 	e.generation++
@@ -591,9 +801,12 @@ func (e *EpochTx) Commit(ctx context.Context) error {
 	for k, v := range e.provisionalNodes {
 		provisionalCopy[k] = v
 	}
+	recordTx.mu.Lock()
+	recordGraphDrops := append([]txGraphDrop(nil), recordTx.graphDrops...)
+	recordTx.mu.Unlock()
 	e.mu.Unlock()
 
-	reserveGraphOps := func(reservedIDs map[string]uint64) ([]storage.TxOperation, func() error) {
+	reserveGraphOps := func(reservedIDs map[string]uint64) ([]storage.TxOperation, func(uint64) error) {
 		// reservedIDs: "collection\x00recordID" → reserved GraphNodeID (pre-assigned by commitTxWithGraph).
 		// Remap provisional edge endpoints to these committed IDs.
 		if len(reservedIDs) > 0 && len(provisionalCopy) > 0 {
@@ -611,17 +824,29 @@ func (e *EpochTx) Commit(ctx context.Context) error {
 			}
 		}
 		graphOps := e.buildGraphOps(graphs)
-		return graphOps, func() error {
+		for _, drop := range recordGraphDrops {
+			graphOps = append(graphOps, storage.TxOperation{
+				Type: storage.TxOperationGraphNodeDrop, Collection: drop.collection,
+				EdgeSrc: drop.nodeID,
+			})
+		}
+		return graphOps, func(commitLSN uint64) error {
 			for _, gtx := range graphs {
-				if err := gtx.ApplyInMemory(); err != nil {
+				var err error
+				if commitLSN != 0 {
+					err = gtx.ApplyInMemoryAtLSN(commitLSN)
+				} else {
+					err = gtx.ApplyInMemory()
+				}
+				if err != nil {
 					return err
 				}
 			}
-			return nil
+			return e.db.applyGraphNodeDrops(recordGraphDrops, commitLSN)
 		}
 	}
 
-	return e.db.commitTxWithGraph(ctx, recordTx.ops, reserveGraphOps, nil)
+	return e.db.commitTxWithGraph(ctx, recordTx.ops, reserveGraphOps, nil, nil)
 }
 
 // buildGraphOps converts staged graph Txns to TxOperations with collection identity.
@@ -632,7 +857,7 @@ func (e *EpochTx) buildGraphOps(graphs []*graph.Txn) []storage.TxOperation {
 		for _, add := range adds {
 			ops = append(ops, storage.TxOperation{
 				Type: storage.TxOperationGraphEdgeAdd, Collection: name,
-				EdgeSrc: add.Src, EdgeTgt: add.Tgt, EdgeWeight: add.Weight, EdgeKind: add.Kind,
+				EdgeSrc: add.Src, EdgeTgt: add.Tgt, EdgeWeight: add.Weight, EdgeKind: add.Kind, EdgeProperties: append([]byte(nil), add.Properties...),
 			})
 		}
 		for _, remove := range removes {

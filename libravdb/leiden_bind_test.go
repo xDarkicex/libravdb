@@ -114,8 +114,8 @@ func TestLeidenBind_BasicBinding(t *testing.T) {
 	}
 
 	// Edge kind resolved correctly.
-	if len(bound.Spec.EdgeKinds) != 1 || bound.Spec.EdgeKinds[0] != 30 {
-		t.Errorf("EdgeKinds: want [30], got %v", bound.Spec.EdgeKinds)
+	if len(bound.Spec.EdgeKinds) != 1 || bound.Spec.EdgeKinds[0] != 50 {
+		t.Errorf("EdgeKinds: want [50], got %v", bound.Spec.EdgeKinds)
 	}
 
 	// Direction and hops copied.

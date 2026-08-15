@@ -63,7 +63,7 @@ func TestTemporalSQL_GraphOnly(t *testing.T) {
 
 	queryAt := func(ts time.Time) (*SearchResults, error) {
 		sql := fmt.Sprintf("SELECT s.category FROM nodes s AS OF TIMESTAMP '%s' "+
-			"WHERE MATCH (s)-[:GRAPH_ONLY_LINK]->(p:Target) AND p.category = 'Security' LIMIT 5",
+			"WHERE MATCH (s)-[r:GRAPH_ONLY_LINK WHERE r.weight > 0.5]->(p:Target) AND p.category = 'Security' LIMIT 5",
 			ts.UTC().Format(time.RFC3339Nano))
 		return db.Query(ctx, sql)
 	}

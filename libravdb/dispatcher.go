@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +53,7 @@ func (d DispatchPlan) String() string {
 }
 
 // QueryMetrics captures per-query execution statistics for cost-model
-// calibration and offline threshold fitting (M3c).
+// calibration and offline threshold fitting.
 type QueryMetrics struct {
 	PlanChosen     DispatchPlan
 	DispatchReason DispatchReason
@@ -106,7 +107,7 @@ const iterativeCapHard = 1000        // absolute first-batch cap
 // hysteresisBand is the guard-band fraction around switching thresholds.
 // A plan is only eligible for transition when the metric crosses
 // threshold * (1 ± h), preventing flapping from small estimation errors.
-// PROVISIONAL — M3c calibrates.
+// PROVISIONAL — offline calibration may refine these values.
 const hysteresisBand = 0.20
 
 // --- Dispatcher ---
@@ -178,7 +179,7 @@ func (e *Executor) dispatchHybrid(ctx context.Context, plan *optimizer.PhysicalP
 	// predicates or a materializable graph candidate set. Both become one
 	// ordinal bitmap before the index search begins.
 	hasVectorKNN := plan.HasVectorSearch || plan.Kind == optimizer.QueryKindKNN
-	hasBitmapPredicate := (plan.HasRelationalQuery && len(plan.Predicates) > 0) || plan.HasGraphTraversal
+	hasBitmapPredicate := (plan.HasRelationalQuery && planHasPredicates(plan)) || plan.HasGraphTraversal
 	hasFilteredANN := hasVectorKNN && hasBitmapPredicate
 	if hasFilteredANN && c > exactThreshold {
 		m.PlanChosen = DispatchFilteredANN
@@ -202,7 +203,7 @@ func (e *Executor) dispatchHybrid(ctx context.Context, plan *optimizer.PhysicalP
 // (relational predicates OR graph traversal).
 func isHybridQuery(plan *optimizer.PhysicalPlan) bool {
 	hasVector := plan.HasVectorSearch || plan.Kind == optimizer.QueryKindKNN || plan.Kind == optimizer.QueryKindVectorProjection
-	hasFilter := (plan.HasRelationalQuery && len(plan.Predicates) > 0) || plan.HasGraphTraversal
+	hasFilter := (plan.HasRelationalQuery && planHasPredicates(plan)) || plan.HasGraphTraversal
 	return hasVector && hasFilter
 }
 
@@ -227,12 +228,12 @@ func (c *hybridConstraints) graphAllows(recordID string) bool {
 // collection posting index; graph-only constraints resolve MATCH record IDs
 // directly. ListAll is the correctness fallback for unindexed predicates.
 func (e *Executor) hybridCandidateRecords(ctx context.Context, col *Collection, plan *optimizer.PhysicalPlan, constraints *hybridConstraints) ([]Record, error) {
-	if plan.HasRelationalQuery {
+	if plan.HasRelationalQuery && len(plan.PredicateAlternatives) == 0 {
 		for _, predicate := range plan.Predicates {
-			if predicate.Operator != 12 { // lexer.KindEquals
+			if predicate.Operator != 12 || predicate.ValueIsNull || predicate.NullTest != optimizer.NullTestNone { // lexer.KindEquals
 				continue
 			}
-			records, indexed, err := col.lookupIndexedMetadata(ctx, predicate.Column, predicate.Value)
+			records, indexed, err := col.lookupIndexedMetadata(ctx, predicate.Column, predicate.PredicateValue().Bytes())
 			if err != nil {
 				return nil, err
 			}
@@ -325,7 +326,7 @@ func (e *Executor) materializeGraphCandidateIDs(ctx context.Context, plan *optim
 				maxHops = 1 << 20
 			}
 		}
-		edges[i] = EdgePlan{Dir: gep.Direction, Min: minHops, Max: maxHops}
+		edges[i] = EdgePlan{Dir: gep.Direction, Min: minHops, Max: maxHops, Weight: gep.Weight, Predicate: gep.Predicate}
 		if gep.EdgeKind != 0 {
 			edges[i].KindSet.Set(gep.EdgeKind)
 		}
@@ -439,8 +440,19 @@ func filterByHybridConstraints(results *SearchResults, plan *optimizer.PhysicalP
 	if results == nil {
 		return nil
 	}
-	if plan.HasRelationalQuery && len(plan.Predicates) > 0 && len(results.Results) > 0 {
-		results = filterByPredicates(results, plan.Predicates)
+	if plan.HasRelationalQuery && planHasPredicates(plan) && len(results.Results) > 0 {
+		if len(plan.PredicateAlternatives) > 0 {
+			filtered := results.Results[:0]
+			for _, result := range results.Results {
+				if searchResultMatchesPlan(plan, result) {
+					filtered = append(filtered, result)
+				}
+			}
+			results.Results = filtered
+			results.Total = len(filtered)
+		} else {
+			results = filterByPredicates(results, plan.Predicates)
+		}
 	}
 	if constraints == nil || constraints.graphRecordIDs == nil || len(results.Results) == 0 {
 		return results
@@ -477,7 +489,7 @@ func (e *Executor) executeExactCandidateScan(ctx context.Context, plan *optimize
 	// Intersect relational and graph predicates before authoritative scoring.
 	candidates := make([]Record, 0, len(records))
 	for _, rec := range records {
-		scalarMatch := !plan.HasRelationalQuery || len(plan.Predicates) == 0 || recordMatchesPredicates(rec, plan.Predicates)
+		scalarMatch := !plan.HasRelationalQuery || !planHasPredicates(plan) || planMatchesRecord(plan, rec)
 		if scalarMatch {
 			m.ActScalarCandidates++
 		}
@@ -518,7 +530,7 @@ func (e *Executor) buildHybridOrdinalBitmap(ctx context.Context, col *Collection
 	}
 	matchCount := 0
 	for _, rec := range records {
-		scalarMatch := !plan.HasRelationalQuery || len(plan.Predicates) == 0 || recordMatchesPredicates(rec, plan.Predicates)
+		scalarMatch := !plan.HasRelationalQuery || !planHasPredicates(plan) || planMatchesRecord(plan, rec)
 		if scalarMatch {
 			m.ActScalarCandidates++
 		}
@@ -849,12 +861,54 @@ func (e *Executor) collectionSize(ctx context.Context, name string) int {
 // predicates, mirroring predicateMatches semantics.
 func recordMatchesPredicates(rec Record, predicates []optimizer.RelationalPredicate) bool {
 	for _, pred := range predicates {
+		if strings.EqualFold(pred.Column, "id") {
+			// The physical record key is not stored in Metadata. Epoch
+			// full-scans use this helper for SQL WHERE id predicates because
+			// the live B-tree fast path is intentionally bypassed.
+			if pred.NullTest == optimizer.NullTestIsNull {
+				return false
+			}
+			if pred.NullTest == optimizer.NullTestNotNull {
+				continue
+			}
+			if !scalarPredicateMatches(rec.ID, pred) {
+				return false
+			}
+			continue
+		}
+
 		colVal, ok := rec.Metadata[pred.Column]
-		if !ok {
+		isNull := !ok || colVal == nil
+		if pred.NullTest == optimizer.NullTestIsNull {
+			if !isNull {
+				return false
+			}
+			continue
+		}
+		if pred.NullTest == optimizer.NullTestNotNull {
+			if isNull {
+				return false
+			}
+			continue
+		}
+		if isNull || !scalarPredicateMatches(colVal, pred) {
 			return false
 		}
-		colStr := recordMetaToString(colVal)
-		if !compareColumn(colStr, string(pred.Value), pred.Operator) {
+	}
+	return true
+}
+
+func recordMatchesFTSPredicates(rec Record, predicates []optimizer.FTSPredicate) bool {
+	for _, predicate := range predicates {
+		text := predicate.Text
+		if predicate.Column != "" {
+			value, ok := recordMetadataValue(rec.Metadata, predicate.Column)
+			if !ok || value == nil {
+				return false
+			}
+			text = recordMetaToString(value)
+		}
+		if ftsRankTextConfig(text, predicate.Query, predicate.QueryMode, predicate.Config) <= 0 {
 			return false
 		}
 	}
@@ -864,6 +918,8 @@ func recordMatchesPredicates(rec Record, predicates []optimizer.RelationalPredic
 // recordMetaToString renders a metadata value to a string for comparison.
 func recordMetaToString(v interface{}) string {
 	switch t := v.(type) {
+	case util.JSONNull:
+		return "null"
 	case string:
 		return t
 	case []byte:
@@ -1051,7 +1107,7 @@ func (e *Executor) materializeGraphCandidateIDsEpoch(ctx context.Context, plan *
 				maxHops = 1 << 20
 			}
 		}
-		edges[i] = graph.EdgePlan{Dir: gep.Direction, Min: minHops, Max: maxHops}
+		edges[i] = graph.EdgePlan{Dir: gep.Direction, Min: minHops, Max: maxHops, Weight: gep.Weight, Predicate: gep.Predicate}
 		if gep.EdgeKind != 0 {
 			edges[i].KindSet.Set(gep.EdgeKind)
 		}
@@ -1084,8 +1140,7 @@ func (e *Executor) materializeGraphCandidateIDsEpoch(ctx context.Context, plan *
 				neighbors, _ = gtx.NeighborsOverlay(cur.nid)
 			}
 			for _, nb := range neighbors {
-				kindSetZero := graph.KindSet{}
-				if cur.band < len(edges) && edges[cur.band].KindSet != kindSetZero && !edges[cur.band].KindSet.Has(nb.GetKind()) {
+				if cur.band >= len(edges) || !edges[cur.band].Matches(nb) {
 					continue
 				}
 				if visited[nb.Target] {

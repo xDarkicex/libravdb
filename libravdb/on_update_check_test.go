@@ -2,7 +2,6 @@ package libravdb
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -47,16 +46,12 @@ func TestOnUpdateCascade(t *testing.T) {
 		// PK column changes is tested below)
 	})
 
-	t.Run("CHECK rejected at parse time", func(t *testing.T) {
+	t.Run("CHECK enforced at write time", func(t *testing.T) {
 		db := openTempDB(t, "check_reject")
 		defer db.Close()
-		_, err := db.Query(context.Background(),
-			"CREATE TABLE t (id TEXT, age INT CHECK (age > 0))")
-		if err == nil {
-			t.Fatal("expected CHECK rejection, got nil")
-		}
-		if !strings.Contains(err.Error(), "CHECK") {
-			t.Errorf("got: %v", err)
+		exec(t, db, "CREATE TABLE t (id TEXT, age INT CHECK (age > 0))")
+		if _, err := db.Query(context.Background(), "INSERT INTO t (id, age) VALUES ('bad', -1)"); err == nil {
+			t.Fatal("CHECK-violating INSERT succeeded")
 		}
 	})
 }

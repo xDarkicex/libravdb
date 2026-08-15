@@ -284,8 +284,15 @@ func (e *Executor) executeScoredMultiModalWithCentrality(ctx context.Context, co
 	sorted := heap.sorted()
 	out := &SearchResults{Results: make([]*SearchResult, len(sorted)), Total: len(sorted), Columns: plan.Projections}
 	for i, sc := range sorted {
+		metadata := cloneMetadata(sc.record.Metadata)
+		if plan.ScoreAlias != "" {
+			if metadata == nil {
+				metadata = make(map[string]interface{}, 1)
+			}
+			metadata[plan.ScoreAlias] = sc.score
+		}
 		out.Results[i] = &SearchResult{
-			ID: sc.record.ID, Score: float32(sc.score), Metadata: sc.record.Metadata,
+			ID: sc.record.ID, Score: float32(sc.score), Metadata: metadata,
 		}
 	}
 	return out, nil
@@ -345,8 +352,15 @@ func (e *Executor) executeScoredMultiModal(ctx context.Context, col *Collection,
 	sorted := heap.sorted()
 	out := &SearchResults{Results: make([]*SearchResult, len(sorted)), Total: len(sorted), Columns: plan.Projections}
 	for i, sc := range sorted {
+		metadata := cloneMetadata(sc.record.Metadata)
+		if plan.ScoreAlias != "" {
+			if metadata == nil {
+				metadata = make(map[string]interface{}, 1)
+			}
+			metadata[plan.ScoreAlias] = sc.score
+		}
 		out.Results[i] = &SearchResult{
-			ID: sc.record.ID, Score: float32(sc.score), Metadata: sc.record.Metadata,
+			ID: sc.record.ID, Score: float32(sc.score), Metadata: metadata,
 		}
 	}
 	return out, nil

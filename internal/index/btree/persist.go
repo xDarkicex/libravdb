@@ -18,6 +18,11 @@ const btreeVersion uint32 = 1
 func (t *BTree) SerializeToBytes() ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	guard, err := t.enterRead()
+	if err != nil {
+		return nil, err
+	}
+	defer guard.leave()
 
 	ids := t.pageReg.snapshotIDs()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -104,9 +109,11 @@ func (t *BTree) DeserializeFromBytes(ctx context.Context, data []byte) error {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.poolsMu.Lock()
 	for _, id := range t.pageReg.snapshotIDs() {
 		freePage(t, t.pageReg, id)
 	}
+	t.poolsMu.Unlock()
 	t.nodeCount.Store(0)
 
 	type pageRec struct {

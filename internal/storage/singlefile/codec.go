@@ -12,7 +12,7 @@ const (
 	codecVersion byte = 3 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
-const snapshotCodecVersion byte = 4 // v4: adds historical record versions
+const snapshotCodecVersion byte = 6 // v4: historical versions; v5: graph tombstones; v6: temporal catalog
 
 type encodedPayload struct {
 	encoder *util.BinaryEncoder
@@ -42,6 +42,19 @@ func encodeStateBinary(state *persistedState) ([]byte, error) {
 	enc.WriteByte(snapshotCodecVersion)
 	enc.WriteUint64(state.NextCollectionID)
 	enc.WriteUint64(state.NextGraphNodeID)
+	enc.WriteUint32(uint32(len(state.TombstonedGraphNodeIDs)))
+	for _, id := range state.TombstonedGraphNodeIDs {
+		enc.WriteUint64(id)
+	}
+	if uint64(len(state.CommitCatalog)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("commit catalog too large: %d", len(state.CommitCatalog))
+	}
+	enc.WriteUint32(uint32(len(state.CommitCatalog)))
+	for _, entry := range state.CommitCatalog {
+		enc.WriteUint64(entry.LSN)
+		enc.WriteUint64(uint64(entry.Timestamp))
+	}
+	enc.WriteUint64(state.OldestRetainedLSN)
 	names := make([]string, 0, len(state.Collections))
 	for name := range state.Collections {
 		names = append(names, name)
@@ -79,14 +92,55 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 			return nil, err
 		}
 	}
+	var tombstonedGraphNodeIDs []uint64
+	if version >= 5 {
+		count, err := dec.ReadUint32()
+		if err != nil {
+			return nil, err
+		}
+		tombstonedGraphNodeIDs = make([]uint64, count)
+		for i := range tombstonedGraphNodeIDs {
+			tombstonedGraphNodeIDs[i], err = dec.ReadUint64()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	var commitCatalog []commitEntry
+	var oldestRetainedLSN uint64
+	if version >= 6 {
+		count, err := dec.ReadUint32()
+		if err != nil {
+			return nil, err
+		}
+		commitCatalog = make([]commitEntry, count)
+		for i := range commitCatalog {
+			commitCatalog[i].LSN, err = dec.ReadUint64()
+			if err != nil {
+				return nil, err
+			}
+			ts, readErr := dec.ReadUint64()
+			if readErr != nil {
+				return nil, readErr
+			}
+			commitCatalog[i].Timestamp = int64(ts)
+		}
+		oldestRetainedLSN, err = dec.ReadUint64()
+		if err != nil {
+			return nil, err
+		}
+	}
 	count, err := dec.ReadUint32()
 	if err != nil {
 		return nil, err
 	}
 	state := &persistedState{
-		NextCollectionID: nextCollectionID,
-		NextGraphNodeID:  nextGraphNodeID,
-		Collections:      make(map[string]*persistedCollection, count),
+		NextCollectionID:       nextCollectionID,
+		NextGraphNodeID:        nextGraphNodeID,
+		TombstonedGraphNodeIDs: tombstonedGraphNodeIDs,
+		CommitCatalog:          commitCatalog,
+		OldestRetainedLSN:      oldestRetainedLSN,
+		Collections:            make(map[string]*persistedCollection, count),
 	}
 	for i := uint32(0); i < count; i++ {
 		name, err := dec.ReadString()
@@ -266,6 +320,7 @@ type graphEdgeAddPayload struct {
 	Tgt        uint64
 	Weight     float32
 	Kind       uint8
+	Properties []byte
 }
 
 type graphEdgeRemovePayload struct {
@@ -309,13 +364,14 @@ func decodeGraphVertexLabelPayload(data []byte) (graphVertexLabelPayload, error)
 }
 
 func encodeGraphEdgeAddPayload(p graphEdgeAddPayload) encodedPayload {
-	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Collection) + 8 + 8 + 4 + 1)
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Collection) + 8 + 8 + 4 + 1 + 4 + len(p.Properties))
 	enc.WriteByte(codecVersion)
 	enc.WriteString(p.Collection)
 	enc.WriteUint64(p.Src)
 	enc.WriteUint64(p.Tgt)
 	enc.WriteFloat32(p.Weight)
 	enc.WriteByte(p.Kind)
+	enc.WriteBytes(p.Properties)
 	return detachPayload(enc)
 }
 
@@ -344,7 +400,16 @@ func decodeGraphEdgeAddPayload(data []byte) (graphEdgeAddPayload, error) {
 	if err != nil {
 		return graphEdgeAddPayload{}, err
 	}
-	return graphEdgeAddPayload{Collection: collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind}, nil
+	// Property bytes were added after the original graph-edge payload fields.
+	// Older WAL frames end immediately after Kind and remain valid.
+	var properties []byte
+	if dec.Off < len(dec.Data) {
+		properties, err = dec.ReadBytes()
+		if err != nil {
+			return graphEdgeAddPayload{}, err
+		}
+	}
+	return graphEdgeAddPayload{Collection: collection, Src: src, Tgt: tgt, Weight: weight, Kind: kind, Properties: properties}, nil
 }
 
 func encodeGraphEdgeRemovePayload(p graphEdgeRemovePayload) encodedPayload {
@@ -455,7 +520,13 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 		// The optional block is length-prefixed so older readers can skip fields
 		// they do not understand. CostModelStats is intentionally opaque to the
 		// storage layer and is encoded as one length-prefixed optional field.
+		// Collection declarations are appended as a second length-prefixed
+		// optional field so readers of the previous layout can skip them.
+		declarations := encodeCollectionDeclarations(config)
 		optSize := uint32(4 + 4 + 4 + 4 + len(config.CostModelStats))
+		if len(declarations) > 0 {
+			optSize += uint32(4 + len(declarations))
+		}
 		enc.WriteUint32(optSize)
 	}
 	enc.WriteUint32(uint32(config.NClusters))
@@ -463,8 +534,96 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 	if config.Version >= 2 {
 		enc.WriteUint32(uint32(config.IDMapCapacity))
 		enc.WriteBytes(config.CostModelStats)
+		if declarations := encodeCollectionDeclarations(config); len(declarations) > 0 {
+			enc.WriteBytes(declarations)
+		}
 	}
 	return nil
+}
+
+// encodeCollectionDeclarations is deliberately a small, deterministic blob
+// inside the existing optional config block. It carries declarations only;
+// metadata posting lists remain derived from records and are rebuilt on load.
+func encodeCollectionDeclarations(config storage.CollectionConfig) []byte {
+	if len(config.MetadataSchema) == 0 && len(config.IndexedFields) == 0 {
+		return nil
+	}
+
+	fields := make([]string, 0, len(config.MetadataSchema))
+	for field := range config.MetadataSchema {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+
+	enc := util.AcquireBinaryEncoder(estimateCollectionDeclarationsSize(config))
+	enc.WriteUint32(uint32(len(fields)))
+	for _, field := range fields {
+		enc.WriteString(field)
+		_ = enc.WriteByte(config.MetadataSchema[field])
+	}
+	enc.WriteUint32(uint32(len(config.IndexedFields)))
+	for _, field := range config.IndexedFields {
+		enc.WriteString(field)
+	}
+	data := append([]byte(nil), enc.Bytes()...)
+	util.ReleaseBinaryEncoder(enc)
+	return data
+}
+
+func estimateCollectionDeclarationsSize(config storage.CollectionConfig) int {
+	size := 4 + 4
+	for field := range config.MetadataSchema {
+		size += 4 + len(field) + 1
+	}
+	for _, field := range config.IndexedFields {
+		size += 4 + len(field)
+	}
+	return size
+}
+
+func decodeCollectionDeclarations(data []byte) (map[string]uint8, []string, error) {
+	if len(data) == 0 {
+		return nil, nil, nil
+	}
+	dec := &util.BinaryDecoder{Data: data}
+	schemaCount, err := dec.ReadUint32()
+	if err != nil {
+		return nil, nil, err
+	}
+	var schema map[string]uint8
+	if schemaCount > 0 {
+		schema = make(map[string]uint8, schemaCount)
+	}
+	for i := uint32(0); i < schemaCount; i++ {
+		field, err := dec.ReadString()
+		if err != nil {
+			return nil, nil, err
+		}
+		fieldType, err := dec.ReadByte()
+		if err != nil {
+			return nil, nil, err
+		}
+		schema[field] = fieldType
+	}
+	indexedCount, err := dec.ReadUint32()
+	if err != nil {
+		return nil, nil, err
+	}
+	var indexed []string
+	if indexedCount > 0 {
+		indexed = make([]string, 0, indexedCount)
+	}
+	for i := uint32(0); i < indexedCount; i++ {
+		field, err := dec.ReadString()
+		if err != nil {
+			return nil, nil, err
+		}
+		indexed = append(indexed, field)
+	}
+	if dec.Off != len(dec.Data) {
+		return nil, nil, fmt.Errorf("trailing bytes in collection declarations: %d", len(dec.Data)-dec.Off)
+	}
+	return schema, indexed, nil
 }
 
 func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) error {
@@ -525,7 +684,7 @@ func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) e
 }
 
 func estimateStateSize(state *persistedState) int {
-	size := 1 + 8 + 8 + 4 // version + NextCollectionID + NextGraphNodeID + collection count
+	size := 1 + 8 + 8 + 4 + len(state.TombstonedGraphNodeIDs)*8 + 4 + len(state.CommitCatalog)*16 + 8 // version + IDs + tombstones + catalog + collection count
 	for name, collection := range state.Collections {
 		size += 4 + len(name)
 		size += estimateCollectionSize(collection)
@@ -551,6 +710,9 @@ func estimateCollectionConfigSize(config storage.CollectionConfig) int {
 	size := 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + len(config.RawVectorStore) + 4 + 4 + 4
 	if config.Version >= 2 {
 		size += 4 + 4 + len(config.CostModelStats) // block length + stats bytes length + payload
+		if declarations := encodeCollectionDeclarations(config); len(declarations) > 0 {
+			size += 4 + len(declarations)
+		}
 	}
 	return size
 }
@@ -609,6 +771,8 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	var nProbes uint32
 	var idMapCapacity uint32
 	var costModelStats []byte
+	var metadataSchema map[string]uint8
+	var indexedFields []string
 
 	if version >= 2 {
 		if dec.Off+4 <= len(dec.Data) {
@@ -645,6 +809,17 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 			if optSize >= 16 {
 				consumed += 4 + len(costModelStats)
 			}
+			if int(optSize) >= consumed+4 && dec.Off+4 <= len(dec.Data) {
+				declarationBytes, readErr := dec.ReadBytes()
+				if readErr != nil {
+					return storage.CollectionConfig{}, readErr
+				}
+				metadataSchema, indexedFields, readErr = decodeCollectionDeclarations(declarationBytes)
+				if readErr != nil {
+					return storage.CollectionConfig{}, fmt.Errorf("decode collection declarations: %w", readErr)
+				}
+				consumed += 4 + len(declarationBytes)
+			}
 			if int(optSize) > consumed {
 				dec.Off += int(optSize) - consumed
 			}
@@ -680,6 +855,8 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 		RawStoreCap:    int(rawStoreCap),
 		IDMapCapacity:  int(idMapCapacity),
 		CostModelStats: costModelStats,
+		MetadataSchema: metadataSchema,
+		IndexedFields:  indexedFields,
 	}, nil
 }
 

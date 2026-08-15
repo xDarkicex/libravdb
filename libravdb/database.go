@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,11 +42,13 @@ type Database struct {
 	catalog       *catalog.Catalog
 	quantRegistry *quant.Registry
 	// Bounded in-memory query feedback for future calibration aggregation.
-	costModelStats *costModelStats
-	activeSnaps    activeSnapshots
-	temporalCache  *temporalIndexCache
-	mu             sync.RWMutex
-	closed         bool
+	costModelStats    *costModelStats
+	activeSnaps       activeSnapshots
+	temporalCache     *temporalIndexCache
+	autoIncrementMu   sync.Mutex
+	autoIncrementNext map[string]uint64
+	mu                sync.RWMutex
+	closed            bool
 }
 
 // Config holds database-wide configuration
@@ -89,12 +93,16 @@ func WithTemporalANNCache(maxBytes int64, maxEntries int) Option {
 // Open opens a Database at the configured path, creating it if necessary.
 func Open(opts ...Option) (*Database, error) {
 	config := &Config{
-		StoragePath:          "./data",
-		MetricsEnabled:       true,
-		TracingEnabled:       false,
-		MaxCollections:       100,
-		MaxConcurrentWrites:  defaultMaxConcurrentWrites(),
-		MaxWriteQueueDepth:   32,
+		StoragePath:         "./data",
+		MetricsEnabled:      true,
+		TracingEnabled:      false,
+		MaxCollections:      100,
+		MaxConcurrentWrites: defaultMaxConcurrentWrites(),
+		// The default queue must absorb normal transaction fan-in (including
+		// concurrent epoch commits) without rejecting otherwise valid writes.
+		// Callers that need a tighter admission bound can still set it
+		// explicitly with WithMaxWriteQueueDepth.
+		MaxWriteQueueDepth:   128,
 		AsyncIndexQueueDepth: 0,
 		AsyncIndexWorkers:    min(4, runtime.GOMAXPROCS(0)),
 		Durability:           DurabilitySynchronous,
@@ -155,14 +163,15 @@ func Open(opts ...Option) (*Database, error) {
 	}
 
 	db := &Database{
-		collections:    make(map[string]*Collection),
-		storage:        storageEngine,
-		bridge:         bridge,
-		metrics:        metrics,
-		config:         config,
-		logger:         config.Logger,
-		quantRegistry:  quant.NewRegistry(),
-		costModelStats: newCostModelStats(2048),
+		collections:       make(map[string]*Collection),
+		storage:           storageEngine,
+		bridge:            bridge,
+		metrics:           metrics,
+		config:            config,
+		logger:            config.Logger,
+		quantRegistry:     quant.NewRegistry(),
+		costModelStats:    newCostModelStats(2048),
+		autoIncrementNext: make(map[string]uint64),
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
 				arena, err := memory.NewArena(1024*1024, 64)
@@ -283,6 +292,18 @@ func (db *Database) SetLogger(logger Logger) {
 	db.mu.Unlock()
 }
 
+// Catalog returns the current read-only catalog snapshot.
+//
+// DDL performs copy-on-write catalog swaps, so the returned pointer must not
+// be retained across schema changes — it is valid only for the duration of a
+// single synchronous operation. This mirrors how the query path reads
+// db.catalog under RLock and drops it before returning.
+func (db *Database) Catalog() *catalog.Catalog {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.catalog
+}
+
 // CreateCollection creates a new collection with the specified options
 func (db *Database) CreateCollection(ctx context.Context, name string, opts ...CollectionOption) (*Collection, error) {
 	db.mu.Lock()
@@ -338,11 +359,32 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 		Type:  catalog.TypeString,
 		Flags: catalog.ColFlagPrimaryKey | catalog.ColFlagNotNull,
 	}}
+	// Physical collection configs intentionally omit relational schema on
+	// reopen. Preserve the existing catalog columns when a DDL operation (for
+	// example CREATE/DROP JSON INDEX) republishes that collection; otherwise a
+	// harmless index change would erase all metadata columns.
+	if (config == nil || config.MetadataSchema == nil) && db.catalog != nil {
+		if table, err := db.catalog.GetTable(catalog.HashIdentifier(name)); err == nil {
+			columns = columns[:0]
+			for _, existing := range db.catalog.AllColumns(table) {
+				columns = append(columns, catalog.ColumnInfo{Name: existing.Name, Type: existing.Type, Flags: existing.Flags})
+			}
+		}
+	}
 	if config != nil && config.MetadataSchema != nil {
 		for fieldName, fieldType := range config.MetadataSchema {
 			var flags uint16
 			if config.ColumnConstraints != nil {
 				flags = config.ColumnConstraints[fieldName]
+			}
+			// The physical record key is represented by the catalog's id
+			// column. If SQL declared an explicit type for id (for example
+			// BIGINT), update that definition instead of appending a duplicate
+			// name whose earlier textual definition would win binder lookup.
+			if strings.EqualFold(fieldName, "id") {
+				columns[0].Type = metadataFieldToCatalogType(fieldType)
+				columns[0].Flags |= flags
+				continue
 			}
 			columns = append(columns, catalog.ColumnInfo{
 				Name:  fieldName,
@@ -363,6 +405,22 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 		for _, fk := range config.ForeignKeys {
 			builder.AddForeignKey(fk)
 		}
+		// Register CHECK constraints in the catalog.
+		for _, chk := range config.CheckConstraints {
+			builder.AddCheckConstraint(name, chk.Expression, chk.ColumnName)
+		}
+		// Register column DEFAULTs in the catalog.
+		for colName, defaultVal := range config.ColumnDefaults {
+			builder.AddDefaultValue(name, colName, defaultVal)
+		}
+		jsonIndexes := make([]catalog.JSONIndexInfo, 0, len(config.JSONIndexes))
+		for _, jsonIndex := range config.JSONIndexes {
+			jsonIndexes = append(jsonIndexes, catalog.JSONIndexInfo{
+				Name: jsonIndex.Name, Table: name, Column: jsonIndex.Column,
+				Path: jsonIndex.Path, TextResult: jsonIndex.TextResult,
+			})
+		}
+		builder.ReplaceJSONIndexesForTable(name, jsonIndexes)
 	}
 	data := builder.Build()
 	cat, err := catalog.Load(data, db.quantRegistry)
@@ -384,12 +442,22 @@ func metadataFieldToCatalogType(ft FieldType) uint16 {
 	switch ft {
 	case IntField:
 		return catalog.TypeInt
+	case BigIntField:
+		return catalog.TypeBigInt
 	case FloatField:
 		return catalog.TypeFloat
-	case StringField, BoolField, TimeField:
+	case StringField:
 		return catalog.TypeString
+	case BoolField:
+		return catalog.TypeBool
+	case TimeField:
+		return catalog.TypeTimestamp
 	case StringArrayField, IntArrayField, FloatArrayField:
 		return catalog.TypeString // arrays stored as string representations
+	case JSONField:
+		return catalog.TypeJSON
+	case JSONBField:
+		return catalog.TypeJSONB
 	default:
 		return catalog.TypeString
 	}
@@ -426,9 +494,14 @@ func (db *Database) ensureCollection(ctx context.Context, name string, dimension
 		return nil, ErrDatabaseClosed
 	}
 
-	// Fast path: collection exists with correct dimension.
+	// Fast path: collection exists with correct dimension. EnsureCollection is
+	// also a configuration contract: options must either describe the existing
+	// collection or be rejected, never silently discarded.
 	if col, exists := db.collections[name]; exists {
 		if col.Dimension() == dimension {
+			if err := ensureExistingCollectionConfig(name, col, dimension, opts...); err != nil {
+				return nil, err
+			}
 			return col, nil
 		}
 		// Metadata-only ↔ vector mode transitions are destructive — reject
@@ -452,6 +525,9 @@ func (db *Database) ensureCollection(ctx context.Context, name string, dimension
 		// Another caller raced and created it. Use it if dimension matches.
 		if col, getErr := db.getCollectionLocked(name); getErr == nil {
 			if col.Dimension() == dimension {
+				if configErr := ensureExistingCollectionConfig(name, col, dimension, opts...); configErr != nil {
+					return nil, configErr
+				}
 				return col, nil
 			}
 			return nil, newCollectionDimensionMismatchError(name, col.Dimension(), dimension)
@@ -460,12 +536,30 @@ func (db *Database) ensureCollection(ctx context.Context, name string, dimension
 	return nil, err
 }
 
+func ensureExistingCollectionConfig(name string, col *Collection, dimension int, opts ...CollectionOption) error {
+	existing := col.Config()
+	desired := existing
+	for _, opt := range ensureCollectionOptions(dimension, opts) {
+		if err := opt(&desired); err != nil {
+			return fmt.Errorf("failed to apply EnsureCollection option for %q: %w", name, err)
+		}
+	}
+	if reflect.DeepEqual(existing, desired) {
+		return nil
+	}
+	return newCollectionConfigurationMismatchError(name)
+}
+
 func newCollectionDimensionMismatchError(name string, existing, requested int) error {
 	return &CollectionDimensionMismatchError{
 		Collection:         name,
 		ExistingDimension:  existing,
 		RequestedDimension: requested,
 	}
+}
+
+func newCollectionConfigurationMismatchError(name string) error {
+	return &CollectionConfigurationMismatchError{Collection: name}
 }
 
 func ensureCollectionOptions(dimension int, opts []CollectionOption) []CollectionOption {
@@ -575,6 +669,36 @@ func (db *Database) firstGraphCollection() *Collection {
 		}
 	}
 	return nil
+}
+
+// graphCollectionNames returns graph-backed collections in stable order. A
+// logical GRAPH_NODES reference carries a record ID rather than a collection
+// name, so FK validation may need to resolve that ID across the graph-backed
+// collections already owned by this database. The collection owning the FK is
+// placed first when it is graph-backed, which preserves the natural local
+// interpretation and makes duplicate record IDs deterministic.
+func (db *Database) graphCollectionNames(preferred string) []string {
+	db.mu.RLock()
+	names := make([]string, 0, len(db.collections))
+	for name, col := range db.collections {
+		if col.GetGraph() != nil {
+			names = append(names, name)
+		}
+	}
+	db.mu.RUnlock()
+	sort.Strings(names)
+	if preferred != "" {
+		for i, name := range names {
+			if name == preferred {
+				if i > 0 {
+					copy(names[1:i+1], names[0:i])
+					names[0] = preferred
+				}
+				break
+			}
+		}
+	}
+	return names
 }
 
 // ListCollections returns the names of all collections as a best-effort
@@ -928,6 +1052,31 @@ func (db *Database) loadExistingCollections(ctx context.Context, bridge *indexPe
 
 	db.mu.Lock()
 	for name, collection := range loadedCollections {
+		// JSON index definitions live in the durable catalog rather than the
+		// physical collection config. Hydrate them before the first query so the
+		// derived inverted postings can rebuild lazily from visible records.
+		if db.catalog != nil {
+			if table, err := db.catalog.GetTable(catalog.HashIdentifier(name)); err == nil {
+				columns := db.catalog.AllColumns(table)
+				for _, idx := range db.catalog.JSONIndexesForTable(table.NameHash) {
+					columnName := ""
+					for _, column := range columns {
+						if column.NameHash == idx.ColumnHash {
+							columnName = column.Name
+							break
+						}
+					}
+					if columnName == "" {
+						continue
+					}
+					collection.config.JSONIndexes = append(collection.config.JSONIndexes, JSONIndexDefinition{
+						Name:   db.catalog.JSONIndexName(idx),
+						Column: columnName,
+						Path:   db.catalog.JSONIndexPath(idx), TextResult: idx.TextResult != 0,
+					})
+				}
+			}
+		}
 		db.collections[name] = collection
 		// The persisted catalog is authoritative for SQL schema metadata. A
 		// storage collection config contains physical index settings but does

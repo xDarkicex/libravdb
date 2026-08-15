@@ -475,19 +475,37 @@ func newFlatWrapper(core *flat.Core) (*flatWrapper, error) {
 	return &flatWrapper{core: core}, nil
 }
 
-func flatDeltaBytes(entries []*VectorEntry) uint64 {
-	bytes := uint64(16 << 10)
+func flatDeltaCapacity(entries []*VectorEntry, deletes []string) record.DeltaCapacityReport {
+	mutations := make([]record.DeltaCapacityMutation, 0, len(entries)+len(deletes))
 	for _, entry := range entries {
 		if entry == nil {
 			continue
 		}
-		// Per-entry arena cost: stageCell allocates id copy + mutationCell (~48B);
-		// RecordBuilder.Seal allocates recordHeader (~48B) + id + vector + metadata.
-		// The 512B overhead covers the doubled ID copy, both struct headers, and
-		// per-record metadata without assuming it fits in a tight constant.
-		bytes += uint64(len(entry.ID))*2 + uint64(len(entry.Vector))*4 + 512
+		mutations = append(mutations, record.DeltaCapacityMutation{
+			IDBytes:       uint64(len(entry.ID)),
+			VectorBytes:   uint64(len(entry.Vector)) * 4,
+			Ordinal:       entry.Ordinal,
+			OrdinalKnown:  true,
+			ProducesAfter: true,
+		})
 	}
-	return bytes
+	for _, id := range deletes {
+		mutations = append(mutations, record.DeltaCapacityMutation{
+			IDBytes:       uint64(len(id)),
+			ProducesAfter: true,
+			Tombstone:     true,
+			// A delete's prior ordinal is resolved after the delta is allocated;
+			// reserve all three possible copied radix pages here.
+		})
+	}
+	return record.EstimateDeltaCapacity(uint64(len(entries)+len(deletes)), mutations)
+}
+
+// flatDeltaBytes remains as a small compatibility helper for callers and
+// tests that only provide puts. New mutation paths should use the full report
+// so delete and copied-key costs are included as well.
+func flatDeltaBytes(entries []*VectorEntry) uint64 {
+	return flatDeltaCapacity(entries, nil).ArenaBytes
 }
 
 // Insert publishes one immutable off-heap generation. Metadata remains owned
@@ -554,7 +572,8 @@ func (w *flatWrapper) PrepareMutations(ctx context.Context, entries []*VectorEnt
 	if len(entries) == 0 && len(deletes) == 0 {
 		return nil, fmt.Errorf("flat mutation is empty")
 	}
-	delta, err := w.core.NewDelta(flatDeltaBytes(entries)+uint64(len(deletes))*128, uint32(len(entries)+len(deletes)), uint64(len(entries))*128+uint64(len(deletes))*128+4096)
+	capacity := flatDeltaCapacity(entries, deletes)
+	delta, err := w.core.NewDelta(capacity.ArenaBytes, uint32(len(entries)+len(deletes)), capacity.KeyBytes)
 	if err != nil {
 		return nil, err
 	}

@@ -2,11 +2,35 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
+
+// TemporalStats is a defensive, point-in-time observability value. It never
+// owns or changes a snapshot lease and never triggers compaction.
+type TemporalStats struct {
+	ActiveLeaseCount       uint64
+	DistinctPinnedLSNCount uint64
+	MinimumPinnedLSN       uint64
+	OldestPinAge           time.Duration
+	// RetainedVersionCount is the number of archived historical record
+	// versions still available for exact-LSN reads. It excludes each
+	// collection's current live record mirror.
+	RetainedVersionCount uint64
+	// RetainedBytes is the deterministic decoded payload estimate for the
+	// archived historical versions: temporal fields, vectors, and metadata.
+	// It is not process RSS, index memory, or WAL size.
+	RetainedBytes          uint64
+	OldestRetainedLSN      uint64
+	OldestRetainedAt       time.Time
+	ConfiguredRetention    time.Duration
+	LastCompactionBoundary uint64
+}
 
 // TemporalSnapshot is a pinned historical snapshot handle. It registers an
 // active LSN with the database to prevent compaction from evicting history
@@ -41,16 +65,26 @@ type TemporalConfig struct {
 // Compaction cannot advance past the minimum pinned LSN.
 type activeSnapshots struct {
 	mu     sync.Mutex
-	pins   map[uint64]int // LSN → reference count
-	minLSN uint64         // cached minimum; 0 if no pins
+	pins   map[uint64]snapshotPin
+	minLSN uint64 // cached minimum; 0 if no pins
+}
+
+type snapshotPin struct {
+	refs          uint64
+	firstPinnedAt time.Time
 }
 
 func (a *activeSnapshots) pin(lsn uint64) {
 	a.mu.Lock()
 	if a.pins == nil {
-		a.pins = make(map[uint64]int)
+		a.pins = make(map[uint64]snapshotPin)
 	}
-	a.pins[lsn]++
+	pin := a.pins[lsn]
+	if pin.refs == 0 {
+		pin.firstPinnedAt = time.Now()
+	}
+	pin.refs++
+	a.pins[lsn] = pin
 	if a.minLSN == 0 || lsn < a.minLSN {
 		a.minLSN = lsn
 	}
@@ -59,11 +93,12 @@ func (a *activeSnapshots) pin(lsn uint64) {
 
 func (a *activeSnapshots) unpin(lsn uint64) {
 	a.mu.Lock()
-	if c := a.pins[lsn]; c > 0 {
-		if c == 1 {
+	if pin, ok := a.pins[lsn]; ok && pin.refs > 0 {
+		if pin.refs == 1 {
 			delete(a.pins, lsn)
 		} else {
-			a.pins[lsn] = c - 1
+			pin.refs--
+			a.pins[lsn] = pin
 		}
 	}
 	// Recompute min.
@@ -74,6 +109,34 @@ func (a *activeSnapshots) unpin(lsn uint64) {
 		}
 	}
 	a.mu.Unlock()
+}
+
+// stats returns a point-in-time reduction of active snapshot leases. The
+// mutex is held for the complete reduction, so callers never observe a
+// partially pinned or partially released LSN.
+func (a *activeSnapshots) stats(now time.Time) (leases, distinct, minLSN uint64, oldestAge time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	minLSN = a.minLSN
+	for lsn, pin := range a.pins {
+		if pin.refs == 0 {
+			continue
+		}
+		leases += pin.refs
+		distinct++
+		age := now.Sub(pin.firstPinnedAt)
+		if age < 0 {
+			age = 0
+		}
+		if distinct == 1 || age > oldestAge {
+			oldestAge = age
+		}
+		if minLSN == 0 || lsn < minLSN {
+			minLSN = lsn
+		}
+	}
+	return leases, distinct, minLSN, oldestAge
 }
 
 // safeRetentionBoundary returns the highest LSN that is safe to compact
@@ -123,6 +186,90 @@ func (db *Database) SnapshotAtLSN(ctx context.Context, lsn uint64) (*TemporalSna
 	snap := &TemporalSnapshot{LSN: lsn, Timestamp: ts, db: db}
 	db.activeSnaps.pin(lsn)
 	return snap, nil
+}
+
+// LatestCommitLSN returns the exact latest durable transaction LSN. It reads
+// the storage commit catalog and never derives a boundary from wall-clock time
+// or an allocated-but-uncommitted WAL sequence.
+func (db *Database) LatestCommitLSN(ctx context.Context) (uint64, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	db.mu.RLock()
+	closed := db.closed
+	storageEngine := db.storage
+	db.mu.RUnlock()
+	if closed {
+		return 0, ErrDatabaseClosed
+	}
+	provider, ok := storageEngine.(interface{ LatestCommitLSN() (uint64, error) })
+	if !ok {
+		return 0, fmt.Errorf("storage engine does not expose latest committed LSN")
+	}
+	return provider.LatestCommitLSN()
+}
+
+// TemporalStats returns a defensive, point-in-time view of active snapshot
+// leases and retained temporal history. It never creates a temporary lease,
+// triggers compaction, or exposes mutable engine state.
+func (db *Database) TemporalStats(ctx context.Context) (TemporalStats, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return TemporalStats{}, err
+		}
+	}
+
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return TemporalStats{}, ErrDatabaseClosed
+	}
+	storageEngine := db.storage
+	configuredRetention := db.config.Temporal.RetainDuration
+	db.mu.RUnlock()
+
+	leases, distinct, minLSN, oldestAge := db.activeSnaps.stats(time.Now())
+	stats := TemporalStats{
+		ActiveLeaseCount:       leases,
+		DistinctPinnedLSNCount: distinct,
+		MinimumPinnedLSN:       minLSN,
+		OldestPinAge:           oldestAge,
+		ConfiguredRetention:    configuredRetention,
+	}
+	historyInfo, ok := storageEngine.(interface {
+		RetainedHistoryStats() (uint64, uint64, error)
+	})
+	if !ok {
+		return TemporalStats{}, fmt.Errorf("storage engine does not expose retained history stats")
+	}
+	retainedVersions, retainedBytes, err := historyInfo.RetainedHistoryStats()
+	if err != nil {
+		return TemporalStats{}, err
+	}
+	stats.RetainedVersionCount = retainedVersions
+	stats.RetainedBytes = retainedBytes
+
+	retentionInfo, ok := storageEngine.(interface {
+		OldestRetained() (time.Time, uint64, error)
+	})
+	if !ok {
+		return TemporalStats{}, fmt.Errorf("storage engine does not expose retention info")
+	}
+	oldestAt, oldestLSN, err := retentionInfo.OldestRetained()
+	if err != nil {
+		if errors.Is(err, singlefile.ErrNoCommits) {
+			return stats, nil
+		}
+		return TemporalStats{}, err
+	}
+	stats.OldestRetainedAt = oldestAt
+	stats.OldestRetainedLSN = oldestLSN
+	if oldestLSN != 0 {
+		stats.LastCompactionBoundary = oldestLSN
+	}
+	return stats, nil
 }
 
 func (db *Database) unpinSnapshot(lsn uint64) {

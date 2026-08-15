@@ -3,10 +3,12 @@ package libravdb
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/memory"
+	"github.com/xDarkicex/libravdb/internal/optimizer"
 	"github.com/xDarkicex/libravdb/internal/quant"
 )
 
@@ -153,10 +155,46 @@ func WithPrimaryKeyColumns(columns ...string) CollectionOption {
 	}
 }
 
+// WithNamedUniqueConstraint registers a named SQL UNIQUE constraint/index.
+// Names are compared case-insensitively at execution time.
+func WithNamedUniqueConstraint(name string, columns ...string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if strings.TrimSpace(name) == "" || len(columns) == 0 {
+			return fmt.Errorf("named unique constraint requires a name and columns")
+		}
+		if c.NamedUniqueConstraints == nil {
+			c.NamedUniqueConstraints = make(map[string][]string)
+		}
+		c.NamedUniqueConstraints[name] = append([]string(nil), columns...)
+		return nil
+	}
+}
+
 // WithForeignKeys registers foreign key constraints for the collection catalog.
 func WithForeignKeys(fks []catalog.ForeignKeyInfo) CollectionOption {
 	return func(c *CollectionConfig) error {
 		c.ForeignKeys = append(c.ForeignKeys, fks...)
+		return nil
+	}
+}
+
+// WithCheckConstraints registers CHECK constraints for the collection.
+func WithCheckConstraints(checks []optimizer.DDLCheckConstraint) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.CheckConstraints = append(c.CheckConstraints, checks...)
+		return nil
+	}
+}
+
+// WithColumnDefaults registers column DEFAULT literal values for the collection.
+func WithColumnDefaults(defaults map[string]string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		if c.ColumnDefaults == nil {
+			c.ColumnDefaults = make(map[string]string, len(defaults))
+		}
+		for k, v := range defaults {
+			c.ColumnDefaults[k] = v
+		}
 		return nil
 	}
 }
@@ -466,6 +504,24 @@ func WithIndexedFields(fields ...string) CollectionOption {
 		}
 
 		c.IndexedFields = fields
+		return nil
+	}
+}
+
+// WithJSONIndexes declares durable JSON path expression indexes. The posting
+// lists are rebuilt from authoritative records after reopen, while the
+// declarations are persisted in the SQL catalog.
+func WithJSONIndexes(indexes ...JSONIndexDefinition) CollectionOption {
+	return func(c *CollectionConfig) error {
+		for _, index := range indexes {
+			if strings.TrimSpace(index.Name) == "" || strings.TrimSpace(index.Column) == "" {
+				return fmt.Errorf("JSON index requires a name and column")
+			}
+			if strings.TrimSpace(index.Path) == "" {
+				return fmt.Errorf("JSON index %q requires a non-empty path", index.Name)
+			}
+		}
+		c.JSONIndexes = append(c.JSONIndexes, indexes...)
 		return nil
 	}
 }

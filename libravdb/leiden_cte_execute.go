@@ -29,7 +29,7 @@ func (e *EpochTx) ExecuteLeidenCTE(
 	doc *parser.QueryDoc,
 	bound *BoundLeidenCTE,
 	selectIndex int,
-	params QueryParams,
+	params *optimizer.ParameterSet,
 ) (*SearchResults, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -488,7 +488,7 @@ func evaluateCTEProjection(
 	proj parser.Projection,
 	row *cteJoinedRow,
 	col *Collection,
-	params QueryParams,
+	params *optimizer.ParameterSet,
 ) (interface{}, bool, error) {
 	_ = ctx
 	if proj.Star {
@@ -525,7 +525,7 @@ func evaluateCTEProjection(
 	}
 }
 
-func resolveCTEVectorOperand(src []byte, doc *parser.QueryDoc, ref parser.NodeRef, params QueryParams) ([]float32, error) {
+func resolveCTEVectorOperand(src []byte, doc *parser.QueryDoc, ref parser.NodeRef, params *optimizer.ParameterSet) ([]float32, error) {
 	switch ref.Kind {
 	case parser.NodeKindString:
 		s := doc.Strings[ref.ID]
@@ -539,19 +539,17 @@ func resolveCTEVectorOperand(src []byte, doc *parser.QueryDoc, ref parser.NodeRe
 		if id.Start >= id.End || int(id.End) > len(src) {
 			return nil, fmt.Errorf("invalid vector parameter identifier")
 		}
-		name := string(src[id.Start:id.End])
-		if len(name) < 2 || (name[0] != '$' && name[0] != '@') {
+		if id.End-id.Start < 2 || (src[id.Start] != '$' && src[id.Start] != '@') {
 			return nil, fmt.Errorf("vector operand must be a named parameter or literal")
 		}
-		value, ok := params[name[1:]]
+		value, ok := params.Lookup(src, id.Start, id.End)
 		if !ok {
-			return nil, fmt.Errorf("vector parameter %q is missing", name)
+			return nil, fmt.Errorf("vector parameter is missing")
 		}
-		vector, ok := value.([]float32)
-		if !ok {
-			return nil, fmt.Errorf("vector parameter %q must be []float32", name)
+		if value.Kind != optimizer.ScalarVector {
+			return nil, fmt.Errorf("vector parameter must be []float32")
 		}
-		return append([]float32(nil), vector...), nil
+		return append([]float32(nil), value.Vector...), nil
 	default:
 		return nil, fmt.Errorf("vector operand must be a vector literal or named parameter")
 	}

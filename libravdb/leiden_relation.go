@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -111,6 +112,13 @@ func (e *EpochTx) MaterializeLeidenRelation(
 		// Resolve node to (collection, recordID) via epoch-aware path.
 		resolvedCol, recordID, err := e.ResolveNodeID(ctx, nodeID)
 		if err != nil {
+			// MATCH can legitimately return a graph endpoint whose record was
+			// deleted in the current epoch branch. Such a node has no row in
+			// the relational local_clusters relation; omit it rather than
+			// turning a valid staged delete into a materialization failure.
+			if errors.Is(err, ErrRecordNotFound) {
+				continue
+			}
 			return nil, fmt.Errorf("resolve node %d: %w", nodeID, err)
 		}
 

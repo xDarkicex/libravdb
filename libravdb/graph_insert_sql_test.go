@@ -141,6 +141,42 @@ func TestSQLInsertGraphEdge_BadKindName(t *testing.T) {
 	t.Logf("✅ unknown edge kind correctly rejected: %v", err)
 }
 
+func TestSQLInsertGraphEdge_Properties(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(t.TempDir() + "/graph_insert_properties.libravdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Drop(ctx)
+	gr, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gr.Close()
+	col, err := db.CreateCollection(ctx, "docs", WithMetadataOnly(), WithGraph(gr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"A", "B"} {
+		if err := col.Insert(ctx, id, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !graph.RegisterEdgeKind("ROUTES_TO", 96) {
+		t.Fatal("edge kind registration failed")
+	}
+	if _, err := db.Query(ctx, `INSERT INTO GRAPH_EDGES (source, type, target, properties) VALUES ('A', 'ROUTES_TO', 'B', '{"cost":4.2,"confidence":0.98}')`); err != nil {
+		t.Fatalf("property graph insert: %v", err)
+	}
+	rows, err := db.Query(ctx, "SELECT id FROM docs s WHERE MATCH (s)-[r:ROUTES_TO {cost > 4.0, confidence >= 0.9}]->(target)")
+	if err != nil {
+		t.Fatalf("property graph query: %v", err)
+	}
+	if rows.Total != 1 || rows.Results[0].ID != "A" {
+		t.Fatalf("property graph query rows=%v", rows.Results)
+	}
+}
+
 // TestSQLInsertGraphEdge_NonexistentNode verifies error handling for
 // record IDs that don't exist.
 func TestSQLInsertGraphEdge_NonexistentNode(t *testing.T) {
