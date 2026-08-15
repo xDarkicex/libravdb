@@ -5823,9 +5823,8 @@ func (e *Engine) Close() error {
 	if e.dirty || e.catalogDirty {
 		savedProvider := e.indexProvider
 		e.indexProvider = nil // skip index serialization (rebuilt on recovery)
-		if err := e.checkpointLocked(); err != nil {
-			// Best-effort: WAL replay will recover on next Open.
-		}
+		// Best-effort: WAL replay will recover on next Open.
+		_ = e.checkpointLocked()
 		e.indexProvider = savedProvider
 	}
 

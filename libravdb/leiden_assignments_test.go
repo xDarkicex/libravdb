@@ -145,8 +145,6 @@ func TestLeiden_Assignments_DefensiveCopy(t *testing.T) {
 		first[0].NodeID = 99999
 		first[0].CommunityID = 88888
 	}
-	first = append(first, LeidenAssignment{NodeID: 77777, CommunityID: 66666})
-
 	second := result.Assignments()
 
 	want := []LeidenAssignment{

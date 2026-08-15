@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestMetrics_PageRankMaintenanceStatus(t *testing.T) {
 	if err := txn.AddEdge(1, 2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := txn.Commit(nil); err != nil {
+	if err := txn.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	afterMutation := store.Stats()
@@ -40,7 +41,7 @@ func TestMetrics_PageRankMaintenanceStatus(t *testing.T) {
 	if err := txn.AddEdge(3, 2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := txn.Commit(nil); err != nil {
+	if err := txn.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	stale := store.Stats()

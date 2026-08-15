@@ -76,8 +76,9 @@ func (c *Cursor) descend(target []byte) {
 
 	// B-link: if target is past this leaf's last key, follow right sibling
 	for idx >= int(page.Header.Count) && page.Header.RightSibling != 0 {
-		page = c.tree.pageReg.get(page.Header.RightSibling)
-		pageID = page.Header.RightSibling
+		nextID := page.Header.RightSibling
+		page = c.tree.pageReg.get(nextID)
+		pageID = nextID
 		if page == nil {
 			c.valid = false
 			return
@@ -364,8 +365,9 @@ func (c *Cursor) descendPrev(target []byte) {
 
 	// B-link: follow left siblings until we find a non-empty page
 	for idx < 0 && page.Header.LeftSibling != 0 {
-		page = c.tree.pageReg.get(page.Header.LeftSibling)
-		pageID = page.Header.LeftSibling
+		previousID := page.Header.LeftSibling
+		page = c.tree.pageReg.get(previousID)
+		pageID = previousID
 		if page == nil {
 			return
 		}

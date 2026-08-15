@@ -306,7 +306,6 @@ func (e *EpochTx) ComputeLeiden(ctx context.Context, opts EpochLeidenOptions) (*
 			break
 		}
 		current = agg
-		n = len(current.nodes)
 		twoM = 2.0 * current.totalM
 		if twoM < 1e-15 {
 			twoM = 1.0

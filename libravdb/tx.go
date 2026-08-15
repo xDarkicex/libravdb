@@ -414,13 +414,11 @@ func (tx *transaction) Rename(ctx context.Context, collection, oldID, newID stri
 		vector = old.Vector
 	}
 	renameMetadata := cloneMetadata(old.Metadata)
-	if metadata != nil {
-		for key, value := range metadata {
-			if renameMetadata == nil {
-				renameMetadata = make(map[string]interface{})
-			}
-			renameMetadata[key] = cloneMetadataValue(value)
+	for key, value := range metadata {
+		if renameMetadata == nil {
+			renameMetadata = make(map[string]interface{})
 		}
+		renameMetadata[key] = cloneMetadataValue(value)
 	}
 	if err := coll.validateNotNullConstraints(renameMetadata); err != nil {
 		return err

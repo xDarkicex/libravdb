@@ -48,12 +48,12 @@ func TestOrdinalBitset_Basic(t *testing.T) {
 // TestOrdinalBitset_Pool verifies acquire / release round-trip.
 func TestOrdinalBitset_Pool(t *testing.T) {
 	s1 := acquireOrdinalBitset(100)
-	s1[0] = 0xDEADBEEF
+	s1.words[0] = 0xDEADBEEF
 	releaseOrdinalBitset(s1)
 
 	// Re-acquire: must get a zeroed slice.
 	s2 := acquireOrdinalBitset(100)
-	for i, w := range s2 {
+	for i, w := range s2.words {
 		if w != 0 {
 			t.Fatalf("word %d = %x, want 0 (pool didn't zero)", i, w)
 		}
@@ -67,8 +67,8 @@ func TestOrdinalBitset_PoolGrow(t *testing.T) {
 	releaseOrdinalBitset(small)
 
 	large := acquireOrdinalBitset(100000)
-	if cap(large)*ordinalBitsetWordBits < 100000 {
-		t.Fatalf("bitset too small: cap=%d words, need >= %d", cap(large), 100000/ordinalBitsetWordBits+1)
+	if cap(large.words)*ordinalBitsetWordBits < 100000 {
+		t.Fatalf("bitset too small: cap=%d words, need >= %d", cap(large.words), 100000/ordinalBitsetWordBits+1)
 	}
 	releaseOrdinalBitset(large)
 }
@@ -80,8 +80,8 @@ func TestOrdinalBitset_Concurrent(t *testing.T) {
 		go func() {
 			for i := 0; i < 1000; i++ {
 				s := acquireOrdinalBitset(1000)
-				s[0] = 1
-				s[1] = 1
+				s.words[0] = 1
+				s.words[1] = 1
 				releaseOrdinalBitset(s)
 			}
 			done <- struct{}{}
@@ -102,7 +102,7 @@ func BenchmarkOrdinalBitsetMembershipBuild(b *testing.B) {
 
 	for range b.N {
 		bits := acquireOrdinalBitset(uint32(N * 2))
-		bm := &bitsetMembership{bits: bits}
+		bm := &bitsetMembership{bits: bits.words, buffer: bits}
 		for ord := uint32(0); ord < uint32(N); ord++ {
 			bm.set(ord)
 		}
@@ -151,7 +151,7 @@ func BenchmarkOrdinalBitmapFromIDs(b *testing.B) {
 func BenchmarkOrdinalBitset_Test(b *testing.B) {
 	const N = 100000
 	bits := acquireOrdinalBitset(uint32(N))
-	bm := &bitsetMembership{bits: bits}
+	bm := &bitsetMembership{bits: bits.words, buffer: bits}
 	for i := uint32(0); i < uint32(N); i += 2 {
 		bm.set(i)
 	}
@@ -346,9 +346,11 @@ func TestMultiModalExactCandidatesAreShardSafe(t *testing.T) {
 // ordinal membership between shards.
 func TestOrdinalBitmap_ShardIsolation(t *testing.T) {
 	// Create per-shard memberships where ordinal 5 is in shard 0 but not shard 1.
-	b0 := &bitsetMembership{bits: acquireOrdinalBitset(100)}
+	b0Buffer := acquireOrdinalBitset(100)
+	b0 := &bitsetMembership{bits: b0Buffer.words, buffer: b0Buffer}
 	b0.set(5)
-	b1 := &bitsetMembership{bits: acquireOrdinalBitset(100)}
+	b1Buffer := acquireOrdinalBitset(100)
+	b1 := &bitsetMembership{bits: b1Buffer.words, buffer: b1Buffer}
 	b1.set(10)
 
 	bitmap := &ordinalBitmap{

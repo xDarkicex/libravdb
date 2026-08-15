@@ -200,11 +200,10 @@ func TestLeiden_ReferenceModularity(t *testing.T) {
 // =============================================================================
 
 func TestLeiden_DeterministicRandomGraphs(t *testing.T) {
-	rng := rand.New(rand.NewSource(42))
 	const tolerance = 1e-10
 
 	for seed := int64(0); seed < 100; seed++ {
-		rng = rand.New(rand.NewSource(seed + 42))
+		rng := rand.New(rand.NewSource(seed + 42))
 		n := 2 + rng.Intn(7) // 2–8 nodes
 		var edges [][3]float64
 		for i := 0; i < n; i++ {
@@ -250,7 +249,6 @@ func TestLeiden_DeterministicRandomGraphs(t *testing.T) {
 				// Also verify reference.
 				lg.nodeToComm[node] = dst // restore for ref check
 				refBefore := referenceModularity(lg, 1.0, twoM)
-				lg.nodeToComm[node] = lg.nodeToComm[node] // no-op, already set
 				if math.Abs(qAfter-refBefore) > tolerance {
 					t.Fatalf("seed=%d: ref mismatch after move", seed)
 				}

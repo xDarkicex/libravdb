@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -511,9 +510,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, tlsConfig *tls.C
 		}
 		msgType, payload, err := readMessageArena(rw, arena)
 		if err != nil {
-			if err != io.EOF {
-				// Log? For now, just close.
-			}
 			return
 		}
 

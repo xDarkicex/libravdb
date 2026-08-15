@@ -34,10 +34,10 @@ func TestGraphNodeIDValidate(t *testing.T) {
 
 func TestGraphNodeIDIsValidNoAlloc(t *testing.T) {
 	// Both valid and invalid paths must be allocation-free.
-	if n := testing.AllocsPerRun(100, func() { GraphNodeID(0).IsValid() }); n > 0 {
+	if n := testing.AllocsPerRun(100, func() { _ = GraphNodeID(0).IsValid() }); n > 0 {
 		t.Errorf("IsValid(invalid) allocated %f per call", n)
 	}
-	if n := testing.AllocsPerRun(100, func() { GraphNodeID(42).IsValid() }); n > 0 {
+	if n := testing.AllocsPerRun(100, func() { _ = GraphNodeID(42).IsValid() }); n > 0 {
 		t.Errorf("IsValid(valid) allocated %f per call", n)
 	}
 }

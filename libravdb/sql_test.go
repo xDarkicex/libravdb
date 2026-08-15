@@ -391,7 +391,7 @@ func TestSQL_PgClassCount(t *testing.T) {
 	if len(results.Results) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(results.Results))
 	}
-	if results.Columns == nil || len(results.Columns) == 0 || results.Columns[0] != "count" {
+	if len(results.Columns) == 0 || results.Columns[0] != "count" {
 		t.Errorf("expected Columns=[count], got %v", results.Columns)
 	}
 	v, ok := results.Results[0].Metadata["count"]
@@ -427,7 +427,7 @@ func TestSQL_PgClassCount(t *testing.T) {
 	if len(results.Results) != 2 {
 		t.Errorf("expected 2 rows, got %d", len(results.Results))
 	}
-	if results.Columns == nil || len(results.Columns) == 0 || results.Columns[0] != "relname" {
+	if len(results.Columns) == 0 || results.Columns[0] != "relname" {
 		t.Errorf("expected Columns=[relname], got %v", results.Columns)
 	}
 	// Verify both table names appear.

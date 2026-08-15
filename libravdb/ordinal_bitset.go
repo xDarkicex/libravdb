@@ -7,35 +7,36 @@ import (
 
 const ordinalBitsetWordBits = 64
 
-// ordinalBitsetPool reuses []uint64 backing arrays across queries. Each slot is
-// sized for the largest collection seen; smaller collections reuse a sub-slice.
-var ordinalBitsetPool = sync.Pool{New: func() any { return make([]uint64, 0, 1024) }}
 var bitsetMembershipPool = sync.Pool{New: func() any { return &bitsetMembership{} }}
 
 type ordinalBitsetBuffer struct{ words []uint64 }
 
 var ordinalBitsetBufferPool = sync.Pool{New: func() any { return &ordinalBitsetBuffer{words: make([]uint64, 0, 1024)} }}
 
-// acquireOrdinalBitset returns a zeroed []uint64 sized for at least maxOrdinal
-// ordinals. The caller owns the slice until ReleaseOrdinalBitset is called.
-func acquireOrdinalBitset(maxOrdinal uint32) []uint64 {
+// acquireOrdinalBitset returns a zeroed buffer sized for at least maxOrdinal
+// ordinals. The caller owns the buffer until releaseOrdinalBitset is called.
+func acquireOrdinalBitset(maxOrdinal uint32) *ordinalBitsetBuffer {
 	words := int(maxOrdinal)/ordinalBitsetWordBits + 1
-	s := ordinalBitsetPool.Get().([]uint64)
-	if cap(s) < words {
-		s = make([]uint64, words)
+	buffer := ordinalBitsetBufferPool.Get().(*ordinalBitsetBuffer)
+	if cap(buffer.words) < words {
+		buffer.words = make([]uint64, words)
 	} else {
-		s = s[:words]
+		buffer.words = buffer.words[:words]
 	}
-	for i := range s {
-		s[i] = 0
+	for i := range buffer.words {
+		buffer.words[i] = 0
 	}
-	return s
+	return buffer
 }
 
-// releaseOrdinalBitset returns a bitset slice to the pool. The caller must
-// not read or write the slice after this call.
-func releaseOrdinalBitset(s []uint64) {
-	ordinalBitsetPool.Put(s[:0])
+// releaseOrdinalBitset returns a bitset buffer to the pool. The caller must
+// not read or write the buffer after this call.
+func releaseOrdinalBitset(buffer *ordinalBitsetBuffer) {
+	if buffer == nil {
+		return
+	}
+	buffer.words = buffer.words[:0]
+	ordinalBitsetBufferPool.Put(buffer)
 }
 
 func acquireBitsetMembership(maxOrdinal uint32) *bitsetMembership {
@@ -135,8 +136,6 @@ func (bm *bitsetMembership) release() {
 			bm.buffer.words = bm.bits[:0]
 			ordinalBitsetBufferPool.Put(bm.buffer)
 			bm.buffer = nil
-		} else {
-			releaseOrdinalBitset(bm.bits)
 		}
 		bm.bits = nil
 	}

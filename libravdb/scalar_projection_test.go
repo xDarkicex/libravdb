@@ -82,7 +82,7 @@ func TestSQLScalarCaseNullAndFunctions(t *testing.T) {
 	if results.Results[0].Metadata["without_three"] != nil || results.Results[1].Metadata["without_three"] != nil {
 		t.Fatalf("NULLIF values=%#v %#v", results.Results[0].Metadata["without_three"], results.Results[1].Metadata["without_three"])
 	}
-	if _, ok := results.Results[0].Metadata["observed_at"].(interface{}); !ok {
+	if _, ok := results.Results[0].Metadata["observed_at"]; !ok {
 		t.Fatalf("NOW result missing: %#v", results.Results[0].Metadata)
 	}
 }

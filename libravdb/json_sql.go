@@ -1001,12 +1001,11 @@ func evaluateJSONArrayExpansion(name string, args []interface{}) ([]interface{},
 			if !isObject {
 				return nil, true, fmt.Errorf("%s JSON value must be an object", name)
 			}
-			base := map[string]interface{}{}
 			decoded, baseOK := decodeJSONValue(args[0])
 			if !baseOK || decoded == nil {
 				return nil, true, fmt.Errorf("%s base value is invalid", name)
 			}
-			base, isObject = decoded.(map[string]interface{})
+			base, isObject := decoded.(map[string]interface{})
 			if !isObject {
 				return nil, true, fmt.Errorf("%s base value must be an object", name)
 			}

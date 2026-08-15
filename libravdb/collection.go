@@ -2635,8 +2635,8 @@ func (c *Collection) lookupJSONContainment(ctx context.Context, column string, o
 		return nil, false, nil
 	}
 	node := value
-	valid := true
 	if operator != lexer.KindJSONExists {
+		var valid bool
 		node, valid = decodeJSONValue(value)
 		if !valid {
 			return nil, true, nil

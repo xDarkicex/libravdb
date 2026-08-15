@@ -781,7 +781,7 @@ func TestEpoch_FullScratchpadAcceptance(t *testing.T) {
 	}
 	edges, _ := gr.Neighbors(0)
 	if len(edges) != 0 {
-		// Check any node — edges should be clean.
+		t.Errorf("edges leaked after rollback: %v", edges)
 	}
 	t.Logf("✅ rollback: no record or edge leaked")
 }

@@ -130,7 +130,7 @@ func TestAdversarialGraphNodeID_AbortedCommitsNoGap(t *testing.T) {
 	ops := []storage.TxOperation{
 		{Collection: "col", ID: "tx1", Vector: []float32{1, 0, 0, 0}, Type: storage.TxOperationPut},
 	}
-	ops, err := e.PrepareTx(ctx, ops)
+	_, err := e.PrepareTx(ctx, ops)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

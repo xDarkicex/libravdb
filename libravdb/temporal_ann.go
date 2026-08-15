@@ -337,10 +337,6 @@ func (e *Executor) executeMultiModalWithANN(ctx context.Context, col *Collection
 
 	// Build a local-ordinal bitmap filter for the temporal HNSW.
 	filter := &temporalCandidateFilter{allowed: localOrdinals}
-	efSearch := e.db.config.TemporalANN.EfSearch
-	if efSearch <= 0 {
-		efSearch = entry.key.efConst * 4
-	}
 
 	// Search the temporal HNSW with the candidate filter.
 	k := plan.Limit

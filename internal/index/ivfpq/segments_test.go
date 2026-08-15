@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xDarkicex/memory"
 	"github.com/xDarkicex/libravdb/internal/quant"
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 // trainedPQ builds a small IVF-PQ index with trained ProductQuantizer.
@@ -228,7 +228,6 @@ func TestForcedGCReleasesCallerInput(t *testing.T) {
 	for i := range keep {
 		keep[i] = nil
 	}
-	keep = nil
 	for i := 0; i < 4; i++ {
 		runtime.GC()
 		time.Sleep(5 * time.Millisecond)

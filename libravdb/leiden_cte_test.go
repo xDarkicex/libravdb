@@ -429,7 +429,7 @@ func TestLeidenCTE_NoMutation(t *testing.T) {
 	parser.Parse(src, &doc)
 
 	for i := 0; i < 5; i++ {
-		_, err := epoch.BindLeidenCTE(context.Background(), src, &doc, i%1) // always index 0
+		_, err := epoch.BindLeidenCTE(context.Background(), src, &doc, 0) // always index 0
 		if err != nil {
 			t.Fatalf("bind %d: %v", i, err)
 		}

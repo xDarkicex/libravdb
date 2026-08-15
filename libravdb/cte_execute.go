@@ -3321,7 +3321,7 @@ func evalVirtualExpr(doc *parser.QueryDoc, src []byte, ref parser.NodeRef, row v
 		}
 		return matched
 	case parser.NodeKindSubqueryExpr:
-		return membership != nil && len(membership) > 0
+		return len(membership) > 0
 	}
 	return false
 }

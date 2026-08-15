@@ -394,11 +394,7 @@ func (e *Executor) executeSetOperation(ctx context.Context, plan *optimizer.Phys
 		return nil, fmt.Errorf("set operation column count mismatch: left=%d right=%d", len(left.Columns), len(right.Columns))
 	}
 	result := &SearchResults{Columns: append([]string(nil), left.Columns...), ColumnTypes: append([]uint16(nil), left.ColumnTypes...)}
-	leftKeys := make([]string, 0, len(left.Results))
 	rightKeys := make(map[string]int, len(right.Results))
-	for _, row := range left.Results {
-		leftKeys = append(leftKeys, setResultKey(row, left.Columns))
-	}
 	for _, row := range right.Results {
 		rightKeys[setResultKey(row, right.Columns)]++
 	}
@@ -1688,7 +1684,7 @@ func (e *Executor) executeGraphEpoch(ctx context.Context, plan *optimizer.Physic
 			cur := queue[0]
 			queue = queue[1:]
 
-			key := visitKey{cur.nodeID, cur.band, cur.step}
+			key := visitKey(cur)
 			if visited[key] {
 				continue
 			}
@@ -5068,7 +5064,7 @@ func (e *Executor) updatedPrimaryKeyID(ctx context.Context, collection, oldID st
 			}
 		}
 	}
-	newID := oldID
+	var newID string
 	if len(pkColumns) == 1 && strings.EqualFold(pkColumns[0], "id") {
 		newID = values["id"]
 	} else {
