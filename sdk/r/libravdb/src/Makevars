@@ -1,0 +1,2 @@
+PKG_LIBS = -L/Users/z3robit/Development/golang/src/github.com/xDarkicex/libraVDB/sdk/cgo -Wl,-rpath,/Users/z3robit/Development/golang/src/github.com/xDarkicex/libraVDB/sdk/cgo -lravdb
+PKG_CPPFLAGS = -I/Users/z3robit/Development/golang/src/github.com/xDarkicex/libraVDB/sdk/cgo

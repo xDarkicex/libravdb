@@ -87,6 +87,36 @@ namespace LibraVDB
             return result;
         }
 
+        internal static string ParseQueryResult(IntPtr resultPtr, string context)
+        {
+            if (resultPtr == IntPtr.Zero)
+            {
+                throw new LibraVDBException($"{context}: null pointer returned");
+            }
+
+            string result = Marshal.PtrToStringUTF8(resultPtr);
+            Bindings.FreeString(resultPtr);
+
+            if (result != null && result.StartsWith("{\"error\""))
+            {
+                throw new LibraVDBException($"{context} failed: {result}");
+            }
+
+            return result;
+        }
+
+        public string Query(string sql)
+        {
+            IntPtr resPtr = Bindings.DatabaseQuery(_dbID, sql);
+            return ParseQueryResult(resPtr, "Query");
+        }
+
+        public string QueryWithParams(string sql, string parameters = "")
+        {
+            IntPtr resPtr = Bindings.DatabaseQueryWithParams(_dbID, sql, parameters);
+            return ParseQueryResult(resPtr, "QueryWithParams");
+        }
+
         public void Dispose()
         {
             if (!_disposed)

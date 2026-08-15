@@ -274,6 +274,44 @@ impl LibraVDB {
         }
         Ok(())
     }
+
+    fn parse_query_result(&self, res_ptr: *mut c_char, op_name: &str) -> Result<Value, LibraError> {
+        let json_str = from_c_string(res_ptr);
+        if let Some(msg) = json_str {
+            if msg.starts_with("{\"error\"") {
+                let v: Value = serde_json::from_str(&msg).unwrap_or(Value::Null);
+                let err_text = v["error"].as_str().unwrap_or("Unknown error");
+                return Err(LibraError(format!("{} failed: {}", op_name, err_text)));
+            }
+            if msg.is_empty() {
+                return Ok(Value::Null);
+            }
+            let v: Value = serde_json::from_str(&msg)
+                .map_err(|e| LibraError(format!("JSON Parse error: {}", e)))?;
+            return Ok(v);
+        }
+        Ok(Value::Null)
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Value, LibraError> {
+        let c_sql = to_c_string(sql);
+        let res_ptr = unsafe { bindings::DatabaseQuery(self.handle, c_sql.as_ptr() as *mut c_char) };
+        self.parse_query_result(res_ptr, "Query")
+    }
+
+    pub fn query_with_params(&self, sql: &str, params: Option<Value>) -> Result<Value, LibraError> {
+        let c_sql = to_c_string(sql);
+        let params_str = params.map(|p| p.to_string()).unwrap_or_default();
+        let c_params = to_c_string(&params_str);
+        let res_ptr = unsafe {
+            bindings::DatabaseQueryWithParams(
+                self.handle,
+                c_sql.as_ptr() as *mut c_char,
+                c_params.as_ptr() as *mut c_char,
+            )
+        };
+        self.parse_query_result(res_ptr, "QueryWithParams")
+    }
 }
 
 impl Drop for LibraVDB {

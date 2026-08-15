@@ -2,6 +2,14 @@
 
 A native, high-performance Odin wrapper for LibraVDB, built with zero-overhead `foreign` C interoperability.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Installation
 
 Add the `libravdb` package to your project. Since LibraVDB uses a Go C-shared library, ensure `libravdb.dylib` (macOS), `libravdb.so` (Linux), or `libravdb.dll` (Windows) is available in your dynamic linker path or next to your executable.

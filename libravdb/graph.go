@@ -16,6 +16,8 @@ type Graph interface {
 	AddEdgeWithProperties(txn *graph.Txn, src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error
 	RemoveEdge(txn *graph.Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *graph.Txn, nodeID uint64) error
+	SetEdgeKindDirection(kind uint8, undirected bool)
+	IsEdgeKindUndirected(kind uint8) bool
 
 	// Edge queries.
 	Neighbors(nodeID uint64) ([]Edge, error)
@@ -59,7 +61,8 @@ type Graph interface {
 // then call Commit or let the transaction be discarded.
 type Txn = graph.Txn
 
-// Edge represents a directed edge in the graph.
+// Edge represents one stored graph edge. Its traversal direction is defined by
+// the registered edge kind; directed kinds are the default.
 type Edge = graph.Edge
 
 // EdgeView is an edge with its canonical, versioned JSON property envelope.
@@ -138,6 +141,19 @@ func NewGraph(config GraphConfig) (Graph, error) {
 // name/kind pair.
 func RegisterEdgeKind(name string, kind uint8) bool {
 	return graph.RegisterEdgeKind(name, kind)
+}
+
+// RegisterEdgeKindWithDirection registers a named edge kind and explicitly
+// declares whether it is bidirectional. Undirected kinds still use one
+// canonical stored edge; traversal exposes the reverse direction without
+// duplicating physical edges or WAL records.
+func RegisterEdgeKindWithDirection(name string, kind uint8, undirected bool) bool {
+	return graph.RegisterEdgeKindWithDirection(name, kind, undirected)
+}
+
+// RegisterUndirectedEdgeKind registers a bidirectional edge kind.
+func RegisterUndirectedEdgeKind(name string, kind uint8) bool {
+	return graph.RegisterUndirectedEdgeKind(name, kind)
 }
 
 // ResolveEdgeKind returns the numeric kind for a registered edge name, or 0

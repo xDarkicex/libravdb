@@ -418,7 +418,8 @@ func (t *Txn) AddEdgeWithPropertiesJSON(src, tgt uint64, weight float32, kind ui
 	return nil
 }
 
-// RemoveEdge removes a directed edge from the graph within this transaction.
+// RemoveEdge removes an edge from the graph within this transaction. For an
+// undirected kind either endpoint order addresses the one canonical edge.
 //
 // Ordered log invariant: every call appends exactly one entry so savepoint
 // positions remain stable. When the edge exists in staged adds, it is removed
@@ -429,18 +430,18 @@ func (t *Txn) RemoveEdge(src, tgt uint64, kind uint8) error {
 	if t == nil || t.closed {
 		return fmt.Errorf("graph transaction is closed")
 	}
-	// Always record the ordered op first — append-only invariant.
-	t.orderedOps = append(t.orderedOps, StagedGraphOp{
-		Kind: StagedGraphEdgeRemove, Collection: t.collection,
-		Src: src, Tgt: tgt, EdgeKind: kind,
-	})
-
 	// If the edge was staged as an add in this same transaction, cancel it
 	// by removing from adds. The overlay will then fall through to the base
 	// (or remaining staged ops) for this edge.
 	for i := range t.adds {
-		if t.adds[i].Src == src && t.adds[i].Tgt == tgt && t.adds[i].Kind == kind {
+		if t.adds[i].Kind == kind && ((t.adds[i].Src == src && t.adds[i].Tgt == tgt) ||
+			(t.store.isUndirectedKind(kind) && t.adds[i].Src == tgt && t.adds[i].Tgt == src)) {
+			removeSrc, removeTgt := t.adds[i].Src, t.adds[i].Tgt
 			t.adds = append(t.adds[:i], t.adds[i+1:]...)
+			t.orderedOps = append(t.orderedOps, StagedGraphOp{
+				Kind: StagedGraphEdgeRemove, Collection: t.collection,
+				Src: removeSrc, Tgt: removeTgt, EdgeKind: kind,
+			})
 			return nil
 		}
 	}
@@ -449,7 +450,17 @@ func (t *Txn) RemoveEdge(src, tgt uint64, kind uint8) error {
 	if _, err := t.store.edge(src, tgt, kind); err != nil {
 		return err
 	}
-	t.removes = append(t.removes, storage.GraphEdgeOp{Collection: t.collection, Src: src, Tgt: tgt, Kind: kind})
+	removeSrc, removeTgt := src, tgt
+	if t.store.isUndirectedKind(kind) {
+		if !t.store.physicalEdge(src, tgt, kind) && t.store.physicalEdge(tgt, src, kind) {
+			removeSrc, removeTgt = tgt, src
+		}
+	}
+	t.orderedOps = append(t.orderedOps, StagedGraphOp{
+		Kind: StagedGraphEdgeRemove, Collection: t.collection,
+		Src: removeSrc, Tgt: removeTgt, EdgeKind: kind,
+	})
+	t.removes = append(t.removes, storage.GraphEdgeOp{Collection: t.collection, Src: removeSrc, Tgt: removeTgt, Kind: kind})
 	return nil
 }
 
@@ -488,21 +499,29 @@ func (t *Txn) NeighborsOverlay(nodeID uint64) ([]Edge, error) {
 		return nil, err
 	}
 	for _, op := range t.removes {
-		if op.Src != nodeID {
+		if op.Src != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Tgt == nodeID) {
 			continue
 		}
+		target := op.Tgt
+		if op.Src != nodeID {
+			target = op.Src
+		}
 		for i := range base {
-			if base[i].Target == op.Tgt && base[i].GetKind() == op.Kind {
+			if base[i].Target == target && base[i].GetKind() == op.Kind {
 				base = append(base[:i], base[i+1:]...)
 				break
 			}
 		}
 	}
 	for _, op := range t.adds {
-		if op.Src != nodeID {
+		if op.Src != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Tgt == nodeID) {
 			continue
 		}
-		base = append(base, Edge{Target: op.Tgt, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
+		target := op.Tgt
+		if op.Src != nodeID {
+			target = op.Src
+		}
+		base = append(base, Edge{Target: target, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
 	}
 	return base, nil
 }
@@ -525,21 +544,29 @@ func (t *Txn) NeighborsOverlayWithProperties(nodeID uint64) ([]EdgeView, error) 
 		return nil, err
 	}
 	for _, op := range t.removes {
-		if op.Src != nodeID {
+		if op.Src != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Tgt == nodeID) {
 			continue
 		}
+		target := op.Tgt
+		if op.Src != nodeID {
+			target = op.Src
+		}
 		for i := range base {
-			if base[i].Edge.Target == op.Tgt && base[i].Edge.GetKind() == op.Kind {
+			if base[i].Edge.Target == target && base[i].Edge.GetKind() == op.Kind {
 				base = append(base[:i], base[i+1:]...)
 				break
 			}
 		}
 	}
 	for _, op := range t.adds {
-		if op.Src != nodeID {
+		if op.Src != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Tgt == nodeID) {
 			continue
 		}
-		e := Edge{Target: op.Tgt, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
+		target := op.Tgt
+		if op.Src != nodeID {
+			target = op.Src
+		}
+		e := Edge{Target: target, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
 		base = append(base, EdgeView{Edge: e, Properties: append([]byte(nil), op.Properties...)})
 	}
 	return base, nil
@@ -548,63 +575,19 @@ func (t *Txn) NeighborsOverlayWithProperties(nodeID uint64) ([]EdgeView, error) 
 // InboundNeighborsAtLSN returns inbound edges (v→nodeID) visible at snapshotLSN.
 // Combines live inbound edges with temporal-only edges visible at the snapshot.
 func (g *graphStore) InboundNeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error) {
-	liveEdges, err := g.InboundNeighbors(nodeID)
-	g.temporalMu.Lock()
-	defer g.temporalMu.Unlock()
+	views, err := g.InboundNeighborsAtLSNWithProperties(nodeID, snapshotLSN)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build result: live edges visible at snapshot + temporal-only inbound edges.
-	seen := make(map[edgeTemporalKey]bool)
-	var result []Edge
-
-	// Pass 1: include live inbound edges visible at snapshot.
-	for _, e := range liveEdges {
-		// Inbound: edge goes from e.Target → nodeID.
-		key := edgeTemporalKey{Src: e.Target, Tgt: nodeID, Kind: e.GetKind()}
-		state, ok := g.temporalEdges[key]
-		if !ok {
-			result = append(result, e)
-			seen[key] = true
-			continue
-		}
-		visible := false
-		for i := len(state.Versions) - 1; i >= 0; i-- {
-			if state.Versions[i].BeginLSN <= snapshotLSN &&
-				(state.Versions[i].EndLSN == 0 || snapshotLSN < state.Versions[i].EndLSN) {
-				visible = true
-				break
-			}
-		}
-		if visible {
-			result = append(result, e)
-			seen[key] = true
-		}
+	edges := make([]Edge, len(views))
+	for i := range views {
+		edges[i] = views[i].Edge
 	}
-
-	// Pass 2: add temporal-only inbound edges visible at snapshot.
-	if g.temporalEdges != nil {
-		for key, state := range g.temporalEdges {
-			if key.Tgt != nodeID || seen[key] {
-				continue
-			}
-			for i := len(state.Versions) - 1; i >= 0; i-- {
-				v := state.Versions[i]
-				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
-					e := Edge{Target: key.Src, Weight: v.Weight}
-					e.SetKind(key.Kind)
-					result = append(result, e)
-					break
-				}
-			}
-		}
-	}
-	return result, nil
+	return edges, nil
 }
 
 func (g *graphStore) InboundNeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
-	liveEdges, err := g.InboundNeighborsWithProperties(nodeID)
+	liveEdges, err := g.liveOrientedNeighbors(nodeID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -612,35 +595,33 @@ func (g *graphStore) InboundNeighborsAtLSNWithProperties(nodeID uint64, snapshot
 	defer g.temporalMu.Unlock()
 	seen := make(map[edgeTemporalKey]bool)
 	var result []EdgeView
-	for _, view := range liveEdges {
-		key := edgeTemporalKey{Src: view.Edge.Target, Tgt: nodeID, Kind: view.Edge.GetKind()}
+	for _, oriented := range liveEdges {
+		key := oriented.key
 		state, ok := g.temporalEdges[key]
 		if !ok {
-			result = append(result, view)
+			result = append(result, oriented.view)
 			seen[key] = true
 			continue
 		}
-		for i := len(state.Versions) - 1; i >= 0; i-- {
-			v := state.Versions[i]
-			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
-				result = append(result, view)
-				seen[key] = true
-				break
-			}
+		if _, visible := visibleEdgeVersion(state, snapshotLSN); visible {
+			result = append(result, oriented.view)
+			seen[key] = true
 		}
 	}
 	for key, state := range g.temporalEdges {
-		if key.Tgt != nodeID || seen[key] {
+		if seen[key] || (key.Tgt != nodeID && (!g.isUndirectedKind(key.Kind) || key.Src != nodeID)) {
 			continue
 		}
-		for i := len(state.Versions) - 1; i >= 0; i-- {
-			v := state.Versions[i]
-			if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
-				e := Edge{Target: key.Src, Weight: v.Weight, Stamp: uint32(key.Kind) << 24}
-				result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
-				break
-			}
+		v, visible := visibleEdgeVersion(state, snapshotLSN)
+		if !visible {
+			continue
 		}
+		target := key.Src
+		if key.Tgt != nodeID {
+			target = key.Tgt
+		}
+		e := Edge{Target: target, Weight: v.Weight, Stamp: uint32(key.Kind) << 24}
+		result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
 	}
 	return result, nil
 }
@@ -661,19 +642,27 @@ func (t *Txn) InboundNeighborsOverlay(nodeID uint64) ([]Edge, error) {
 		return nil, err
 	}
 	for _, op := range t.removes {
-		if op.Tgt != nodeID {
+		if op.Tgt != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Src == nodeID) {
 			continue
 		}
+		target := op.Src
+		if op.Tgt != nodeID {
+			target = op.Tgt
+		}
 		for i := range base {
-			if base[i].Target == op.Src && base[i].GetKind() == op.Kind {
+			if base[i].Target == target && base[i].GetKind() == op.Kind {
 				base = append(base[:i], base[i+1:]...)
 				break
 			}
 		}
 	}
 	for _, op := range t.adds {
-		if op.Tgt == nodeID {
-			base = append(base, Edge{Target: op.Src, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
+		if op.Tgt == nodeID || (t.store.isUndirectedKind(op.Kind) && op.Src == nodeID) {
+			target := op.Src
+			if op.Tgt != nodeID {
+				target = op.Tgt
+			}
+			base = append(base, Edge{Target: target, Weight: op.Weight, Stamp: uint32(op.Kind) << 24})
 		}
 	}
 	return base, nil
@@ -694,21 +683,29 @@ func (t *Txn) InboundNeighborsOverlayWithProperties(nodeID uint64) ([]EdgeView, 
 		return nil, err
 	}
 	for _, op := range t.removes {
-		if op.Tgt != nodeID {
+		if op.Tgt != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Src == nodeID) {
 			continue
 		}
+		target := op.Src
+		if op.Tgt != nodeID {
+			target = op.Tgt
+		}
 		for i := range base {
-			if base[i].Edge.Target == op.Src && base[i].Edge.GetKind() == op.Kind {
+			if base[i].Edge.Target == target && base[i].Edge.GetKind() == op.Kind {
 				base = append(base[:i], base[i+1:]...)
 				break
 			}
 		}
 	}
 	for _, op := range t.adds {
-		if op.Tgt != nodeID {
+		if op.Tgt != nodeID && !(t.store.isUndirectedKind(op.Kind) && op.Src == nodeID) {
 			continue
 		}
-		e := Edge{Target: op.Src, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
+		target := op.Src
+		if op.Tgt != nodeID {
+			target = op.Tgt
+		}
+		e := Edge{Target: target, Weight: op.Weight, Stamp: uint32(op.Kind) << 24}
 		base = append(base, EdgeView{Edge: e, Properties: append([]byte(nil), op.Properties...)})
 	}
 	return base, nil
@@ -724,6 +721,8 @@ type Graph interface {
 	AddEdgeWithProperties(txn *Txn, src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error
 	RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *Txn, nodeID uint64) error
+	SetEdgeKindDirection(kind uint8, undirected bool)
+	IsEdgeKindUndirected(kind uint8) bool
 	Neighbors(nodeID uint64) ([]Edge, error)
 	NeighborsWithProperties(nodeID uint64) ([]EdgeView, error)
 	NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error)
@@ -754,27 +753,29 @@ type Graph interface {
 }
 
 type graphStore struct {
-	cfg            GraphConfig
-	edgePool       *memory.ShardedFreeList
-	pagePools      []*memory.ShardedFreeList // segmented
-	pagePoolsMu    sync.RWMutex
-	writeMu        sync.Mutex
-	pageSegments   map[*EdgeTablePage]int
-	pageOwners     map[*EdgeTablePage]*memory.ShardedFreeList
-	propertyOwners map[*EdgePropertyPage]*memory.ShardedFreeList
-	ownersMu       sync.RWMutex
-	bitsetPool     *memory.ShardedFreeList
-	frontierPool   *memory.ShardedFreeList
-	pageReg        *PageRegistry
-	propertyReg    *PropertyPageRegistry
-	index          *EdgeTableIndex
-	reverse        *ReverseIndex
-	manifest       *DBManifest
-	globalStamp    atomic.Uint32
-	metrics        storeMetrics
-	lastFlushedGen uint32
-	nextTxnID      atomic.Uint64
-	walWriter      storage.GraphWALWriter
+	cfg             GraphConfig
+	directionMu     sync.RWMutex
+	undirectedKinds KindSet
+	edgePool        *memory.ShardedFreeList
+	pagePools       []*memory.ShardedFreeList // segmented
+	pagePoolsMu     sync.RWMutex
+	writeMu         sync.Mutex
+	pageSegments    map[*EdgeTablePage]int
+	pageOwners      map[*EdgeTablePage]*memory.ShardedFreeList
+	propertyOwners  map[*EdgePropertyPage]*memory.ShardedFreeList
+	ownersMu        sync.RWMutex
+	bitsetPool      *memory.ShardedFreeList
+	frontierPool    *memory.ShardedFreeList
+	pageReg         *PageRegistry
+	propertyReg     *PropertyPageRegistry
+	index           *EdgeTableIndex
+	reverse         *ReverseIndex
+	manifest        *DBManifest
+	globalStamp     atomic.Uint32
+	metrics         storeMetrics
+	lastFlushedGen  uint32
+	nextTxnID       atomic.Uint64
+	walWriter       storage.GraphWALWriter
 
 	// MVP node label registry: in-memory only, not persisted.
 	// Used for label-scan seeding in graph queries.
@@ -1339,6 +1340,40 @@ func (g *graphStore) SetCollectionName(name string) {
 	g.collectionName = name
 }
 
+// SetEdgeKindDirection installs collection-local direction metadata. The
+// storage format keeps one canonical edge and the reverse index; this flag
+// controls whether that reverse index is exposed as a logical outbound edge.
+func (g *graphStore) SetEdgeKindDirection(kind uint8, undirected bool) {
+	if g == nil || kind == 0 {
+		return
+	}
+	g.directionMu.Lock()
+	if undirected {
+		g.undirectedKinds.Set(kind)
+	} else {
+		g.undirectedKinds.Clear(kind)
+	}
+	g.directionMu.Unlock()
+}
+
+func (g *graphStore) isUndirectedKind(kind uint8) bool {
+	g.directionMu.RLock()
+	value := g.undirectedKinds.Has(kind)
+	g.directionMu.RUnlock()
+	return value
+}
+
+func (g *graphStore) IsEdgeKindUndirected(kind uint8) bool {
+	return g.isUndirectedKind(kind)
+}
+
+func (g *graphStore) hasUndirectedKinds() bool {
+	g.directionMu.RLock()
+	value := g.undirectedKinds != (KindSet{})
+	g.directionMu.RUnlock()
+	return value
+}
+
 // ── Temporal edge visibility ──────────────────────────────────────────
 
 // recordEdgeCommitLSN stamps one committed graph transaction. The operation
@@ -1451,8 +1486,72 @@ func (g *graphStore) NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, 
 	return edges, nil
 }
 
+type orientedEdgeView struct {
+	view EdgeView
+	key  edgeTemporalKey
+}
+
+// liveOrientedNeighbors reads both physical indexes and attaches the
+// canonical source/target identity needed by temporal visibility. The reverse
+// index stores a view of every edge, but it is only a logical outbound view
+// for an undirected kind.
+func (g *graphStore) liveOrientedNeighbors(nodeID uint64, inbound bool) ([]orientedEdgeView, error) {
+	outbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	reverse, err := g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]orientedEdgeView, 0, len(outbound)+len(reverse))
+	if inbound {
+		for _, view := range reverse {
+			result = append(result, orientedEdgeView{
+				view: view,
+				key:  edgeTemporalKey{Src: view.Edge.Target, Tgt: nodeID, Kind: view.Edge.GetKind()},
+			})
+		}
+		for _, view := range outbound {
+			if view.Edge.Target != nodeID && g.isUndirectedKind(view.Edge.GetKind()) {
+				result = append(result, orientedEdgeView{
+					view: view,
+					key:  edgeTemporalKey{Src: nodeID, Tgt: view.Edge.Target, Kind: view.Edge.GetKind()},
+				})
+			}
+		}
+		return result, nil
+	}
+
+	for _, view := range outbound {
+		result = append(result, orientedEdgeView{
+			view: view,
+			key:  edgeTemporalKey{Src: nodeID, Tgt: view.Edge.Target, Kind: view.Edge.GetKind()},
+		})
+	}
+	for _, view := range reverse {
+		if view.Edge.Target != nodeID && g.isUndirectedKind(view.Edge.GetKind()) {
+			result = append(result, orientedEdgeView{
+				view: view,
+				key:  edgeTemporalKey{Src: view.Edge.Target, Tgt: nodeID, Kind: view.Edge.GetKind()},
+			})
+		}
+	}
+	return result, nil
+}
+
+func visibleEdgeVersion(state *edgeTemporalState, snapshotLSN uint64) (edgeTemporalVersion, bool) {
+	for i := len(state.Versions) - 1; i >= 0; i-- {
+		version := state.Versions[i]
+		if version.BeginLSN <= snapshotLSN && (version.EndLSN == 0 || snapshotLSN < version.EndLSN) {
+			return version, true
+		}
+	}
+	return edgeTemporalVersion{}, false
+}
+
 func (g *graphStore) NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
-	liveEdges, err := g.NeighborsWithProperties(nodeID)
+	liveEdges, err := g.liveOrientedNeighbors(nodeID, false)
 	g.temporalMu.Lock()
 	defer g.temporalMu.Unlock()
 	if err != nil {
@@ -1465,25 +1564,16 @@ func (g *graphStore) NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uin
 	var result []EdgeView
 
 	// Pass 1: include live edges visible at snapshot.
-	for _, view := range liveEdges {
-		e := view.Edge
-		key := edgeTemporalKey{Src: nodeID, Tgt: e.Target, Kind: e.GetKind()}
+	for _, oriented := range liveEdges {
+		key := oriented.key
 		state, ok := g.temporalEdges[key]
 		if !ok {
-			result = append(result, view)
+			result = append(result, oriented.view)
 			seen[key] = true
 			continue
 		}
-		visible := false
-		for i := len(state.Versions) - 1; i >= 0; i-- {
-			if state.Versions[i].BeginLSN <= snapshotLSN &&
-				(state.Versions[i].EndLSN == 0 || snapshotLSN < state.Versions[i].EndLSN) {
-				visible = true
-				break
-			}
-		}
-		if visible {
-			result = append(result, view)
+		if _, visible := visibleEdgeVersion(state, snapshotLSN); visible {
+			result = append(result, oriented.view)
 			seen[key] = true
 		}
 	}
@@ -1491,18 +1581,20 @@ func (g *graphStore) NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uin
 	// Pass 2: add temporal-only edges (no longer live but visible at snapshot).
 	if g.temporalEdges != nil {
 		for key, state := range g.temporalEdges {
-			if key.Src != nodeID || seen[key] {
+			if seen[key] || (key.Src != nodeID && (!g.isUndirectedKind(key.Kind) || key.Tgt != nodeID)) {
 				continue
 			}
-			for i := len(state.Versions) - 1; i >= 0; i-- {
-				v := state.Versions[i]
-				if v.BeginLSN <= snapshotLSN && (v.EndLSN == 0 || snapshotLSN < v.EndLSN) {
-					e := Edge{Target: key.Tgt, Weight: v.Weight}
-					e.SetKind(key.Kind)
-					result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
-					break
-				}
+			v, visible := visibleEdgeVersion(state, snapshotLSN)
+			if !visible {
+				continue
 			}
+			target := key.Tgt
+			if key.Src != nodeID {
+				target = key.Src
+			}
+			e := Edge{Target: target, Weight: v.Weight}
+			e.SetKind(key.Kind)
+			result = append(result, EdgeView{Edge: e, Properties: append([]byte(nil), v.Properties...)})
 		}
 	}
 	return result, nil
@@ -1775,6 +1867,19 @@ func (g *graphStore) edge(src, tgt uint64, kind uint8) (Edge, error) {
 	return Edge{}, ErrEdgeNotFound
 }
 
+func (g *graphStore) physicalEdge(src, tgt uint64, kind uint8) bool {
+	edges, err := g.neighborsFromTable(src, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return false
+	}
+	for _, edge := range edges {
+		if edge.Target == tgt && edge.GetKind() == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 	edges, _ := g.Neighbors(src)
 	var weight float32
@@ -1859,27 +1964,93 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 }
 
 func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
-	return g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	outbound, err := g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	if !g.hasUndirectedKinds() {
+		return outbound, nil
+	}
+	reverse, err := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	for _, edge := range reverse {
+		if edge.Target != nodeID && g.isUndirectedKind(edge.GetKind()) {
+			outbound = append(outbound, edge)
+		}
+	}
+	return outbound, nil
 }
 
 func (g *graphStore) NeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
-	return g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	outbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	if !g.hasUndirectedKinds() {
+		return outbound, nil
+	}
+	reverse, err := g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	for _, view := range reverse {
+		if view.Edge.Target != nodeID && g.isUndirectedKind(view.Edge.GetKind()) {
+			outbound = append(outbound, view)
+		}
+	}
+	return outbound, nil
 }
 
 func (g *graphStore) InboundNeighbors(nodeID uint64) ([]Edge, error) {
-	return g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	inbound, err := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	if !g.hasUndirectedKinds() {
+		return inbound, nil
+	}
+	outbound, err := g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	for _, edge := range outbound {
+		if edge.Target != nodeID && g.isUndirectedKind(edge.GetKind()) {
+			inbound = append(inbound, edge)
+		}
+	}
+	return inbound, nil
 }
 
 func (g *graphStore) InboundNeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
-	return g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	inbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	if !g.hasUndirectedKinds() {
+		return inbound, nil
+	}
+	outbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	if err != nil {
+		return nil, err
+	}
+	for _, view := range outbound {
+		if view.Edge.Target != nodeID && g.isUndirectedKind(view.Edge.GetKind()) {
+			inbound = append(inbound, view)
+		}
+	}
+	return inbound, nil
 }
 
 func (g *graphStore) Degree(nodeID uint64) (int, error) {
-	return g.degreeFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
+	edges, err := g.Neighbors(nodeID)
+	return len(edges), err
 }
 
 func (g *graphStore) InboundDegree(nodeID uint64) (int, error) {
-	return g.degreeFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
+	edges, err := g.InboundNeighbors(nodeID)
+	return len(edges), err
 }
 
 // GraphCentrality returns normalized inbound degree centrality for nodeID.
@@ -2157,4 +2328,17 @@ func (g *graphStore) registerVertexLabel(nodeID uint64, label string) {
 // Returns nil if no nodes have the label.
 func (g *graphStore) GetLabelNodes(label string) []uint64 {
 	return g.labelToNodes[label]
+}
+
+// ForEachVertexLabel exposes the in-memory label registry to the owning
+// libravdb package for runtime graph replacement. It is intentionally an
+// optional method rather than part of the public Graph interface.
+func (g *graphStore) ForEachVertexLabel(fn func(nodeID uint64, label string) bool) {
+	for label, nodes := range g.labelToNodes {
+		for _, nodeID := range nodes {
+			if !fn(nodeID, label) {
+				return
+			}
+		}
+	}
 }

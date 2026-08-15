@@ -2,6 +2,14 @@
 
 A high-performance C#/.NET native wrapper for LibraVDB, providing zero-allocation vector batching using `unsafe` blocks and zero-overhead CGO P/Invoke bindings.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Installation
 
 Add the library to your project:

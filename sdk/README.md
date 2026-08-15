@@ -19,6 +19,8 @@ The SDKs in this directory provide idiomatic, language-specific wrappers over th
 *   **[Odin SDK](./odin/README.md)**: Zero-overhead native `foreign` bindings utilizing direct slice mapping `raw_data(vector)` for seamless memory mapping.
 *   **[Perl SDK](./perl/README.md)**: A robust native FFI wrapper utilizing CPAN's `FFI::Platypus` and the Core `JSON::PP` module.
 *   **[PHP SDK](./php/README.md)**: Utilizes PHP's native `FFI` extension (PHP 7.4+) enabling zero-copy batching of multi-dimensional PHP float arrays.
+*   **[Lua SDK](./lua/README.md)**: A completely native Lua implementation powered by `LuaJIT`'s FFI engine, offering full object-orientation and pure-Lua JSON parsing for embedded workflows and game engines.
+*   **[R SDK](./r/README.md)**: A high-performance wrapper tailored for data scientists using `Rcpp` to bind directly to the Go engine's C-Shared library with flawless `jsonlite` `data.frame` mapping.
 
 ## The CGO Bridge
 All SDKs communicate with the native Go engine via the `libravdb` C-Shared Library. 

@@ -468,10 +468,14 @@ type PhysicalPlan struct {
 	HavingAggregateColumn string   // aggregate argument, empty for COUNT(*)
 
 	// DDL fields — populated when Kind == QueryKindDDL
-	DDLKind      uint8 // 0=create table, 1=drop table, 2=create index, 3=drop index, 4=alter table
-	DDLTableName string
-	DDLIndexName string
-	DDLColumns   []struct {
+	DDLKind                 uint8 // 0=create table, 1=drop table, 2=create index, 3=drop index, 4=alter table, 5=create edge type
+	DDLTableName            string
+	DDLEdgeTypeName         string
+	DDLEdgeTypeUndirected   bool
+	DDLEdgeTypeDirectionSet bool
+	DDLGraph                bool
+	DDLIndexName            string
+	DDLColumns              []struct {
 		Name            string
 		Type            string
 		VectorDimension uint32 // parsed dimension from VECTOR(n); 0 for non-vector columns
@@ -563,6 +567,9 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 	o.params = legacyParams
 	o.boundParams = params
 	// DDL statements — dispatched directly
+	if len(doc.CreateEdgeTypeStmts) > 0 {
+		return o.optimizeCreateEdgeType(doc, src)
+	}
 	if len(doc.CreateTableStmts) > 0 {
 		return o.optimizeCreateTable(doc, src)
 	}
@@ -2881,6 +2888,7 @@ func (o *Optimizer) optimizeCreateTable(doc *parser.QueryDoc, src []byte) (*Phys
 		DDLKind:        0,
 		DDLTableName:   string(src[stmt.TableStart:stmt.TableEnd]),
 		CollectionName: string(src[stmt.TableStart:stmt.TableEnd]),
+		DDLGraph:       stmt.Graph,
 	}
 	for _, col := range stmt.Columns {
 		flags := col.Flags
@@ -2966,6 +2974,17 @@ func (o *Optimizer) optimizeCreateTable(doc *parser.QueryDoc, src []byte) (*Phys
 		plan.DDLColumnDefaults[colName] = extractDefaultValue(doc, src, col.DefaultExpr)
 	}
 	return plan, nil
+}
+
+func (o *Optimizer) optimizeCreateEdgeType(doc *parser.QueryDoc, src []byte) (*PhysicalPlan, error) {
+	stmt := &doc.CreateEdgeTypeStmts[0]
+	return &PhysicalPlan{
+		Kind:                    QueryKindDDL,
+		DDLKind:                 5,
+		DDLEdgeTypeName:         string(src[stmt.NameStart:stmt.NameEnd]),
+		DDLEdgeTypeUndirected:   stmt.Undirected,
+		DDLEdgeTypeDirectionSet: stmt.DirectionSpecified,
+	}, nil
 }
 
 // extractDefaultValue resolves a DEFAULT NodeRef to its literal string value

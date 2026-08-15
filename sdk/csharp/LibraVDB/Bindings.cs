@@ -23,6 +23,12 @@ namespace LibraVDB
         public static extern int GetCollection(int dbID, string name);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr DatabaseQuery(int dbID, string sql);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr DatabaseQueryWithParams(int dbID, string sql, string paramsStr);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr InsertVector(int colID, string id, float[] vector, int dim, string metadataJson);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

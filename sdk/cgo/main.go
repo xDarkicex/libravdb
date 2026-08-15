@@ -883,6 +883,87 @@ func FreeString(str *C.char) {
 	}
 }
 
+//export DatabaseQuery
+func DatabaseQuery(dbID C.int, sql *C.char) *C.char {
+	mu.RLock()
+	db, ok := dbs[int(dbID)]
+	mu.RUnlock()
+
+	if !ok {
+		return C.CString(`{"error": "database not found"}`)
+	}
+
+	goSQL := C.GoString(sql)
+
+	results, err := db.Query(context.Background(), goSQL)
+	if err != nil {
+		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return C.CString(string(errBytes))
+	}
+
+	bytes, err := json.Marshal(results)
+	if err != nil {
+		errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to marshal results: %v", err)})
+		return C.CString(string(errBytes))
+	}
+	return C.CString(string(bytes))
+}
+
+//export DatabaseQueryWithParams
+func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.char {
+	mu.RLock()
+	db, ok := dbs[int(dbID)]
+	mu.RUnlock()
+
+	if !ok {
+		return C.CString(`{"error": "database not found"}`)
+	}
+
+	goSQL := C.GoString(sql)
+
+	var params libravdb.QueryParams
+	if paramsJSON != nil {
+		goParamsJSON := C.GoString(paramsJSON)
+		if goParamsJSON != "" {
+			if err := json.Unmarshal([]byte(goParamsJSON), &params); err != nil {
+				errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to parse params: %v", err)})
+				return C.CString(string(errBytes))
+			}
+			// Normalize []interface{} to []float32 for vectors
+			for k, v := range params {
+				if slice, ok := v.([]interface{}); ok {
+					vec := make([]float32, len(slice))
+					isVec := true
+					for i, val := range slice {
+						if f, ok := val.(float64); ok {
+							vec[i] = float32(f)
+						} else {
+							isVec = false
+							break
+						}
+					}
+					if isVec {
+						params[k] = vec
+					}
+				}
+			}
+		}
+	}
+
+	results, err := db.QueryWithParams(context.Background(), goSQL, params)
+	if err != nil {
+		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return C.CString(string(errBytes))
+	}
+
+	bytes, err := json.Marshal(results)
+	if err != nil {
+		errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to marshal results: %v", err)})
+		return C.CString(string(errBytes))
+	}
+	return C.CString(string(bytes))
+}
+
 func main() {
 	// Required for c-shared build mode, but ignored
 }

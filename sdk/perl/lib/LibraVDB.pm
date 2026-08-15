@@ -17,6 +17,8 @@ our @EXPORT_OK = qw(
     InsertBatch
     DeleteVector
     DeleteBatch
+    DatabaseQuery
+    DatabaseQueryWithParams
     FreeString
 );
 
@@ -50,6 +52,8 @@ $ffi->attach( 'DropDatabase'     => ['int'] => 'string' );
 $ffi->attach( 'InsertBatch'      => ['int', 'string[]', 'float[]', 'int', 'int', 'string[]'] => 'string' );
 $ffi->attach( 'DeleteVector'     => ['int', 'string'] => 'string' );
 $ffi->attach( 'DeleteBatch'      => ['int', 'string[]', 'int'] => 'string' );
+$ffi->attach( 'DatabaseQuery'    => ['int', 'string'] => 'string' );
+$ffi->attach( 'DatabaseQueryWithParams' => ['int', 'string', 'string'] => 'string' );
 $ffi->attach( 'FreeString'       => ['opaque'] => 'void' );
 
 1;

@@ -15,6 +15,7 @@ import (
 	"github.com/xDarkicex/libravdb/internal/graph"
 	btree "github.com/xDarkicex/libravdb/internal/index/btree"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
+	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
 
@@ -3766,34 +3767,14 @@ func (e *Executor) executeInsertGraphEdge(ctx context.Context, plan *optimizer.P
 		return nil, fmt.Errorf("unknown edge kind %q", kindName)
 	}
 
-	// Find the first collection that has a graph for node ID resolution.
-	col := e.db.firstGraphCollection()
-	if col == nil {
-		return nil, fmt.Errorf("no collection with a graph found for edge insert")
-	}
-
-	// Resolve record IDs to graph node IDs.
-	// Inside an epoch, check provisional IDs for staged records first.
-	var srcNode, tgtNode uint64
-	var err error
-	if epoch := epochFromContext(ctx); epoch != nil {
-		srcNode, err = epoch.LookupNodeID(ctx, col.name, srcID)
-		if err != nil {
-			return nil, fmt.Errorf("resolving source node %q: %w", srcID, err)
-		}
-		tgtNode, err = epoch.LookupNodeID(ctx, col.name, tgtID)
-		if err != nil {
-			return nil, fmt.Errorf("resolving target node %q: %w", tgtID, err)
-		}
-	} else {
-		srcNode, err = col.LookupNodeID(ctx, srcID)
-		if err != nil {
-			return nil, fmt.Errorf("resolving source node %q: %w", srcID, err)
-		}
-		tgtNode, err = col.LookupNodeID(ctx, tgtID)
-		if err != nil {
-			return nil, fmt.Errorf("resolving target node %q: %w", tgtID, err)
-		}
+	// GRAPH_EDGES does not carry a collection column, so resolve both record
+	// IDs against the same graph-backed collection. The old first-collection
+	// lookup made SQL graph bootstrap fail as soon as a database contained more
+	// than one graph collection: CREATE GRAPH TABLE could create the nodes, but
+	// GRAPH_EDGES would search an unrelated graph first.
+	col, srcNode, tgtNode, err := e.resolveGraphEdgeEndpoints(ctx, srcID, tgtID)
+	if err != nil {
+		return nil, err
 	}
 
 	g := col.GetGraph()
@@ -3821,6 +3802,46 @@ func (e *Executor) executeInsertGraphEdge(ctx context.Context, plan *optimizer.P
 		return nil, fmt.Errorf("committing graph edge: %w", err)
 	}
 	return &SearchResults{Total: 1}, nil
+}
+
+// resolveGraphEdgeEndpoints resolves both endpoint record IDs within one
+// graph-backed collection. Record IDs are database-scoped graph identities,
+// but GRAPH_EDGES intentionally keeps its SQL shape compact and therefore
+// omits a collection column. Stable collection ordering preserves the
+// existing deterministic behavior when duplicate record IDs exist.
+func (e *Executor) resolveGraphEdgeEndpoints(ctx context.Context, srcID, tgtID string) (*Collection, uint64, uint64, error) {
+	names := e.db.graphCollectionNames("")
+	if len(names) == 0 {
+		return nil, 0, 0, fmt.Errorf("no collection with a graph found for edge insert")
+	}
+
+	var srcErr, tgtErr error
+	for _, name := range names {
+		col, err := e.db.GetCollection(name)
+		if err != nil || col.GetGraph() == nil {
+			continue
+		}
+
+		var srcNode, tgtNode uint64
+		if epoch := epochFromContext(ctx); epoch != nil {
+			srcNode, srcErr = epoch.LookupNodeID(ctx, name, srcID)
+			tgtNode, tgtErr = epoch.LookupNodeID(ctx, name, tgtID)
+		} else {
+			srcNode, srcErr = col.LookupNodeID(ctx, srcID)
+			tgtNode, tgtErr = col.LookupNodeID(ctx, tgtID)
+		}
+		if srcErr == nil && tgtErr == nil && srcNode != 0 && tgtNode != 0 {
+			return col, srcNode, tgtNode, nil
+		}
+	}
+
+	if srcErr != nil {
+		return nil, 0, 0, fmt.Errorf("resolving source node %q: %w", srcID, srcErr)
+	}
+	if tgtErr != nil {
+		return nil, 0, 0, fmt.Errorf("resolving target node %q: %w", tgtID, tgtErr)
+	}
+	return nil, 0, 0, fmt.Errorf("resolving graph edge endpoints %q and %q failed", srcID, tgtID)
 }
 
 // executeAggregate scans a collection and computes COUNT/SUM/AVG/MIN/MAX.
@@ -4329,6 +4350,14 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 	switch plan.DDLKind {
 	case 0: // CREATE TABLE
 		opts := []CollectionOption{WithMetadataOnly()}
+		var graphLayer Graph
+		if plan.DDLGraph {
+			var err error
+			graphLayer, err = NewGraph(GraphConfig{})
+			if err != nil {
+				return nil, fmt.Errorf("create graph table %q: %w", plan.DDLTableName, err)
+			}
+		}
 		var schema MetadataSchema
 		var vectorCount int
 		primaryKeyColumns := append([]string(nil), plan.DDLPrimaryKeyColumns...)
@@ -4546,9 +4575,21 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 				}
 			}
 		}
+		if graphLayer != nil {
+			opts = append(opts, WithGraph(graphLayer))
+		}
 
 		_, err := e.db.CreateCollection(ctx, plan.DDLTableName, opts...)
 		if err != nil {
+			if graphLayer != nil {
+				_ = graphLayer.Close()
+			}
+			return nil, err
+		}
+		return &SearchResults{}, nil
+
+	case 5: // CREATE EDGE TYPE
+		if err := e.db.createSQLEdgeKind(plan.DDLEdgeTypeName, plan.DDLEdgeTypeUndirected, plan.DDLEdgeTypeDirectionSet); err != nil {
 			return nil, err
 		}
 		return &SearchResults{}, nil
@@ -5158,6 +5199,7 @@ func (e *Executor) executeDeleteGraphEdges(ctx context.Context, plan *optimizer.
 		return nil, fmt.Errorf("no collection with a graph found for edge delete")
 	}
 	g := col.GetGraph()
+	edgeKindNames := e.graphEdgeKindNames()
 	type edgeDelete struct {
 		src  uint64
 		tgt  uint64
@@ -5170,13 +5212,25 @@ func (e *Executor) executeDeleteGraphEdges(ctx context.Context, plan *optimizer.
 		if srcErr != nil || tgtErr != nil || srcCollection != col.name || tgtCollection != col.name {
 			return true
 		}
-		matchesPredicates := graphEdgeMatchesPredicates(srcID, tgtID, edge, plan.Predicates)
+		matchesPredicates := graphEdgeMatchesPredicates(srcID, tgtID, edge, plan.Predicates, edgeKindNames)
 		if len(plan.PredicateAlternatives) > 0 {
 			matchesPredicates = false
 			for _, clause := range plan.PredicateAlternatives {
-				if graphEdgeMatchesPredicates(srcID, tgtID, edge, clause) {
+				if graphEdgeMatchesPredicates(srcID, tgtID, edge, clause, edgeKindNames) {
 					matchesPredicates = true
 					break
+				}
+			}
+		}
+		if !matchesPredicates && col.GetGraph().IsEdgeKindUndirected(edge.GetKind()) {
+			matchesPredicates = graphEdgeMatchesPredicates(tgtID, srcID, edge, plan.Predicates, edgeKindNames)
+			if len(plan.PredicateAlternatives) > 0 {
+				matchesPredicates = false
+				for _, clause := range plan.PredicateAlternatives {
+					if graphEdgeMatchesPredicates(tgtID, srcID, edge, clause, edgeKindNames) {
+						matchesPredicates = true
+						break
+					}
 				}
 			}
 		}
@@ -5211,8 +5265,43 @@ func (e *Executor) executeDeleteGraphEdges(ctx context.Context, plan *optimizer.
 	return &SearchResults{Total: len(matches)}, nil
 }
 
-func graphEdgeMatchesPredicates(sourceID, targetID string, edge graph.Edge, predicates []optimizer.RelationalPredicate) bool {
+func (e *Executor) graphEdgeKindNames() map[uint8][]string {
+	names := make(map[uint8][]string)
+	if definitions, ok := e.db.storage.(storage.EdgeKindDefinitionStore); ok {
+		if rows, err := definitions.ListEdgeKindDefinitions(); err == nil {
+			for name, definition := range rows {
+				names[definition.Kind] = append(names[definition.Kind], name)
+			}
+			return names
+		}
+	}
+	if kinds, ok := e.db.storage.(storage.EdgeKindStore); ok {
+		if rows, err := kinds.ListEdgeKinds(); err == nil {
+			for name, kind := range rows {
+				names[kind] = append(names[kind], name)
+			}
+		}
+	}
+	return names
+}
+
+func graphEdgeMatchesPredicates(sourceID, targetID string, edge graph.Edge, predicates []optimizer.RelationalPredicate, edgeKindNames map[uint8][]string) bool {
 	for _, predicate := range predicates {
+		if strings.EqualFold(predicate.Column, "type") || strings.EqualFold(predicate.Column, "kind") || strings.EqualFold(predicate.Column, "edge_kind") {
+			if names := edgeKindNames[edge.GetKind()]; len(names) > 0 {
+				matched := false
+				for _, name := range names {
+					if scalarPredicateMatches(name, predicate) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return false
+				}
+				continue
+			}
+		}
 		var actual interface{}
 		switch {
 		case strings.EqualFold(predicate.Column, "source"), strings.EqualFold(predicate.Column, "src"):

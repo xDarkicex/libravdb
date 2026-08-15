@@ -32,6 +32,35 @@ class LibraVDB {
     }
   }
 
+  String _parseQueryResult(Pointer<Utf8> resPtr, String opName) {
+    if (resPtr == nullptr) {
+      throw LibraException('$opName failed: null pointer returned');
+    }
+    final result = resPtr.toDartString();
+    lib.freeString(resPtr);
+
+    if (result.startsWith('{"error"')) {
+      throw LibraException('$opName failed: $result');
+    }
+    return result;
+  }
+
+  String query(String sql) {
+    final sqlPtr = sql.toNativeUtf8();
+    final resPtr = lib.databaseQuery(_handle, sqlPtr);
+    malloc.free(sqlPtr);
+    return _parseQueryResult(resPtr, 'Query');
+  }
+
+  String queryWithParams(String sql, [String params = ""]) {
+    final sqlPtr = sql.toNativeUtf8();
+    final paramsPtr = params.toNativeUtf8();
+    final resPtr = lib.databaseQueryWithParams(_handle, sqlPtr, paramsPtr);
+    malloc.free(sqlPtr);
+    malloc.free(paramsPtr);
+    return _parseQueryResult(resPtr, 'QueryWithParams');
+  }
+
   void ping() {
     final errPtr = lib.ping(_handle);
     _checkError(errPtr, 'Ping');

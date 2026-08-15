@@ -2,6 +2,14 @@
 
 The official Rust SDK for LibraVDB provides an extremely fast, zero-allocation interface to the core Go engine via a `bindgen` generated CGO bridge. It achieves 100% API parity with the Python, Node, and Ruby SDKs, specifically designed for high-performance agent harnesses and AI sidecars.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Architecture
 
 This SDK utilizes `bindgen` to generate unsafe Rust bindings against the `libravdb` CGO library. These raw C-bindings are wrapped in a 100% safe, idiomatic Rust API (`LibraVDB` and `Collection`), returning `Result<T, LibraError>` types and managing memory allocations and freeing across the FFI boundary automatically.

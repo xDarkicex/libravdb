@@ -219,10 +219,28 @@ func (c *Collection) Config() CollectionConfig {
 // is wired automatically so Txn.Commit() writes durable edge records.
 func (c *Collection) SetGraph(g Graph) {
 	c.mu.Lock()
+	previous := c.graph
 	c.graph = g
 	c.mu.Unlock()
 
+	// Graph-enabled collections are now recreated automatically on reopen.
+	// Preserve the historical public reattach workflow as well: callers that
+	// provide a replacement graph receive the live topology already recovered
+	// into the previous runtime graph. The copy is in-memory only and therefore
+	// does not emit duplicate WAL frames.
+	if previous != nil && previous != g && g != nil {
+		copyGraphTopology(previous, g)
+		_ = previous.Close()
+	}
+
 	if c.db != nil && g != nil {
+		if definitions, ok := c.db.storage.(storage.EdgeKindDefinitionStore); ok {
+			if kinds, err := definitions.ListEdgeKindDefinitions(); err == nil {
+				for _, definition := range kinds {
+					g.SetEdgeKindDirection(definition.Kind, definition.Undirected)
+				}
+			}
+		}
 		// Wire WAL writer independently.
 		if w, ok := g.(interface {
 			SetWALWriter(w storage.GraphWALWriter)
@@ -243,6 +261,28 @@ func (c *Collection) SetGraph(g Graph) {
 				setter.SetGraphRecoveryTarget(c.name, target)
 			}
 		}
+	}
+}
+
+func copyGraphTopology(source, target Graph) {
+	txn := target.BeginTxn()
+	if txn == nil {
+		return
+	}
+	source.ForEachEdge(func(src, tgt uint64, edge Edge) bool {
+		if err := target.AddEdge(txn, src, tgt, edge.Weight, edge.GetKind()); err != nil {
+			return false
+		}
+		return true
+	})
+	_ = txn.ApplyInMemory()
+	if labels, ok := source.(interface {
+		ForEachVertexLabel(func(uint64, string) bool)
+	}); ok {
+		labels.ForEachVertexLabel(func(nodeID uint64, label string) bool {
+			target.RegisterVertexLabel(nodeID, label)
+			return true
+		})
 	}
 }
 
@@ -564,6 +604,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		IDMapCapacity:  config.IDMapCapacity,
 		MetadataSchema: metadataSchemaToStorage(config.MetadataSchema),
 		IndexedFields:  append([]string(nil), config.IndexedFields...),
+		GraphEnabled:   config.Graph != nil,
 	}
 
 	// Initialize memory manager if memory management is configured
@@ -640,6 +681,14 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 
 // newCollectionFromStorage creates a collection instance from existing storage
 func newCollectionFromStorage(ctx context.Context, name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index) (*Collection, error) {
+	var graphLayer Graph
+	if engineConfig.GraphEnabled {
+		var err error
+		graphLayer, err = NewGraph(GraphConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("recreate graph for collection %q: %w", name, err)
+		}
+	}
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
 		Dimension:      engineConfig.Dimension,
@@ -657,6 +706,7 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 		IDMapCapacity:  engineConfig.IDMapCapacity,
 		MetadataSchema: metadataSchemaFromStorage(engineConfig.MetadataSchema),
 		IndexedFields:  append([]string(nil), engineConfig.IndexedFields...),
+		Graph:          graphLayer,
 	}
 	if config.NClusters <= 0 {
 		config.NClusters = 100
@@ -800,6 +850,14 @@ func (p storageEntryProvider) IterateEntries(fn func(id string, ordinal uint32, 
 
 // newShardedCollectionFromStorage creates a sharded collection from existing shard storages
 func newShardedCollectionFromStorage(ctx context.Context, name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController) (*Collection, error) {
+	var graphLayer Graph
+	if engineConfig.GraphEnabled {
+		var err error
+		graphLayer, err = NewGraph(GraphConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("recreate graph for collection %q: %w", name, err)
+		}
+	}
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
 		Dimension:      engineConfig.Dimension,
@@ -817,6 +875,7 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 		IDMapCapacity:  engineConfig.IDMapCapacity,
 		MetadataSchema: metadataSchemaFromStorage(engineConfig.MetadataSchema),
 		IndexedFields:  append([]string(nil), engineConfig.IndexedFields...),
+		Graph:          graphLayer,
 		Sharded:        true, // Mark as sharded so lifecycle methods work correctly
 	}
 	if config.NClusters <= 0 {

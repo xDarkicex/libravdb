@@ -344,7 +344,7 @@ func parseSQL(sql string) (*parser.QueryDoc, error) {
 
 	stmtCount := rootSelectCount + len(doc.InsertStmts) +
 		len(doc.InsertGraphEdgeStmts) + len(doc.UpdateStmts) +
-		len(doc.DeleteStmts) + len(doc.CreateTableStmts) +
+		len(doc.DeleteStmts) + len(doc.CreateTableStmts) + len(doc.CreateEdgeTypeStmts) +
 		len(doc.DropTableStmts) + len(doc.CreateIndexStmts) +
 		len(doc.DropIndexStmts) + len(doc.AlterTableStmts) +
 		len(doc.TransactionStmts) + len(doc.PrepareStmts) + len(doc.ExecuteStmts) + len(doc.SessionSettingStmts) + standaloneLeidenCount

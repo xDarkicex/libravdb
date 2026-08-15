@@ -32,6 +32,8 @@ class LibraVDB {
                 void* ScanCollection(int colID, int offset, int limit);
                 void* Vacuum(int dbID);
                 void* DropDatabase(int dbID);
+                void* DatabaseQuery(int dbID, const char* sql);
+                void* DatabaseQueryWithParams(int dbID, const char* sql, const char* params);
                 void* InsertBatch(int colID, const char** ids, float* vectors, int count, int dimension, const char** metadata);
                 void* DeleteVector(int colID, const char* id);
                 void* DeleteBatch(int colID, const char** ids, int count);
@@ -72,6 +74,22 @@ class LibraVDB {
         self::getFFI()->FreeString($ptr);
 
         if (str_starts_with(strtolower($str), "error")) {
+            throw new \Exception($str);
+        }
+
+        return $str;
+    }
+
+    public static function extractQueryResult(?\FFI\CData $ptr): string {
+        if ($ptr === null) {
+            throw new \Exception("Query returned null pointer");
+        }
+
+        $charPtr = self::getFFI()->cast("char*", $ptr);
+        $str = \FFI::string($charPtr);
+        self::getFFI()->FreeString($ptr);
+
+        if (str_starts_with($str, "{\"error\"")) {
             throw new \Exception($str);
         }
 

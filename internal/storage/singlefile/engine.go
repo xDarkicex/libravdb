@@ -56,6 +56,7 @@ const (
 	recordTypeGraphNodeDrop    = uint16(24)
 	recordTypeCommitTimestamp  = uint16(25) // commit LSN → UTC timestamp mapping
 	recordTypeGraphVertexLabel = uint16(26)
+	recordTypeEdgeKindCreate   = uint16(27)
 )
 
 // ReserveGraphNodeIDs reserves n sequential graph node IDs atomically.
@@ -194,6 +195,8 @@ type persistedState struct {
 	TombstonedGraphNodeIDs []uint64                        `json:"tombstoned_graph_node_ids,omitempty"`
 	CommitCatalog          []commitEntry                   `json:"commit_catalog,omitempty"`
 	OldestRetainedLSN      uint64                          `json:"oldest_retained_lsn,omitempty"`
+	EdgeKinds              map[string]uint8                `json:"edge_kinds,omitempty"`
+	UndirectedEdgeKinds    map[string]bool                 `json:"undirected_edge_kinds,omitempty"`
 }
 
 type persistedCollection struct {
@@ -739,7 +742,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	engine := &Engine{
 		path:        resolved,
 		file:        file,
-		state:       &persistedState{NextCollectionID: 1, NextGraphNodeID: 1, Collections: make(map[string]*persistedCollection)},
+		state:       &persistedState{NextCollectionID: 1, NextGraphNodeID: 1, Collections: make(map[string]*persistedCollection), EdgeKinds: make(map[string]uint8), UndirectedEdgeKinds: make(map[string]bool)},
 		collections: make(map[string]*Collection),
 		walSync:     true,
 	}
@@ -874,6 +877,12 @@ func (e *Engine) openExisting() error {
 	e.activeMetaPage = metaPageNumber(chosen.meta)
 	e.lastLSN.Store(chosen.meta.LastAppliedLSN)
 	e.state = chosen.state
+	if e.state.EdgeKinds == nil {
+		e.state.EdgeKinds = make(map[string]uint8)
+	}
+	if e.state.UndirectedEdgeKinds == nil {
+		e.state.UndirectedEdgeKinds = make(map[string]bool)
+	}
 	e.commitCatalog = append([]commitEntry(nil), e.state.CommitCatalog...)
 	e.oldestRetainedLSN = e.state.OldestRetainedLSN
 
@@ -1893,6 +1902,12 @@ func (e *Engine) applyCommittedFrames(
 				return err
 			}
 			e.applyCollectionCostModelStats(payload.Name, payload.Stats)
+		case recordTypeEdgeKindCreate:
+			payload, err := decodeEdgeKindCreatePayload(record.Payload)
+			if err != nil {
+				return err
+			}
+			e.applyEdgeKindCreate(payload.Name, payload.Kind, payload.Undirected)
 		case recordTypeRecordPut:
 			payload, err := decodeRecordPutPayloadBinary(record.Payload)
 			if err != nil {
@@ -1983,6 +1998,21 @@ func (e *Engine) applyCollectionCostModelStats(name string, stats []byte) {
 		return
 	}
 	collection.Config.CostModelStats = append(collection.Config.CostModelStats[:0], stats...)
+}
+
+func (e *Engine) applyEdgeKindCreate(name string, kind uint8, undirected bool) {
+	if e.state.EdgeKinds == nil {
+		e.state.EdgeKinds = make(map[string]uint8)
+	}
+	if e.state.UndirectedEdgeKinds == nil {
+		e.state.UndirectedEdgeKinds = make(map[string]bool)
+	}
+	e.state.EdgeKinds[name] = kind
+	if undirected {
+		e.state.UndirectedEdgeKinds[name] = true
+	} else {
+		delete(e.state.UndirectedEdgeKinds, name)
+	}
 }
 
 func (e *Engine) applyCreateCollection(name string, config storage.CollectionConfig, lsn uint64) {
@@ -2974,6 +3004,93 @@ func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label stri
 	return nil
 }
 
+// ListEdgeKinds returns the durable SQL graph edge-kind registry. The map is
+// copied so callers can register names with the runtime graph package without
+// holding the storage lock.
+func (e *Engine) ListEdgeKinds() (map[string]uint8, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make(map[string]uint8, len(e.state.EdgeKinds))
+	for name, kind := range e.state.EdgeKinds {
+		result[name] = kind
+	}
+	return result, nil
+}
+
+// ListEdgeKindDefinitions returns the durable SQL edge-kind registry,
+// including traversal direction metadata. The result is copied so callers can
+// rebuild process-local graph registries without holding the storage lock.
+func (e *Engine) ListEdgeKindDefinitions() (map[string]storage.EdgeKindDefinition, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make(map[string]storage.EdgeKindDefinition, len(e.state.EdgeKinds))
+	for name, kind := range e.state.EdgeKinds {
+		result[name] = storage.EdgeKindDefinition{Kind: kind, Undirected: e.state.UndirectedEdgeKinds[name]}
+	}
+	return result, nil
+}
+
+// CreateEdgeKind durably registers one SQL edge type using the same
+// transaction/WAL/checkpoint machinery as collection and graph mutations.
+// Numeric kinds are assigned by libravdb; this storage method validates and
+// records the already-resolved mapping.
+func (e *Engine) CreateEdgeKind(name string, kind uint8) error {
+	return e.CreateEdgeKindDefinition(name, kind, false)
+}
+
+// CreateEdgeKindDefinition durably registers a named SQL edge type and its
+// direction through the same transaction/WAL/checkpoint machinery as other
+// database metadata.
+func (e *Engine) CreateEdgeKindDefinition(name string, kind uint8, undirected bool) error {
+	if name == "" {
+		return fmt.Errorf("edge type name must not be empty")
+	}
+	if kind == 0 {
+		return fmt.Errorf("edge type kind 0 is reserved")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
+	if existing, ok := e.state.EdgeKinds[name]; ok {
+		if existing == kind {
+			if e.state.UndirectedEdgeKinds[name] == undirected {
+				return nil
+			}
+			return fmt.Errorf("edge type %q already has a conflicting direction", name)
+		}
+		return fmt.Errorf("edge type %q already uses kind %d", name, existing)
+	}
+
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
+	payload := encodeEdgeKindCreatePayload(edgeKindCreatePayload{Name: name, Kind: kind, Undirected: undirected})
+	frames := []walRecord{
+		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
+		newFrame(recordTypeEdgeKindCreate, opLSN, txID, beginLSN, payload),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
+	}
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		releaseDetachedPayload(payload.bytes, payload.encoder)
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return err
+	}
+	e.recordPendingCommitLocked()
+	e.applyEdgeKindCreate(name, kind, undirected)
+	e.markDirtyLocked(written, 1)
+	return e.maybeCheckpointLocked()
+}
+
 // AppendGraphEdges submits graph edge operations into the unified batch
 // system. The ops share a commit LSN with any concurrent record writes in
 // the same flush. It waits for that flush so Graph Txn.Commit has a real
@@ -3337,7 +3454,17 @@ func captureState(e *Engine) *persistedState {
 		TombstonedGraphNodeIDs: append([]uint64(nil), e.state.TombstonedGraphNodeIDs...),
 		CommitCatalog:          append([]commitEntry(nil), e.commitCatalog...),
 		OldestRetainedLSN:      e.oldestRetainedLSN,
+		EdgeKinds:              make(map[string]uint8, len(e.state.EdgeKinds)),
+		UndirectedEdgeKinds:    make(map[string]bool, len(e.state.UndirectedEdgeKinds)),
 		Collections:            make(map[string]*persistedCollection, len(e.state.Collections)),
+	}
+	for name, kind := range e.state.EdgeKinds {
+		cloned.EdgeKinds[name] = kind
+	}
+	for name, undirected := range e.state.UndirectedEdgeKinds {
+		if undirected {
+			cloned.UndirectedEdgeKinds[name] = true
+		}
 	}
 	for name, coll := range e.state.Collections {
 		c := &persistedCollection{

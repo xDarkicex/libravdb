@@ -828,6 +828,60 @@ registered graph labels, and graph identity is mapped to collection record
 IDs. `MATCH` is available as a `WHERE` predicate, a `JOIN MATCH` relation, and
 inside `GRAPH_TABLE`.
 
+### Graph schema and bootstrap
+
+SQL can create the graph-backed collection and durable relationship registry;
+no native Go bootstrap call is required:
+
+```sql
+CREATE GRAPH TABLE users (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE EDGE TYPE FOLLOWS;
+
+INSERT INTO users (id, name) VALUES ('alice', 'Alice');
+INSERT INTO users (id, name) VALUES ('bob', 'Bob');
+INSERT INTO GRAPH_EDGES VALUES ('alice', 'FOLLOWS', 'bob');
+```
+
+`CREATE GRAPH TABLE` uses the same collection, record, graph-node, WAL, epoch,
+and reopen machinery as the native API. Each inserted record receives a durable
+graph identity; `GRAPH_EDGES` then resolves the logical record IDs to those
+nodes. `CREATE EDGE TYPE` assigns an internal numeric kind and persists the
+name-to-kind mapping, so typed `MATCH` continues to work after a process
+restart. `CREATE TABLE ... REFERENCES GRAPH_NODES` declares a relational
+foreign key; it does not by itself attach a graph layer. `GRAPH_NODES` remains a
+read-only virtual relation.
+
+Relationship kinds are directed by default. Declare a kind `UNDIRECTED` when
+the relationship should be traversable from either endpoint:
+
+```sql
+CREATE EDGE TYPE KNOWS UNDIRECTED;
+INSERT INTO GRAPH_EDGES VALUES ('alice', 'KNOWS', 'bob');
+
+-- Both queries return the other endpoint.
+SELECT target.id
+FROM users AS source
+JOIN MATCH (source)-[:KNOWS]->(target)
+WHERE source.id = 'alice';
+
+SELECT target.id
+FROM users AS source
+JOIN MATCH (source)-[:KNOWS]->(target)
+WHERE source.id = 'bob';
+```
+
+An undirected relationship is stored once with one canonical source and target;
+the reverse adjacency index supplies the opposite traversal. This avoids
+duplicate edge rows, WAL records, history versions, or property blocks. The
+ordinary `-[:KNOWS]-` pattern remains available when a query should traverse
+both directions for the selected pattern. `DELETE FROM GRAPH_EDGES` accepts
+either endpoint order for an undirected kind and removes the one canonical
+edge.
+
 ### Traversal
 
 ```sql

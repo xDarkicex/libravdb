@@ -250,6 +250,17 @@ module LibraVDB
       check_error(err_ptr, "Drop database")
     end
 
+    def query(sql)
+      res_ptr = Core.DatabaseQuery(@handle, sql)
+      parse_result(res_ptr, "Query")
+    end
+
+    def query_with_params(sql, params)
+      params_str = params.nil? ? "" : params
+      res_ptr = Core.DatabaseQueryWithParams(@handle, sql, params_str)
+      parse_result(res_ptr, "QueryWithParams")
+    end
+
     def set_memory_limit(limit)
       err_ptr = Core.SetGlobalMemoryLimit(@handle, limit)
       check_error(err_ptr, "Set memory limit")

@@ -1,6 +1,8 @@
 package singlefile
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -12,7 +14,9 @@ const (
 	codecVersion byte = 3 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
-const snapshotCodecVersion byte = 6 // v4: historical versions; v5: graph tombstones; v6: temporal catalog
+const snapshotCodecVersion byte = 8 // v4: historical versions; v5: graph tombstones; v6: temporal catalog; v7: edge kinds; v8: edge directionality
+
+var graphConfigFieldMagic = []byte{'G', 'R', 'P', 'H', 1}
 
 type encodedPayload struct {
 	encoder *util.BinaryEncoder
@@ -55,6 +59,24 @@ func encodeStateBinary(state *persistedState) ([]byte, error) {
 		enc.WriteUint64(uint64(entry.Timestamp))
 	}
 	enc.WriteUint64(state.OldestRetainedLSN)
+	if uint64(len(state.EdgeKinds)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("edge kind registry too large: %d", len(state.EdgeKinds))
+	}
+	edgeKindNames := make([]string, 0, len(state.EdgeKinds))
+	for name := range state.EdgeKinds {
+		edgeKindNames = append(edgeKindNames, name)
+	}
+	sort.Strings(edgeKindNames)
+	enc.WriteUint32(uint32(len(edgeKindNames)))
+	for _, name := range edgeKindNames {
+		enc.WriteString(name)
+		_ = enc.WriteByte(state.EdgeKinds[name])
+		if state.UndirectedEdgeKinds[name] {
+			_ = enc.WriteByte(1)
+		} else {
+			_ = enc.WriteByte(0)
+		}
+	}
 	names := make([]string, 0, len(state.Collections))
 	for name := range state.Collections {
 		names = append(names, name)
@@ -108,6 +130,8 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 	}
 	var commitCatalog []commitEntry
 	var oldestRetainedLSN uint64
+	var edgeKinds map[string]uint8
+	var stateUndirectedEdgeKinds map[string]bool
 	if version >= 6 {
 		count, err := dec.ReadUint32()
 		if err != nil {
@@ -130,6 +154,38 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 			return nil, err
 		}
 	}
+	if version >= 7 {
+		count, err := dec.ReadUint32()
+		if err != nil {
+			return nil, err
+		}
+		if count > 0 {
+			edgeKinds = make(map[string]uint8, count)
+		}
+		for i := uint32(0); i < count; i++ {
+			name, err := dec.ReadString()
+			if err != nil {
+				return nil, err
+			}
+			kind, err := dec.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			edgeKinds[name] = kind
+			if version >= 8 {
+				undirected, err := dec.ReadByte()
+				if err != nil {
+					return nil, err
+				}
+				if undirected != 0 {
+					if stateUndirectedEdgeKinds == nil {
+						stateUndirectedEdgeKinds = make(map[string]bool, count)
+					}
+					stateUndirectedEdgeKinds[name] = true
+				}
+			}
+		}
+	}
 	count, err := dec.ReadUint32()
 	if err != nil {
 		return nil, err
@@ -140,6 +196,8 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 		TombstonedGraphNodeIDs: tombstonedGraphNodeIDs,
 		CommitCatalog:          commitCatalog,
 		OldestRetainedLSN:      oldestRetainedLSN,
+		EdgeKinds:              edgeKinds,
+		UndirectedEdgeKinds:    stateUndirectedEdgeKinds,
 		Collections:            make(map[string]*persistedCollection, count),
 	}
 	for i := uint32(0); i < count; i++ {
@@ -340,6 +398,51 @@ type graphVertexLabelPayload struct {
 	Label  string
 }
 
+type edgeKindCreatePayload struct {
+	Name       string
+	Kind       uint8
+	Undirected bool
+}
+
+func encodeEdgeKindCreatePayload(p edgeKindCreatePayload) encodedPayload {
+	enc := util.AcquireBinaryEncoder(1 + 4 + len(p.Name) + 2)
+	enc.WriteByte(codecVersion)
+	enc.WriteString(p.Name)
+	_ = enc.WriteByte(p.Kind)
+	if p.Undirected {
+		_ = enc.WriteByte(1)
+	} else {
+		_ = enc.WriteByte(0)
+	}
+	return detachPayload(enc)
+}
+
+func decodeEdgeKindCreatePayload(data []byte) (edgeKindCreatePayload, error) {
+	dec := &util.BinaryDecoder{Data: data}
+	if err := dec.ExpectVersion(); err != nil {
+		return edgeKindCreatePayload{}, err
+	}
+	name, err := dec.ReadString()
+	if err != nil {
+		return edgeKindCreatePayload{}, err
+	}
+	kind, err := dec.ReadByte()
+	if err != nil {
+		return edgeKindCreatePayload{}, err
+	}
+	// The direction byte was added after the original edge-kind WAL format.
+	// Old committed frames remain directed and continue to replay normally.
+	undirected := false
+	if dec.Off < len(dec.Data) {
+		value, readErr := dec.ReadByte()
+		if readErr != nil {
+			return edgeKindCreatePayload{}, readErr
+		}
+		undirected = value != 0
+	}
+	return edgeKindCreatePayload{Name: name, Kind: kind, Undirected: undirected}, nil
+}
+
 func encodeGraphVertexLabelPayload(p graphVertexLabelPayload) encodedPayload {
 	enc := util.AcquireBinaryEncoder(1 + 8 + 4 + len(p.Label))
 	enc.WriteByte(codecVersion)
@@ -527,6 +630,11 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 		if len(declarations) > 0 {
 			optSize += uint32(4 + len(declarations))
 		}
+		if config.GraphEnabled {
+			// A trailing length-prefixed optional field keeps older readers able
+			// to skip this declaration using the existing optSize boundary.
+			optSize += 5 // uint32 length + one boolean byte
+		}
 		enc.WriteUint32(optSize)
 	}
 	enc.WriteUint32(uint32(config.NClusters))
@@ -536,6 +644,9 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 		enc.WriteBytes(config.CostModelStats)
 		if declarations := encodeCollectionDeclarations(config); len(declarations) > 0 {
 			enc.WriteBytes(declarations)
+		}
+		if config.GraphEnabled {
+			enc.WriteBytes(graphConfigFieldMagic)
 		}
 	}
 	return nil
@@ -713,6 +824,9 @@ func estimateCollectionConfigSize(config storage.CollectionConfig) int {
 		if declarations := encodeCollectionDeclarations(config); len(declarations) > 0 {
 			size += 4 + len(declarations)
 		}
+		if config.GraphEnabled {
+			size += 5
+		}
 	}
 	return size
 }
@@ -773,6 +887,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	var costModelStats []byte
 	var metadataSchema map[string]uint8
 	var indexedFields []string
+	var graphEnabled bool
 
 	if version >= 2 {
 		if dec.Off+4 <= len(dec.Data) {
@@ -809,7 +924,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 			if optSize >= 16 {
 				consumed += 4 + len(costModelStats)
 			}
-			if int(optSize) >= consumed+4 && dec.Off+4 <= len(dec.Data) {
+			if !hasGraphConfigField(dec, optSize, consumed) && int(optSize) >= consumed+4 && dec.Off+4 <= len(dec.Data) {
 				declarationBytes, readErr := dec.ReadBytes()
 				if readErr != nil {
 					return storage.CollectionConfig{}, readErr
@@ -819,6 +934,14 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 					return storage.CollectionConfig{}, fmt.Errorf("decode collection declarations: %w", readErr)
 				}
 				consumed += 4 + len(declarationBytes)
+			}
+			if hasGraphConfigField(dec, optSize, consumed) {
+				graphBytes, readErr := dec.ReadBytes()
+				if readErr != nil {
+					return storage.CollectionConfig{}, readErr
+				}
+				graphEnabled = bytes.Equal(graphBytes, graphConfigFieldMagic)
+				consumed += 4 + len(graphBytes)
 			}
 			if int(optSize) > consumed {
 				dec.Off += int(optSize) - consumed
@@ -857,7 +980,19 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 		CostModelStats: costModelStats,
 		MetadataSchema: metadataSchema,
 		IndexedFields:  indexedFields,
+		GraphEnabled:   graphEnabled,
 	}, nil
+}
+
+func hasGraphConfigField(dec *util.BinaryDecoder, optSize uint32, consumed int) bool {
+	if int(optSize) < consumed+4 || dec.Off+4 > len(dec.Data) {
+		return false
+	}
+	length := binary.LittleEndian.Uint32(dec.Data[dec.Off : dec.Off+4])
+	if length != uint32(len(graphConfigFieldMagic)) || dec.Off+4+int(length) > len(dec.Data) {
+		return false
+	}
+	return bytes.Equal(dec.Data[dec.Off+4:dec.Off+4+int(length)], graphConfigFieldMagic)
 }
 
 func readCollection(dec *util.BinaryDecoder, snapshotVersion byte) (*persistedCollection, error) {
@@ -962,7 +1097,10 @@ func readCollection(dec *util.BinaryDecoder, snapshotVersion byte) (*persistedCo
 		}
 	}
 	// Historical versions (snapshot codec v4+).
-	if snapshotVersion >= snapshotCodecVersion {
+	// Historical versions were introduced in snapshot codec v4. Keep this
+	// threshold independent of the current codec version so v7 snapshots
+	// remain readable after v8 adds edge direction metadata.
+	if snapshotVersion >= 4 {
 		numHistorical, err := dec.ReadUint32()
 		if err != nil {
 			return nil, err

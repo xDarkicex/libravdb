@@ -79,26 +79,48 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 		}
 
 		page := g.index.Lookup(node)
-		if page == nil {
-			if err := guard.leave(); err != nil {
-				return err
-			}
-			continue
-		}
+		if page != nil {
+			gen := g.enumerateTargets(page, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, 1, false)
 
-		gen := g.enumerateTargets(page, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, 1)
-
-		if atomic.LoadUint32(&page.Header.Generation) != gen {
-			if err := guard.leave(); err != nil {
-				return err
+			if atomic.LoadUint32(&page.Header.Generation) != gen {
+				if err := guard.leave(); err != nil {
+					return err
+				}
+				for i := oldTail; i < frontier.tail; i++ {
+					bitset.ClearBit(frontier.data[i].NodeID)
+				}
+				frontier.tail = oldTail
+				goto retry
 			}
-			for i := oldTail; i < frontier.tail; i++ {
-				bitset.ClearBit(frontier.data[i].NodeID)
-			}
-			frontier.tail = oldTail
-			goto retry
 		}
 		if err := guard.leave(); err != nil {
+			return err
+		}
+
+		// Plain BFS has no edge-kind filter, so only the reverse-index entries
+		// belonging to explicitly undirected kinds are supplemental neighbors.
+		if !g.hasUndirectedKinds() {
+			continue
+		}
+		reverseGuard, err := g.enterHyaline(g.reverse.pool, int(shard))
+		if err != nil {
+			return err
+		}
+		reversePage := g.reverse.locator.Lookup(node)
+		if reversePage != nil {
+			reverseGen := g.enumerateTargets(reversePage, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, 1, true)
+			if atomic.LoadUint32(&reversePage.Header.Generation) != reverseGen {
+				if err := reverseGuard.leave(); err != nil {
+					return err
+				}
+				for i := oldTail; i < frontier.tail; i++ {
+					bitset.ClearBit(frontier.data[i].NodeID)
+				}
+				frontier.tail = oldTail
+				goto retry
+			}
+		}
+		if err := reverseGuard.leave(); err != nil {
 			return err
 		}
 	}
@@ -147,8 +169,11 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 			predicate := edges[band].Predicate
 			shard := node % uint64(g.cfg.PageShards)
 
-			// Forward direction (outbound)
-			if dir >= 0 {
+			// Forward direction (outbound). For a directed query, the
+			// supplemental outbound scan is limited to undirected kinds so a
+			// kind's metadata can expose the reverse relationship without
+			// changing directed edge semantics.
+			if dir >= 0 || (dir < 0 && g.hasUndirectedKinds()) {
 				guard, err := g.enterHyaline(g.pagePools[0], int(shard))
 				if err != nil {
 					return err
@@ -156,7 +181,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 				oldTail := frontier.tail
 				page := g.index.Lookup(node)
 				if page != nil {
-					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands)
+					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands, dir < 0)
 					if atomic.LoadUint32(&page.Header.Generation) != gen {
 						for i := oldTail; i < frontier.tail; i++ {
 							nd := frontier.data[i]
@@ -170,8 +195,9 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 				}
 			}
 
-			// Reverse direction (inbound)
-			if dir <= 0 {
+			// Reverse direction (inbound), with the same undirected-only
+			// supplemental scan for an outbound arrow.
+			if dir <= 0 || (dir > 0 && g.hasUndirectedKinds()) {
 				guard, err := g.enterHyaline(g.reverse.pool, int(shard))
 				if err != nil {
 					return err
@@ -179,7 +205,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 				oldTail := frontier.tail
 				page := g.reverse.locator.Lookup(node)
 				if page != nil {
-					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands)
+					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands, dir > 0)
 					if atomic.LoadUint32(&page.Header.Generation) != gen {
 						for i := oldTail; i < frontier.tail; i++ {
 							nd := frontier.data[i]
@@ -216,7 +242,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 // step deeper.  The caller must hold HyalineEnter on the appropriate pool.
 // Returns the generation snapshot taken at entry; the caller compares with a
 // re-read to detect concurrent writes.
-func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, bitset *Bitset, frontier *FrontierBuf, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, numBands int) uint32 {
+func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, bitset *Bitset, frontier *FrontierBuf, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, numBands int, onlyUndirected bool) uint32 {
 	gen := atomic.LoadUint32(&page.Header.Generation)
 	totalCount := page.Header.Count
 
@@ -233,7 +259,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 
 		if pageCount <= EdgePageInlineCapacity {
 			for i := uint16(0); i < pageCount; i++ {
-				if !g.matchesEdgeFilters(currPage.Inline[i], filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
 					continue
 				}
 				target := currPage.Inline[i].Target
@@ -246,7 +272,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 			}
 		} else {
 			for i := uint16(0); i < EdgePageInlineCapacity; i++ {
-				if !g.matchesEdgeFilters(currPage.Inline[i], filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
 					continue
 				}
 				target := currPage.Inline[i].Target
@@ -260,7 +286,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
 			extraCount := pageCount - EdgePageInlineCapacity
 			for i := uint16(0); i < extraCount; i++ {
-				if !g.matchesEdgeFilters(extra[i], filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(extra[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
 					continue
 				}
 				target := extra[i].Target
@@ -283,6 +309,13 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 	}
 
 	return gen
+}
+
+func (g *graphStore) matchesTraversalEdge(edge Edge, onlyUndirected, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate) bool {
+	if onlyUndirected && !g.isUndirectedKind(edge.GetKind()) {
+		return false
+	}
+	return g.matchesEdgeFilters(edge, filterActive, kindFilter, weightFilter, predicate)
 }
 
 func (g *graphStore) matchesEdgeFilters(edge Edge, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate) bool {

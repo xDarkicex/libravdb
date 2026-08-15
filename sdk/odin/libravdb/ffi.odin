@@ -22,5 +22,7 @@ foreign libravdb {
     InsertBatch :: proc(colID: i32, ids: ^cstring, vectors: ^f32, count: i32, dimension: i32, metadata: ^cstring) -> cstring ---
     DeleteVector :: proc(colID: i32, id: cstring) -> cstring ---
     DeleteBatch :: proc(colID: i32, ids: ^cstring, count: i32) -> cstring ---
+    DatabaseQuery :: proc(dbID: i32, sql: cstring) -> cstring ---
+    DatabaseQueryWithParams :: proc(dbID: i32, sql: cstring, paramsJSON: cstring) -> cstring ---
     FreeString :: proc(ptr: cstring) ---
 }

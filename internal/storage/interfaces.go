@@ -37,7 +37,35 @@ type CollectionConfig struct {
 	// IndexedFields contains the metadata fields whose derived posting lists
 	// should be used for equality lookups.
 	IndexedFields []string
-	DataLSN       uint64
+	// GraphEnabled persists that the collection owns a graph layer. The graph
+	// object itself is runtime state and is recreated by libravdb on reopen.
+	GraphEnabled bool
+	DataLSN      uint64
+}
+
+// EdgeKindStore is the optional database-level durable registry used by the
+// SQL CREATE EDGE TYPE surface. It is separate from Engine so alternate
+// storage implementations can opt in without breaking the core interface.
+type EdgeKindStore interface {
+	ListEdgeKinds() (map[string]uint8, error)
+	CreateEdgeKind(name string, kind uint8) error
+}
+
+// EdgeKindDefinition is the durable SQL graph edge-kind contract. The
+// numeric kind remains the compact value stored in every edge; Undirected is
+// metadata about how that kind is traversed and does not duplicate physical
+// edges or WAL records.
+type EdgeKindDefinition struct {
+	Kind       uint8
+	Undirected bool
+}
+
+// EdgeKindDefinitionStore is the direction-aware extension of EdgeKindStore.
+// EdgeKindStore remains available for older/custom storage engines, whose
+// definitions are interpreted as directed.
+type EdgeKindDefinitionStore interface {
+	ListEdgeKindDefinitions() (map[string]EdgeKindDefinition, error)
+	CreateEdgeKindDefinition(name string, kind uint8, undirected bool) error
 }
 
 // CostModelStatisticsStore is an optional persistence seam for optimizer

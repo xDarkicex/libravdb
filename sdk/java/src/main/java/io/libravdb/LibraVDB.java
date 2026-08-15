@@ -27,6 +27,31 @@ public class LibraVDB implements AutoCloseable {
         }
     }
 
+    private String parseQueryResult(Pointer resPtr, String opName) {
+        if (resPtr == null) {
+            throw new LibraException(opName + " failed: null pointer returned");
+        }
+
+        String result = resPtr.getString(0);
+        LibraVDBLibrary.INSTANCE.FreeString(resPtr);
+
+        if (result.startsWith("{\"error\"")) {
+            throw new LibraException(opName + " failed: " + result);
+        }
+
+        return result;
+    }
+
+    public String query(String sql) {
+        Pointer resPtr = LibraVDBLibrary.INSTANCE.DatabaseQuery(handle, sql);
+        return parseQueryResult(resPtr, "Query");
+    }
+
+    public String queryWithParams(String sql, String params) {
+        Pointer resPtr = LibraVDBLibrary.INSTANCE.DatabaseQueryWithParams(handle, sql, params == null ? "" : params);
+        return parseQueryResult(resPtr, "QueryWithParams");
+    }
+
     public void ping() {
         Pointer errPtr = LibraVDBLibrary.INSTANCE.Ping(handle);
         checkError(errPtr, "Ping");
@@ -50,7 +75,7 @@ public class LibraVDB implements AutoCloseable {
     public List<String> listCollections() {
         Pointer resPtr = LibraVDBLibrary.INSTANCE.ListCollections(handle);
         if (resPtr == null) return new ArrayList<>();
-        
+
         String msg = resPtr.getString(0);
         LibraVDBLibrary.INSTANCE.FreeString(resPtr);
 

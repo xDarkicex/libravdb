@@ -124,6 +124,8 @@ extern char* DisableMemoryMapping(int colID);
 extern char* SaveIndex(int colID, char* path);
 extern char* LoadIndex(int colID, char* path);
 extern void FreeString(char* str);
+extern char* DatabaseQuery(int dbID, char* sql);
+extern char* DatabaseQueryWithParams(int dbID, char* sql, char* paramsJSON);
 
 #ifdef __cplusplus
 }

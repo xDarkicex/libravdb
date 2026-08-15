@@ -27,6 +27,33 @@ class LibraVDB(path: String) {
         }
     }
 
+    private fun parseQueryResult(resPtr: CPointer<ByteVar>?, opName: String): String {
+        if (resPtr == null) {
+            throw LibraException("$opName failed: null pointer returned")
+        }
+        val result = resPtr.toKString()
+        FreeString(resPtr)
+        if (result.startsWith("{\"error\"")) {
+            throw LibraException("$opName failed: $result")
+        }
+        return result
+    }
+
+    fun query(sql: String): String {
+        return memScoped {
+            val resPtr = DatabaseQuery(handle, sql.cstr.ptr)
+            parseQueryResult(resPtr, "Query")
+        }
+    }
+
+    fun queryWithParams(sql: String, params: String? = null): String {
+        return memScoped {
+            val paramsStr = params ?: ""
+            val resPtr = DatabaseQueryWithParams(handle, sql.cstr.ptr, paramsStr.cstr.ptr)
+            parseQueryResult(resPtr, "QueryWithParams")
+        }
+    }
+
     fun ping() {
         val errPtr = Ping(handle)
         checkError(errPtr, "Ping")

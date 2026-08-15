@@ -68,7 +68,7 @@ json Collection::parse_result(char* res_ptr, const std::string& op_name) const {
     if (!msg || msg->empty()) {
         return json(nullptr);
     }
-    
+
     if (msg->rfind("{\"error\"", 0) == 0) {
         try {
             auto j = json::parse(*msg);
@@ -77,7 +77,7 @@ json Collection::parse_result(char* res_ptr, const std::string& op_name) const {
             throw LibraException(op_name + " failed: " + *msg);
         }
     }
-    
+
     try {
         return json::parse(*msg);
     } catch (const json::parse_error& e) {
@@ -89,13 +89,13 @@ void Collection::insert(const std::string& id, const std::vector<float>& vector,
     if (vector.size() != static_cast<size_t>(dim)) {
         throw LibraException("Vector dimension mismatch");
     }
-    
+
     std::string meta_str = metadata ? metadata->dump() : "";
     char* err_ptr = InsertVector(
-        handle, 
-        const_cast<char*>(id.c_str()), 
-        const_cast<float*>(vector.data()), 
-        dim, 
+        handle,
+        const_cast<char*>(id.c_str()),
+        const_cast<float*>(vector.data()),
+        dim,
         const_cast<char*>(meta_str.c_str())
     );
     check_error(err_ptr, "Insert");
@@ -104,10 +104,10 @@ void Collection::insert(const std::string& id, const std::vector<float>& vector,
 void Collection::update(const std::string& id, const std::vector<float>& vector, const std::optional<json>& metadata) const {
     std::string meta_str = metadata ? metadata->dump() : "";
     char* err_ptr = UpdateVector(
-        handle, 
-        const_cast<char*>(id.c_str()), 
-        const_cast<float*>(vector.data()), 
-        dim, 
+        handle,
+        const_cast<char*>(id.c_str()),
+        const_cast<float*>(vector.data()),
+        dim,
         const_cast<char*>(meta_str.c_str())
     );
     check_error(err_ptr, "Update");
@@ -116,10 +116,10 @@ void Collection::update(const std::string& id, const std::vector<float>& vector,
 void Collection::update_if_version(const std::string& id, const std::vector<float>& vector, uint64_t expected_version, const std::optional<json>& metadata) const {
     std::string meta_str = metadata ? metadata->dump() : "";
     char* err_ptr = UpdateVectorIfVersion(
-        handle, 
-        const_cast<char*>(id.c_str()), 
-        const_cast<float*>(vector.data()), 
-        dim, 
+        handle,
+        const_cast<char*>(id.c_str()),
+        const_cast<float*>(vector.data()),
+        dim,
         const_cast<char*>(meta_str.c_str()),
         expected_version
     );
@@ -134,10 +134,10 @@ json Collection::get(const std::string& id) const {
 json Collection::search(const std::vector<float>& vector, int k, const std::optional<Filter>& filter) const {
     std::string filter_str = filter ? filter->to_json().dump() : "";
     char* res_ptr = QueryVector(
-        handle, 
-        const_cast<float*>(vector.data()), 
-        dim, 
-        k, 
+        handle,
+        const_cast<float*>(vector.data()),
+        dim,
+        k,
         const_cast<char*>(filter_str.c_str())
     );
     return parse_result(res_ptr, "Search");
@@ -152,7 +152,7 @@ void Collection::insert_batch(const std::vector<std::string>& ids, const std::ve
     if (ids.size() != vectors.size()) {
         throw LibraException("ids and vectors must have the same length");
     }
-    
+
     std::vector<float> flat_vectors;
     flat_vectors.reserve(ids.size() * dim);
     for (const auto& vec : vectors) {
@@ -161,15 +161,15 @@ void Collection::insert_batch(const std::vector<std::string>& ids, const std::ve
         }
         flat_vectors.insert(flat_vectors.end(), vec.begin(), vec.end());
     }
-    
+
     std::vector<char*> c_ids;
     c_ids.reserve(ids.size());
     for (const auto& id : ids) c_ids.push_back(const_cast<char*>(id.c_str()));
-    
+
     std::vector<std::string> meta_strings;
     std::vector<char*> c_metas;
     char** meta_ptr = nullptr;
-    
+
     if (metadata) {
         if (metadata->size() != ids.size()) throw LibraException("ids and metadata length mismatch");
         meta_strings.reserve(metadata->size());
@@ -182,7 +182,7 @@ void Collection::insert_batch(const std::vector<std::string>& ids, const std::ve
         }
         meta_ptr = c_metas.data();
     }
-    
+
     char* err_ptr = InsertBatch(
         handle,
         c_ids.data(),
@@ -198,7 +198,7 @@ void Collection::delete_batch(const std::vector<std::string>& ids) const {
     std::vector<char*> c_ids;
     c_ids.reserve(ids.size());
     for (const auto& id : ids) c_ids.push_back(const_cast<char*>(id.c_str()));
-    
+
     char* err_ptr = DeleteBatch(handle, c_ids.data(), static_cast<int>(ids.size()));
     check_error(err_ptr, "DeleteBatch");
 }
@@ -301,6 +301,43 @@ Collection LibraVDB::get_collection(const std::string& name, int dimension) cons
         throw LibraException("Failed to get collection " + name);
     }
     return Collection(col_handle, dimension);
+}
+
+json LibraVDB::parse_query_result(char* res_ptr, const std::string& op_name) const {
+    auto msg = from_c_string(res_ptr);
+    if (!msg || msg->empty()) {
+        return json(nullptr);
+    }
+
+    if (msg->rfind("{\"error\"", 0) == 0) {
+        try {
+            auto j = json::parse(*msg);
+            throw LibraException(op_name + " failed: " + j.value("error", "Unknown error"));
+        } catch (const json::parse_error&) {
+            throw LibraException(op_name + " failed: " + *msg);
+        }
+    }
+
+    try {
+        return json::parse(*msg);
+    } catch (const json::parse_error& e) {
+        throw LibraException("JSON Parse error: " + std::string(e.what()));
+    }
+}
+
+json LibraVDB::query(const std::string& sql) const {
+    char* res_ptr = DatabaseQuery(handle, const_cast<char*>(sql.c_str()));
+    return parse_query_result(res_ptr, "Query");
+}
+
+json LibraVDB::query_with_params(const std::string& sql, const std::optional<json>& params) const {
+    std::string params_str = params ? params->dump() : "";
+    char* res_ptr = DatabaseQueryWithParams(
+        handle,
+        const_cast<char*>(sql.c_str()),
+        const_cast<char*>(params_str.c_str())
+    );
+    return parse_query_result(res_ptr, "QueryWithParams");
 }
 
 } // namespace libravdb

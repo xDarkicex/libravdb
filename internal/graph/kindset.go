@@ -19,6 +19,13 @@ func (ks *KindSet) Set(kind uint8) {
 	ks[word] |= (1 << bit)
 }
 
+// Clear removes a kind from the set.
+func (ks *KindSet) Clear(kind uint8) {
+	word := kind / 64
+	bit := kind % 64
+	ks[word] &^= 1 << bit
+}
+
 // NewKindSet creates a set from kind values
 func NewKindSet(kinds ...uint8) KindSet {
 	var ks KindSet
@@ -31,12 +38,14 @@ func NewKindSet(kinds ...uint8) KindSet {
 // EdgeKindRegistry maps edge type names to their assigned uint8 kind values.
 // Register kinds before using them in graph queries with typed edges.
 var EdgeKindRegistry = struct {
-	mu     sync.RWMutex
-	byName map[string]uint8
-	byKind map[uint8]string
+	mu         sync.RWMutex
+	byName     map[string]uint8
+	byKind     map[uint8]string
+	undirected map[string]bool
 }{
-	byName: make(map[string]uint8),
-	byKind: make(map[uint8]string),
+	byName:     make(map[string]uint8),
+	byKind:     make(map[uint8]string),
+	undirected: make(map[string]bool),
 }
 
 // RegisterEdgeKind assigns a kind number to an edge type name.
@@ -51,19 +60,76 @@ var EdgeKindRegistry = struct {
 // Returns false when the kind number is 0 or when the name is already mapped
 // to a different kind number.
 func RegisterEdgeKind(name string, kind uint8) bool {
+	return registerEdgeKind(name, kind, false, false)
+}
+
+// RegisterEdgeKindWithDirection registers an edge type and its traversal
+// direction. The direction is part of the edge-kind definition, not of an
+// individual edge, so all aliases of the same numeric kind share it.
+//
+// Unlike RegisterEdgeKind, this function treats the direction as explicit:
+// attempting to reuse a kind with a conflicting direction is rejected. This
+// prevents two durable SQL databases in one process from silently changing
+// the meaning of an already registered kind.
+func RegisterEdgeKindWithDirection(name string, kind uint8, undirected bool) bool {
+	return registerEdgeKind(name, kind, undirected, true)
+}
+
+// RegisterUndirectedEdgeKind is the concise public form for a bidirectional
+// edge type.
+func RegisterUndirectedEdgeKind(name string, kind uint8) bool {
+	return RegisterEdgeKindWithDirection(name, kind, true)
+}
+
+func registerEdgeKind(name string, kind uint8, undirected, explicit bool) bool {
 	if kind == 0 {
 		return false
 	}
 	EdgeKindRegistry.mu.Lock()
 	defer EdgeKindRegistry.mu.Unlock()
 	if existing, ok := EdgeKindRegistry.byName[name]; ok {
-		return existing == kind
+		if existing != kind {
+			return false
+		}
+		if explicit && EdgeKindRegistry.undirected[name] != undirected {
+			return false
+		}
+		return true
+	}
+	if explicit {
+		EdgeKindRegistry.undirected[name] = undirected
+	} else if _, ok := EdgeKindRegistry.undirected[name]; !ok {
+		// Legacy registrations are directed unless a durable definition has
+		// already established the kind as undirected.
+		EdgeKindRegistry.undirected[name] = false
 	}
 	EdgeKindRegistry.byName[name] = kind
 	if _, ok := EdgeKindRegistry.byKind[kind]; !ok {
 		EdgeKindRegistry.byKind[kind] = name
 	}
 	return true
+}
+
+// IsUndirectedEdgeKind reports whether a registered kind has bidirectional
+// traversal semantics. Unknown kinds remain directed for compatibility.
+func IsUndirectedEdgeKind(kind uint8) bool {
+	EdgeKindRegistry.mu.RLock()
+	defer EdgeKindRegistry.mu.RUnlock()
+	for name, registeredKind := range EdgeKindRegistry.byName {
+		if registeredKind == kind && EdgeKindRegistry.undirected[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// IsUndirectedEdgeType reports direction metadata for a name without the
+// ambiguity that a process-wide registry necessarily has for reused numeric
+// kinds across independent database instances.
+func IsUndirectedEdgeType(name string) bool {
+	EdgeKindRegistry.mu.RLock()
+	defer EdgeKindRegistry.mu.RUnlock()
+	return EdgeKindRegistry.undirected[name]
 }
 
 // ResolveEdgeKind returns the kind value for an edge type name, or 0 if not found.

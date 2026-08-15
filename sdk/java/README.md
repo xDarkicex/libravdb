@@ -4,6 +4,14 @@ The official Java SDK provides a high-performance, pure Java wrapper around the 
 
 It guarantees 100% API parity with the Python, Node, Ruby, Rust, and C++ SDKs.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Installation
 
 This SDK is built with Maven. The native `libravdb` shared library must be available in your system's library path (`LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`), or explicitly provided to JNA via `-Djna.library.path=/path/to/libravdb/sdk/cgo`.

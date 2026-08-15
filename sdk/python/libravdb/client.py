@@ -366,5 +366,30 @@ class LibraVDB:
             raise RuntimeError(f"Database Stats failed: {err.get('error')}")
         return json.loads(res_json)
 
+    def query(self, sql: str) -> Dict[str, Any]:
+        res_ptr = _lib.DatabaseQuery(self._handle, _to_c_string(sql))
+        res_json = _from_c_string(res_ptr)
+        if not res_json:
+            return {}
+        if res_json.startswith('{"error"'):
+            err = json.loads(res_json)
+            raise RuntimeError(f"Query failed: {err.get('error')}")
+        return json.loads(res_json)
+
+    def query_with_params(self, sql: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        params_str = json.dumps(params) if params else ""
+        res_ptr = _lib.DatabaseQueryWithParams(
+            self._handle,
+            _to_c_string(sql),
+            _to_c_string(params_str)
+        )
+        res_json = _from_c_string(res_ptr)
+        if not res_json:
+            return {}
+        if res_json.startswith('{"error"'):
+            err = json.loads(res_json)
+            raise RuntimeError(f"QueryWithParams failed: {err.get('error')}")
+        return json.loads(res_json)
+
     def __del__(self):
         self.close()

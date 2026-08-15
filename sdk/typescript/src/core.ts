@@ -49,7 +49,7 @@ export const _lib = {
     InsertBatch: lib.func('InsertBatch', CString, ['int', CStringArray, CFloatArray, 'int', 'int', CStringArray]),
     DeleteBatch: lib.func('DeleteBatch', CString, ['int', CStringArray, 'int']),
     ScanCollection: lib.func('ScanCollection', CString, ['int', 'int', 'int']),
-    
+
     GetVector: lib.func('GetVector', CString, ['int', 'str']),
     GetCollectionCount: lib.func('GetCollectionCount', 'longlong', ['int']),
     UpdateVectorIfVersion: lib.func('UpdateVectorIfVersion', CString, ['int', 'str', CFloatArray, 'int', 'str', 'uint64']),
@@ -61,7 +61,10 @@ export const _lib = {
     DisableMemoryMapping: lib.func('DisableMemoryMapping', CString, ['int']),
     SaveIndex: lib.func('SaveIndex', CString, ['int', 'str']),
     LoadIndex: lib.func('LoadIndex', CString, ['int', 'str']),
-    
+
+    DatabaseQuery: lib.func('DatabaseQuery', CString, ['int', 'str']),
+    DatabaseQueryWithParams: lib.func('DatabaseQueryWithParams', CString, ['int', 'str', 'str']),
+
     FreeString: lib.func('FreeString', 'void', [CString]),
 };
 

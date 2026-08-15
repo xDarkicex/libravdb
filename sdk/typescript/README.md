@@ -2,6 +2,14 @@
 
 The LibraVDB TypeScript SDK provides a native, high-performance Node.js interface to the LibraVDB engine using [Koffi](https://koffi.dev/) for blazing-fast C Foreign Function Interface (FFI) bindings. It achieves 100% API parity with the Go library and Python SDK.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Installation
 
 *(Coming soon to NPM)*

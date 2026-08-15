@@ -176,6 +176,14 @@ _lib.SaveIndex.restype = ctypes.POINTER(ctypes.c_char)
 _lib.LoadIndex.argtypes = [c_int, c_char_p]
 _lib.LoadIndex.restype = ctypes.POINTER(ctypes.c_char)
 
+# char* DatabaseQuery(int dbID, char* sql)
+_lib.DatabaseQuery.argtypes = [c_int, c_char_p]
+_lib.DatabaseQuery.restype = ctypes.POINTER(ctypes.c_char)
+
+# char* DatabaseQueryWithParams(int dbID, char* sql, char* paramsJSON)
+_lib.DatabaseQueryWithParams.argtypes = [c_int, c_char_p, c_char_p]
+_lib.DatabaseQueryWithParams.restype = ctypes.POINTER(ctypes.c_char)
+
 # void FreeString(char* str)
 _lib.FreeString.argtypes = [ctypes.POINTER(ctypes.c_char)]
 _lib.FreeString.restype = None

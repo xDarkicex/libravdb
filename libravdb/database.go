@@ -183,6 +183,42 @@ func Open(opts ...Option) (*Database, error) {
 		},
 	}
 
+	// Restore SQL edge-kind names and direction metadata before collections and
+	// queries are exposed. Numeric kinds are stored in the single-file state/WAL;
+	// graph instances receive the direction metadata after they are recreated.
+	durableEdgeKinds := make(map[string]storage.EdgeKindDefinition)
+	if edgeKinds, ok := storageEngine.(storage.EdgeKindDefinitionStore); ok {
+		kinds, err := edgeKinds.ListEdgeKindDefinitions()
+		if err != nil {
+			_ = storageEngine.Close()
+			bridge.closeCachedIndexes()
+			return nil, fmt.Errorf("load durable graph edge kinds: %w", err)
+		}
+		for name, definition := range kinds {
+			durableEdgeKinds[name] = definition
+			if !RegisterEdgeKindWithDirection(name, definition.Kind, definition.Undirected) {
+				_ = storageEngine.Close()
+				bridge.closeCachedIndexes()
+				return nil, fmt.Errorf("restore graph edge kind %q=%d: runtime registry conflict", name, definition.Kind)
+			}
+		}
+	} else if edgeKinds, ok := storageEngine.(storage.EdgeKindStore); ok {
+		kinds, err := edgeKinds.ListEdgeKinds()
+		if err != nil {
+			_ = storageEngine.Close()
+			bridge.closeCachedIndexes()
+			return nil, fmt.Errorf("load durable graph edge kinds: %w", err)
+		}
+		for name, kind := range kinds {
+			durableEdgeKinds[name] = storage.EdgeKindDefinition{Kind: kind}
+			if !RegisterEdgeKind(name, kind) {
+				_ = storageEngine.Close()
+				bridge.closeCachedIndexes()
+				return nil, fmt.Errorf("restore graph edge kind %q=%d: runtime registry conflict", name, kind)
+			}
+		}
+	}
+
 	// Load catalog from storage engine if it was persisted in a previous session.
 	// Falls back to the sidecar file, then to an empty catalog for fresh databases.
 	if data, ok := db.storage.(interface{ CatalogData() []byte }); ok {
@@ -234,6 +270,13 @@ func Open(opts ...Option) (*Database, error) {
 		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
 	}
+	for _, col := range db.collections {
+		if g := col.GetGraph(); g != nil {
+			for _, definition := range durableEdgeKinds {
+				g.SetEdgeKindDirection(definition.Kind, definition.Undirected)
+			}
+		}
+	}
 
 	// Wire graph WAL: if the engine supports graph edge persistence, wire it
 	// to every collection's graph so Txn.Commit() writes durable edge records.
@@ -260,6 +303,105 @@ func Open(opts ...Option) (*Database, error) {
 	}
 
 	return db, nil
+}
+
+// createSQLEdgeKind allocates, registers, and durably records a named graph
+// edge kind for CREATE EDGE TYPE. The numeric kind is an internal wire/storage
+// detail; SQL callers use the stable name.
+func (db *Database) createSQLEdgeKind(name string, undirected bool, directionSpecified bool) error {
+	if name == "" {
+		return fmt.Errorf("edge type name must not be empty")
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	store, ok := db.storage.(storage.EdgeKindStore)
+	if !ok {
+		return fmt.Errorf("storage engine does not support durable SQL edge types")
+	}
+	var kinds map[string]uint8
+	definitions := make(map[string]storage.EdgeKindDefinition)
+	if definitionStore, ok := db.storage.(storage.EdgeKindDefinitionStore); ok {
+		loaded, loadErr := definitionStore.ListEdgeKindDefinitions()
+		if loadErr != nil {
+			return loadErr
+		}
+		definitions = loaded
+		kinds = make(map[string]uint8, len(loaded))
+		for edgeName, definition := range loaded {
+			kinds[edgeName] = definition.Kind
+		}
+	} else {
+		loaded, loadErr := store.ListEdgeKinds()
+		if loadErr != nil {
+			return loadErr
+		}
+		kinds = loaded
+		for edgeName, kind := range loaded {
+			definitions[edgeName] = storage.EdgeKindDefinition{Kind: kind}
+		}
+	}
+	if existing, exists := kinds[name]; exists {
+		if ResolveEdgeKind(name) != 0 && ResolveEdgeKind(name) != existing {
+			return fmt.Errorf("edge type %q is already registered with kind %d", name, ResolveEdgeKind(name))
+		}
+		existingDefinition := definitions[name]
+		if directionSpecified && existingDefinition.Undirected != undirected {
+			return fmt.Errorf("edge type %q already has a conflicting direction", name)
+		}
+		if !RegisterEdgeKindWithDirection(name, existing, existingDefinition.Undirected) {
+			return fmt.Errorf("runtime graph registry rejected edge type %q=%d", name, existing)
+		}
+		for _, col := range db.collections {
+			if g := col.GetGraph(); g != nil {
+				g.SetEdgeKindDirection(existing, existingDefinition.Undirected)
+			}
+		}
+		return nil
+	}
+
+	kind := ResolveEdgeKind(name)
+	if kind == 0 {
+		for candidate := uint8(1); candidate != 0; candidate++ {
+			used := false
+			for _, existing := range kinds {
+				if existing == candidate {
+					used = true
+					break
+				}
+			}
+			if !used {
+				kind = candidate
+				break
+			}
+		}
+	}
+	if kind == 0 {
+		return fmt.Errorf("no graph edge kinds remain")
+	}
+	if definitionStore, ok := db.storage.(storage.EdgeKindDefinitionStore); ok {
+		if err := definitionStore.CreateEdgeKindDefinition(name, kind, undirected); err != nil {
+			return err
+		}
+	} else {
+		if undirected {
+			return fmt.Errorf("storage engine does not support durable undirected edge types")
+		}
+		if err := store.CreateEdgeKind(name, kind); err != nil {
+			return err
+		}
+	}
+	if !RegisterEdgeKindWithDirection(name, kind, undirected) {
+		return fmt.Errorf("runtime graph registry rejected edge type %q=%d", name, kind)
+	}
+	for _, col := range db.collections {
+		if g := col.GetGraph(); g != nil {
+			g.SetEdgeKindDirection(kind, undirected)
+		}
+	}
+	return nil
 }
 
 // wireGraphWAL sets the engine WAL writer on a collection's graph so edge
@@ -1133,6 +1275,9 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 			return nil, fmt.Errorf("failed to create sharded collection from storage: %w", err)
 		}
 		collection.db = db
+		if g := collection.GetGraph(); g != nil {
+			collection.SetGraph(g)
+		}
 		if err := db.configureAsyncIndex(collection); err != nil {
 			_ = collection.Close()
 			return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)
@@ -1158,6 +1303,9 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
 	collection.db = db
+	if g := collection.GetGraph(); g != nil {
+		collection.SetGraph(g)
+	}
 	if err := db.configureAsyncIndex(collection); err != nil {
 		_ = collection.Close()
 		return nil, fmt.Errorf("failed to configure asynchronous index: %w", err)

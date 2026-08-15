@@ -83,6 +83,12 @@ public:
     std::vector<std::string> list_collections() const;
     Collection create_collection(const std::string& name, int dimension) const;
     Collection get_collection(const std::string& name, int dimension) const;
+
+    json query(const std::string& sql) const;
+    json query_with_params(const std::string& sql, const std::optional<json>& params = std::nullopt) const;
+
+private:
+    json parse_query_result(char* res_ptr, const std::string& op_name) const;
 };
 
 } // namespace libravdb

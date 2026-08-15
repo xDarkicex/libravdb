@@ -23,6 +23,8 @@ module LibraVDB
     attach_function :CloseDB, [:int], :void
     attach_function :CreateCollection, [:int, :string, :int], :int
     attach_function :GetCollection, [:int, :string], :int
+    attach_function :DatabaseQuery, [:int, :string], :pointer
+    attach_function :DatabaseQueryWithParams, [:int, :string, :string], :pointer
     
     # Vector CRUD
     attach_function :InsertVector, [:int, :string, :pointer, :int, :string], :pointer

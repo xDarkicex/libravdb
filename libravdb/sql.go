@@ -176,7 +176,7 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	if len(doc.SelectStmts) == 0 && len(doc.InsertStmts) == 0 &&
 		len(doc.InsertGraphEdgeStmts) == 0 &&
 		len(doc.UpdateStmts) == 0 && len(doc.DeleteStmts) == 0 &&
-		len(doc.CreateTableStmts) == 0 && len(doc.DropTableStmts) == 0 &&
+		len(doc.CreateTableStmts) == 0 && len(doc.CreateEdgeTypeStmts) == 0 && len(doc.DropTableStmts) == 0 &&
 		len(doc.CreateIndexStmts) == 0 && len(doc.DropIndexStmts) == 0 &&
 		len(doc.AlterTableStmts) == 0 {
 		if len(doc.TransactionStmts) > 0 {

@@ -335,4 +335,17 @@ export class LibraVDB {
         const jsonStr = this.checkError(resPtr, "Database Stats");
         return jsonStr ? JSON.parse(jsonStr) : {};
     }
+
+    query(sql: string): any {
+        const resPtr = _lib.DatabaseQuery(this.handle, sql);
+        const jsonStr = this.checkError(resPtr, "Query");
+        return jsonStr ? JSON.parse(jsonStr) : {};
+    }
+
+    queryWithParams(sql: string, params: Record<string, any>): any {
+        const paramsStr = params ? JSON.stringify(params) : "";
+        const resPtr = _lib.DatabaseQueryWithParams(this.handle, sql, paramsStr);
+        const jsonStr = this.checkError(resPtr, "QueryWithParams");
+        return jsonStr ? JSON.parse(jsonStr) : {};
+    }
 }

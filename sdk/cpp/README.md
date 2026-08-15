@@ -2,6 +2,14 @@
 
 The official C++ SDK provides a modern, fast, and type-safe wrapper around the native LibraVDB CGO engine. Leveraging C++17 and `nlohmann::json`, it delivers zero-allocation vector batching and complete memory safety across the FFI boundary, achieving 100% API parity with the Python, Node, Ruby, and Rust SDKs.
 
+## Unified SQL Engine
+
+This SDK natively integrates with the LibraVDB Unified SQL Engine. You can execute expressive queries seamlessly across multiple paradigms:
+- **Relational SQL**: Standard ANSI SQL data manipulation.
+- **Vector SQL**: Order by `VECTOR_DISTANCE` and perform similarity matching.
+- **Graph SQL**: Perform Cypher-like graph traversals using `JOIN MATCH (src)-[:EDGE]->(tgt)`.
+- **Temporal SQL**: Query historical database snapshots using `AS OF TIMESTAMP`.
+
 ## Installation
 
 This SDK uses CMake. It automatically downloads the header-only `nlohmann/json` library during configuration.

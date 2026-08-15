@@ -52,6 +52,19 @@ class Database {
         LibraVDB::checkError($errPtr);
     }
 
+    public function query(string $sql): string {
+        $ffi = LibraVDB::getFFI();
+        $resPtr = $ffi->DatabaseQuery($this->dbID, $sql);
+        return LibraVDB::extractQueryResult($resPtr);
+    }
+
+    public function queryWithParams(string $sql, ?string $params = null): string {
+        $ffi = LibraVDB::getFFI();
+        $paramsStr = $params ?? "";
+        $resPtr = $ffi->DatabaseQueryWithParams($this->dbID, $sql, $paramsStr);
+        return LibraVDB::extractQueryResult($resPtr);
+    }
+
     public function close(): void {
         if ($this->dbID >= 0) {
             LibraVDB::getFFI()->CloseDB($this->dbID);

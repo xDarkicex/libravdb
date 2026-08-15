@@ -64,6 +64,32 @@ sub _check_error {
     }
 }
 
+sub query {
+    my ($self, $sql) = @_;
+    my $res_str = LibraVDB::DatabaseQuery($self->{db_id}, $sql);
+    return {} unless defined $res_str;
+    if ($res_str =~ /^{"error"/) {
+        require JSON::PP;
+        my $err = JSON::PP::decode_json($res_str);
+        die "Query failed: " . $err->{error} . "\n";
+    }
+    require JSON::PP;
+    return JSON::PP::decode_json($res_str);
+}
+
+sub query_with_params {
+    my ($self, $sql, $params) = @_;
+    require JSON::PP;
+    my $params_str = defined $params ? JSON::PP::encode_json($params) : "";
+    my $res_str = LibraVDB::DatabaseQueryWithParams($self->{db_id}, $sql, $params_str);
+    return {} unless defined $res_str;
+    if ($res_str =~ /^{"error"/) {
+        my $err = JSON::PP::decode_json($res_str);
+        die "QueryWithParams failed: " . $err->{error} . "\n";
+    }
+    return JSON::PP::decode_json($res_str);
+}
+
 sub DESTROY {
     my ($self) = @_;
     if (defined $self->{db_id} && $self->{db_id} >= 0) {

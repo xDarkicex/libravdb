@@ -53,6 +53,16 @@ typedef GetCollectionNative = Int32 Function(Int32 dbID, Pointer<Utf8> name);
 typedef GetCollectionDart = int Function(int dbID, Pointer<Utf8> name);
 final getCollection = _lib.lookupFunction<GetCollectionNative, GetCollectionDart>('GetCollection');
 
+// DatabaseQuery
+typedef DatabaseQueryNative = Pointer<Utf8> Function(Int32 dbID, Pointer<Utf8> sql);
+typedef DatabaseQueryDart = Pointer<Utf8> Function(int dbID, Pointer<Utf8> sql);
+final databaseQuery = _lib.lookupFunction<DatabaseQueryNative, DatabaseQueryDart>('DatabaseQuery');
+
+// DatabaseQueryWithParams
+typedef DatabaseQueryWithParamsNative = Pointer<Utf8> Function(Int32 dbID, Pointer<Utf8> sql, Pointer<Utf8> params);
+typedef DatabaseQueryWithParamsDart = Pointer<Utf8> Function(int dbID, Pointer<Utf8> sql, Pointer<Utf8> params);
+final databaseQueryWithParams = _lib.lookupFunction<DatabaseQueryWithParamsNative, DatabaseQueryWithParamsDart>('DatabaseQueryWithParams');
+
 // InsertVector
 typedef InsertVectorNative = Pointer<Utf8> Function(Int32 colID, Pointer<Utf8> id, Pointer<Float> vec, Int32 dim, Pointer<Utf8> metadataJSON);
 typedef InsertVectorDart = Pointer<Utf8> Function(int colID, Pointer<Utf8> id, Pointer<Float> vec, int dim, Pointer<Utf8> metadataJSON);

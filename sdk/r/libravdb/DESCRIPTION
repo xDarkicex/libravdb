@@ -1,0 +1,13 @@
+Package: libravdb
+Type: Package
+Title: LibraVDB Client
+Version: 1.0.0
+Date: 2026-08-15
+Author: xDarkicex
+Maintainer: xDarkicex <xdarkicex@example.com>
+Description: High-performance FFI R wrapper for the LibraVDB Go C-Shared Engine.
+License: MIT
+Encoding: UTF-8
+Imports: R6, jsonlite, Rcpp
+LinkingTo: Rcpp
+RoxygenNote: 7.2.3
