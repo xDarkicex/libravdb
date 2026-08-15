@@ -662,6 +662,7 @@ Detailed architecture documentation: [docs/design/architecture.md](docs/design/a
 ### Getting Started
 - [**Installation & Setup**](docs/getting-started.md) - Complete setup guide with examples
 - [**API Reference**](docs/api-reference.md) - Comprehensive API documentation
+- [**Supported SQL**](docs/sql-supported.md) - Official SQL language and compatibility reference
 - [**Configuration Guide**](docs/configuration/configuration.md) - Advanced configuration options
 - [**Performance Tuning**](docs/configuration/performance-tuning.md) - Optimization strategies
 
