@@ -24,5 +24,8 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      - name: Resolve published lexer module
+        run: go mod edit -dropreplace=github.com/xDarkicex/lexer
+
       - name: Run graph, HNSW, and SIMD tests
         run: GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go test -v -race ./internal/graph/... ./internal/index/hnsw ./internal/util/simd

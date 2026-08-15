@@ -1,6 +1,9 @@
 package graph
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestUndirectedEdgeUsesOneStoredEdgeAndTraversesEitherWay(t *testing.T) {
 	store, err := NewGraph(testConfig())
@@ -15,7 +18,7 @@ func TestUndirectedEdgeUsesOneStoredEdgeAndTraversesEitherWay(t *testing.T) {
 	if err := txn.AddEdge(1, 2, 1, kind); err != nil {
 		t.Fatal(err)
 	}
-	if err := txn.Commit(nil); err != nil {
+	if err := txn.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,7 +76,7 @@ func TestUndirectedEdgeUsesOneStoredEdgeAndTraversesEitherWay(t *testing.T) {
 	if err := removeTxn.RemoveEdge(2, 1, kind); err != nil {
 		t.Fatalf("reverse-order remove: %v", err)
 	}
-	if err := removeTxn.Commit(nil); err != nil {
+	if err := removeTxn.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	edges, err := store.Neighbors(1)
