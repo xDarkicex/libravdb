@@ -2,8 +2,6 @@
   <img src="assets/libravdb-banner.png" alt="LibraVDB" width="100%">
 </div>
 
-# LibraVDB
-
 <div align="center">
 
 [![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org/doc/devel/release.html)
