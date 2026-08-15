@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/libravdb-banner.png" alt="LibraVDB" width="100%">
+</div>
+
 # LibraVDB
 
 <div align="center">
