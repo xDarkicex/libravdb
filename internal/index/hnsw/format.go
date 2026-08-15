@@ -28,6 +28,10 @@ const (
 	SFLMetadataOverhead = 48
 )
 
+func alignedSFLSlotSize(size uint64) uint64 {
+	return (size + 63) &^ 63
+}
+
 // IndexFileHeader defines the binary file format header
 // Total size: 128 bytes (cache-line friendly)
 type IndexFileHeader struct {

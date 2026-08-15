@@ -12,15 +12,16 @@ import (
 
 // Core errors
 var (
-	ErrDatabaseClosed     = errors.New("database is closed")
-	ErrCollectionClosed   = errors.New("collection is closed")
-	ErrCollectionExists   = errors.New("collection already exists")
-	ErrTooManyCollections = errors.New("maximum number of collections exceeded")
-	ErrCollectionNotFound = errors.New("collection not found")
-	ErrInvalidDimension   = errors.New("invalid vector dimension")
-	ErrDimensionMismatch  = errors.New("collection dimension does not match")
-	ErrInvalidK           = errors.New("k must be positive")
-	ErrEmptyIndex         = errors.New("index is empty")
+	ErrDatabaseClosed                  = errors.New("database is closed")
+	ErrCollectionClosed                = errors.New("collection is closed")
+	ErrCollectionExists                = errors.New("collection already exists")
+	ErrCollectionConfigurationMismatch = errors.New("collection configuration does not match")
+	ErrTooManyCollections              = errors.New("maximum number of collections exceeded")
+	ErrCollectionNotFound              = errors.New("collection not found")
+	ErrInvalidDimension                = errors.New("invalid vector dimension")
+	ErrDimensionMismatch               = errors.New("collection dimension does not match")
+	ErrInvalidK                        = errors.New("k must be positive")
+	ErrEmptyIndex                      = errors.New("index is empty")
 )
 
 // CollectionDimensionMismatchError describes an existing collection whose
@@ -38,6 +39,22 @@ func (e *CollectionDimensionMismatchError) Error() string {
 
 func (e *CollectionDimensionMismatchError) Unwrap() error {
 	return ErrDimensionMismatch
+}
+
+// CollectionConfigurationMismatchError describes an existing collection for
+// which EnsureCollection was given options that cannot be applied in place.
+// Returning this error prevents a caller from unknowingly running without a
+// requested metadata schema or posting-list declaration.
+type CollectionConfigurationMismatchError struct {
+	Collection string
+}
+
+func (e *CollectionConfigurationMismatchError) Error() string {
+	return fmt.Sprintf("%v: collection %q already exists with a different configuration; requested options were not applied", ErrCollectionConfigurationMismatch, e.Collection)
+}
+
+func (e *CollectionConfigurationMismatchError) Unwrap() error {
+	return ErrCollectionConfigurationMismatch
 }
 
 // Streaming errors

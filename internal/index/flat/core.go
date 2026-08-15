@@ -332,7 +332,7 @@ func (idx *Core) SearchBorrowed(ctx context.Context, query record.VectorView, k 
 		count--
 		heap[0] = heap[count]
 		coreDownHeap(heap, 0, count)
-		results[i] = coreResult{ref: root.ref, score: root.score}
+		results[i] = coreResult(root)
 	}
 	return &ResultSet{arena: arena, snapshot: snapshot, results: results}, nil
 }

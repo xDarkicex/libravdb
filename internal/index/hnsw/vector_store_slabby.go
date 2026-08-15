@@ -1,7 +1,9 @@
 package hnsw
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -16,11 +18,21 @@ const (
 	userDataOffset               = 64
 )
 
+type slabbyVectorSegment struct {
+	sfl *memory.ShardedFreeList
+}
+
 type SlabbyRawVectorStore struct {
+	// sfl remains an alias for the first segment for internal diagnostics and
+	// compatibility with existing allocator instrumentation.
 	sfl             *memory.ShardedFreeList
 	metadataPool    *memory.Pool
 	recycler        *vectorRecycler
 	slots           rawSlotArray[byte]
+	owners          rawSlotArray[slabbyVectorSegment]
+	segmentsMu      sync.RWMutex
+	segments        []*slabbyVectorSegment
+	activeSegment   atomic.Pointer[slabbyVectorSegment]
 	dim             int
 	bytesPerVector  int
 	slotSize        int
@@ -39,18 +51,8 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 
 	bytesPerVector := dim * 4
 	slotSize := uint64(bytesPerVector + userDataOffset)
-	slotSize = (slotSize + 7) &^ 7
-	poolSize := uint64(64 * 1024 * 1024)
-	if required := uint64(segmentCapacity) * slotSize; required > poolSize {
-		poolSize = (required + 2*1024*1024 - 1) &^ (2*1024*1024 - 1)
-	}
-
-	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
-		PoolSize:  poolSize,
-		SlotSize:  slotSize,
-		SlabSize:  2 * 1024 * 1024,
-		SlabCount: 16,
-	}, 64, 16)
+	slotSize = (slotSize + 63) &^ 63
+	firstSegment, err := newSlabbyVectorSegment(slotSize, segmentCapacity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memory pool for slabby store: %w", err)
 	}
@@ -59,13 +61,13 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		SlabSize: 1024 * 1024,
 	}, 64)
 	if err != nil {
-		_ = sfl.Free()
+		_ = firstSegment.sfl.Free()
 		return nil, fmt.Errorf("failed to create slabby metadata pool: %w", err)
 	}
-	recycler, err := newVectorRecycler(int(poolSize / slotSize))
+	recycler, err := newVectorRecycler(segmentCapacity)
 	if err != nil {
 		metadataPool.Free()
-		_ = sfl.Free()
+		_ = firstSegment.sfl.Free()
 		return nil, fmt.Errorf("failed to create slabby logical slot recycler: %w", err)
 	}
 
@@ -74,26 +76,89 @@ func NewSlabbyRawVectorStore(dim, segmentCapacity int) (*SlabbyRawVectorStore, e
 		bytesPerVector:  bytesPerVector,
 		slotSize:        int(slotSize),
 		segmentCapacity: segmentCapacity,
-		sfl:             sfl,
+		sfl:             firstSegment.sfl,
 		metadataPool:    metadataPool,
 		recycler:        recycler,
+		segments:        []*slabbyVectorSegment{firstSegment},
 	}
+	store.activeSegment.Store(firstSegment)
 	if err := store.slots.Init(metadataPool); err != nil {
 		recycler.close()
 		metadataPool.Free()
-		_ = sfl.Free()
+		_ = firstSegment.sfl.Free()
 		return nil, fmt.Errorf("failed to initialize slabby slots: %w", err)
+	}
+	if err := store.owners.Init(metadataPool); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("failed to initialize slabby slot owners: %w", err)
+	}
+	return store, nil
+}
+
+func newSlabbyVectorSegment(slotSize uint64, capacity int) (*slabbyVectorSegment, error) {
+	alignedSlotSize := (slotSize + 63) &^ 63
+	segmentBytes := uint64(capacity) * alignedSlotSize
+	if segmentBytes < alignedSlotSize {
+		segmentBytes = alignedSlotSize
+	}
+	sfl, err := memory.NewShardedFreeList(memory.FreeListConfig{
+		PoolSize:  segmentBytes,
+		SlotSize:  slotSize,
+		SlabSize:  segmentBytes,
+		SlabCount: 1,
+	}, 64, 16)
+	if err != nil {
+		return nil, err
 	}
 	prewarmed, err := sfl.Allocate()
 	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("prewarm slabby vector allocator: %w", err)
+		_ = sfl.Free()
+		return nil, fmt.Errorf("prewarm allocator: %w", err)
 	}
 	if err := sfl.Deallocate(prewarmed); err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("return prewarmed slabby vector slot: %w", err)
+		_ = sfl.Free()
+		return nil, fmt.Errorf("return prewarmed slot: %w", err)
 	}
-	return store, nil
+	return &slabbyVectorSegment{sfl: sfl}, nil
+}
+
+func (s *SlabbyRawVectorStore) allocateSlot() (*slabbyVectorSegment, []byte, error) {
+	if segment := s.activeSegment.Load(); segment != nil {
+		if slot, err := segment.sfl.Allocate(); err == nil {
+			return segment, slot, nil
+		} else if !errors.Is(err, memory.ErrFreelistExhausted) {
+			return nil, nil, err
+		}
+	}
+
+	s.segmentsMu.Lock()
+	defer s.segmentsMu.Unlock()
+	// A prior segment may have gained a reclaimed slot, or another writer may
+	// have grown the list while this writer waited for the lock.
+	for i := len(s.segments) - 1; i >= 0; i-- {
+		segment := s.segments[i]
+		slot, err := segment.sfl.Allocate()
+		if err == nil {
+			s.activeSegment.Store(segment)
+			return segment, slot, nil
+		}
+		if !errors.Is(err, memory.ErrFreelistExhausted) {
+			return nil, nil, err
+		}
+	}
+
+	segment, err := newSlabbyVectorSegment(uint64(s.slotSize), s.segmentCapacity)
+	if err != nil {
+		return nil, nil, err
+	}
+	slot, err := segment.sfl.Allocate()
+	if err != nil {
+		_ = segment.sfl.Free()
+		return nil, nil, err
+	}
+	s.segments = append(s.segments, segment)
+	s.activeSegment.Store(segment)
+	return segment, slot, nil
 }
 
 func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
@@ -101,7 +166,7 @@ func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
 		return VectorRef{}, fmt.Errorf("vector dimension mismatch: expected %d, got %d", s.dim, len(vec))
 	}
 
-	slot, err := s.sfl.Allocate()
+	segment, slot, err := s.allocateSlot()
 	if err != nil {
 		return VectorRef{}, fmt.Errorf("failed to allocate vector slot: %w", err)
 	}
@@ -111,8 +176,14 @@ func (s *SlabbyRawVectorStore) Put(vec []float32) (VectorRef, error) {
 		slotIndex = s.nextSlot.Add(1) - 1
 	}
 	writeVectorBytes(slot[userDataOffset:], vec)
+	if err := s.owners.Store(slotIndex, segment); err != nil {
+		_ = segment.sfl.Deallocate(slot)
+		_ = s.recycler.put(nil, slotIndex)
+		return VectorRef{}, err
+	}
 	if err := s.slots.Store(slotIndex, &slot[0]); err != nil {
-		_ = s.sfl.Deallocate(slot)
+		_ = segment.sfl.Deallocate(slot)
+		_ = s.owners.CompareAndSwap(slotIndex, segment, nil)
 		_ = s.recycler.put(nil, slotIndex)
 		return VectorRef{}, err
 	}
@@ -157,14 +228,21 @@ func (s *SlabbyRawVectorStore) detachPointer(ref VectorRef) unsafe.Pointer {
 }
 
 func (s *SlabbyRawVectorStore) reclaimPointer(ptr unsafe.Pointer, logical uint32) error {
-	if s == nil || s.sfl == nil || ptr == nil {
+	if s == nil || ptr == nil {
 		return nil
 	}
-	if err := s.sfl.Deallocate(unsafe.Slice((*byte)(ptr), s.slotSize)); err != nil {
+	segment := s.owners.Load(logical)
+	if segment == nil || segment.sfl == nil {
+		return fmt.Errorf("slabby vector slot %d has no owning segment", logical)
+	}
+	if err := segment.sfl.Deallocate(unsafe.Slice((*byte)(ptr), s.slotSize)); err != nil {
 		return err
 	}
-	if s.recycler == nil || !s.recycler.put(nil, logical) {
-		return fmt.Errorf("slabby logical slot recycler is full")
+	s.owners.CompareAndSwap(logical, segment, nil)
+	// A full logical recycler only means this ordinal hole will not be reused;
+	// the physical vector slot has still been returned to its segment.
+	if s.recycler != nil {
+		_ = s.recycler.put(nil, logical)
 	}
 	return nil
 }
@@ -175,15 +253,28 @@ func (s *SlabbyRawVectorStore) release(ref VectorRef) error {
 
 func (s *SlabbyRawVectorStore) Reset() error {
 	s.slots.Reset()
+	s.owners.Reset()
 	if s.recycler != nil {
 		s.recycler.reset()
 	}
-	if s.sfl != nil {
-		s.sfl.Reset()
+	s.segmentsMu.Lock()
+	for _, segment := range s.segments {
+		if segment != nil && segment.sfl != nil {
+			segment.sfl.Reset()
+		}
 	}
+	if len(s.segments) > 0 {
+		s.activeSegment.Store(s.segments[0])
+	} else {
+		s.activeSegment.Store(nil)
+	}
+	s.segmentsMu.Unlock()
 	if s.metadataPool != nil {
 		s.metadataPool.Reset()
 		if err := s.slots.Init(s.metadataPool); err != nil {
+			return err
+		}
+		if err := s.owners.Init(s.metadataPool); err != nil {
 			return err
 		}
 	}
@@ -194,13 +285,24 @@ func (s *SlabbyRawVectorStore) Reset() error {
 
 func (s *SlabbyRawVectorStore) Close() error {
 	s.slots.Detach()
+	s.owners.Detach()
 	if s.recycler != nil {
 		s.recycler.close()
 	}
 	var firstErr error
-	if s.sfl != nil {
-		firstErr = s.sfl.Free()
+	s.activeSegment.Store(nil)
+	s.segmentsMu.Lock()
+	for _, segment := range s.segments {
+		if segment == nil || segment.sfl == nil {
+			continue
+		}
+		if err := segment.sfl.Free(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	s.segments = nil
+	s.sfl = nil
+	s.segmentsMu.Unlock()
 	if s.metadataPool != nil {
 		s.metadataPool.Free()
 	}
@@ -221,13 +323,19 @@ func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
 		Dimension:      s.dim,
 		BytesPerVector: s.bytesPerVector,
 	}
-	if s.sfl != nil {
-		stats := s.sfl.Stats()
-		profile.ReservedBytes = int64(stats.Reserved)
-		profile.LiveBytes = int64(stats.Allocated)
-		profile.FreeBytes = int64(stats.Reserved - stats.Allocated)
-		profile.MemoryUsage = profile.ReservedBytes
+	s.segmentsMu.RLock()
+	for _, segment := range s.segments {
+		if segment == nil || segment.sfl == nil {
+			continue
+		}
+		stats := segment.sfl.Stats()
+		profile.ReservedBytes += int64(stats.Reserved)
+		profile.LiveBytes += int64(stats.Allocated)
+		profile.FreeBytes += int64(stats.Reserved - stats.Allocated)
 	}
+	s.segmentsMu.RUnlock()
+	profile.ReservedDataBytes = profile.ReservedBytes
+	profile.MemoryUsage = profile.ReservedBytes
 	if s.metadataPool != nil {
 		stats := s.metadataPool.Stats()
 		profile.ReservedMetaBytes = int64(stats.Reserved)
@@ -240,6 +348,7 @@ func (s *SlabbyRawVectorStore) Profile() RawVectorStoreProfile {
 		profile.ReservedBytes += recyclerBytes
 		profile.MemoryUsage = profile.ReservedBytes
 	}
+	profile.CapacityUtilization = float64(profile.LiveBytes) / float64(max(int64(1), profile.ReservedDataBytes))
 	return profile
 }
 

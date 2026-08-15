@@ -1,6 +1,7 @@
 package record
 
 import (
+	"fmt"
 	"sync/atomic"
 	"unsafe"
 
@@ -108,7 +109,7 @@ func NewGeneration(parent *Generation, delta *Delta) (*Generation, error) {
 			if generation.parent != nil {
 				generation.parent.Release()
 			}
-			return nil, err
+			return nil, fmt.Errorf("record: generation ordinal %d: %w", after.Ordinal(), err)
 		}
 	}
 	// The published generation owns the arena. The staging IDMap is no longer
@@ -135,7 +136,7 @@ func (g *Generation) setOrdinal(ordinal uint32, ref RecordRef) error {
 		if child == nil || child.owner != g.id {
 			cloned, err := cloneOrdinalNode(g.arena, g.id, child)
 			if err != nil {
-				return err
+				return fmt.Errorf("record: ordinal level %d remaining %d: %w", level, g.arena.Remaining(), err)
 			}
 			node.slots[index] = unsafe.Pointer(cloned)
 			child = cloned

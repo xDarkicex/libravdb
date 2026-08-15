@@ -2,6 +2,7 @@ package btree
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -28,14 +29,16 @@ func DefaultConfig() Config {
 // a modestly-sized ShardedFreeList. When one segment is exhausted, a new one is
 // created and appended. This avoids pre-allocating large pools for small tables.
 type BTree struct {
-	cfg           Config
-	pageReg       *pageRegistry
-	pagePools     []*memory.ShardedFreeList
-	pageSegments  map[uint32]uint8 // slot ID → pool segment index
-	rootID        atomic.Uint32
-	gen           atomic.Uint32
-	mu            sync.Mutex
-	nodeCount     atomic.Int64
+	cfg          Config
+	pageReg      *pageRegistry
+	pagePools    []*memory.ShardedFreeList
+	pageSegments map[uint32]uint8 // slot ID → pool segment index
+	pageOwners   map[*BTreePage]*memory.ShardedFreeList
+	poolsMu      sync.RWMutex
+	rootID       atomic.Uint32
+	gen          atomic.Uint32
+	mu           sync.Mutex
+	nodeCount    atomic.Int64
 }
 
 const segmentPages = 1024 // 4MB per segment (1024 × 4096)
@@ -57,7 +60,7 @@ func New(cfg Config) (*BTree, error) {
 		return nil, err
 	}
 
-	_, rootID, err := allocPageFromPool(pool, reg, P_LEAF, 0)
+	rootPage, rootID, err := allocPageFromPool(pool, reg, P_LEAF, 0)
 	if err != nil {
 		pool.Free()
 		return nil, err
@@ -68,8 +71,10 @@ func New(cfg Config) (*BTree, error) {
 		pageReg:      reg,
 		pagePools:    []*memory.ShardedFreeList{pool},
 		pageSegments: make(map[uint32]uint8),
+		pageOwners:   make(map[*BTreePage]*memory.ShardedFreeList),
 	}
 	t.pageSegments[rootID] = 0
+	t.pageOwners[rootPage] = pool
 	t.rootID.Store(rootID)
 	return t, nil
 }
@@ -86,6 +91,9 @@ func newSegment(pageShards int) (*memory.ShardedFreeList, error) {
 
 // allocateSlot gets a page slot from the segmented pools, growing if needed.
 func (t *BTree) allocateSlot() (*memory.ShardedFreeList, int, []byte, error) {
+	t.poolsMu.Lock()
+	defer t.poolsMu.Unlock()
+
 	// Try newest segment first for locality
 	for i := len(t.pagePools) - 1; i >= 0; i-- {
 		slot, err := t.pagePools[i].Allocate()
@@ -130,7 +138,7 @@ func allocPage(t *BTree, reg *pageRegistry, flags uint16, shard int) (*BTreePage
 	slotID := reg.register(page)
 	page.initPage(flags, slotID, shard)
 	t.pageSegments[slotID] = uint8(segIdx)
-	_ = pool // used
+	t.pageOwners[page] = pool
 	return page, slotID, nil
 }
 
@@ -142,9 +150,10 @@ func freePage(t *BTree, reg *pageRegistry, slotID uint32) {
 	reg.unregister(slotID)
 	if page != nil {
 		slotBytes := pageSlotBytes(page)
-		if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
-			t.pagePools[seg].Deallocate(slotBytes)
+		if pool := t.pageOwners[page]; pool != nil {
+			_ = pool.Deallocate(slotBytes)
 		}
+		delete(t.pageOwners, page)
 		delete(t.pageSegments, slotID)
 	}
 }
@@ -154,11 +163,18 @@ func (t *BTree) retireSlot(slotID uint32) {
 	if page == nil {
 		return
 	}
-	slotBytes := pageSlotBytes(page)
-	if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
-		t.pagePools[seg].Retire(slotBytes)
-	}
+	t.retirePage(page)
 	delete(t.pageSegments, slotID)
+}
+
+func (t *BTree) retirePage(page *BTreePage) {
+	if page == nil {
+		return
+	}
+	if pool := t.pageOwners[page]; pool != nil {
+		_ = pool.Retire(pageSlotBytes(page))
+	}
+	delete(t.pageOwners, page)
 }
 
 func (t *BTree) deallocateSlot(slotID uint32) {
@@ -166,11 +182,19 @@ func (t *BTree) deallocateSlot(slotID uint32) {
 	if page == nil {
 		return
 	}
-	slotBytes := pageSlotBytes(page)
-	if seg, ok := t.pageSegments[slotID]; ok && int(seg) < len(t.pagePools) {
-		t.pagePools[seg].Deallocate(slotBytes)
-	}
+	t.deallocatePage(page)
 	delete(t.pageSegments, slotID)
+}
+
+func (t *BTree) deallocatePage(page *BTreePage) {
+	if page == nil {
+		return
+	}
+	slotBytes := pageSlotBytes(page)
+	if pool := t.pageOwners[page]; pool != nil {
+		_ = pool.Deallocate(slotBytes)
+	}
+	delete(t.pageOwners, page)
 }
 
 // Insert inserts or replaces a key-value pair using COW semantics.
@@ -185,7 +209,15 @@ func (t *BTree) Insert(ctx context.Context, key, value []byte) error {
 	rootID := t.rootID.Load()
 	root := t.pageReg.get(rootID)
 	if root == nil {
-		return errTreeClosed
+		// Tree was emptied by deleting the last entry.  Rebuild a fresh
+		// root so the insertion can proceed.
+		var err error
+		root, _, err = allocPage(t, t.pageReg, P_LEAF, 0)
+		if err != nil {
+			return err
+		}
+		t.rootID.Store(root.Header.PageSlot)
+		rootID = root.Header.PageSlot
 	}
 
 	txn := &writeTxn{
@@ -276,11 +308,14 @@ func (t *BTree) splitLeaf(page *BTreePage, insertIdx int, key, value []byte) (ui
 	if err != nil {
 		return 0, err
 	}
+	leftSibling := page.Header.LeftSibling
+	rightSibling := page.Header.RightSibling
 
 	all := collectLeafKVs(page, insertIdx, key, value)
 	splitPoint := len(all) / 2
 
 	page.resetPage(P_LEAF)
+	page.Header.LeftSibling = leftSibling
 	for i := 0; i < splitPoint; i++ {
 		insertCell(page, i, all[i].key, all[i].value, 0)
 	}
@@ -289,8 +324,14 @@ func (t *BTree) splitLeaf(page *BTreePage, insertIdx int, key, value []byte) (ui
 		insertCell(rightPage, i-splitPoint, all[i].key, all[i].value, 0)
 	}
 
-	rightPage.Header.RightSibling = page.Header.RightSibling
+	rightPage.Header.RightSibling = rightSibling
 	page.Header.RightSibling = rightID
+	rightPage.Header.LeftSibling = page.Header.PageSlot
+	if rightSibling != 0 {
+		if neighbor := t.pageReg.get(rightSibling); neighbor != nil {
+			neighbor.Header.LeftSibling = rightID
+		}
+	}
 	page.Header.Generation++
 	rightPage.Header.Generation++
 
@@ -303,6 +344,8 @@ func (t *BTree) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, newCh
 	if err != nil {
 		return 0, nil, err
 	}
+	leftSibling := page.Header.LeftSibling
+	rightSibling := page.Header.RightSibling
 
 	all := collectBranchEntries(page, insertIdx, sepKey, newChildID)
 	splitPoint := len(all) / 2
@@ -312,6 +355,7 @@ func (t *BTree) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, newCh
 	// Left page: entries 0..splitPoint-1
 	// all[0] = FirstChild (no key), all[1..splitPoint-1] = (key, child) pairs
 	page.resetPage(P_BRANCH)
+	page.Header.LeftSibling = leftSibling
 	page.Header.FirstChild = all[0].childID
 	for i := 0; i < splitPoint-1; i++ {
 		insertCell(page, i, all[i+1].key, nil, all[i+1].childID)
@@ -325,9 +369,14 @@ func (t *BTree) splitBranch(page *BTreePage, insertIdx int, sepKey []byte, newCh
 		insertCell(rightPage, i, all[splitPoint+1+i].key, nil, all[splitPoint+1+i].childID)
 	}
 
-	rightPage.Header.RightSibling = page.Header.RightSibling
+	rightPage.Header.RightSibling = rightSibling
 	page.Header.RightSibling = rightID
 	rightPage.Header.LeftSibling = page.Header.PageSlot
+	if rightSibling != 0 {
+		if neighbor := t.pageReg.get(rightSibling); neighbor != nil {
+			neighbor.Header.LeftSibling = rightID
+		}
+	}
 	page.Header.Generation++
 	rightPage.Header.Generation++
 
@@ -349,10 +398,22 @@ func (t *BTree) newRoot(leftID, rightID uint32, sepKey []byte) (uint32, error) {
 }
 
 // Search finds the value for an exact key. Lock-free read with generation check.
-func (t *BTree) Search(ctx context.Context, key []byte) ([]byte, error) {
+func (t *BTree) Search(ctx context.Context, key []byte) (result []byte, err error) {
 	if len(key) > MaxKeyLen {
 		return nil, errKeyTooLarge
 	}
+	guard, err := t.enterRead()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		leaveErr := guard.leave()
+		if err == nil {
+			err = leaveErr
+		} else if leaveErr != nil {
+			err = errors.Join(err, leaveErr)
+		}
+	}()
 
 	for {
 		gen := t.gen.Load()
@@ -438,10 +499,14 @@ func (p *BTreePage) findChild(key []byte) (idx int, childID uint32) {
 func (t *BTree) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.poolsMu.Lock()
+	defer t.poolsMu.Unlock()
 	for _, id := range t.pageReg.snapshotIDs() {
 		freePage(t, t.pageReg, id)
 	}
-	for _, p := range t.pagePools { p.Free() }
+	for _, p := range t.pagePools {
+		_ = p.Free()
+	}
 	return nil
 }
 
@@ -537,40 +602,105 @@ func (t *BTree) Delete(ctx context.Context, key []byte) error {
 		oldRoot:    rootID,
 	}
 
-	if err := t.deleteCOW(ctx, txn, root, key); err != nil {
+	empty, err := t.deleteCOW(ctx, txn, root, key)
+	if err != nil {
 		txn.abort()
 		return err
 	}
 
 	txn.commit()
 	t.nodeCount.Add(-1)
+	if empty {
+		t.rootID.Store(0)
+	}
 	return nil
 }
 
-func (t *BTree) deleteCOW(ctx context.Context, txn *writeTxn, page *BTreePage, key []byte) error {
+// deleteCOW removes key and returns whether the subtree became empty. Branch
+// pages are rebuilt along the path so separator keys continue to describe the
+// first key in each child after a delete. Keeping that invariant is required
+// for later replayed replacements to find and remove their prior index entry.
+func (t *BTree) deleteCOW(ctx context.Context, txn *writeTxn, page *BTreePage, key []byte) (bool, error) {
 	_ = ctx
+	page = resolveChild(t, txn, page.Header.PageSlot)
 	if page.IsLeaf() {
 		idx, found := page.findKey(key)
 		if !found {
-			return errKeyNotFound
+			return false, errKeyNotFound
 		}
-		copy := txn.copyPage(page)
-		deleteCell(copy, idx)
-		// Check fill threshold and rebalance if needed
-		return t.rebalance(ctx, txn, copy)
+		dirty := txn.copyPage(page)
+		deleteCell(dirty, idx)
+		if dirty.Header.Count == 0 {
+			loosePage(txn, page)
+			return true, nil
+		}
+		return false, nil
 	}
 
-	// Branch — descend to child
 	_, childID := page.findChild(key)
-	child := t.pageReg.get(childID)
+	child := resolveChild(t, txn, childID)
 	if child == nil {
-		return errTreeCorrupt
+		return false, errTreeCorrupt
 	}
-	if err := t.deleteCOW(ctx, txn, child, key); err != nil {
-		return err
+	childEmpty, err := t.deleteCOW(ctx, txn, child, key)
+	if err != nil {
+		return false, err
 	}
-	// After child deletion, check if this branch page needs rebalancing
-	return t.rebalance(ctx, txn, page)
+
+	children := make([]uint32, 0, int(page.Header.Count)+1)
+	children = append(children, page.Header.FirstChild)
+	for i := 0; i < int(page.Header.Count); i++ {
+		children = append(children, page.NodeAt(i).Child)
+	}
+	// A child can become empty after the delete. Remove empty children from
+	// this branch instead of leaving a stale route to an empty leaf.
+	kept := children[:0]
+	for _, id := range children {
+		if id == childID && childEmpty {
+			continue
+		}
+		kept = append(kept, id)
+	}
+	children = kept
+	if len(children) == 0 {
+		loosePage(txn, page)
+		return true, nil
+	}
+
+	// A root with one remaining child can collapse back to that child. This
+	// also avoids retaining an empty separator-only branch after deletes.
+	if page.Header.PageSlot == t.rootID.Load() && len(children) == 1 {
+		t.rootID.Store(children[0])
+		loosePage(txn, page)
+		return false, nil
+	}
+
+	branch := ensureDirty(txn, page)
+	rightSibling := page.Header.RightSibling
+	leftSibling := page.Header.LeftSibling
+	branch.resetPage(P_BRANCH)
+	branch.Header.RightSibling = rightSibling
+	branch.Header.LeftSibling = leftSibling
+	branch.Header.FirstChild = children[0]
+	for i := 1; i < len(children); i++ {
+		childPage := resolveChild(t, txn, children[i])
+		firstKey := subtreeFirstKey(t, txn, childPage)
+		if len(firstKey) == 0 {
+			return false, errTreeCorrupt
+		}
+		insertCell(branch, i-1, firstKey, nil, children[i])
+	}
+	return false, nil
+}
+
+func subtreeFirstKey(t *BTree, txn *writeTxn, page *BTreePage) []byte {
+	for page != nil && page.IsBranch() {
+		page = resolveChild(t, txn, page.Header.FirstChild)
+	}
+	if page == nil || page.Header.Count == 0 {
+		return nil
+	}
+	return cloneBytes(page.NodeAt(0).Key())
 }
 
 // deleteCell removes a node at index idx from a page.
@@ -580,24 +710,21 @@ func deleteCell(page *BTreePage, idx int) {
 		return
 	}
 
-	// Shift ptrs: move ptrs[idx+1..n-1] → ptrs[idx..n-2]
-	// Ptrs grow downward starting at Lower. Removing idx means
-	// the ptr array shrinks by 2 bytes (Lower increases).
+	// Ptrs grow downward starting at Lower. Removing a cell advances Lower by
+	// two bytes, so the surviving pointers must be written beginning at the
+	// new base (the old position 1). Copy from right to left because the
+	// destination overlaps the old pointer array and the removed cell may be
+	// anywhere in it.
 	ptrs := page.Ptrs()
-	removedOffset := ptrs[idx]
-
-	// Shift ptrs left (toward lower addresses = higher byte offsets since Lower decreases)
-	copy(ptrs[idx:], ptrs[idx+1:])
-
-	// Increase Lower (shrink ptr array upward)
+	for i := n - 2; i >= 0; i-- {
+		src := i
+		if i >= idx {
+			src++
+		}
+		ptrs[i+1] = ptrs[src]
+	}
 	page.Header.Lower += 2
 	page.Header.Count--
-
-	// TODO: compact node data (shift nodes after the removed one down)
-	// For Phase 1: leave the deleted node in place (wasted space).
-	// NodeAt(idx) now returns the old node that was at idx+1.
-	// The old node at removedOffset is orphaned (its bytes are still in the page).
-	_ = removedOffset
 }
 
 // fillThreshold is the minimum fill percentage before a page is merged.

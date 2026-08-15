@@ -99,11 +99,9 @@ func TestIVFPQBatchIngressSurvivesConcurrentGC(t *testing.T) {
 		t.Fatalf("BatchInsert 2: %v", err)
 	}
 
-	// Drop caller-owned ingress objects before the final GC. The index may
-	// retain ordinals and PQ codes, but never IDs, vectors, or metadata.
+	// The index may retain ordinals and PQ codes, but never IDs, vectors, or
+	// metadata. The caller-owned objects are no longer live after this point.
 	query := entries[0].Vector
-	entries = nil
-	entries2 = nil
 
 	// Force another GC and sleep to ensure caller-owned data is collectible.
 	runtime.GC()

@@ -40,6 +40,14 @@ type SearchResults struct {
 	Results []*SearchResult `json:"results"`
 	Took    time.Duration   `json:"took"`
 	Total   int             `json:"total"`
+	// Columns holds the projected column names in order (SQL SELECT list).
+	// Empty means the default id/score shape. Populated by the SQL executor
+	// so wire layers (pgwire) can emit a faithful RowDescription.
+	Columns []string `json:"columns,omitempty"`
+	// ColumnTypes optionally carries catalog type identifiers in the same
+	// order as Columns. It lets protocol adapters describe empty result sets
+	// without guessing from row values. Zero means no explicit type metadata.
+	ColumnTypes []uint16 `json:"column_types,omitempty"`
 }
 
 // DatabaseStats represents database-wide statistics
@@ -108,6 +116,13 @@ const (
 	StringArrayField
 	IntArrayField
 	FloatArrayField
+	// BigIntField represents a signed 64-bit integer. It is appended to keep
+	// the persisted FieldType values of existing collections stable.
+	BigIntField
+	// JSONField and JSONBField retain JSON document values in metadata. They
+	// are append-only so existing persisted schema enum values remain stable.
+	JSONField
+	JSONBField
 )
 
 // String returns the string representation of the field type
@@ -129,6 +144,12 @@ func (ft FieldType) String() string {
 		return "int_array"
 	case FloatArrayField:
 		return "float_array"
+	case BigIntField:
+		return "bigint"
+	case JSONField:
+		return "json"
+	case JSONBField:
+		return "jsonb"
 	default:
 		return "unknown"
 	}
@@ -166,7 +187,7 @@ func (ms MetadataSchema) Validate() error {
 		if field == "" {
 			return fmt.Errorf("field name cannot be empty")
 		}
-		if fieldType < StringField || fieldType > FloatArrayField {
+		if fieldType < StringField || fieldType > JSONBField {
 			return fmt.Errorf("invalid field type for field '%s': %v", field, fieldType)
 		}
 	}

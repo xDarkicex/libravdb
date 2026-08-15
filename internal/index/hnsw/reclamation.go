@@ -241,6 +241,7 @@ func (h *Index) reclaimAllocation(record retiredAllocation) {
 	ptr := unsafe.Pointer(record.ptr)
 	switch record.kind {
 	case retiredNode:
+		h.releaseCompressedVector((*Node)(unsafe.Add(ptr, SFLMetadataOverhead)).Ordinal)
 		if h.nodeSFL != nil {
 			_ = h.nodeSFL.Deallocate(h.nodeSlotFromBase(ptr))
 		}
@@ -263,10 +264,12 @@ func (h *Index) reclaimAllocation(record retiredAllocation) {
 }
 
 func (h *Index) nodeSlotFromBase(base unsafe.Pointer) []byte {
-	slotSize := int(uint64(SFLMetadataOverhead) + inlineNodeSlotPayloadSize(h.config.M))
-	return unsafe.Slice((*byte)(base), slotSize)
+	return unsafe.Slice((*byte)(base), h.nodeSlotSize)
 }
 
 func (h *Index) linkSlotFromBase(base unsafe.Pointer, level int) []byte {
-	return unsafe.Slice((*byte)(base), int(SFLMetadataOverhead)+linkArrayCapacity(h.config.M, level)*4)
+	if level == 0 {
+		return unsafe.Slice((*byte)(base), h.link0SlotSize)
+	}
+	return unsafe.Slice((*byte)(base), h.linkSlotSize)
 }

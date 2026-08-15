@@ -81,8 +81,14 @@ func BenchmarkHyalineSMR(b *testing.B) {
 					return
 				default:
 				}
-				sfl.HyalineEnter(slot)
-				sfl.HyalineLeave(slot)
+				handle, err := sfl.HyalineEnter(slot)
+				if err != nil {
+					runtime.Gosched()
+					continue
+				}
+				if err := sfl.HyalineLeave(handle); err != nil {
+					return
+				}
 				readOps.Add(1)
 			}
 		})

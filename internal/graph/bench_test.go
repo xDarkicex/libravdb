@@ -13,7 +13,6 @@ func BenchmarkAddEdge(b *testing.B) {
 	defer os.RemoveAll(tmpDir)
 
 	cfg := DefaultGraphConfig()
-	// cfg.DataPath = tmpDir // GraphConfig doesn't have DataPath, graph is off-heap only
 	g, err := NewGraph(cfg)
 	if err != nil {
 		b.Fatal(err)

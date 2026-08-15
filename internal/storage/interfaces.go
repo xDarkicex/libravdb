@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"errors"
+	"time"
 
 	"github.com/xDarkicex/libravdb/internal/index"
 )
@@ -25,6 +26,26 @@ type CollectionConfig struct {
 	Version        int
 	RawStoreCap    int
 	IDMapCapacity  int
+	// CostModelStats is an opaque, versioned collection-statistics payload.
+	// The storage engine persists it but intentionally does not interpret it.
+	// DataLSN is populated on reads only and is never serialized as config.
+	CostModelStats []byte
+	// MetadataSchema contains application metadata field type codes. The
+	// storage layer treats the codes as opaque; the owning package interprets
+	// them when it rebuilds the public collection configuration.
+	MetadataSchema map[string]uint8
+	// IndexedFields contains the metadata fields whose derived posting lists
+	// should be used for equality lookups.
+	IndexedFields []string
+	DataLSN       uint64
+}
+
+// CostModelStatisticsStore is an optional persistence seam for optimizer
+// statistics.  Keeping this separate from Engine avoids forcing alternate
+// storage backends to implement the feature before they can serve queries.
+type CostModelStatisticsStore interface {
+	SetCollectionCostModelStatsIfDataLSN(ctx context.Context, name string, expectedDataLSN uint64, stats []byte) (bool, error)
+	CollectionDataLSN(name string) (uint64, error)
 }
 
 // Engine defines the storage engine interface
@@ -41,6 +62,10 @@ type Engine interface {
 	// Graph Identity API
 	GetNodeID(ctx context.Context, collection, id string) (uint64, error)
 	ResolveNodeID(ctx context.Context, graphNodeID uint64) (string, string, error)
+
+	// Graph recovery wiring — called before WAL replay so committed graph edge
+	// records can be routed back into the in-memory graph.
+	SetGraphRecoveryTarget(collection string, target GraphRecoveryTarget)
 }
 
 // WriteStats captures coarse write-path instrumentation for benchmarking.
@@ -65,7 +90,7 @@ const (
 )
 
 var (
-	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
+	ErrMemoryLimitExceeded   = errors.New("memory limit exceeded")
 	ErrUnknownGraphNodeID    = errors.New("unknown graph node ID")
 	ErrTombstonedGraphNodeID = errors.New("tombstoned graph node ID")
 )
@@ -79,11 +104,14 @@ type WriteStatsProvider interface {
 type TxOperationType uint8
 
 const (
-	TxOperationPut TxOperationType = iota
-	TxOperationDelete
+	TxOperationPut             TxOperationType = iota // record insert/update
+	TxOperationDelete                                 // record delete
+	TxOperationGraphEdgeAdd                           // graph edge add
+	TxOperationGraphEdgeRemove                        // graph edge remove
+	TxOperationGraphNodeDrop                          // graph node drop (all edges)
 )
 
-// TxOperation represents one row-level mutation in a transactional batch.
+// TxOperation represents one row-level or graph mutation in a transactional batch.
 type TxOperation struct {
 	Metadata           map[string]interface{}
 	Collection         string
@@ -94,12 +122,43 @@ type TxOperation struct {
 	GraphNodeID        uint64
 	Type               TxOperationType
 	HasExpectedVersion bool
+
+	// Graph edge fields (used when Type is TxOperationGraphEdge*).
+	EdgeSrc    uint64
+	EdgeTgt    uint64
+	EdgeWeight float32
+	EdgeKind   uint8
+	// EdgeProperties is the versioned JSON property envelope attached to the
+	// node-owned edge record. Empty means no arbitrary properties.
+	EdgeProperties []byte
 }
 
 // TransactionalEngine extends Engine with atomic multi-collection commit support.
 type TransactionalEngine interface {
 	PrepareTx(ctx context.Context, ops []TxOperation) ([]TxOperation, error)
 	CommitTx(ctx context.Context, ops []TxOperation) error
+	// ReserveGraphNodeIDs reserves n sequential graph node IDs and returns
+	// the first ID. Used by epoch transactions that need to pre-assign
+	// node IDs for remapping provisional graph edge references before
+	// the combined record+graph WAL commit.
+	ReserveGraphNodeIDs(ctx context.Context, n int) (uint64, error)
+}
+
+// CommitReceipt identifies the exact durable transaction boundary produced by
+// a successful WAL commit. It is intentionally separate from
+// TransactionalEngine so storage implementations that only support the
+// legacy error-only CommitTx method remain source-compatible.
+type CommitReceipt struct {
+	CommitLSN uint64
+}
+
+// DurableTransactionalEngine is the optional exact-receipt extension to
+// TransactionalEngine. LatestCommitLSN reads the persisted commit catalog
+// rather than the next allocated WAL sequence number.
+type DurableTransactionalEngine interface {
+	TransactionalEngine
+	CommitTxDurable(ctx context.Context, ops []TxOperation) (CommitReceipt, error)
+	LatestCommitLSN() (uint64, error)
 }
 
 // Collection defines the collection storage interface
@@ -146,4 +205,85 @@ type DurableRangeCollection interface {
 // OrdinalAssigner assigns stable internal ordinals to entries before indexing.
 type OrdinalAssigner interface {
 	AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error
+}
+
+// GraphEdgeOp is a single edge mutation queued for WAL recording.
+type GraphEdgeOp struct {
+	Collection string
+	Src        uint64
+	Tgt        uint64
+	Weight     float32
+	Kind       uint8
+	Properties []byte
+}
+
+// GraphNodeDropOp is a collection-aware node-drop mutation. It carries the
+// owning collection so that WAL frames, deferred recovery, and live graph
+// publication can route the operation to the correct collection's graph.
+type GraphNodeDropOp struct {
+	Collection string
+	NodeID     uint64
+}
+
+// GraphWALWriter is implemented by the storage engine to durably record graph
+// edge mutations. Graph ops submitted through this interface share a commit
+// LSN with any concurrent record writes in the same batch flush. The onCommit
+// callback is invoked after WAL sync with the shared commit LSN.
+type GraphWALWriter interface {
+	AppendGraphEdges(ctx context.Context, adds, removes []GraphEdgeOp, nodeDrops []GraphNodeDropOp, onCommit func(lsn uint64)) (commitLSN uint64, err error)
+}
+
+// GraphLabelWALWriter durably records a vertex-label assignment.
+type GraphLabelWALWriter interface {
+	AppendGraphLabel(ctx context.Context, nodeID uint64, label string, onCommit func(lsn uint64)) error
+}
+
+// GraphRecoveryTarget is implemented by the graph store to replay edge
+// operations during WAL recovery. These methods mutate the in-memory edge
+// table directly — the WAL frames are already committed.
+type GraphRecoveryTarget interface {
+	ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, properties []byte, commitLSN uint64) error
+	ReplayEdgeRemove(src, tgt uint64, kind uint8, commitLSN uint64) error
+	ReplayNodeEdgeDrop(nodeID uint64, commitLSN uint64) error
+	ReplayVertexLabel(nodeID uint64, label string, commitLSN uint64) error
+}
+
+// TemporalRecord is a resolved historical record returned by temporal read
+// APIs. It bridges the storage engine's MVCC layer to the public libravdb API.
+type TemporalRecord struct {
+	Metadata map[string]interface{}
+	ID       string
+	Vector   []float32
+	Ordinal  uint32
+	Version  uint64
+}
+
+// TemporalVersion is one retained record version and its validity interval.
+// BeginTime is inclusive; EndTime is exclusive and zero for a still-live
+// version. The interval is derived from the durable commit catalog, not wall
+// clock observation at query time.
+type TemporalVersion struct {
+	Metadata  map[string]interface{}
+	ID        string
+	Vector    []float32
+	Ordinal   uint32
+	Version   uint64
+	BeginLSN  uint64
+	EndLSN    uint64
+	BeginTime time.Time
+	EndTime   time.Time
+}
+
+// TemporalReader is optionally implemented by storage engines that support
+// MVCC record visibility at historical snapshot LSNs.
+type TemporalReader interface {
+	GetRecordAtLSN(collectionName, id string, snapshotLSN uint64) (*TemporalRecord, error)
+	ListVisibleAtLSN(collectionName string, snapshotLSN uint64, fn func(*TemporalRecord) bool) error
+}
+
+// TemporalRangeReader enumerates retained versions whose validity intervals
+// overlap an inclusive LSN range. It is optional so alternate storage engines
+// can continue implementing point-in-time reads independently.
+type TemporalRangeReader interface {
+	ListVersionsBetween(collectionName string, startLSN, endLSN uint64, fn func(*TemporalVersion) bool) error
 }

@@ -647,10 +647,10 @@ func TestRealCentroidDistance(t *testing.T) {
 	}
 
 	// Pack IDs: subspace << 8 | centroid
-	idSub0Cent0 := uint32(0<<8 | 0)
-	idSub0Cent1 := uint32(0<<8 | 1)
-	idSub1Cent0 := uint32(1<<8 | 0)
-	idSub1Cent1 := uint32(1<<8 | 1)
+	idSub0Cent0 := uint32(0)
+	idSub0Cent1 := uint32(1)
+	idSub1Cent0 := uint32(256)
+	idSub1Cent1 := uint32(257)
 
 	// Distance between Sub 0 Cent 0 and Sub 0 Cent 1
 	// dx = 4.0 - 1.0 = 3.0, dy = 6.0 - 2.0 = 4.0. dist = sqrt(9 + 16) = 5.0

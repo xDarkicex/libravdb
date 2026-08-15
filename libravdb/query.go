@@ -49,6 +49,21 @@ func (t *thresholdGraphFilter) Threshold() float32 {
 	return t.threshold
 }
 
+func (t *thresholdGraphFilter) Selectivity() float64 {
+	if selective, ok := t.base.(interface{ Selectivity() float64 }); ok {
+		return selective.Selectivity()
+	}
+	return 1.0
+}
+
+func (t *thresholdGraphFilter) ForShard(shard int) GraphFilter {
+	base := t.base
+	if factory, ok := base.(interface{ ForShard(int) GraphFilter }); ok {
+		base = factory.ForShard(shard)
+	}
+	return &thresholdGraphFilter{base: base, threshold: t.threshold}
+}
+
 // FilterOperator defines filter comparison operations (deprecated, use filter package)
 type FilterOperator int
 
@@ -340,7 +355,7 @@ func (qb *QueryBuilder) WithEfSearch(efSearch int) *QueryBuilder {
 	return qb
 }
 
-// WithGraphFilter adds a graph bitset filter for pruning candidates during search.
+// WithGraphFilter restricts which ANN candidates may be returned.
 func (qb *QueryBuilder) WithGraphFilter(filter GraphFilter) *QueryBuilder {
 	qb.graphFilter = filter
 	return qb
@@ -369,7 +384,7 @@ func (qb *QueryBuilder) Execute() (*SearchResults, error) {
 	}
 
 	// Get initial search results from vector index
-	result, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), execFilter)
+	result, err := qb.collection.searchWithGraphFilterAndEf(qb.ctx, qb.vector, qb.getSearchLimit(), qb.efSearch, execFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -415,7 +430,7 @@ func (qb *QueryBuilder) List() ([]Record, error) {
 			return nil, fmt.Errorf("limit must be positive, got %d", qb.limit)
 		}
 
-		results, err := qb.collection.SearchWithGraphFilter(qb.ctx, qb.vector, qb.getSearchLimit(), qb.graphFilter)
+		results, err := qb.collection.searchWithGraphFilterAndEf(qb.ctx, qb.vector, qb.getSearchLimit(), qb.efSearch, qb.graphFilter)
 		if err != nil {
 			return nil, err
 		}

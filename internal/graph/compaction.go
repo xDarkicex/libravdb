@@ -6,7 +6,6 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
-	"unsafe"
 
 	"github.com/xDarkicex/memory"
 )
@@ -38,6 +37,9 @@ func CompactSegment(inPath, outPath string) error {
 	header, err := DeserializeSegmentHeader(data)
 	if err != nil {
 		return err
+	}
+	if header.Version != LegacySegmentVersion && header.Version != SegmentVersion {
+		return fmt.Errorf("unsupported segment version: %d", header.Version)
 	}
 
 	// Overflow-safe bounds check
@@ -142,25 +144,51 @@ func CompactSegment(inPath, outPath string) error {
 		edgeCount := binary.LittleEndian.Uint16(nodeBytes[8:10])
 		offset += 16
 
-		edgesBytesSize := int(edgeCount) * int(unsafe.Sizeof(Edge{}))
-		if offset+edgesBytesSize > dataEnd {
-			return fmt.Errorf("unexpected EOF reading edges at offset %d", offset)
-		}
-
 		if _, err = fOut.Write(nodeBytes); err != nil {
 			return err
 		}
 		crc.Write(nodeBytes)
 		writtenNodes++
 
-		if edgeCount > 0 {
-			edgesBytes := data[offset : offset+edgesBytesSize]
-			if _, err = fOut.Write(edgesBytes); err != nil {
+		for i := 0; i < int(edgeCount); i++ {
+			var fixed [20]byte
+			if header.Version == LegacySegmentVersion {
+				if offset+16 > dataEnd {
+					return fmt.Errorf("unexpected EOF reading legacy edge at offset %d", offset)
+				}
+				copy(fixed[:16], data[offset:offset+16])
+				offset += 16
+			} else {
+				if offset+20 > dataEnd {
+					return fmt.Errorf("unexpected EOF reading edge at offset %d", offset)
+				}
+				copy(fixed[:], data[offset:offset+20])
+				offset += 20
+				propertyLength := binary.LittleEndian.Uint32(fixed[16:20])
+				if uint64(offset)+uint64(propertyLength) > uint64(dataEnd) {
+					return fmt.Errorf("unexpected EOF reading edge properties at offset %d", offset)
+				}
+				if _, err = fOut.Write(fixed[:]); err != nil {
+					return err
+				}
+				crc.Write(fixed[:])
+				if propertyLength > 0 {
+					props := data[offset : offset+int(propertyLength)]
+					if _, err = fOut.Write(props); err != nil {
+						return err
+					}
+					crc.Write(props)
+					offset += int(propertyLength)
+				}
+				writtenEdges++
+				continue
+			}
+			binary.LittleEndian.PutUint32(fixed[16:20], 0)
+			if _, err = fOut.Write(fixed[:]); err != nil {
 				return err
 			}
-			crc.Write(edgesBytes)
-			offset += edgesBytesSize
-			writtenEdges += uint64(edgeCount)
+			crc.Write(fixed[:])
+			writtenEdges++
 		}
 	}
 

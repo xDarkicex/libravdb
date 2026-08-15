@@ -61,15 +61,15 @@ type asyncIndexStorage interface {
 }
 
 type asyncIndexQueue struct {
-	collection *Collection
-	storage    asyncIndexStorage
-	arena      *offheap.Arena
-	slots      []asyncIndexSlot
-	workReady  chan struct{}
-	capacity   uint64
-	workers    int
-	wg         sync.WaitGroup
-	applyGate  sync.RWMutex
+	collection     *Collection
+	storage        asyncIndexStorage
+	arena          *offheap.Arena
+	slots          []asyncIndexSlot
+	workReady      chan struct{}
+	capacity       uint64
+	workers        int
+	wg             sync.WaitGroup
+	applyGate      sync.RWMutex
 	maintainWakeup chan struct{}
 
 	enqueuePos  atomic.Uint64
@@ -121,14 +121,14 @@ func newAsyncIndexQueue(collection *Collection, depth, workers int) (*asyncIndex
 	}
 
 	q := &asyncIndexQueue{
-		collection: collection,
-		storage:    store,
-		arena:      arena,
-		slots:      slots,
-		workReady:  make(chan struct{}, workers),
+		collection:     collection,
+		storage:        store,
+		arena:          arena,
+		slots:          slots,
+		workReady:      make(chan struct{}, workers),
 		maintainWakeup: make(chan struct{}, 1),
-		capacity:   uint64(depth),
-		workers:    workers,
+		capacity:       uint64(depth),
+		workers:        workers,
 	}
 	frontier := store.DurableFrontier()
 	q.durable.Store(frontier)
@@ -228,27 +228,34 @@ type physicalMigrator interface {
 
 func (q *asyncIndexQueue) maintainWorker() {
 	defer q.wg.Done()
-	
+
 	lastMaintainLSN := q.applied.Load()
 	cursor := uint32(1)
-	
+
 	for {
 		<-q.maintainWakeup
 		if q.closing.Load() {
 			return
 		}
-		
+
 		applied := q.applied.Load()
-		if applied - lastMaintainLSN >= 10000 {
+		if applied-lastMaintainLSN >= 10000 {
 			if q.collection != nil && q.collection.db != nil {
 				_ = q.collection.db.Maintain(context.Background(), q.collection.name, 10000)
 			}
 			lastMaintainLSN = applied
 		}
-		
-		// Bounded random walk physical migration (trickles work between ticks)
-		if pm, ok := q.collection.index.(physicalMigrator); ok {
-			pm.IncrementalMigrate(&cursor, 100)
+
+		// Bounded random walk physical migration (trickles work between ticks).
+		// Index publication swaps collection.index under collection.mu; keep the
+		// read lock through the call so a concurrent transaction cannot replace
+		// and close the index while the maintenance worker is using it.
+		if q.collection != nil {
+			q.collection.mu.RLock()
+			if pm, ok := q.collection.index.(physicalMigrator); ok {
+				pm.IncrementalMigrate(&cursor, 100)
+			}
+			q.collection.mu.RUnlock()
 		}
 	}
 }
@@ -297,7 +304,9 @@ func (q *asyncIndexQueue) apply(task asyncIndexTask, pos uint64) {
 	q.applyGate.RLock()
 	if err == nil {
 		entry := index.VectorEntry{ID: id, Vector: vector, Ordinal: task.ordinal}
+		q.collection.mu.RLock()
 		err = q.collection.index.Insert(context.Background(), entryForIndex(q.collection.config.Metric, &entry))
+		q.collection.mu.RUnlock()
 	}
 	if err != nil {
 		q.recordFailure(fmt.Errorf("apply durable transaction %d ordinal %d: %w", task.commitLSN, task.ordinal, err))

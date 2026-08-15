@@ -1,6 +1,8 @@
 package libravdb
 
 import (
+	"time"
+
 	"github.com/xDarkicex/libravdb/internal/graph"
 )
 
@@ -11,13 +13,18 @@ type Graph interface {
 
 	// Edge mutations (must be called within a transaction).
 	AddEdge(txn *graph.Txn, src, tgt uint64, weight float32, kind uint8) error
+	AddEdgeWithProperties(txn *graph.Txn, src, tgt uint64, weight float32, kind uint8, properties map[string]interface{}) error
 	RemoveEdge(txn *graph.Txn, src, tgt uint64, kind uint8) error
 	DropNodeEdges(txn *graph.Txn, nodeID uint64) error
 
 	// Edge queries.
 	Neighbors(nodeID uint64) ([]Edge, error)
+	NeighborsWithProperties(nodeID uint64) ([]graph.EdgeView, error)
+	NeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([]Edge, error)
+	NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]graph.EdgeView, error)
 	Degree(nodeID uint64) (int, error)
 	InboundNeighbors(nodeID uint64) ([]Edge, error)
+	InboundNeighborsWithProperties(nodeID uint64) ([]graph.EdgeView, error)
 	InboundDegree(nodeID uint64) (int, error)
 	NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error)
 	ForEachEdge(fn func(src, tgt uint64, edge Edge) bool)
@@ -32,8 +39,19 @@ type Graph interface {
 	GetFrontierBuf() (*graph.FrontierBuf, error)
 	PutFrontierBuf(f *graph.FrontierBuf)
 
+	// Vertex label registry. Labels are WAL-backed when the graph is attached
+	// to a collection, and replayed when that collection is reopened.
+	RegisterVertexLabel(nodeID uint64, label string)
+	GetLabelNodes(label string) []uint64
+
 	// Lifecycle.
 	Stats() graph.GraphStats
+	GraphCentrality(nodeID uint64) float64
+	CentralityAtLSN(nodeID uint64, snapshotLSN uint64) float64
+	// RecordPageRankPublication publishes maintenance metadata for a derived
+	// PageRank vector. It does not compute PageRank; callers should invoke this
+	// after atomically publishing their own vector.
+	RecordPageRankPublication(snapshotLSN uint64, duration time.Duration)
 	Close() error
 }
 
@@ -43,6 +61,9 @@ type Txn = graph.Txn
 
 // Edge represents a directed edge in the graph.
 type Edge = graph.Edge
+
+// EdgeView is an edge with its canonical, versioned JSON property envelope.
+type EdgeView = graph.EdgeView
 
 // KindSet represents a set of allowed edge kinds.
 type KindSet = graph.KindSet
@@ -109,4 +130,18 @@ func NewGraph(config GraphConfig) (Graph, error) {
 	}
 
 	return graph.NewGraph(internalConfig)
+}
+
+// RegisterEdgeKind makes a named edge kind available to SQL GRAPH_EDGES,
+// MATCH, JOIN MATCH, and other graph-aware query paths. Kind 0 is reserved for
+// untyped edges. Registration is process-wide and idempotent for the same
+// name/kind pair.
+func RegisterEdgeKind(name string, kind uint8) bool {
+	return graph.RegisterEdgeKind(name, kind)
+}
+
+// ResolveEdgeKind returns the numeric kind for a registered edge name, or 0
+// when the name is unknown.
+func ResolveEdgeKind(name string) uint8 {
+	return graph.ResolveEdgeKind(name)
 }

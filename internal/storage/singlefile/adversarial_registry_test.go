@@ -130,7 +130,7 @@ func TestAdversarialGraphNodeID_AbortedCommitsNoGap(t *testing.T) {
 	ops := []storage.TxOperation{
 		{Collection: "col", ID: "tx1", Vector: []float32{1, 0, 0, 0}, Type: storage.TxOperationPut},
 	}
-	ops, err := e.PrepareTx(ctx, ops)
+	_, err := e.PrepareTx(ctx, ops)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -507,7 +507,10 @@ func TestAdversarialGraphNodeID_LegacyV2Migration(t *testing.T) {
 		t.Errorf("GraphNodeID changed after reopen! Expected %d, got %d", gnid, gnid2)
 	}
 
-	// Assert the resulting snapshot is properly formatted as codec V3.
+	// Assert the resulting snapshot is rewritten using the current snapshot
+	// codec. Legacy v2 input must never force a downgrade: the current encoder
+	// carries newer persisted state (for example graph tombstones and the
+	// temporal commit catalog) that must survive migration.
 	meta3, err := e3.readMetaPage(e3.activeMetaPage)
 	if err != nil {
 		t.Fatalf("Failed to read metapage: %v", err)
@@ -519,8 +522,8 @@ func TestAdversarialGraphNodeID_LegacyV2Migration(t *testing.T) {
 	if len(snapshotChunk) == 0 {
 		t.Fatalf("Snapshot chunk is empty")
 	}
-	if snapshotChunk[0] != 3 { // codecVersion == 3
-		t.Errorf("Expected migrated snapshot to be codec V3, got %d", snapshotChunk[0])
+	if snapshotChunk[0] != snapshotCodecVersion {
+		t.Errorf("Expected migrated snapshot to be current snapshot codec v%d, got %d", snapshotCodecVersion, snapshotChunk[0])
 	}
 }
 

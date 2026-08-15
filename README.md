@@ -9,9 +9,9 @@
 [![Security Scan](https://img.shields.io/badge/security-govulncheck-brightgreen.svg)](https://github.com/xDarkicex/libravdb/actions)
 [![Go Reference](https://pkg.go.dev/badge/github.com/xDarkicex/libravdb.svg)](https://pkg.go.dev/github.com/xDarkicex/libravdb)
 
-**High-Performance Hybrid Vector-Graph Database for Go**
+**A high-performance unified single-file SQL engine for relational, vector, graph, and temporal data**
 
-*Vector similarity search meets directed relationship modeling — zero-allocation graph traversal with WAL durability*
+*Vector similarity search meets directed relationship modeling — zero-allocation graph traversal and WAL durability, with relational SQL and temporal snapshots.*
 
 [**Quick Start**](#-quick-start) •
 [**Documentation**](#-documentation) •
@@ -25,6 +25,7 @@
 ## Table of Contents
 
 - [Overview](#-overview)
+- [Unified SQL Engine](#-unified-sql-engine)
 - [Key Features](#-key-features)
 - [Measured Performance](#-measured-performance)
 - [Durability and Recovery](#-durability-and-recovery)
@@ -47,7 +48,22 @@
 
 ## 🎯 Overview
 
-LibraVDB is a high-performance hybrid vector-graph database library for Go applications. It provides similarity search, metadata-aware retrieval, directed edge relationship modeling, graph traversal, batch and streaming ingestion, and persistent single-file storage with HNSW, IVF-PQ, and Flat indexing.
+LibraVDB is an embedded database for applications that need more than rows or
+vectors alone. It stores relational records, vector embeddings, directed graph
+relationships, and time-aware history in one durable `.libravdb` file. You can
+use the native Go API for maximum control, or use the same engine through SQL
+and the PostgreSQL wire protocol with existing tools and application libraries.
+
+That means a document can be filtered by ordinary columns, ranked by semantic
+distance, restricted by graph relationships, and evaluated at a historical
+snapshot without copying the data into four different systems.
+
+The unified SQL layer sits on the same performance-oriented engine used by the
+native APIs: HNSW, IVF-PQ, and Flat indexing, bounded write admission,
+off-heap memory management, and WAL-backed persistence. See
+[Measured Performance](#-measured-performance) and
+[Durability and Recovery](#-durability-and-recovery) for workload measurements
+and operational details.
 
 ### Why LibraVDB?
 
@@ -59,6 +75,67 @@ LibraVDB is a high-performance hybrid vector-graph database library for Go appli
 - **🔍 Feature Rich**: Complex filtering, streaming operations, and automatic index optimization
 - **📊 Observable**: Built-in metrics, health checks, and performance monitoring
 - **🛡️ Safer Writes**: Bounded write admission for concurrent, batch, and streaming writers
+- **One durable file**: Deploy an application database without a separate
+  vector service, graph service, and time-series store for the same records.
+- **One query model**: Combine relational predicates, vector ranking, graph
+  traversal, aggregates, and temporal snapshots in a single SQL statement.
+- **PostgreSQL-compatible access**: Connect `pgx`, `database/sql`, GORM,
+  psycopg, asyncpg, SQLAlchemy, Alembic, and Django through pgwire for the
+  supported SQL surface.
+- **Go-native when you need it**: Use typed collection, transaction, vector,
+  and graph APIs without giving up SQL when your application benefits from it.
+- **Durable by default**: WAL-backed persistence, crash recovery, reopenable
+  indexes, and historical reads are part of the database rather than an
+  application-side convention.
+- **Built for retrieval workloads**: HNSW, IVF-PQ, Flat, metadata filtering,
+  graph traversal, full-text search, and hybrid ranking are available in the
+  same engine.
+
+## 🌐 Unified SQL Engine
+
+LibraVDB's SQL surface is designed for the queries modern applications
+actually need: ordinary relational work alongside semantic search, connected
+data, and time-aware reads.
+
+| Dimension | What it adds to the same database |
+| --- | --- |
+| Relational | Tables, joins, constraints, aggregates, JSON/JSONB, indexes, and ORM-friendly DDL/DML |
+| Vector | `VECTOR(n)` columns, `VECTOR_DISTANCE`, `SIMILARITY`, `VECTOR_AVG`, and nearest-neighbor ordering |
+| Graph | `MATCH`, `JOIN MATCH`, typed directed edges, bounded traversal, centrality, and Leiden computation |
+| Temporal | `AS OF TIMESTAMP`, retained historical snapshots, version ranges, and temporal graph state |
+
+The important part is the composition. This is one query over one durable
+dataset, not a multi-step application workflow that joins results from
+separate databases:
+
+```sql
+SELECT d.id,
+       d.title,
+       VECTOR_DISTANCE(d.embedding, $query_vector) AS distance
+FROM documents AS OF TIMESTAMP $snapshot d
+JOIN authors AS a ON a.id = d.author_id
+JOIN MATCH (d)-[:RELATES]->(related)
+WHERE a.name = $author
+ORDER BY distance, d.id
+LIMIT 10;
+```
+
+The same SQL model is available in-process and over PostgreSQL wire. Native Go
+queries use `Database.Query` or `Database.QueryWithParams`; PostgreSQL clients
+use the normal driver connection and parameter binding. See the
+[supported SQL reference](docs/sql-supported.md) for the compatibility scope,
+supported types, graph syntax, temporal behavior, and client matrix.
+
+### Why a single file matters
+
+- **Simpler deployment**: one embedded database file instead of coordinating
+  several services and synchronization jobs.
+- **Consistent state**: records, vectors, graph edges, and temporal versions
+  participate in the same durable storage and transaction model.
+- **Fewer data copies**: retrieve a row, its embedding, its neighbors, and its
+  historical context from the same source of truth.
+- **A gradual adoption path**: start with Go collections or GORM CRUD, then add
+  unified SQL as the product needs semantic, graph, or temporal queries.
 
 ## ✨ Key Features
 
@@ -106,6 +183,11 @@ These are local Apple M2 measurements with Go 1.25 and 768-dimensional
 storage outside the timed region so graph topology cost is not confused with
 the required owned-vector copy. Results are workload and hardware dependent;
 use the commands below on deployment hardware.
+
+New collections use the production bounded-recall HNSW profile
+`M=32, efConstruction=200, efSearch=200`. For a deliberate latency/recall
+tradeoff, opt into `WithFastHNSW()` rather than accidentally inheriting a
+throughput-oriented `M=16, efSearch=50` configuration.
 
 ### HNSW Construction And Search
 
@@ -448,6 +530,123 @@ func generateEmbedding(text string) []float32 {
 }
 ```
 
+### SQL quickstart
+
+The native SQL path uses the same single-file database and the same durable
+storage as the Go collection API. Create ordinary columns and an embedding in
+one schema, then query them together:
+
+```go
+ctx := context.Background()
+db, err := libravdb.Open(libravdb.WithStoragePath("./knowledge.libravdb"))
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+if _, err := db.Query(ctx, `
+    CREATE TABLE documents (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        category TEXT,
+        embedding VECTOR(3)
+    )`); err != nil {
+    log.Fatal(err)
+}
+
+rows, err := db.QueryWithParams(ctx, `
+    SELECT id, title,
+           VECTOR_DISTANCE(embedding, $query_vector) AS distance
+    FROM documents
+    WHERE category = $category
+    ORDER BY distance
+    LIMIT $limit`, libravdb.QueryParams{
+    "query_vector": []float32{0.2, 0.1, 0.9},
+    "category":     "guides",
+    "limit":        10,
+})
+if err != nil {
+    log.Fatal(err)
+}
+_ = rows
+```
+
+Once relationships and history are present, the query can add `JOIN MATCH`
+and `AS OF TIMESTAMP` without exporting data to another system. The unified
+query shown above in the [Unified SQL Engine](#-unified-sql-engine) section is
+the same SQL shape used by native Go and PostgreSQL-wire clients.
+
+### PostgreSQL compatibility
+
+Expose the database over the public PostgreSQL wire package and use familiar
+clients such as `psql`, `pgx`, or Go's `database/sql`:
+
+```go
+import "github.com/xDarkicex/libravdb/pgwire"
+
+server := pgwire.NewServer(db, pgwire.ServerConfig{
+    Addr: "127.0.0.1:5432",
+})
+if err := server.Serve(ctx); err != nil {
+    log.Fatal(err)
+}
+```
+
+Then connect with a normal PostgreSQL connection string:
+
+```bash
+psql "postgresql://localhost:5432/libravdb?sslmode=disable"
+```
+
+The wire layer supports the documented SQL surface, including simple and
+extended queries, prepared statements, transactions, typed results, JSONB,
+vectors, temporal queries, and graph SQL. It is PostgreSQL-compatible for the
+supported surface, not a claim of implementing every PostgreSQL extension.
+See [Supported SQL](docs/sql-supported.md) for the exact client and feature
+matrix.
+
+### GORM compatibility
+
+Existing GORM applications can use the PostgreSQL dialector over pgwire for
+schema management and ordinary CRUD, then use `Raw` for LibraVDB's unified
+operators when a feature needs vector, graph, or temporal SQL:
+
+```go
+type Document struct {
+    ID       string `gorm:"primaryKey"`
+    Title    string
+    Category string
+}
+
+orm, err := gorm.Open(
+    postgres.Open("host=127.0.0.1 port=5432 dbname=libravdb sslmode=disable"),
+    &gorm.Config{},
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+if err := orm.AutoMigrate(&Document{}); err != nil {
+    log.Fatal(err)
+}
+if err := orm.Create(&Document{
+    ID: "doc-1", Title: "Getting started", Category: "guides",
+}).Error; err != nil {
+    log.Fatal(err)
+}
+
+var documents []Document
+if err := orm.Raw(
+    `SELECT id, title, category FROM documents WHERE category = ? ORDER BY title`,
+    "guides",
+).Scan(&documents).Error; err != nil {
+    log.Fatal(err)
+}
+```
+
+This keeps the normal GORM development experience while leaving the database
+free to execute its unified SQL when the application grows beyond CRUD.
+
 ## 💡 Usage Examples
 
 ### Document Search System
@@ -657,6 +856,7 @@ Detailed architecture documentation: [docs/design/architecture.md](docs/design/a
 ### Getting Started
 - [**Installation & Setup**](docs/getting-started.md) - Complete setup guide with examples
 - [**API Reference**](docs/api-reference.md) - Comprehensive API documentation
+- [**Supported SQL**](docs/sql-supported.md) - Official SQL language and compatibility reference
 - [**Configuration Guide**](docs/configuration/configuration.md) - Advanced configuration options
 - [**Performance Tuning**](docs/configuration/performance-tuning.md) - Optimization strategies
 

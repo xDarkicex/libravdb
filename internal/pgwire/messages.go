@@ -12,43 +12,45 @@ import (
 // PostgreSQL protocol v3 message types.
 const (
 	// Frontend (client → server)
-	msgPassword    byte = 'p'
-	msgQuery       byte = 'Q'
-	msgParse       byte = 'P'
-	msgBind        byte = 'B'
-	msgDescribe    byte = 'D'
-	msgExecute     byte = 'E'
-	msgSync        byte = 'S'
-	msgTerminate   byte = 'X'
-	msgFlush       byte = 'H'
-	msgClose       byte = 'C'
-	msgCopyData    byte = 'd' // COPY data from client
-	msgCopyDone    byte = 'c' // COPY complete from client
-	msgCopyFail    byte = 'f' // COPY failed from client
+	msgPassword  byte = 'p'
+	msgQuery     byte = 'Q'
+	msgParse     byte = 'P'
+	msgBind      byte = 'B'
+	msgDescribe  byte = 'D'
+	msgExecute   byte = 'E'
+	msgSync      byte = 'S'
+	msgTerminate byte = 'X'
+	msgFlush     byte = 'H'
+	msgClose     byte = 'C'
+	msgCopyData  byte = 'd' // COPY data from client
+	msgCopyDone  byte = 'c' // COPY complete from client
+	msgCopyFail  byte = 'f' // COPY failed from client
 
 	// Backend (server → client)
-	msgAuth            byte = 'R'
-	msgParameterStatus byte = 'S'
-	msgBackendKeyData  byte = 'K'
-	msgReadyForQuery   byte = 'Z'
-	msgRowDescription  byte = 'T'
-	msgDataRow         byte = 'D'
-	msgCommandComplete byte = 'C'
-	msgErrorResponse   byte = 'E'
-	msgNoticeResponse  byte = 'N'
-	msgEmptyQuery      byte = 'I'
-	msgParseComplete   byte = '1'
-	msgBindComplete    byte = '2'
-	msgCloseComplete   byte = '3'
-	msgNoData          byte = 'n'
-	msgCopyInResponse  byte = 'G'
-	msgCopyOutResponse byte = 'H'
+	msgAuth                 byte = 'R'
+	msgParameterStatus      byte = 'S'
+	msgBackendKeyData       byte = 'K'
+	msgReadyForQuery        byte = 'Z'
+	msgRowDescription       byte = 'T'
+	msgDataRow              byte = 'D'
+	msgCommandComplete      byte = 'C'
+	msgErrorResponse        byte = 'E'
+	msgNoticeResponse       byte = 'N'
+	msgEmptyQuery           byte = 'I'
+	msgParseComplete        byte = '1'
+	msgBindComplete         byte = '2'
+	msgCloseComplete        byte = '3'
+	msgNoData               byte = 'n'
+	msgParameterDescription byte = 't'
+	msgPortalSuspended      byte = 's'
+	msgCopyInResponse       byte = 'G'
+	msgCopyOutResponse      byte = 'H'
 
 	// SSL negotiation
 	sslRequestCode int32 = 80877103
 
 	// Authentication types
-	authOK       int32 = 0
+	authOK        int32 = 0
 	authCleartext int32 = 3
 )
 
@@ -58,6 +60,18 @@ const protocolVersion int32 = 196608 // 3.0
 // ReadMessage reads a single pgwire message: 1-byte type + 4-byte length (incl. self) + payload.
 // Returns the message type byte and payload. On EOF, returns 0, nil, io.EOF.
 func ReadMessage(r io.Reader) (byte, []byte, error) {
+	return readMessageWithMax(r, 1<<24) // 16MB cap for normal protocol messages.
+}
+
+// readMessageWithMax reads a single pgwire message while enforcing the
+// caller's payload limit before allocating the payload buffer. Authentication
+// protocols should use a protocol-specific limit here rather than relying on
+// ReadMessage's general-purpose limit.
+func readMessageWithMax(r io.Reader, maxPayload int) (byte, []byte, error) {
+	if maxPayload < 0 {
+		return 0, nil, fmt.Errorf("invalid maximum message payload: %d", maxPayload)
+	}
+
 	var header [5]byte
 	if _, err := io.ReadFull(r, header[:1]); err != nil {
 		return 0, nil, err
@@ -67,12 +81,16 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 	if _, err := io.ReadFull(r, header[1:5]); err != nil {
 		return 0, nil, fmt.Errorf("reading message length: %w", err)
 	}
-	length := int(binary.BigEndian.Uint32(header[1:5])) - 4 // subtract self
-	if length < 0 || length > 1<<24 { // 16MB cap
-		return 0, nil, fmt.Errorf("invalid message length: %d", length)
+	wireLength := binary.BigEndian.Uint32(header[1:5])
+	if wireLength < 4 {
+		return 0, nil, fmt.Errorf("invalid message length: %d", int64(wireLength)-4)
+	}
+	length := wireLength - 4 // subtract self
+	if uint64(length) > uint64(maxPayload) {
+		return 0, nil, fmt.Errorf("message payload length %d exceeds limit %d", length, maxPayload)
 	}
 
-	payload := make([]byte, length)
+	payload := make([]byte, int(length))
 	if length > 0 {
 		if _, err := io.ReadFull(r, payload); err != nil {
 			return 0, nil, fmt.Errorf("reading message payload: %w", err)
@@ -117,4 +135,16 @@ func ReadNullTerminated(payload []byte, offset int) (string, int) {
 		end++ // skip null terminator
 	}
 	return s, end
+}
+
+// sendParameterDescription sends a ParameterDescription ('t') message.
+// OIDs of 0 mean "unspecified type"; clients then send those parameters in
+// text format. Inferable parameter OIDs are populated by the describe pass.
+func sendParameterDescription(w io.Writer, oids []uint32) error {
+	buf := make([]byte, 2+4*len(oids))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(oids)))
+	for i, oid := range oids {
+		binary.BigEndian.PutUint32(buf[2+4*i:], oid)
+	}
+	return WriteMessage(w, msgParameterDescription, buf)
 }

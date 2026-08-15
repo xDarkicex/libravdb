@@ -56,7 +56,7 @@ func TestCompactSegment(t *testing.T) {
 	g2 := gi2.(*graphStore)
 	defer g2.Close()
 
-	if err := g2.LoadFromSegment(compactPath, nil); err != nil {
+	if err := g2.LoadFromSegment(compactPath); err != nil {
 		t.Fatalf("LoadFromSegment: %v", err)
 	}
 

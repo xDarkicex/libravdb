@@ -3,8 +3,8 @@ package libravdb
 import (
 	"context"
 	"fmt"
-	"hash/crc32"
 	"github.com/xDarkicex/libravdb/internal/index/hnsw"
+	"hash/crc32"
 )
 
 // Maintain sweeps the graph topology of the specified collection to cluster nodes into
@@ -47,7 +47,7 @@ func (db *Database) Maintain(ctx context.Context, collectionName string, budget 
 	checksum := crc32.ChecksumIEEE(chunk)
 
 	// 1. Give it to the engine for the next checkpoint
-	if sfEngine, ok := db.storage.(interface{
+	if sfEngine, ok := db.storage.(interface {
 		SetPendingCommunityState(chunk []byte, checksum uint32)
 	}); ok {
 		sfEngine.SetPendingCommunityState(chunk, checksum)

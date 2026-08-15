@@ -10,21 +10,73 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/xDarkicex/libravdb/internal/catalog"
+	"github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/index"
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/memory"
 )
 
+// ctxKeySkipFKValidation is a context key that signals FK validation should be
+// skipped. Used during cascade SET NULL / SET DEFAULT so the child row's FK
+// check does not fail on a parent row that is being deleted in the same
+// transaction.
+type ctxKeySkipFKValidation struct{}
+
+// transactionContextKey carries the private write transaction through schema
+// validation. It never escapes the process and is used only to make staged
+// parent rows visible to FK checks before WAL commit.
+type transactionContextKey struct{}
+
+func withTransactionContext(ctx context.Context, tx *transaction) context.Context {
+	return context.WithValue(ctx, transactionContextKey{}, tx)
+}
+
+func transactionFromContext(ctx context.Context) *transaction {
+	if ctx == nil {
+		return nil
+	}
+	tx, _ := ctx.Value(transactionContextKey{}).(*transaction)
+	return tx
+}
+
 var (
-	ErrTxClosed            = errors.New("transaction is closed")
-	ErrTxValidation        = errors.New("transaction validation failed")
-	ErrTxCommitFailed      = errors.New("transaction commit failed")
-	ErrTxRollbackFailed    = errors.New("transaction rollback failed")
-	ErrTxEngineUnsupported = errors.New("storage engine does not support transactions")
-	ErrTxConflict          = errors.New("transaction conflict")
-	ErrRecordNotFound      = errors.New("record not found")
-	ErrVersionConflict     = errors.New("version conflict")
+	ErrTxClosed             = errors.New("transaction is closed")
+	ErrTxValidation         = errors.New("transaction validation failed")
+	ErrTxCommitFailed       = errors.New("transaction commit failed")
+	ErrTxRollbackFailed     = errors.New("transaction rollback failed")
+	ErrTxReceiptUnsupported = errors.New("exact transaction commit receipts unsupported")
+	ErrTxEngineUnsupported  = errors.New("storage engine does not support transactions")
+	ErrTxConflict           = errors.New("transaction conflict")
+	ErrRecordNotFound       = errors.New("record not found")
+	ErrVersionConflict      = errors.New("version conflict")
+	// ErrForeignKeyCycle is returned when a cascading delete would revisit a
+	// row already on the current cascade stack.  Failing the transaction is
+	// safer than recursing indefinitely or partially publishing a cycle.
+	ErrForeignKeyCycle = errors.New("foreign-key cascade cycle detected")
 )
+
+type cascadeContextKey struct{}
+
+// cascadeState is shared by every recursive delete in one transaction.  The
+// active set detects cycles, while planned prevents the same row from being
+// staged twice when multiple foreign keys point at it.
+type cascadeState struct {
+	active  map[string]struct{}
+	planned map[string]struct{}
+}
+
+func cascadeStateFromContext(ctx context.Context) *cascadeState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(cascadeContextKey{}).(*cascadeState)
+	return state
+}
+
+func withCascadeState(ctx context.Context, state *cascadeState) context.Context {
+	return context.WithValue(ctx, cascadeContextKey{}, state)
+}
 
 // VersionConflictError reports an optimistic concurrency failure.
 type VersionConflictError struct {
@@ -58,8 +110,26 @@ type Tx interface {
 	// The caller must not read or write them after the call returns.
 	UpdateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
 	Upsert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error
+	// Rename changes the physical record key while preserving the record
+	// payload. It is used for updates to declared PRIMARY KEY columns.
+	Rename(ctx context.Context, collection, oldID, newID string, vector []float32, metadata map[string]interface{}) error
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
+}
+
+// CommitReceipt identifies the exact durable WAL transaction boundary for a
+// successful commit. CommitLSN is zero only when no transaction was committed
+// (for example, an empty transaction).
+type CommitReceipt struct {
+	CommitLSN uint64
+}
+
+// ReceiptTx is the optional receipt-capable extension returned by
+// BeginTxWithReceipt. Tx remains unchanged so existing callers and alternate
+// transaction implementations retain source compatibility.
+type ReceiptTx interface {
+	Tx
+	CommitWithReceipt(ctx context.Context) (CommitReceipt, error)
 }
 
 type txMutationKind uint8
@@ -69,12 +139,15 @@ const (
 	txMutationUpdate
 	txMutationDelete
 	txMutationUpsert
+	txMutationRename
 )
 
 type txMutation struct {
 	metadata           map[string]interface{}
 	collection         string
 	id                 string
+	oldID              string
+	graphNodeID        uint64
 	vector             []float32
 	expectedVersion    uint64
 	kind               txMutationKind
@@ -82,11 +155,55 @@ type txMutation struct {
 }
 
 type transaction struct {
-	db        *Database
-	ops       []txMutation
-	mu        sync.Mutex
-	closed    bool
-	committed bool
+	db         *Database
+	ops        []txMutation
+	graphDrops []txGraphDrop
+	graphHooks []txGraphHook
+	mu         sync.Mutex
+	closed     bool
+	committed  bool
+}
+
+// txGraphDrop is published in the same storage transaction as its record
+// delete. The graph WAL frame is durable before the in-memory graph is
+// updated, matching EpochTx's combined commit contract.
+type txGraphDrop struct {
+	collection string
+	nodeID     uint64
+	graph      Graph
+}
+
+// txGraphHook retains deprecated delete-hook graph mutations until the record
+// transaction is durably committed.  Hooks therefore remain source-compatible
+// without reintroducing the old record-first/graph-second commit split.
+type txGraphHook struct {
+	collection string
+	txn        *graph.Txn
+}
+
+func (db *Database) applyGraphNodeDrops(drops []txGraphDrop, commitLSN uint64) error {
+	for _, drop := range drops {
+		g := drop.graph
+		if g == nil {
+			continue
+		}
+		gtx := g.BeginTxn()
+		if err := gtx.DropNodeEdges(drop.nodeID); err != nil {
+			_ = gtx.Rollback()
+			return err
+		}
+		var err error
+		if commitLSN != 0 {
+			err = gtx.ApplyInMemoryAtLSN(commitLSN)
+		} else {
+			err = gtx.ApplyInMemory()
+		}
+		if err != nil {
+			_ = gtx.Rollback()
+			return err
+		}
+	}
+	return nil
 }
 
 // BeginTx starts a new write transaction.
@@ -108,6 +225,20 @@ func (db *Database) BeginTx(ctx context.Context) (Tx, error) {
 	return &transaction{db: db}, nil
 }
 
+// BeginTxWithReceipt starts a transaction whose commit can return the exact
+// durable WAL LSN. The transaction still exposes the complete legacy Tx API.
+func (db *Database) BeginTxWithReceipt(ctx context.Context) (ReceiptTx, error) {
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	receiptTx, ok := tx.(ReceiptTx)
+	if !ok {
+		return nil, ErrTxReceiptUnsupported
+	}
+	return receiptTx, nil
+}
+
 // WithTx runs fn inside a write transaction and commits on success.
 func (db *Database) WithTx(ctx context.Context, fn func(tx Tx) error) error {
 	tx, err := db.BeginTx(ctx)
@@ -125,8 +256,40 @@ func (db *Database) WithTx(ctx context.Context, fn func(tx Tx) error) error {
 	return tx.Commit(ctx)
 }
 
+// WithTxReceipt runs fn inside a write transaction and returns the exact
+// durable commit LSN. Callback failures roll back and return no receipt.
+func (db *Database) WithTxReceipt(ctx context.Context, fn func(tx ReceiptTx) error) (CommitReceipt, error) {
+	var empty CommitReceipt
+	tx, err := db.BeginTxWithReceipt(ctx)
+	if err != nil {
+		return empty, err
+	}
+	if err := fn(tx); err != nil {
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return empty, fmt.Errorf("%w: callback error: %v, rollback error: %v", ErrTxRollbackFailed, err, rbErr)
+		}
+		return empty, err
+	}
+	return tx.CommitWithReceipt(ctx)
+}
+
 func (tx *transaction) Insert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := tx.validateStage(ctx, collection, id, vector, true); err != nil {
+		return err
+	}
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	metadata, err = tx.prepareInsertMetadata(coll, metadata)
+	if err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, id, metadata); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, id, metadata); err != nil {
 		return err
 	}
 	return tx.append(txMutation{
@@ -139,7 +302,22 @@ func (tx *transaction) Insert(ctx context.Context, collection, id string, vector
 }
 
 func (tx *transaction) InsertOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := tx.validateStage(ctx, collection, id, vector, true); err != nil {
+		return err
+	}
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	metadata, err = tx.prepareInsertMetadata(coll, metadata)
+	if err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, id, metadata); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, id, metadata); err != nil {
 		return err
 	}
 	return tx.append(txMutation{
@@ -160,7 +338,22 @@ func (tx *transaction) UpdateOwned(ctx context.Context, collection, id string, v
 }
 
 func (tx *transaction) Upsert(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := tx.validateStage(ctx, collection, id, vector, true); err != nil {
+		return err
+	}
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	metadata, err = tx.prepareInsertMetadata(coll, metadata)
+	if err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, id, metadata); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, id, metadata); err != nil {
 		return err
 	}
 	return tx.append(txMutation{
@@ -172,27 +365,356 @@ func (tx *transaction) Upsert(ctx context.Context, collection, id string, vector
 	})
 }
 
+// prepareInsertMetadata creates the transaction-owned metadata image and
+// applies schema defaults and CHECK constraints before any FK/UNIQUE check or
+// mutation-log append. The caller's map is never mutated.
+func (tx *transaction) prepareInsertMetadata(coll *Collection, metadata map[string]interface{}) (map[string]interface{}, error) {
+	prepared := cloneMetadata(metadata)
+	if prepared == nil {
+		prepared = make(map[string]interface{})
+	}
+	coll.applyDefaults(prepared)
+	if err := coll.validateNotNullConstraints(prepared); err != nil {
+		return nil, err
+	}
+	if err := coll.validateCheckConstraints(prepared); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+// Rename stages a primary-key/physical-key migration. The commit state turns
+// this into a delete of oldID plus a put of newID in one WAL transaction.
+func (tx *transaction) Rename(ctx context.Context, collection, oldID, newID string, vector []float32, metadata map[string]interface{}) error {
+	ctx = withTransactionContext(ctx, tx)
+	if oldID == "" || newID == "" {
+		return fmt.Errorf("%w: primary-key values cannot be empty", ErrTxValidation)
+	}
+	if oldID == newID {
+		return tx.Update(ctx, collection, oldID, vector, metadata)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := tx.validateStage(ctx, collection, newID, vector, false); err != nil {
+		return err
+	}
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	old, err := tx.currentRecord(ctx, collection, oldID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.currentRecord(ctx, collection, newID); err == nil {
+		return fmt.Errorf("%w: record %s already exists in collection %s", ErrTxConflict, newID, collection)
+	}
+	if vector == nil {
+		vector = old.Vector
+	}
+	renameMetadata := cloneMetadata(old.Metadata)
+	for key, value := range metadata {
+		if renameMetadata == nil {
+			renameMetadata = make(map[string]interface{})
+		}
+		renameMetadata[key] = cloneMetadataValue(value)
+	}
+	if err := coll.validateNotNullConstraints(renameMetadata); err != nil {
+		return err
+	}
+	if err := coll.validateCheckConstraints(renameMetadata); err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, newID, renameMetadata); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, newID, renameMetadata); err != nil {
+		return err
+	}
+	cascades, err := coll.collectUpdateCascades(ctx, oldID, newID, old.Metadata, renameMetadata)
+	if err != nil {
+		return err
+	}
+	graphNodeID, _ := tx.db.GetNodeID(ctx, collection, oldID)
+	if err := tx.append(txMutation{kind: txMutationRename, collection: collection, id: newID, oldID: oldID, graphNodeID: graphNodeID, vector: cloneVector(vector), metadata: cloneMetadata(renameMetadata)}); err != nil {
+		return err
+	}
+	for _, cascade := range cascades {
+		if err := tx.appendCascadeUpdate(cascade); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *transaction) currentRecord(ctx context.Context, collection, id string) (Record, error) {
+	col, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return Record{}, err
+	}
+	rec, err := col.Get(ctx, id)
+	if err != nil {
+		if !isNotFoundError(err) && !errors.Is(err, ErrRecordNotFound) {
+			return Record{}, err
+		}
+		rec = Record{ID: id}
+		// A missing base record is only valid if a later staged insert creates it.
+		rec.Metadata = nil
+		rec.Vector = nil
+	}
+	present := err == nil
+	tx.mu.Lock()
+	ops := append([]txMutation(nil), tx.ops...)
+	tx.mu.Unlock()
+	for _, op := range ops {
+		if op.collection != collection {
+			continue
+		}
+		switch op.kind {
+		case txMutationDelete:
+			if op.id == id {
+				present = false
+			}
+		case txMutationInsert, txMutationUpsert:
+			if op.id == id {
+				rec = Record{ID: id, Vector: cloneVector(op.vector), Metadata: cloneMetadata(op.metadata)}
+				present = true
+			}
+		case txMutationUpdate:
+			if op.id == id && present {
+				if op.vector != nil {
+					rec.Vector = cloneVector(op.vector)
+				}
+				rec.Metadata = mergeMetadata(rec.Metadata, op.metadata)
+			}
+		case txMutationRename:
+			if op.oldID == id {
+				present = false
+			}
+			if op.id == id {
+				rec = Record{ID: id, Vector: cloneVector(op.vector), Metadata: cloneMetadata(op.metadata)}
+				present = true
+			}
+		}
+	}
+	if !present {
+		return Record{}, fmt.Errorf("%w: vector with ID %s not found", ErrRecordNotFound, id)
+	}
+	return rec, nil
+}
+
+// visibleRecords reconstructs one collection's transaction-local relation:
+// committed rows plus ordered staged mutations, with last-write-wins
+// semantics. It is intentionally used by referential-integrity validation so
+// a parent inserted earlier in the same transaction is a valid FK target and
+// a parent deleted earlier is no longer one.
+func (tx *transaction) visibleRecords(ctx context.Context, collection string) ([]Record, error) {
+	col, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return nil, err
+	}
+	base, err := col.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]Record, len(base))
+	order := make([]string, 0, len(base))
+	for _, rec := range base {
+		byID[rec.ID] = rec
+		order = append(order, rec.ID)
+	}
+	tx.mu.Lock()
+	ops := append([]txMutation(nil), tx.ops...)
+	tx.mu.Unlock()
+	for _, op := range ops {
+		if op.collection != collection {
+			continue
+		}
+		switch op.kind {
+		case txMutationDelete:
+			delete(byID, op.id)
+		case txMutationInsert, txMutationUpsert:
+			if _, exists := byID[op.id]; !exists {
+				order = append(order, op.id)
+			}
+			byID[op.id] = Record{ID: op.id, Vector: cloneVector(op.vector), Metadata: cloneMetadata(op.metadata)}
+		case txMutationUpdate:
+			current, exists := byID[op.id]
+			if !exists {
+				continue
+			}
+			if op.vector != nil {
+				current.Vector = cloneVector(op.vector)
+			}
+			if op.metadata != nil {
+				merged := cloneMetadata(current.Metadata)
+				if merged == nil {
+					merged = make(map[string]interface{}, len(op.metadata))
+				}
+				for key, value := range op.metadata {
+					merged[key] = value
+				}
+				current.Metadata = merged
+			}
+			byID[op.id] = current
+		case txMutationRename:
+			delete(byID, op.oldID)
+			if _, exists := byID[op.id]; !exists {
+				order = append(order, op.id)
+			}
+			byID[op.id] = Record{ID: op.id, Vector: cloneVector(op.vector), Metadata: cloneMetadata(op.metadata)}
+		}
+	}
+
+	visible := make([]Record, 0, len(byID))
+	for _, id := range order {
+		if rec, exists := byID[id]; exists {
+			visible = append(visible, rec)
+		}
+	}
+	return visible, nil
+}
+
 func (tx *transaction) UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
 	return tx.update(ctx, collection, id, vector, metadata, expectedVersion, true)
 }
 
 func (tx *transaction) update(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64, hasExpectedVersion bool) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := tx.validateStage(ctx, collection, id, vector, false); err != nil {
 		return err
 	}
-	return tx.append(txMutation{
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	existing, err := tx.currentRecord(ctx, collection, id)
+	if err != nil {
+		return err
+	}
+	merged := cloneMetadata(existing.Metadata)
+	for k, v := range metadata {
+		if merged == nil {
+			merged = make(map[string]interface{})
+		}
+		merged[k] = cloneMetadataValue(v)
+	}
+	if err := coll.validateNotNullConstraints(merged); err != nil {
+		return err
+	}
+	if err := coll.validateCheckConstraints(merged); err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, id, merged); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, id, merged); err != nil {
+		return err
+	}
+	cascades, err := coll.collectUpdateCascades(ctx, id, id, existing.Metadata, merged)
+	if err != nil {
+		return err
+	}
+	preparedDelta := cloneMetadata(metadata)
+	if err := coll.validateJSONFields(preparedDelta); err != nil {
+		return err
+	}
+	if err := tx.append(txMutation{
 		kind:               txMutationUpdate,
 		collection:         collection,
 		id:                 id,
 		vector:             cloneVector(vector),
-		metadata:           cloneMetadata(metadata),
+		metadata:           preparedDelta,
 		hasExpectedVersion: hasExpectedVersion,
 		expectedVersion:    expectedVersion,
+	}); err != nil {
+		return err
+	}
+	for _, cascade := range cascades {
+		if err := tx.appendCascadeUpdate(cascade); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendCascadeUpdate converts one referential-action update into a single
+// transaction mutation. In particular, a composite ON UPDATE CASCADE is
+// appended as one metadata image so no intermediate mixed tuple can become
+// visible to later validation or commit preparation.
+func (tx *transaction) appendCascadeUpdate(cascade cascadeOp) error {
+	updateMeta := make(map[string]interface{})
+	switch cascade.action {
+	case catalog.OnDeleteSetNull, catalog.OnDeleteSetDefault:
+		for col, val := range cascade.columnValues {
+			if val.Null {
+				updateMeta[col] = nil
+			} else {
+				updateMeta[col] = parseDefaultLiteral(val.Value)
+			}
+		}
+	case catalog.OnDeleteCascade:
+		if cascade.updateCascade {
+			for col, val := range cascade.columnValues {
+				if val.Null {
+					updateMeta[col] = nil
+				} else {
+					if cascade.action == catalog.OnDeleteSetDefault {
+						updateMeta[col] = parseDefaultLiteral(val.Value)
+					} else {
+						updateMeta[col] = val.Value
+					}
+				}
+			}
+		} else if cascade.sourceCol != "" {
+			updateMeta[cascade.sourceCol] = cascade.newFKValue
+		}
+	}
+	if len(updateMeta) == 0 {
+		return nil
+	}
+	return tx.append(txMutation{
+		kind: txMutationUpdate, collection: cascade.collectionName,
+		id: cascade.recordID, metadata: updateMeta,
 	})
 }
 
 func (tx *transaction) updateOwned(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64, hasExpectedVersion bool) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := tx.validateStage(ctx, collection, id, vector, false); err != nil {
+		return err
+	}
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	existing, err := tx.currentRecord(ctx, collection, id)
+	if err != nil {
+		return err
+	}
+	merged := cloneMetadata(existing.Metadata)
+	for k, v := range metadata {
+		if merged == nil {
+			merged = make(map[string]interface{})
+		}
+		merged[k] = cloneMetadataValue(v)
+	}
+	if err := coll.validateNotNullConstraints(merged); err != nil {
+		return err
+	}
+	if err := coll.validateCheckConstraints(merged); err != nil {
+		return err
+	}
+	if err := coll.validateForeignKeys(ctx, id, merged); err != nil {
+		return err
+	}
+	if err := coll.validateUniqueConstraints(ctx, id, merged); err != nil {
+		return err
+	}
+	preparedDelta := cloneMetadata(metadata)
+	if err := coll.validateJSONFields(preparedDelta); err != nil {
 		return err
 	}
 	return tx.append(txMutation{
@@ -200,7 +722,7 @@ func (tx *transaction) updateOwned(ctx context.Context, collection, id string, v
 		collection:         collection,
 		id:                 id,
 		vector:             vector,
-		metadata:           metadata,
+		metadata:           preparedDelta,
 		hasExpectedVersion: hasExpectedVersion,
 		expectedVersion:    expectedVersion,
 	})
@@ -215,6 +737,7 @@ func (tx *transaction) DeleteIfVersion(ctx context.Context, collection, id strin
 }
 
 func (tx *transaction) delete(ctx context.Context, collection, id string, expectedVersion uint64, hasExpectedVersion bool) error {
+	ctx = withTransactionContext(ctx, tx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -224,16 +747,112 @@ func (tx *transaction) delete(ctx context.Context, collection, id string, expect
 	if id == "" {
 		return fmt.Errorf("%w: vector ID cannot be empty", ErrTxValidation)
 	}
-	if _, err := tx.db.GetCollection(collection); err != nil {
+	coll, err := tx.db.GetCollection(collection)
+	if err != nil {
 		return fmt.Errorf("%w: %v", ErrCollectionNotFound, err)
 	}
-	return tx.append(txMutation{
+	state := cascadeStateFromContext(ctx)
+	if state == nil {
+		state = &cascadeState{
+			active:  make(map[string]struct{}),
+			planned: make(map[string]struct{}),
+		}
+		ctx = withCascadeState(ctx, state)
+	}
+	key := collection + "\x00" + id
+	if _, active := state.active[key]; active {
+		return fmt.Errorf("%w: %s", ErrForeignKeyCycle, key)
+	}
+	if _, planned := state.planned[key]; planned {
+		return nil
+	}
+	state.active[key] = struct{}{}
+	state.planned[key] = struct{}{}
+	defer delete(state.active, key)
+
+	// Enforce RESTRICT before staging and translate CASCADE references into
+	// ordinary transaction mutations so the entire delete remains rollbackable.
+	cascades, err := coll.checkDeleteFKReferences(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, cascade := range cascades {
+		switch cascade.action {
+		case catalog.OnDeleteSetNull, catalog.OnDeleteSetDefault:
+			// SET NULL / SET DEFAULT: update child's FK columns in the
+			// same transaction instead of deleting the child row.
+			// Skip FK validation during this cascade update — the parent
+			// being deleted would fail the child's FK check.
+			updateMeta := make(map[string]interface{}, len(cascade.columnValues))
+			for col, val := range cascade.columnValues {
+				if val.Null {
+					updateMeta[col] = nil
+				} else {
+					updateMeta[col] = val.Value
+				}
+			}
+			cascadeCtx := context.WithValue(ctx, ctxKeySkipFKValidation{}, true)
+			if err := tx.Update(cascadeCtx, cascade.collectionName, cascade.recordID, nil, updateMeta); err != nil {
+				return err
+			}
+		default:
+			// CASCADE (and any unset action): recursively delete child row.
+			if err := tx.delete(ctx, cascade.collectionName, cascade.recordID, 0, false); err != nil {
+				return err
+			}
+		}
+	}
+	if err := tx.append(txMutation{
 		kind:               txMutationDelete,
 		collection:         collection,
 		id:                 id,
 		hasExpectedVersion: hasExpectedVersion,
 		expectedVersion:    expectedVersion,
-	})
+	}); err != nil {
+		return err
+	}
+	// Every live record has a database-scoped GraphNodeID. Record the graph
+	// tombstone beside the record delete so SQL autocommit and explicit Tx
+	// paths publish both operations in one WAL transaction.
+	if nodeID, nodeErr := tx.db.GetNodeID(ctx, collection, id); nodeErr == nil && nodeID != 0 {
+		graphStore := coll.GetGraph()
+		coll.mu.RLock()
+		deleteHooks := append([]DeleteHook(nil), coll.deleteHooks...)
+		coll.mu.RUnlock()
+		// Deprecated delete hooks are staged into the same combined graph WAL
+		// transaction. They no longer receive a live graph transaction that can
+		// publish ahead of the record delete.
+		if len(deleteHooks) > 0 {
+			var hookTxn *graph.Txn
+			if graphStore != nil {
+				hookTxn = graphStore.BeginTxn()
+				hookTxn.SetCollection(collection)
+			}
+			if hookTxn == nil {
+				hookTxn = &graph.Txn{}
+			}
+			for _, hook := range deleteHooks {
+				if hook == nil {
+					continue
+				}
+				if err := hook(hookTxn, nodeID); err != nil {
+					_ = hookTxn.Rollback()
+					return fmt.Errorf("delete hook failed: %w", err)
+				}
+			}
+			tx.mu.Lock()
+			if !tx.closed {
+				tx.graphHooks = append(tx.graphHooks, txGraphHook{collection: collection, txn: hookTxn})
+			}
+			tx.mu.Unlock()
+		}
+		tx.mu.Lock()
+		if !tx.closed {
+			tx.graphDrops = append(tx.graphDrops, txGraphDrop{collection: collection, nodeID: nodeID, graph: graphStore})
+		}
+		tx.mu.Unlock()
+	}
+	return nil
 }
 
 func (tx *transaction) DeleteBatch(ctx context.Context, collection string, ids []string) error {
@@ -341,6 +960,18 @@ func (tx *transaction) ListByMetadata(ctx context.Context, collection, field str
 }
 
 func (tx *transaction) Commit(ctx context.Context) error {
+	return tx.commitWithReceipt(ctx, nil)
+}
+
+// CommitWithReceipt publishes the transaction through the same atomic record
+// and graph WAL path as Commit, returning the exact durable commit LSN.
+func (tx *transaction) CommitWithReceipt(ctx context.Context) (CommitReceipt, error) {
+	var receipt CommitReceipt
+	err := tx.commitWithReceipt(ctx, &receipt)
+	return receipt, err
+}
+
+func (tx *transaction) commitWithReceipt(ctx context.Context, receipt *CommitReceipt) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -351,11 +982,65 @@ func (tx *transaction) Commit(ctx context.Context) error {
 		return ErrTxClosed
 	}
 	ops := append([]txMutation(nil), tx.ops...)
+	graphDrops := append([]txGraphDrop(nil), tx.graphDrops...)
+	graphHooks := append([]txGraphHook(nil), tx.graphHooks...)
 	tx.closed = true
 	tx.mu.Unlock()
 
 	start := time.Now()
-	if err := tx.db.commitTx(ctx, ops); err != nil {
+	graphOps := make([]storage.TxOperation, 0, len(graphDrops)+len(graphHooks))
+	for _, hook := range graphHooks {
+		if hook.txn == nil {
+			continue
+		}
+		adds, removes, drops := hook.txn.StagedOps()
+		for _, add := range adds {
+			graphOps = append(graphOps, storage.TxOperation{
+				Type: storage.TxOperationGraphEdgeAdd, Collection: hook.collection,
+				EdgeSrc: add.Src, EdgeTgt: add.Tgt, EdgeWeight: add.Weight, EdgeKind: add.Kind, EdgeProperties: append([]byte(nil), add.Properties...),
+			})
+		}
+		for _, remove := range removes {
+			graphOps = append(graphOps, storage.TxOperation{
+				Type: storage.TxOperationGraphEdgeRemove, Collection: hook.collection,
+				EdgeSrc: remove.Src, EdgeTgt: remove.Tgt, EdgeKind: remove.Kind,
+			})
+		}
+		for _, drop := range drops {
+			graphOps = append(graphOps, storage.TxOperation{
+				Type: storage.TxOperationGraphNodeDrop, Collection: hook.collection,
+				EdgeSrc: drop.NodeID,
+			})
+		}
+	}
+	for _, drop := range graphDrops {
+		graphOps = append(graphOps, storage.TxOperation{
+			Type:       storage.TxOperationGraphNodeDrop,
+			Collection: drop.collection,
+			EdgeSrc:    drop.nodeID,
+		})
+	}
+	var graphApplyFn func(uint64) error
+	if len(graphDrops) > 0 || len(graphHooks) > 0 {
+		graphApplyFn = func(commitLSN uint64) error {
+			for _, hook := range graphHooks {
+				if hook.txn == nil {
+					continue
+				}
+				var err error
+				if commitLSN != 0 {
+					err = hook.txn.ApplyInMemoryAtLSN(commitLSN)
+				} else {
+					err = hook.txn.ApplyInMemory()
+				}
+				if err != nil {
+					return err
+				}
+			}
+			return tx.db.applyGraphNodeDrops(graphDrops, commitLSN)
+		}
+	}
+	if err := tx.db.commitTxWithGraphReceipt(ctx, ops, nil, graphApplyFn, graphOps, receipt); err != nil {
 		tx.mu.Lock()
 		tx.closed = false
 		tx.mu.Unlock()
@@ -396,11 +1081,54 @@ func (tx *transaction) Rollback(ctx context.Context) error {
 	}
 	tx.closed = true
 	tx.ops = nil
+	tx.graphDrops = nil
+	for _, hook := range tx.graphHooks {
+		if hook.txn != nil {
+			_ = hook.txn.Rollback()
+		}
+	}
+	tx.graphHooks = nil
 
 	if tx.db.metrics != nil {
 		tx.db.metrics.TxRollbacks.Inc()
 	}
 	return nil
+}
+
+// StagedOps returns the accumulated record operations for combined atomic
+// commit through the storage engine's transactional interface.
+func (tx *transaction) StagedOps() []storage.TxOperation {
+	tx.mu.Lock()
+	ops := append([]txMutation(nil), tx.ops...)
+	tx.mu.Unlock()
+
+	out := make([]storage.TxOperation, 0, len(ops))
+	for _, op := range ops {
+		switch op.kind {
+		case txMutationInsert, txMutationUpdate, txMutationUpsert:
+			out = append(out, storage.TxOperation{
+				Type:               storage.TxOperationPut,
+				Collection:         op.collection,
+				ID:                 op.id,
+				Vector:             op.vector,
+				Metadata:           op.metadata,
+				HasExpectedVersion: op.hasExpectedVersion,
+				ExpectedVersion:    op.expectedVersion,
+			})
+		case txMutationDelete:
+			out = append(out, storage.TxOperation{
+				Type:       storage.TxOperationDelete,
+				Collection: op.collection,
+				ID:         op.id,
+			})
+		case txMutationRename:
+			out = append(out,
+				storage.TxOperation{Type: storage.TxOperationDelete, Collection: op.collection, ID: op.oldID},
+				storage.TxOperation{Type: storage.TxOperationPut, Collection: op.collection, ID: op.id, Vector: op.vector, Metadata: op.metadata, GraphNodeID: op.graphNodeID},
+			)
+		}
+	}
+	return out
 }
 
 func (tx *transaction) append(op txMutation) error {
@@ -437,7 +1165,31 @@ func (tx *transaction) validateStage(ctx context.Context, collection, id string,
 }
 
 func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
-	if len(ops) == 0 {
+	return db.commitTxWithGraph(ctx, ops, nil, nil, nil)
+}
+
+// commitTxWithGraph commits record operations through the standard flow,
+// appends graph TxOperations to the same WAL transaction, and calls
+// graphApplyFn to publish graph topology in-memory only after durable success.
+//
+// If reserveGraphOps is non-nil, it is called after PrepareTx assigns ordinals
+// and before CommitTx. It receives the number of new records and returns graph
+// TxOperations with provisional node IDs remapped to reserved committed IDs.
+// This enables epoch transactions to pre-assign GraphNodeIDs before the
+// combined WAL write, avoiding separate record-then-graph commits.
+func (db *Database) commitTxWithGraph(ctx context.Context, ops []txMutation, reserveGraphOps func(reservedIDs map[string]uint64) ([]storage.TxOperation, func(uint64) error), graphApplyFn func(uint64) error, initialGraphOps []storage.TxOperation) error {
+	return db.commitTxWithGraphReceipt(ctx, ops, reserveGraphOps, graphApplyFn, initialGraphOps, nil)
+}
+
+func (db *Database) commitTxWithGraphReceipt(ctx context.Context, ops []txMutation, reserveGraphOps func(reservedIDs map[string]uint64) ([]storage.TxOperation, func(uint64) error), graphApplyFn func(uint64) error, initialGraphOps []storage.TxOperation, receipt *CommitReceipt) error {
+	var graphOps []storage.TxOperation
+	if reserveGraphOps != nil {
+		// graphOps will be built later, after PrepareTx.
+	} else {
+		graphOps = nil // passed directly (backward compat path)
+	}
+
+	if len(ops) == 0 && reserveGraphOps == nil && len(initialGraphOps) == 0 {
 		return nil
 	}
 
@@ -501,6 +1253,36 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 	state.applyPreparedOrdinals(preparedOps)
 
+	// Build graph ops after record preparation. Reserve GraphNodeIDs for new
+	// records, set them on prepared ops so CommitTx uses them, and pass the
+	// reserved ID → recordID mapping to the callback for graph op remapping.
+	var innerGraphApplyFn func(uint64) error
+	if reserveGraphOps != nil {
+		// Count new records that need GraphNodeID assignment.
+		// Keyed by composite "collection\x00recordID" to avoid
+		// collisions when two collections share a record ID.
+		newRecords := make(map[string]int) // compositeKey → index in preparedOps
+		for i, op := range preparedOps {
+			if op.Type == storage.TxOperationPut && op.GraphNodeID == 0 {
+				newRecords[op.Collection+"\x00"+op.ID] = i
+			}
+		}
+		reservedIDs := make(map[string]uint64, len(newRecords)) // compositeKey → reserved nodeID
+		if len(newRecords) > 0 {
+			idBase, err := engine.ReserveGraphNodeIDs(ctx, len(newRecords))
+			if err != nil {
+				return fmt.Errorf("reserve graph node IDs: %w", err)
+			}
+			nextID := idBase
+			for compositeKey, idx := range newRecords {
+				preparedOps[idx].GraphNodeID = nextID
+				reservedIDs[compositeKey] = nextID
+				nextID++
+			}
+		}
+		graphOps, innerGraphApplyFn = reserveGraphOps(reservedIDs)
+	}
+
 	preparedDeltas, deltaCollections, err := state.prepareIndexDeltas(ctx, names)
 	if err != nil {
 		return err
@@ -528,8 +1310,48 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 	}
 	defer closeIndexes(newIndexes)
 
-	if err := engine.CommitTx(ctx, preparedOps); err != nil {
-		return err
+	// Append graph ops to the same WAL transaction.
+	combinedOps := preparedOps
+	if len(graphOps) > 0 {
+		combinedOps = append(append([]storage.TxOperation{}, preparedOps...), graphOps...)
+	}
+	if len(initialGraphOps) > 0 {
+		combinedOps = append(append([]storage.TxOperation{}, combinedOps...), initialGraphOps...)
+	}
+
+	var commitLSN uint64
+	needExactLSN := receipt != nil || innerGraphApplyFn != nil || graphApplyFn != nil
+	if durableEngine, ok := engine.(storage.DurableTransactionalEngine); ok && needExactLSN {
+		durableReceipt, err := durableEngine.CommitTxDurable(ctx, combinedOps)
+		if err != nil {
+			if receipt != nil && durableReceipt.CommitLSN != 0 {
+				receipt.CommitLSN = durableReceipt.CommitLSN
+			}
+			return err
+		}
+		commitLSN = durableReceipt.CommitLSN
+		if receipt != nil {
+			receipt.CommitLSN = commitLSN
+		}
+	} else {
+		if receipt != nil {
+			return ErrTxReceiptUnsupported
+		}
+		if err := engine.CommitTx(ctx, combinedOps); err != nil {
+			return err
+		}
+	}
+	// Storage is durable at this point. Invalidate metadata posting lists even
+	// if a later index-publication step reports an error, otherwise a committed
+	// UPDATE/DELETE could remain visible through stale equality postings.
+	for _, name := range names {
+		collection := collections[name]
+		if parentName, _, isShard := parseShardName(name); isShard {
+			if parent, err := db.GetCollection(parentName); err == nil {
+				collection = parent
+			}
+		}
+		collection.markMetadataIndexDirty()
 	}
 
 	hasCAS := false
@@ -564,6 +1386,18 @@ func (db *Database) commitTx(ctx context.Context, ops []txMutation) error {
 		_ = oldIndex.Close()
 	}
 
+	// Publish graph topology in-memory after durable WAL success.
+	if innerGraphApplyFn != nil {
+		if err := innerGraphApplyFn(commitLSN); err != nil {
+			return fmt.Errorf("apply graph mutations: %w", err)
+		}
+	}
+	if graphApplyFn != nil {
+		if err := graphApplyFn(commitLSN); err != nil {
+			return fmt.Errorf("apply graph mutations: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -595,6 +1429,13 @@ func (db *Database) routeTxMutations(ops []txMutation) ([]txMutation, error) {
 		}
 		if len(collection.shards) == 0 {
 			continue
+		}
+		if routed[i].kind == txMutationRename {
+			oldShard := shardForID(routed[i].oldID)
+			newShard := shardForID(routed[i].id)
+			if oldShard != newShard {
+				return nil, fmt.Errorf("%w: primary-key rename across shards is not supported", ErrTxValidation)
+			}
 		}
 		shardIndex := shardForID(routed[i].id)
 		if shardIndex < 0 || shardIndex >= len(collection.shards) {
@@ -734,7 +1575,8 @@ type txCollectionState struct {
 }
 
 type txCommitState struct {
-	collections map[string]*txCollectionState
+	collections  map[string]*txCollectionState
+	graphNodeIDs map[string]map[string]uint64
 }
 
 // flatTxSlot is deliberately pointer-free because it is allocated in a
@@ -773,6 +1615,10 @@ func newFlatTxCollectionState(ops []txMutation, collection string) (*flatTxColle
 		}
 		count++
 		keyBytes += uint64(len(op.id))
+		if op.kind == txMutationRename {
+			count++
+			keyBytes += uint64(len(op.oldID))
+		}
 	}
 	if count == 0 {
 		return nil, fmt.Errorf("%w: empty flat transaction state for %s", ErrTxValidation, collection)
@@ -871,6 +1717,26 @@ func (s *flatTxCollectionState) sortEntries() {
 }
 
 func (s *flatTxCollectionState) apply(ctx context.Context, collection *Collection, op txMutation) error {
+	if op.kind == txMutationRename {
+		oldEntry, err := s.entry(ctx, collection, op.oldID)
+		if err != nil {
+			return err
+		}
+		if oldEntry.current == nil {
+			return fmt.Errorf("%w: vector with ID %s not found", ErrTxValidation, op.oldID)
+		}
+		newEntry, err := s.entry(ctx, collection, op.id)
+		if err != nil {
+			return err
+		}
+		if newEntry.current != nil {
+			return fmt.Errorf("%w: record %s already exists in collection %s", ErrTxConflict, op.id, op.collection)
+		}
+		replacement := &index.VectorEntry{ID: op.id, Vector: op.vector, Metadata: op.metadata, Ordinal: oldEntry.current.Ordinal}
+		oldEntry.current = nil
+		newEntry.current = replacement
+		return nil
+	}
 	entry, err := s.entry(ctx, collection, op.id)
 	if err != nil {
 		return err
@@ -939,7 +1805,8 @@ func (s *flatTxCollectionState) apply(ctx context.Context, collection *Collectio
 
 func buildTransactionState(ctx context.Context, collections map[string]*Collection, names []string, ops []txMutation) (*txCommitState, error) {
 	state := &txCommitState{
-		collections: make(map[string]*txCollectionState, len(names)),
+		collections:  make(map[string]*txCollectionState, len(names)),
+		graphNodeIDs: make(map[string]map[string]uint64),
 	}
 	fail := func(err error) (*txCommitState, error) {
 		state.close()
@@ -993,10 +1860,30 @@ func (s *txCommitState) apply(ctx context.Context, ops []txMutation) error {
 		if state == nil {
 			return fmt.Errorf("%w: collection %s not found", ErrTxValidation, op.collection)
 		}
+		if op.kind == txMutationRename && op.graphNodeID != 0 {
+			if s.graphNodeIDs[op.collection] == nil {
+				s.graphNodeIDs[op.collection] = make(map[string]uint64)
+			}
+			s.graphNodeIDs[op.collection][op.id] = op.graphNodeID
+		}
 		if state.flat != nil {
 			if err := state.flat.apply(ctx, state.collection, op); err != nil {
 				return err
 			}
+			continue
+		}
+		if op.kind == txMutationRename {
+			old := state.working[op.oldID]
+			if old == nil {
+				return fmt.Errorf("%w: vector with ID %s not found", ErrTxValidation, op.oldID)
+			}
+			if _, exists := state.working[op.id]; exists {
+				return fmt.Errorf("%w: record %s already exists in collection %s", ErrTxConflict, op.id, op.collection)
+			}
+			state.touched[op.oldID] = struct{}{}
+			state.touched[op.id] = struct{}{}
+			state.working[op.oldID] = nil
+			state.working[op.id] = &index.VectorEntry{ID: op.id, Vector: op.vector, Metadata: op.metadata, Ordinal: old.Ordinal}
 			continue
 		}
 		state.touched[op.id] = struct{}{}
@@ -1094,6 +1981,10 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 						HasExpectedVersion: entry.hasExpectedVersion,
 					})
 				case entry.current != nil:
+					graphNodeID := uint64(0)
+					if ids := s.graphNodeIDs[collectionName]; ids != nil {
+						graphNodeID = ids[entry.id]
+					}
 					ops = append(ops, storage.TxOperation{
 						Type:               storage.TxOperationPut,
 						Collection:         collectionName,
@@ -1101,6 +1992,7 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 						Ordinal:            entry.current.Ordinal,
 						Vector:             entry.current.Vector,
 						Metadata:           entry.current.Metadata,
+						GraphNodeID:        graphNodeID,
 						ExpectedVersion:    entry.expectedVersion,
 						HasExpectedVersion: entry.hasExpectedVersion,
 					})
@@ -1128,6 +2020,10 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 					HasExpectedVersion: hasExpectedVersion,
 				})
 			case after != nil:
+				graphNodeID := uint64(0)
+				if ids := s.graphNodeIDs[collectionName]; ids != nil {
+					graphNodeID = ids[id]
+				}
 				expectedVersion, hasExpectedVersion := state.expected[id]
 				ops = append(ops, storage.TxOperation{
 					Type:               storage.TxOperationPut,
@@ -1136,6 +2032,7 @@ func (s *txCommitState) storageOps() []storage.TxOperation {
 					Ordinal:            after.Ordinal,
 					Vector:             after.Vector,
 					Metadata:           after.Metadata,
+					GraphNodeID:        graphNodeID,
 					ExpectedVersion:    expectedVersion,
 					HasExpectedVersion: hasExpectedVersion,
 				})
@@ -1223,7 +2120,9 @@ func (s *txCommitState) buildIndexes(ctx context.Context, names []string, logger
 		state := s.collections[name]
 		entries := make([]*index.VectorEntry, 0, len(state.working))
 		for _, entry := range state.working {
-			entries = append(entries, entry)
+			if entry != nil {
+				entries = append(entries, entry)
+			}
 		}
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].ID < entries[j].ID

@@ -185,6 +185,17 @@ func (w *hnswWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) e
 // Search adapts the search results from HNSW to interface types
 func (w *hnswWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
 	hnswResults, err := w.index.Search(ctx, query, k, filter)
+	return adaptHNSWSearchResults(hnswResults, err)
+}
+
+// SearchWithEf exposes HNSW's per-query breadth without expanding the common
+// Index interface for backends that do not use ef.
+func (w *hnswWrapper) SearchWithEf(ctx context.Context, query []float32, k, ef int, filter GraphFilter) ([]*SearchResult, error) {
+	hnswResults, err := w.index.SearchWithEf(ctx, query, k, ef, filter)
+	return adaptHNSWSearchResults(hnswResults, err)
+}
+
+func adaptHNSWSearchResults(hnswResults []*hnsw.SearchResult, err error) ([]*SearchResult, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -464,19 +475,37 @@ func newFlatWrapper(core *flat.Core) (*flatWrapper, error) {
 	return &flatWrapper{core: core}, nil
 }
 
-func flatDeltaBytes(entries []*VectorEntry) uint64 {
-	bytes := uint64(16 << 10)
+func flatDeltaCapacity(entries []*VectorEntry, deletes []string) record.DeltaCapacityReport {
+	mutations := make([]record.DeltaCapacityMutation, 0, len(entries)+len(deletes))
 	for _, entry := range entries {
 		if entry == nil {
 			continue
 		}
-		// Per-entry arena cost: stageCell allocates id copy + mutationCell (~48B);
-		// RecordBuilder.Seal allocates recordHeader (~48B) + id + vector + metadata.
-		// The 512B overhead covers the doubled ID copy, both struct headers, and
-		// per-record metadata without assuming it fits in a tight constant.
-		bytes += uint64(len(entry.ID))*2 + uint64(len(entry.Vector))*4 + 512
+		mutations = append(mutations, record.DeltaCapacityMutation{
+			IDBytes:       uint64(len(entry.ID)),
+			VectorBytes:   uint64(len(entry.Vector)) * 4,
+			Ordinal:       entry.Ordinal,
+			OrdinalKnown:  true,
+			ProducesAfter: true,
+		})
 	}
-	return bytes
+	for _, id := range deletes {
+		mutations = append(mutations, record.DeltaCapacityMutation{
+			IDBytes:       uint64(len(id)),
+			ProducesAfter: true,
+			Tombstone:     true,
+			// A delete's prior ordinal is resolved after the delta is allocated;
+			// reserve all three possible copied radix pages here.
+		})
+	}
+	return record.EstimateDeltaCapacity(uint64(len(entries)+len(deletes)), mutations)
+}
+
+// flatDeltaBytes remains as a small compatibility helper for callers and
+// tests that only provide puts. New mutation paths should use the full report
+// so delete and copied-key costs are included as well.
+func flatDeltaBytes(entries []*VectorEntry) uint64 {
+	return flatDeltaCapacity(entries, nil).ArenaBytes
 }
 
 // Insert publishes one immutable off-heap generation. Metadata remains owned
@@ -543,7 +572,8 @@ func (w *flatWrapper) PrepareMutations(ctx context.Context, entries []*VectorEnt
 	if len(entries) == 0 && len(deletes) == 0 {
 		return nil, fmt.Errorf("flat mutation is empty")
 	}
-	delta, err := w.core.NewDelta(flatDeltaBytes(entries)+uint64(len(deletes))*128, uint32(len(entries)+len(deletes)), uint64(len(entries))*128+uint64(len(deletes))*128+4096)
+	capacity := flatDeltaCapacity(entries, deletes)
+	delta, err := w.core.NewDelta(capacity.ArenaBytes, uint32(len(entries)+len(deletes)), capacity.KeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -872,6 +902,12 @@ func (w *btreeWrapper) BatchInsert(ctx context.Context, entries []*VectorEntry) 
 func (w *btreeWrapper) Search(ctx context.Context, query []float32, k int, filter GraphFilter) ([]*SearchResult, error) {
 	// B-tree is an ordered index, not a vector index. Range scans use cursor directly.
 	return nil, nil
+}
+
+// Get performs a point lookup by record ID. Returns the ordinal, version,
+// and graph node ID. Returns an error if the key does not exist.
+func (w *btreeWrapper) Get(ctx context.Context, id string) (ordinal, version uint32, graphNodeID uint64, err error) {
+	return w.index.Get(ctx, id)
 }
 
 func (w *btreeWrapper) Delete(ctx context.Context, id string) error {

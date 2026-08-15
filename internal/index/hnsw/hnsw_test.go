@@ -13,6 +13,212 @@ import (
 	"github.com/xDarkicex/memory"
 )
 
+type testOrdinalFilter map[uint32]bool
+
+func (f testOrdinalFilter) Test(idx uint64) bool { return f[uint32(idx)] }
+
+type selectiveOrdinalFilter struct {
+	allowed     testOrdinalFilter
+	selectivity float64
+}
+
+func (f selectiveOrdinalFilter) Test(idx uint64) bool { return f.allowed.Test(idx) }
+func (f selectiveOrdinalFilter) Selectivity() float64 { return f.selectivity }
+
+func TestHNSWFilterAppliedBeforeResultLimit(t *testing.T) {
+	const (
+		n = 500
+		k = 10
+	)
+	config := &Config{
+		Dimension:      16,
+		M:              16,
+		EfConstruction: 64,
+		EfSearch:       32,
+		ML:             1.0,
+		Metric:         util.L2Distance,
+		RandomSeed:     42,
+		RawStoreCap:    n,
+	}
+	index, err := NewHNSW(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+
+	vectors := generateTestVectors(n, config.Dimension)
+	allowed := make(testOrdinalFilter)
+	for i, vector := range vectors {
+		if err := index.Insert(context.Background(), &VectorEntry{
+			ID:     fmt.Sprintf("filtered-%d", i),
+			Vector: vector,
+		}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		if i%5 == 0 {
+			allowed[uint32(i)] = true
+		}
+	}
+
+	results, err := index.SearchWithEf(context.Background(), vectors[0], k, n, allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != k {
+		t.Fatalf("filtered result count = %d, want %d", len(results), k)
+	}
+	for _, result := range results {
+		if !allowed[result.Ordinal] {
+			t.Fatalf("result ordinal %d does not pass filter", result.Ordinal)
+		}
+	}
+}
+
+func TestHNSWFilteredResultHeapIsIndependentFromRoutingHeap(t *testing.T) {
+	config := &Config{
+		Dimension:      4,
+		M:              4,
+		EfConstruction: 8,
+		EfSearch:       2,
+		ML:             1.0,
+		Metric:         util.L2Distance,
+		RandomSeed:     42,
+		RawStoreCap:    5,
+	}
+	index, err := NewHNSW(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		// Node 4 is deliberately much farther from the query than the two
+		// candidates retained by the ordinary ef=2 routing heap.
+		distance := float32(i)
+		if i == 4 {
+			distance = 100
+		}
+		if err := index.Insert(ctx, &VectorEntry{
+			ID:      fmt.Sprintf("beam-%d", i),
+			Ordinal: uint32(i),
+			Vector:  []float32{distance, 0, 0, 0},
+		}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Replace construction topology with a deterministic star. All four
+	// neighbors are scored together by the existing SIMD/assembly batch path.
+	for i := 0; i < 5; i++ {
+		node := index.nodes.Get(uint32(i))
+		for level := 0; level < MaxLevel; level++ {
+			atomic.StoreUint32(&node.LinkCounts[level], 0)
+			atomic.StoreUint32(&node.BacklinkCounts[level], 0)
+		}
+	}
+	for i := uint32(1); i < 5; i++ {
+		if !index.manualConnect(0, i, 0) {
+			t.Fatalf("connect entry to node %d", i)
+		}
+	}
+
+	query := []float32{0, 0, 0, 0}
+	scratch := index.acquireSearchScratchWithEF(2)
+	routing, err := index.searchLevelScratchValues(ctx, query, index.nodes.Get(0), 2, 0, scratch, nil, nil, true)
+	index.releaseSearchScratch(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range routing {
+		if candidate.ID == 4 {
+			t.Fatal("fixture invalid: far valid node survived the ordinary routing heap")
+		}
+	}
+
+	scratch = index.acquireFilteredSearchScratchWithEF(2)
+	filtered, err := index.searchLevelScratchValues(ctx, query, index.nodes.Get(0), 2, 0, scratch, nil, testOrdinalFilter{4: true}, true)
+	index.releaseSearchScratch(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != 4 {
+		t.Fatalf("filtered result heap = %+v, want only node 4", filtered)
+	}
+}
+
+func TestHNSWACORNLiteExpandsRejectedBridgeWithinBudget(t *testing.T) {
+	config := &Config{
+		Dimension:      4,
+		M:              2,
+		EfConstruction: 8,
+		EfSearch:       2,
+		ML:             1.0,
+		Metric:         util.L2Distance,
+		RandomSeed:     42,
+		RawStoreCap:    4,
+	}
+	index, err := NewHNSW(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+
+	ctx := context.Background()
+	for ordinal, distance := range []float32{0, 1, 10, 11} {
+		if err := index.Insert(ctx, &VectorEntry{
+			ID:      fmt.Sprintf("acorn-%d", ordinal),
+			Ordinal: uint32(ordinal),
+			Vector:  []float32{distance, 0, 0, 0},
+		}); err != nil {
+			t.Fatalf("insert %d: %v", ordinal, err)
+		}
+	}
+
+	// ef=2 retains entry 0 and close invalid node 1. Rejected bridge 2 is
+	// too far for the ordinary routing beam, but its neighbor 3 is the only
+	// predicate-valid result. ACORN-lite must discover 3 through bridge 2.
+	for i := 0; i < 4; i++ {
+		node := index.nodes.Get(uint32(i))
+		for level := 0; level < MaxLevel; level++ {
+			atomic.StoreUint32(&node.LinkCounts[level], 0)
+			atomic.StoreUint32(&node.BacklinkCounts[level], 0)
+		}
+	}
+	if !index.manualConnect(0, 1, 0) || !index.manualConnect(0, 2, 0) || !index.manualConnect(2, 3, 0) {
+		t.Fatal("build deterministic rejected-bridge topology")
+	}
+
+	query := []float32{0, 0, 0, 0}
+	validOnly := testOrdinalFilter{3: true}
+	scratch := index.acquireFilteredSearchScratchWithEF(2)
+	scratch.filteredTarget = 1
+	withoutRescue, err := index.searchLevelScratchValues(ctx, query, index.nodes.Get(0), 2, 0, scratch, nil, validOnly, true)
+	index.releaseSearchScratch(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withoutRescue) != 0 {
+		t.Fatalf("ordinary filtered traversal = %+v, want no result", withoutRescue)
+	}
+
+	sparseFilter := selectiveOrdinalFilter{allowed: validOnly, selectivity: 0.02}
+	scratch = index.acquireFilteredSearchScratchWithEF(2)
+	scratch.filteredTarget = 1
+	withRescue, err := index.searchLevelScratchValues(ctx, query, index.nodes.Get(0), 2, 0, scratch, nil, sparseFilter, true)
+	groups, candidates := scratch.acornGroups, scratch.acornCandidates
+	index.releaseSearchScratch(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withRescue) != 1 || withRescue[0].ID != 3 {
+		t.Fatalf("ACORN-lite result = %+v, want only node 3", withRescue)
+	}
+	if groups == 0 || groups > acornLiteMaxGroups || candidates != 1 || candidates > acornLiteMaxCandidates {
+		t.Fatalf("ACORN-lite budget groups=%d candidates=%d", groups, candidates)
+	}
+}
+
 func TestAppendUniqueLinkPreventsDuplicates(t *testing.T) {
 	arena, err := memory.NewArena(4096, 64)
 	if err != nil {
@@ -370,8 +576,8 @@ func TestCommunityPruningThresholds(t *testing.T) {
 
 func TestComputeCommunitiesTotalMapping(t *testing.T) {
 	idx := &Index{
-		config: &Config{Dimension: 128}, 
-		nodes: newSegmentedNodeArray(),
+		config:   &Config{Dimension: 128},
+		nodes:    newSegmentedNodeArray(),
 		distance: func(a, b []float32) float32 { return 0 },
 	}
 	for i := 1; i <= 10; i++ {
@@ -380,7 +586,7 @@ func TestComputeCommunitiesTotalMapping(t *testing.T) {
 		node := &Node{Ordinal: uint32(i), Vector: vec}
 		idx.nodes.Set(uint32(i), node)
 	}
-	
+
 	// Add some dummy edges
 	for i := 1; i < 10; i++ {
 		idx.getNodeLinks(idx.nodes.Get(uint32(i)), 0)

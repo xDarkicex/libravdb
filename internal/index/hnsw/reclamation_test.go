@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/xDarkicex/libravdb/internal/util"
+	"github.com/xDarkicex/memory"
 )
 
 func newReclamationTestIndex(t testing.TB, rawStore string) *Index {
@@ -411,19 +412,46 @@ func BenchmarkHNSWHyalineReadEpoch(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				slot := i & 63
-				index.nodeSFL.HyalineEnter(slot)
-				index.linkSFL.HyalineEnter(slot)
-				index.link0SFL.HyalineEnter(slot)
+				nodeHandle, err := index.nodeSFL.HyalineEnter(slot)
+				if err != nil {
+					b.Fatal(err)
+				}
+				linkHandle, err := index.linkSFL.HyalineEnter(slot)
+				if err != nil {
+					_ = index.nodeSFL.HyalineLeave(nodeHandle)
+					b.Fatal(err)
+				}
+				link0Handle, err := index.link0SFL.HyalineEnter(slot)
+				if err != nil {
+					_ = index.linkSFL.HyalineLeave(linkHandle)
+					_ = index.nodeSFL.HyalineLeave(nodeHandle)
+					b.Fatal(err)
+				}
+				var vectorHandle memory.HyalineHandle
 				if vectorStore != nil {
-					vectorStore.sfl.HyalineEnter(slot)
+					vectorHandle, err = vectorStore.sfl.HyalineEnter(slot)
+					if err != nil {
+						_ = index.link0SFL.HyalineLeave(link0Handle)
+						_ = index.linkSFL.HyalineLeave(linkHandle)
+						_ = index.nodeSFL.HyalineLeave(nodeHandle)
+						b.Fatal(err)
+					}
 				}
 
 				if vectorStore != nil {
-					vectorStore.sfl.HyalineLeave(slot)
+					if err := vectorStore.sfl.HyalineLeave(vectorHandle); err != nil {
+						b.Fatal(err)
+					}
 				}
-				index.link0SFL.HyalineLeave(slot)
-				index.linkSFL.HyalineLeave(slot)
-				index.nodeSFL.HyalineLeave(slot)
+				if err := index.link0SFL.HyalineLeave(link0Handle); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.linkSFL.HyalineLeave(linkHandle); err != nil {
+					b.Fatal(err)
+				}
+				if err := index.nodeSFL.HyalineLeave(nodeHandle); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

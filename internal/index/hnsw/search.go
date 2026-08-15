@@ -21,23 +21,36 @@ type commBound struct {
 }
 
 type searchScratch struct {
-	slot          uint8
-	arena         *memory.Arena
-	arenaBytes    uint64
-	visitedMarks  []uint32
-	maxHeapBuf    []util.Candidate
-	minHeapBuf    []util.Candidate
-	soaIDs        []uint32
-	soaDistances  []float32
+	slot            uint8
+	arena           *memory.Arena
+	arenaBytes      uint64
+	visitedMarks    []uint32
+	maxHeapBuf      []util.Candidate
+	minHeapBuf      []util.Candidate
+	filteredHeapBuf []util.Candidate
+	soaIDs          []uint32
+	soaDistances    []float32
 	pruneBuf        []util.Candidate
 	commLowerBounds []commBound
 	commGen         uint32
 	inFlightBuf     []uint32
 	prefetchedIDs   []uint32
-	prefetchPtrs  []unsafe.Pointer
-	prefetchVecs  [][]float32
-	visitMark     uint32
+	prefetchPtrs    []unsafe.Pointer
+	prefetchVecs    [][]float32
+	visitMark       uint32
+	filteredTarget  int
+	acornGroups     int
+	acornCandidates int
 }
+
+const (
+	// ACORN-lite is deliberately a bounded, search-time rescue rather than a
+	// construction-time graph expansion. It only applies to sparse filters
+	// that expose Selectivity below the threshold below.
+	acornLiteMaxSelectivity = 0.10
+	acornLiteMaxGroups      = 4
+	acornLiteMaxCandidates  = 128
+)
 
 func (s *searchScratch) nextVisitMark() uint32 {
 	s.visitMark++
@@ -633,6 +646,36 @@ func admitBatch4Reservoir(candidates *reservoirTopK, working *candidateMinHeap, 
 	admitCandidateReservoir(candidates, working, ids[3], d3)
 }
 
+// admitFilteredCandidate records a predicate-valid node in a result heap that
+// is independent from the routing beam. The routing beam still contains both
+// valid and invalid nodes, preserving HNSW connectivity; this heap only decides
+// which already-scored nodes may be returned.
+func (h *Index) admitFilteredCandidate(results *candidateMaxHeap, filter interface{ Test(idx uint64) bool }, ef int, id uint32, distance float32) {
+	if filter == nil || ef <= 0 {
+		return
+	}
+	node := h.nodes.Get(id)
+	if node == nil || !filter.Test(uint64(node.Ordinal)) {
+		return
+	}
+
+	candidate := util.Candidate{ID: id, Distance: distance}
+	if len(results.items) < ef {
+		results.PushCandidate(candidate)
+		return
+	}
+	if candidateBetter(candidate, results.Top()) {
+		results.ReplaceTop(candidate)
+	}
+}
+
+func (h *Index) admitFilteredBatch4(results *candidateMaxHeap, filter interface{ Test(idx uint64) bool }, ef int, ids []uint32, d0, d1, d2, d3 float32) {
+	h.admitFilteredCandidate(results, filter, ef, ids[0], d0)
+	h.admitFilteredCandidate(results, filter, ef, ids[1], d1)
+	h.admitFilteredCandidate(results, filter, ef, ids[2], d2)
+	h.admitFilteredCandidate(results, filter, ef, ids[3], d3)
+}
+
 func (h *Index) acquireSearchScratch() *searchScratch {
 	return h.acquireSearchScratchWithEF(0)
 }
@@ -641,11 +684,19 @@ func (h *Index) acquireSearchScratchWithEF(ef int) *searchScratch {
 	return h.acquireSearchScratchWithNodeCountAndEF(h.nodes.Len(), ef)
 }
 
+func (h *Index) acquireFilteredSearchScratchWithEF(ef int) *searchScratch {
+	return h.acquireSearchScratchWithNodeCountEFAndFilter(h.nodes.Len(), ef, true)
+}
+
 func (h *Index) acquireSearchScratchWithNodeCount(nodeCount int) *searchScratch {
 	return h.acquireSearchScratchWithNodeCountAndEF(nodeCount, 0)
 }
 
 func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *searchScratch {
+	return h.acquireSearchScratchWithNodeCountEFAndFilter(nodeCount, ef, false)
+}
+
+func (h *Index) acquireSearchScratchWithNodeCountEFAndFilter(nodeCount int, ef int, filtered bool) *searchScratch {
 	var scratch *searchScratch
 	for scratch == nil {
 		free := h.searchScratchFree.Load()
@@ -659,14 +710,14 @@ func (h *Index) acquireSearchScratchWithNodeCountAndEF(nodeCount int, ef int) *s
 			scratch = &h.searchScratches[slot]
 		}
 	}
-	h.prepareSearchScratch(scratch, nodeCount, ef)
+	h.prepareSearchScratch(scratch, nodeCount, ef, filtered)
 	if h.reclamation != nil {
 		h.reclamation.enter(scratch.slot)
 	}
 	return scratch
 }
 
-func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef int) {
+func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef int, filtered bool) {
 	maxCap, minCap := searchHeapCaps(nodeCount, ef)
 	soaCap := min(max(ef, 1), max(nodeCount, 1))
 	inFlightCap := inFlightSnapshotLimit
@@ -681,7 +732,15 @@ func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef i
 	// grows the result slice on the Go heap.
 	maxCap += inFlightCap
 	prefetchCap := max(128, linkArrayCapacity(h.config.M, 0)*2)
-	candidateBytes := uint64(maxCap+minCap) * uint64(unsafe.Sizeof(util.Candidate{}))
+	filteredCap := 0
+	if filtered {
+		filteredCap = min(max(ef, 1), max(nodeCount, 1))
+		// Keep the normal links+backlinks batch capacity, plus a bounded tail
+		// for ACORN-lite's second-hop IDs. Pure-vector scratch remains exactly
+		// the original size.
+		prefetchCap += min(acornLiteMaxCandidates, max(32, h.config.M*4))
+	}
+	candidateBytes := uint64(maxCap+minCap+filteredCap) * uint64(unsafe.Sizeof(util.Candidate{}))
 	if soaMode {
 		candidateBytes += uint64(soaCap) * uint64(unsafe.Sizeof(uint32(0))+unsafe.Sizeof(float32(0)))
 	}
@@ -742,6 +801,15 @@ func (h *Index) prepareSearchScratch(scratch *searchScratch, nodeCount int, ef i
 		panic("hnsw: arena maxHeapBuf: " + err.Error())
 	}
 	scratch.maxHeapBuf = maxHeap[:0]
+	if filteredCap > 0 {
+		filteredHeap, err := memory.ArenaSlice[util.Candidate](scratch.arena, filteredCap)
+		if err != nil {
+			panic("hnsw: arena filteredHeapBuf: " + err.Error())
+		}
+		scratch.filteredHeapBuf = filteredHeap[:0]
+	} else {
+		scratch.filteredHeapBuf = nil
+	}
 	inFlightBuf, err := memory.ArenaSlice[uint32](scratch.arena, inFlightCap)
 	if err != nil {
 		panic("hnsw: arena inFlightBuf: " + err.Error())
@@ -976,8 +1044,14 @@ func (h *Index) searchAndSelectForConstructionWithScratch(
 }
 
 func (h *Index) searchLevelWithOptions(ctx context.Context, query []float32, entryPoint *Node, ef int, level int, sortResults bool, queryState any, filter interface{ Test(idx uint64) bool }) ([]*util.Candidate, error) {
-	scratch := h.acquireSearchScratchWithEF(ef)
+	var scratch *searchScratch
+	if filter != nil {
+		scratch = h.acquireFilteredSearchScratchWithEF(ef)
+	} else {
+		scratch = h.acquireSearchScratchWithEF(ef)
+	}
 	defer h.releaseSearchScratch(scratch)
+	scratch.filteredTarget = ef
 
 	values, err := h.searchLevelValuesWithScratch(ctx, query, entryPoint, ef, level, sortResults, scratch, queryState, filter, true)
 	if err != nil {
@@ -1034,6 +1108,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	visitMark := scratch.nextVisitMark()
 	scratch.maxHeapBuf = scratch.maxHeapBuf[:0]
 	scratch.minHeapBuf = scratch.minHeapBuf[:0]
+	scratch.filteredHeapBuf = scratch.filteredHeapBuf[:0]
 	mode := candidateMode(h.candidateMode.Load())
 	soaMode := mode == candidateModeSOA
 	heapMode := mode == candidateModeHeap
@@ -1041,6 +1116,17 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	heapCandidates := candidateMaxHeap{items: scratch.maxHeapBuf}
 	unsortedCandidates := unsortedTopK{items: scratch.maxHeapBuf, maxSize: ef}
 	reservoirCandidates := reservoirTopK{items: scratch.maxHeapBuf, maxSize: ef}
+	filteredCandidates := candidateMaxHeap{items: scratch.filteredHeapBuf}
+	filteredSearch := isQuery && filter != nil
+	filteredTarget := min(max(scratch.filteredTarget, 1), ef)
+	filterSelectivity := 1.0
+	if selective, ok := filter.(interface{ Selectivity() float64 }); ok {
+		filterSelectivity = selective.Selectivity()
+	}
+	acornLite := filteredSearch && filterSelectivity > 0 && filterSelectivity <= acornLiteMaxSelectivity
+	acornCandidateLimit := min(acornLiteMaxCandidates, max(32, h.config.M*4))
+	scratch.acornGroups = 0
+	scratch.acornCandidates = 0
 	w := &candidateMinHeap{items: scratch.minHeapBuf}
 	soaCandidates := newSOACandidateQueue(scratch.soaIDs, scratch.soaDistances, min(ef, nodeCount))
 	useRawSIMDPtrL2 := h.config.Metric == util.L2Distance && h.quantizer == nil && h.provider == nil && simd.HasL2Batch8Ptr()
@@ -1054,7 +1140,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 
 	if isQuery && h.communities != nil {
 		communities := h.communities
-		
+
 		maxCommID := uint32(0)
 		for commID := range communities.Bounds {
 			if commID > maxCommID {
@@ -1062,12 +1148,12 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			}
 		}
 		neededCap := maxCommID + 1
-		
+
 		if uint32(cap(scratch.commLowerBounds)) < neededCap {
 			scratch.commLowerBounds = make([]commBound, neededCap)
 		}
 		scratch.commLowerBounds = scratch.commLowerBounds[:neededCap]
-		
+
 		scratch.commGen++
 		if scratch.commGen == 0 {
 			// rare overflow, reset all
@@ -1112,6 +1198,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 	}
 	if !soaMode {
 		w.PushCandidate(candidate)
+	}
+	if filteredSearch {
+		h.admitFilteredCandidate(&filteredCandidates, filter, ef, entryID, distance)
 	}
 	visited[entryID] = visitMark
 
@@ -1163,7 +1252,7 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 		if level < (currentNode.Level + 1) {
 			// Process neighbors in batches for better cache locality
 			neighbors := h.getNodeLinks(currentNode, level)
-			
+
 			var worstDist float32
 			var canPrune bool
 			if isQuery && h.communities != nil {
@@ -1193,93 +1282,109 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 			scratch.prefetchedIDs = scratch.prefetchedIDs[:0]
 			scratch.prefetchPtrs = scratch.prefetchPtrs[:0]
 			scratch.prefetchVecs = scratch.prefetchVecs[:0]
+			batchValid := 0
 
-			for _, neighborID := range neighbors {
-				if neighborID < uint32(len(visited)) && visited[neighborID] != visitMark && neighborID != SentinelNodeID {
-					visited[neighborID] = visitMark
-
-					if canPrune {
-						if commID := h.communities.NodeToComm[neighborID]; commID < uint32(len(scratch.commLowerBounds)) {
-							cb := scratch.commLowerBounds[commID]
-							if cb.gen == scratch.commGen && cb.bound > worstDist {
-								continue
-							}
-						}
-					}
-
-					node := h.nodes.Get(neighborID)
-					if node != nil {
-						if useRawSIMDPtrL2 {
-							ptr := node.VectorPtr
-							if ptr == nil {
-								continue
-							}
-							scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
-							scratch.prefetchPtrs = append(scratch.prefetchPtrs, ptr)
-							if n := len(scratch.prefetchPtrs); n&7 == 0 {
-								ptrs := (*[8]unsafe.Pointer)(unsafe.Pointer(&scratch.prefetchPtrs[n-8]))
-								simd.Prefetch8L1(ptrs)
-							}
-							continue
-						}
-						scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
-
-						// Raw float traversal owns direct vector views on Node.
-						// Quantized/provider nodes intentionally fall through to
-						// computeDistanceOptimized in the scoring pass.
-						vec := node.Vector
-						scratch.prefetchVecs = append(scratch.prefetchVecs, vec)
-						if len(vec) > 0 {
-							if useNEONBatchL2 {
-								simd.PrefetchL1(unsafe.Pointer(&vec[0]))
-							} else {
-								_ = vec[0]
-							}
+			enqueueNeighbor := func(neighborID uint32, applyCommunityPrune bool) bool {
+				if neighborID >= uint32(len(visited)) || neighborID == SentinelNodeID || visited[neighborID] == visitMark || len(scratch.prefetchedIDs) >= cap(scratch.prefetchedIDs) {
+					return false
+				}
+				if applyCommunityPrune && canPrune {
+					if commID := h.communities.NodeToComm[neighborID]; commID < uint32(len(scratch.commLowerBounds)) {
+						cb := scratch.commLowerBounds[commID]
+						if cb.gen == scratch.commGen && cb.bound > worstDist {
+							return false
 						}
 					}
 				}
-			}
-			backlinks := h.getNodeBacklinks(currentNode, level)
-			for _, neighborID := range backlinks {
-				if neighborID < uint32(len(visited)) && visited[neighborID] != visitMark && neighborID != SentinelNodeID {
+
+				node := h.nodes.Get(neighborID)
+				if node == nil {
+					return false
+				}
+				isValid := filteredSearch && filter.Test(uint64(node.Ordinal))
+				if useRawSIMDPtrL2 {
+					ptr := node.VectorPtr
+					if ptr == nil {
+						return false
+					}
 					visited[neighborID] = visitMark
+					scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
+					scratch.prefetchPtrs = append(scratch.prefetchPtrs, ptr)
+					if n := len(scratch.prefetchPtrs); n&7 == 0 {
+						ptrs := (*[8]unsafe.Pointer)(unsafe.Pointer(&scratch.prefetchPtrs[n-8]))
+						simd.Prefetch8L1(ptrs)
+					}
+					if isValid {
+						batchValid++
+					}
+					return true
+				}
 
-					if canPrune {
-						if commID := h.communities.NodeToComm[neighborID]; commID < uint32(len(scratch.commLowerBounds)) {
-							cb := scratch.commLowerBounds[commID]
-							if cb.gen == scratch.commGen && cb.bound > worstDist {
-								continue
-							}
+				visited[neighborID] = visitMark
+				scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
+				// Raw float traversal owns direct vector views on Node.
+				// Quantized/provider nodes intentionally fall through to
+				// computeDistanceOptimized in the scoring pass.
+				vec := node.Vector
+				scratch.prefetchVecs = append(scratch.prefetchVecs, vec)
+				if len(vec) > 0 {
+					if useNEONBatchL2 {
+						simd.PrefetchL1(unsafe.Pointer(&vec[0]))
+					} else {
+						_ = vec[0]
+					}
+				}
+				if isValid {
+					batchValid++
+				}
+				return true
+			}
+
+			expandRejected := func(bridgeID uint32) {
+				if !acornLite || len(filteredCandidates.items)+batchValid >= filteredTarget || scratch.acornGroups >= acornLiteMaxGroups || scratch.acornCandidates >= acornCandidateLimit {
+					return
+				}
+				bridge := h.nodes.Get(bridgeID)
+				if bridge == nil || filter.Test(uint64(bridge.Ordinal)) {
+					return
+				}
+				scratch.acornGroups++
+				expandList := func(expandedIDs []uint32) bool {
+					for _, expandedID := range expandedIDs {
+						if scratch.acornCandidates >= acornCandidateLimit || len(scratch.prefetchedIDs) >= cap(scratch.prefetchedIDs) {
+							return true
+						}
+						if enqueueNeighbor(expandedID, false) {
+							scratch.acornCandidates++
 						}
 					}
+					return false
+				}
+				if expandList(h.getNodeLinks(bridge, level)) {
+					return
+				}
+				_ = expandList(h.getNodeBacklinks(bridge, level))
+			}
 
-					node := h.nodes.Get(neighborID)
-					if node != nil {
-						if useRawSIMDPtrL2 {
-							ptr := node.VectorPtr
-							if ptr == nil {
-								continue
-							}
-							scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
-							scratch.prefetchPtrs = append(scratch.prefetchPtrs, ptr)
-							if n := len(scratch.prefetchPtrs); n&7 == 0 {
-								ptrs := (*[8]unsafe.Pointer)(unsafe.Pointer(&scratch.prefetchPtrs[n-8]))
-								simd.Prefetch8L1(ptrs)
-							}
-							continue
-						}
-						scratch.prefetchedIDs = append(scratch.prefetchedIDs, neighborID)
-
-						vec := node.Vector
-						scratch.prefetchVecs = append(scratch.prefetchVecs, vec)
-						if len(vec) > 0 {
-							if useNEONBatchL2 {
-								simd.PrefetchL1(unsafe.Pointer(&vec[0]))
-							} else {
-								_ = vec[0]
-							}
-						}
+			processNeighborList := func(neighborIDs []uint32) {
+				for _, neighborID := range neighborIDs {
+					if neighborID >= uint32(len(visited)) || neighborID == SentinelNodeID || visited[neighborID] == visitMark {
+						continue
 					}
+					if enqueueNeighbor(neighborID, true) {
+						expandRejected(neighborID)
+					}
+				}
+			}
+			if acornLite {
+				processNeighborList(neighbors)
+				processNeighborList(h.getNodeBacklinks(currentNode, level))
+			} else {
+				for _, neighborID := range neighbors {
+					enqueueNeighbor(neighborID, true)
+				}
+				for _, neighborID := range h.getNodeBacklinks(currentNode, level) {
+					enqueueNeighbor(neighborID, true)
 				}
 			}
 			if useRawSIMDPtrL2 {
@@ -1300,6 +1405,10 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							scratch.prefetchPtrs[i+7],
 						)
 						batchIDs := scratch.prefetchedIDs[i : i+8]
+						if filteredSearch {
+							h.admitFilteredBatch4(&filteredCandidates, filter, ef, batchIDs[:4], d0, d1, d2, d3)
+							h.admitFilteredBatch4(&filteredCandidates, filter, ef, batchIDs[4:], d4, d5, d6, d7)
+						}
 						if soaMode {
 							admitBatch4SOA(&soaCandidates, batchIDs[:4], d0, d1, d2, d3)
 							admitBatch4SOA(&soaCandidates, batchIDs[4:], d4, d5, d6, d7)
@@ -1325,6 +1434,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							scratch.prefetchPtrs[i+3],
 						)
 						batchIDs := scratch.prefetchedIDs[i : i+4]
+						if filteredSearch {
+							h.admitFilteredBatch4(&filteredCandidates, filter, ef, batchIDs, d0, d1, d2, d3)
+						}
 						if soaMode {
 							admitBatch4SOA(&soaCandidates, batchIDs, d0, d1, d2, d3)
 						} else if heapMode {
@@ -1340,6 +1452,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 					neighborID := scratch.prefetchedIDs[i]
 					vec := unsafe.Slice((*float32)(scratch.prefetchPtrs[i]), len(query))
 					neighborDistance := h.distance(query, vec)
+					if filteredSearch {
+						h.admitFilteredCandidate(&filteredCandidates, filter, ef, neighborID, neighborDistance)
+					}
 					if soaMode {
 						soaCandidates.Insert(util.Candidate{ID: neighborID, Distance: neighborDistance})
 					} else if heapMode {
@@ -1368,6 +1483,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 							d0, d1, d2, d3 = simd.L2Distance4AVX2(query, v0, v1, v2, v3)
 						}
 						batchIDs := scratch.prefetchedIDs[i : i+4]
+						if filteredSearch {
+							h.admitFilteredBatch4(&filteredCandidates, filter, ef, batchIDs, d0, d1, d2, d3)
+						}
 						if soaMode {
 							admitBatch4SOA(&soaCandidates, batchIDs, d0, d1, d2, d3)
 						} else if heapMode {
@@ -1401,6 +1519,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 						return nil, err
 					}
 				}
+				if filteredSearch {
+					h.admitFilteredCandidate(&filteredCandidates, filter, ef, neighborID, neighborDistance)
+				}
 
 				if soaMode {
 					soaCandidates.Insert(util.Candidate{ID: neighborID, Distance: neighborDistance})
@@ -1414,6 +1535,9 @@ func (h *Index) searchLevelScratchValues(ctx context.Context, query []float32, e
 				i++
 			}
 		}
+	}
+	if filteredSearch {
+		return filteredCandidates.items, nil
 	}
 	if soaMode {
 		return soaCandidates.AppendCandidates(scratch.maxHeapBuf[:0]), nil
@@ -1437,7 +1561,7 @@ func (h *Index) normalizeQuantizedDistance(distance float32) float32 {
 // computeDistanceOptimized provides optimized distance computation with error handling
 func (h *Index) computeDistanceOptimized(query []float32, node *Node, queryState any) (float32, error) {
 	h.distanceToQuery.Add(1)
-	
+
 	if node == nil {
 		return -1, fmt.Errorf("node is nil")
 	}

@@ -3,6 +3,8 @@ package btree
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -91,6 +93,42 @@ func TestCursor_IterateAll(t *testing.T) {
 	}
 	if count != N {
 		t.Fatalf("iterated %d keys, want %d", count, N)
+	}
+}
+
+func TestCursor_IterateAllVariableLengthKeys(t *testing.T) {
+	tree, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tree.Close()
+
+	const want = 500
+	keys := make([]string, 0, want)
+	for i := 0; i < want; i++ {
+		keys = append(keys, fmt.Sprintf("city-%d-%s", i, strings.Repeat("x", i%17)))
+	}
+	rand.New(rand.NewSource(42)).Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+	for _, key := range keys {
+		if err := tree.Insert(context.Background(), []byte(key), []byte("value")); err != nil {
+			t.Fatalf("insert %q: %v", key, err)
+		}
+	}
+
+	cursor := tree.SeekFirst()
+	count := 0
+	var previous string
+	for cursor.Valid() {
+		key := string(cursor.Key())
+		if previous != "" && key <= previous {
+			t.Fatalf("key order violation at %d: %q <= %q", count, key, previous)
+		}
+		previous = key
+		count++
+		cursor.Next()
+	}
+	if count != want {
+		t.Fatalf("iterated %d keys, want %d", count, want)
 	}
 }
 
