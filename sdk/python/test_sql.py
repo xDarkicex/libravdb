@@ -40,6 +40,34 @@ def main():
     res = db.query_with_params("SELECT id, name FROM users ORDER BY VECTOR_DISTANCE(embedding, $vec) ASC LIMIT 2", {"vec": [1.0, 0.0, 0.0]})
     print(f"Vector Result: {res}")
 
+    # 2b. Parameterized JSONB upsert. Structured SDK values travel through
+    # the same shared DatabaseQueryWithParams path as vectors and graph IDs.
+    print("\n--- JSONB upsert SQL ---")
+    db.query("CREATE TABLE people (id STRING PRIMARY KEY, metadata JSONB, vector VECTOR(3))")
+    profile = {
+        "name": "Ada Lovelace",
+        "roles": ["admin", "owner"],
+        "settings": {"alerts": True},
+    }
+    db.query_with_params(
+        """INSERT INTO people (id, metadata, vector)
+           VALUES ($1, $2::jsonb, $3)
+           ON CONFLICT (id) DO UPDATE SET
+             metadata = EXCLUDED.metadata,
+             vector = EXCLUDED.vector""",
+        {"1": "p1", "2": profile, "3": [0.0, 1.0, 0.0]},
+    )
+    updated = dict(profile)
+    updated["name"] = "Ada Lovelace Byron"
+    db.query_with_params(
+        """INSERT INTO people (id, metadata, vector)
+           VALUES ($1, $2::jsonb, $3)
+           ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata""",
+        {"1": "p1", "2": updated, "3": [1.0, 0.0, 0.0]},
+    )
+    res = db.query("SELECT metadata->>'name' AS name FROM people WHERE id = 'p1'")
+    assert res["results"][0]["metadata"]["name"] == "Ada Lovelace Byron", res
+
     # 3. Graph
     print("\n--- Graph SQL ---")
     db.query_with_params("INSERT INTO GRAPH_EDGES VALUES ($1, $2, $3)", {"1": "u1", "2": "FOLLOWS", "3": "u2"})

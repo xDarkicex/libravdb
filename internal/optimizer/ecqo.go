@@ -2776,6 +2776,20 @@ func (o *Optimizer) lowerDMLLiteral(doc *parser.QueryDoc, src []byte, ref parser
 			return nil, true, true
 		}
 		return raw, false, true
+	case parser.NodeKindCastExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.CastExprs) {
+			return nil, false, false
+		}
+		cast := doc.CastExprs[ref.ID]
+		typeName := strings.ToLower(strings.TrimSpace(string(src[cast.TypeStart:cast.TypeEnd])))
+		if typeName != "json" && typeName != "jsonb" {
+			return nil, false, false
+		}
+		// The physical DML path stores metadata values as ordinary Go values
+		// and lets Collection.validateJSONFields decode/canonicalize them. A
+		// JSON cast therefore only needs to preserve the bound document bytes;
+		// it must not be mistaken for an unsupported expression.
+		return o.lowerDMLLiteral(doc, src, cast.Expr)
 	default:
 		return nil, false, false
 	}

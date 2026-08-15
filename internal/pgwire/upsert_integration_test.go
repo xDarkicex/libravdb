@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"math"
 	"net"
 	"testing"
@@ -69,6 +70,49 @@ func TestPGWireSQLUpsert(t *testing.T) {
 	}
 	if counterValue != 246 {
 		t.Fatalf("counter value=%d, want 246", counterValue)
+	}
+}
+
+func TestPGWireParameterizedJSONBUpsert(t *testing.T) {
+	ctx := context.Background()
+	db, err := libravdb.Open(libravdb.WithStoragePath(t.TempDir()+"/pgwire_json_upsert"), libravdb.WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := startTestServer(t, db)
+	host, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := sql.Open("pgx", "postgres://test:test@"+net.JoinHostPort(host, port)+"/test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, "CREATE TABLE people (id TEXT PRIMARY KEY, metadata JSONB, vector VECTOR(3))"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	const upsert = `INSERT INTO people (id, metadata, vector)
+VALUES ($1, $2::jsonb, $3)
+ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata, vector = EXCLUDED.vector`
+	first := json.RawMessage(`{"name":"Ada","roles":["admin"]}`)
+	if _, err := sqlDB.ExecContext(ctx, upsert, "p1", first, "[1,0,0]"); err != nil {
+		t.Fatalf("JSONB insert: %v", err)
+	}
+	second := json.RawMessage(`{"name":"Ada Lovelace","roles":["admin","owner"]}`)
+	if _, err := sqlDB.ExecContext(ctx, upsert, "p1", second, "[0,1,0]"); err != nil {
+		t.Fatalf("JSONB update: %v", err)
+	}
+	var metadata string
+	if err := sqlDB.QueryRowContext(ctx, "SELECT metadata->>'name' FROM people WHERE id = 'p1'").Scan(&metadata); err != nil {
+		t.Fatalf("read JSONB: %v", err)
+	}
+	if metadata != "Ada Lovelace" {
+		t.Fatalf("metadata name=%q", metadata)
 	}
 }
 

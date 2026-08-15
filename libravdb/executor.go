@@ -2,6 +2,7 @@ package libravdb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -3374,6 +3375,14 @@ func conflictColumnValue(id string, metadata map[string]interface{}, column stri
 		if strings.EqualFold(name, column) {
 			if value == nil {
 				return "", false
+			}
+			switch value.(type) {
+			case map[string]interface{}, map[string]string, []interface{}, []string, []bool,
+				[]int, []int8, []int16, []int32, []int64, []uint, []uint8, []uint16,
+				[]uint32, []uint64, []float32, []float64:
+				if encoded, err := json.Marshal(value); err == nil {
+					return string(encoded), true
+				}
 			}
 			return recordMetaToString(value), true
 		}

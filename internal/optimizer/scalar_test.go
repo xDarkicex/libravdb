@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/xDarkicex/lexer"
@@ -37,6 +38,29 @@ func TestScalarNullIsNotTextNULL(t *testing.T) {
 	}
 	if value := ScalarFromLiteralBytes([]byte("NULL")); !value.IsNull() {
 		t.Fatalf("NULL literal kind = %v, want ScalarNull", value.Kind)
+	}
+}
+
+func TestScalarFromInterfacePreservesJSONAndVectors(t *testing.T) {
+	jsonValue := ScalarFromInterface(map[string]interface{}{
+		"name":   "Ada",
+		"nested": map[string]interface{}{"ok": true},
+		"items":  []interface{}{1, "two"},
+	})
+	if jsonValue.Kind != ScalarJSON {
+		t.Fatalf("JSON parameter kind = %v, want ScalarJSON", jsonValue.Kind)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(jsonValue.Bytes(), &decoded); err != nil {
+		t.Fatalf("JSON parameter bytes are invalid: %v", err)
+	}
+	if decoded["name"] != "Ada" {
+		t.Fatalf("decoded JSON = %#v", decoded)
+	}
+
+	vector := ScalarFromInterface([]float32{1, 2, 3})
+	if vector.Kind != ScalarVector || len(vector.Vector) != 3 {
+		t.Fatalf("vector parameter changed kind=%v value=%#v", vector.Kind, vector)
 	}
 }
 

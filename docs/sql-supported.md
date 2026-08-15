@@ -48,6 +48,45 @@ LIMIT $2;
 Parameters remain typed values. LibraVDB does not implement parameter binding
 by interpolating values into SQL text.
 
+### Parameterized JSONB and upserts
+
+Decoded JSON objects may be passed directly as a bound parameter. Use an
+explicit `::json` or `::jsonb` cast at the SQL boundary so the parameter has
+the document type expected by the statement:
+
+```go
+profile := map[string]interface{}{
+    "name": "Ada Lovelace",
+    "roles": []interface{}{"admin", "owner"},
+    "settings": map[string]interface{}{"alerts": true},
+}
+
+_, err := db.QueryWithParams(ctx, `
+    INSERT INTO people (id, metadata, vector)
+    VALUES ($1, $2::jsonb, $3)
+    ON CONFLICT (id) DO UPDATE SET
+        metadata = EXCLUDED.metadata,
+        vector = EXCLUDED.vector`, libravdb.QueryParams{
+    "1": "person-1",
+    "2": profile,
+    "3": []float32{0.1, 0.2, 0.3},
+})
+```
+
+The same SQL and parameter contract is available through every SDK that uses
+the shared `DatabaseQueryWithParams` binding. Python dictionaries, Rust JSON
+values, Java maps, and equivalent structured values are serialized by the SDK
+binding and decoded once at the common Go boundary. JSON documents remain
+JSON values through `INSERT`, `EXCLUDED`, `ON CONFLICT DO UPDATE`,
+`RETURNING`, WAL recovery, and reopen. Top-level numeric arrays retain their
+existing vector meaning; pass a top-level JSON array as JSON text (for
+example, a JSON string or `json.RawMessage`) together with `::jsonb`.
+
+`ON CONFLICT DO NOTHING`, conflict predicates, and expressions over
+`EXCLUDED` values use the same typed path. This is the recommended way for an
+SDK application to replace a native collection upsert when its record has
+nested JSON metadata.
+
 ## Client compatibility
 
 The following client paths are part of the supported wire surface for the SQL

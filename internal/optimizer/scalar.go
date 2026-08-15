@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -23,6 +24,10 @@ const (
 	ScalarVector
 	ScalarBytes
 	ScalarTimestamp
+	// ScalarJSON carries a JSON document supplied as a bound parameter. It is
+	// distinct from ScalarString so callers can pass decoded maps without
+	// first serializing them into SQL text.
+	ScalarJSON
 )
 
 // ScalarValue is the typed value used by optimizer predicates. Bytes is kept
@@ -135,6 +140,10 @@ func VectorValue(v []float32) ScalarValue {
 	return ScalarValue{Kind: ScalarVector, Vector: append([]float32(nil), v...)}
 }
 
+func JSONValue(v []byte) ScalarValue {
+	return ScalarValue{Kind: ScalarJSON, BytesData: append([]byte(nil), v...)}
+}
+
 // ScalarFromInterface converts a native query parameter or metadata value to
 // a typed scalar without going through SQL text.
 func ScalarFromInterface(v interface{}) ScalarValue {
@@ -180,6 +189,18 @@ func ScalarFromInterface(v interface{}) ScalarValue {
 		return VectorValue(x)
 	case time.Time:
 		return ScalarValue{Kind: ScalarTimestamp, Time: x}
+	case json.RawMessage:
+		return JSONValue(x)
+	case map[string]interface{}, map[string]string, []interface{}, []string, []bool,
+		[]int, []int8, []int16, []int32, []int64, []uint, []uint16,
+		[]uint32, []uint64, []float64:
+		// SDKs deserialize nested JSON objects into map[string]interface{} and
+		// arrays into []interface{}. Keep the document opaque at the optimizer
+		// boundary; JSON/JSONB casts and the collection validator decode it into
+		// LibraVDB's canonical JSON tree later.
+		if encoded, err := json.Marshal(x); err == nil {
+			return JSONValue(encoded)
+		}
 	}
 	return ScalarValue{}
 }
@@ -216,7 +237,7 @@ func (v ScalarValue) Bytes() []byte {
 	switch v.Kind {
 	case ScalarNull, ScalarInvalid:
 		return nil
-	case ScalarString:
+	case ScalarString, ScalarJSON:
 		return append([]byte(nil), v.BytesData...)
 	case ScalarInt:
 		return []byte(strconv.FormatInt(v.Int, 10))
@@ -253,7 +274,7 @@ func CompareScalar(actual interface{}, expected ScalarValue) (cmp int, actualNul
 	if expected.Kind == ScalarNull || expected.Kind == ScalarInvalid {
 		return 0, false, nil
 	}
-	if expected.Kind == ScalarString || expected.Kind == ScalarBytes {
+	if expected.Kind == ScalarString || expected.Kind == ScalarBytes || expected.Kind == ScalarJSON {
 		right := expected.BytesData
 		return compareValueBytes(actual, right), false, nil
 	}

@@ -2552,6 +2552,11 @@ func virtualScalarInterface(value optimizer.ScalarValue) interface{} {
 		return nil
 	case optimizer.ScalarString, optimizer.ScalarBytes:
 		return string(value.BytesData)
+	case optimizer.ScalarJSON:
+		if decoded, ok := decodeJSONValue(value.BytesData); ok {
+			return decoded
+		}
+		return string(value.BytesData)
 	case optimizer.ScalarInt:
 		return value.Int
 	case optimizer.ScalarFloat:
