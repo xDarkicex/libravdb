@@ -68,6 +68,14 @@ This matrix demonstrates compatibility for the listed operations. It is not a
 claim that LibraVDB implements every PostgreSQL extension, system catalog, or
 driver-specific feature.
 
+The tested protocol behaviors include repeated prepared execution after schema
+changes, batched `executemany`/pipeline writes, suspended portals for bounded
+cursor fetches, connection-pool reset, nested savepoints, binary JSONB/vector
+values, and typed `Describe` metadata. SQLAlchemy relationship reflection and
+eager loading, Alembic migration comparison and execution, GORM schema
+discovery/`AutoMigrate`, and Django migration/`inspectdb` flows are supported
+for the catalog and SQL operations listed in this page.
+
 ## Data definition language
 
 ### Tables and column types
@@ -104,6 +112,10 @@ CREATE TABLE documents (
 `CREATE TABLE` also supports multiline statements, quoted identifiers, inline
 and table-level constraints, named constraints, and the identity/serial forms
 used by common PostgreSQL ORMs.
+
+Column defaults use supported literal values and are applied on insert before
+`NOT NULL`, `CHECK`, foreign-key, and uniqueness validation. Arbitrary
+expression defaults are not part of the current contract.
 
 ### Constraints
 
@@ -288,6 +300,28 @@ WHERE category = 'archived';
 
 The source query is evaluated before the target writes are applied.
 
+### SQL prepared statements
+
+SQL-level prepared statements are connection-local and are separate from the
+wire protocol's `Parse`/`Bind`/`Execute` messages. They are supported by the
+native SQL session and pgwire paths:
+
+```sql
+PREPARE bump AS
+    INSERT INTO prepared_rows (id, value)
+    VALUES ($1, $2)
+    ON CONFLICT (id) DO UPDATE
+    SET value = prepared_rows.value + EXCLUDED.value;
+
+EXECUTE bump('p1', 4);
+DEALLOCATE bump;
+```
+
+`DEALLOCATE ALL` clears SQL-level prepared statements and connection-local
+portals. Extended-protocol prepared statements support typed parameters,
+statement reuse, `Describe`, and portal execution independently of this SQL
+syntax.
+
 ### `COPY` over PostgreSQL wire
 
 The pgwire server supports `COPY FROM STDIN` and `COPY TO STDOUT` for supported
@@ -343,6 +377,18 @@ WHERE category IN ('graph', 'vector')
 ORDER BY id;
 ```
 
+The same predicates and pagination clauses accept typed parameters:
+
+```sql
+SELECT id
+FROM documents
+WHERE category IN ($category_a, $category_b)
+  AND score BETWEEN $minimum_score AND $maximum_score
+ORDER BY id
+OFFSET $skip
+LIMIT $take;
+```
+
 `LIKE` is case-sensitive. `ILIKE` uses the supported case-folded comparison.
 SQL `NULL` is distinct from empty strings, JSON literal `null`, and zero
 values.
@@ -366,7 +412,10 @@ ORDER BY a.id, d.id;
 
 Unmatched sides of outer joins are returned as SQL `NULL`. Derived relations
 may be used as join sources where their correlation and join direction are
-supported.
+supported. Correlated `RIGHT JOIN` and `FULL JOIN` against a derived relation
+are rejected because their unmatched-side semantics require a stable
+right-side relation; use `INNER`, `LEFT`, or `CROSS JOIN` for those correlated
+forms.
 
 ### DISTINCT and set operations
 
@@ -435,6 +484,13 @@ WHERE category = 'graph';
 Ordered-set aggregates `PERCENTILE_CONT`, `PERCENTILE_DISC`, and `MODE` are
 supported with `WITHIN GROUP (ORDER BY ...)` for scalar and grouped queries.
 
+```sql
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY score) AS p50,
+       PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY score) AS median_value,
+       MODE() WITHIN GROUP (ORDER BY category) AS most_common_category
+FROM documents;
+```
+
 ### Window functions
 
 The following ranking and offset window functions are supported:
@@ -445,7 +501,8 @@ The following ranking and offset window functions are supported:
 Aggregate windows support `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. Windows may
 use multiple `PARTITION BY` and `ORDER BY` expressions, `ASC`/`DESC`, explicit
 `NULLS FIRST`/`NULLS LAST`, named `WINDOW` definitions, and supported `ROWS` or
-`RANGE` frames.
+`RANGE` frames. `RANGE` offsets are supported for one numeric ordering
+expression; multi-key or nonnumeric offset frames are rejected explicitly.
 
 ```sql
 SELECT id,
@@ -461,6 +518,19 @@ SELECT id,
        ) AS previous_score
 FROM documents
 ORDER BY id;
+```
+
+Window expressions may also be evaluated over grouped aggregate results:
+
+```sql
+SELECT category,
+       COUNT(*) AS document_count,
+       ROW_NUMBER() OVER (
+           ORDER BY COUNT(*) DESC, category ASC
+       ) AS category_rank
+FROM documents
+GROUP BY category
+ORDER BY category;
 ```
 
 Ordered-set aggregates are not currently ordinary window functions; use them
@@ -612,6 +682,41 @@ LIMIT 10;
 `GRAPH_CENTRALITY` may be included as a third ranking signal for graph-backed
 collections.
 
+## Multimodal query composition
+
+Relational predicates can select graph anchors before traversal, and the
+result can be ranked by vector distance, lexical relevance, or graph
+centrality in one query:
+
+```sql
+SELECT d.title,
+       VECTOR_DISTANCE(d.embedding, $query_vector) AS distance
+FROM documents AS d
+JOIN authors AS a ON a.id = d.author_id
+JOIN MATCH (d)-[:RELATES]->(target)
+WHERE a.name = $author
+ORDER BY distance, d.id
+LIMIT 10;
+```
+
+The same query can use a unified reciprocal-rank score:
+
+```sql
+SELECT d.id,
+       RRF(
+           VECTOR_DISTANCE(d.embedding, $query_vector),
+           FTS_RANK(d.content, $text_query),
+           GRAPH_CENTRALITY(d)
+       ) AS unified_relevance
+FROM documents AS d
+WHERE MATCH (d)<-[:CITES]-(reference)
+ORDER BY unified_relevance DESC
+LIMIT 10;
+```
+
+Temporal forms of these queries use the same resolved snapshot for the
+relational row, vector value, and graph adjacency.
+
 ## Full-text search
 
 The supported full-text subset includes `to_tsvector`, `to_tsquery`,
@@ -654,6 +759,10 @@ WHERE payload @> '{"roles":["admin"]}'::jsonb;
 SELECT id
 FROM documents
 WHERE payload ? 'profile';
+
+SELECT id
+FROM documents
+WHERE payload ?| ARRAY['profile', 'missing'];
 ```
 
 The supported operators include `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`,
@@ -665,6 +774,11 @@ SELECT payload->'roles'->>0 AS first_role
 FROM documents
 WHERE payload#>>$path = $value;
 ```
+
+JSONPath supports root/member paths, array wildcards and indices, recursive
+descent, strict/lax prefixes, scalar comparisons, and filter expressions such
+as `? (@.active == true)`. `@?` preserves error-suppressing existence
+behavior; strict `@@` evaluation reports missing-path errors.
 
 ### JSON functions
 
@@ -686,6 +800,21 @@ SELECT role
 FROM documents AS d
 CROSS JOIN jsonb_array_elements_text(d.payload->'roles') AS role;
 ```
+
+JSONB containment and key predicates may use LibraVDB's rebuildable derived
+postings for candidate reduction:
+
+```sql
+SELECT id
+FROM documents
+WHERE payload @> '{"profile":{"active":true}}';
+```
+
+The JSON evaluator remains the final correctness check. The postings are
+reconstructed from authoritative row data after reopen or schema changes and
+are visible to ordinary current-state queries; epoch overlays use their
+visible relation image. This is not a claim of a PostgreSQL-compatible on-disk
+GIN posting-file format.
 
 JSON literal `null` is distinct from SQL `NULL`. A JSON field containing
 `null` remains discoverable by JSON operators and is returned as JSON text,
@@ -777,7 +906,10 @@ WHERE MATCH (source)-[
 Property comparisons support equality and inequality operators, numeric and
 text values, parameters, and boolean `AND`/`OR` combinations. Missing fields
 and JSON `null` follow SQL NULL comparison behavior. The property envelope is
-not a sidecar store.
+not a sidecar store. The registered relationship kind is available as
+`edge.type`/`edge.kind`, and the durable numeric edge weight is available as
+`edge.weight`; kind fields support equality and inequality comparisons.
+Comma-separated entries in the compact property block are conjoined as `AND`.
 
 The traditional edge fields remain available:
 
@@ -818,6 +950,25 @@ FROM GRAPH_NODES
 WHERE collection = 'users';
 ```
 
+Relational tables may reference `GRAPH_NODES` and participate in the same
+atomic cascade path as ordinary foreign keys. Numeric graph IDs and logical
+text/UUID record IDs are supported by the graph identity resolver:
+
+```sql
+CREATE TABLE graph_refs (
+    id       TEXT PRIMARY KEY,
+    graph_id BIGINT REFERENCES GRAPH_NODES(id) ON DELETE CASCADE
+);
+
+CREATE TABLE text_graph_refs (
+    id TEXT PRIMARY KEY REFERENCES GRAPH_NODES(id) ON DELETE CASCADE
+);
+```
+
+Deleting the parent record removes dependent rows and the corresponding graph
+identity atomically. The same behavior is visible through native SQL, epoch
+overlays, and pgwire.
+
 `GRAPH_CENTRALITY` can be used in a score expression:
 
 ```sql
@@ -833,6 +984,20 @@ LIMIT 10;
 `COMPUTE LEIDEN` is supported as a statement and as a CTE relation:
 
 ```sql
+BEGIN EPOCH TRANSACTION;
+
+COMPUTE LEIDEN FROM MATCH
+    (seed:Document)-[:RELATES*1..3]->(target)
+OPTIONS (resolution = 1.0, iterations = 2, max_vertices = 10000);
+
+ROLLBACK;
+```
+
+The standalone form runs in an epoch SQL session and returns the typed Leiden
+relation, including node and community identifiers plus diagnostics. The CTE
+form can be joined to relational rows:
+
+```sql
 WITH communities AS (
     COMPUTE LEIDEN FROM MATCH
         (seed:Document)-[:RELATES*1..3]->(target)
@@ -842,6 +1007,9 @@ SELECT d.id, c.community_id
 FROM documents AS d
 JOIN communities AS c ON c.node_id = d.graph_id;
 ```
+
+Leiden options include resolution, iteration/pass limits, and a vertex bound;
+conflicting options are rejected with a validation error.
 
 ## Graph and `SELECT` subqueries
 
@@ -874,7 +1042,7 @@ when those sources are combined:
 ```sql
 SELECT d.title,
        d.embedding <-> $query_vector AS distance
-FROM documents AS OF TIMESTAMP $snapshot AS d
+FROM documents AS OF TIMESTAMP $snapshot d
 WHERE MATCH (d)-[:RELATES]->(target)
 ORDER BY distance
 LIMIT 10;
@@ -910,6 +1078,9 @@ version has a SQL NULL `version_end`.
 Epoch transactions provide atomic record, vector, and graph mutations. The
 transaction-local view includes staged writes, while other sessions continue
 to see the committed state until commit.
+
+`BEGIN` and `START TRANSACTION` are accepted as PostgreSQL-compatible aliases
+for the same session transaction branch as `BEGIN EPOCH TRANSACTION`.
 
 ```sql
 BEGIN EPOCH TRANSACTION;
@@ -954,11 +1125,38 @@ SET statement_timeout = '5s';
 SET max_recursion_depth = 100;
 RESET statement_timeout;
 RESET max_recursion_depth;
+RESET ALL;
+DISCARD ALL;
 ```
 
 `statement_timeout` can shorten the server safety timeout. `max_recursion_depth`
 limits recursive CTE evaluation. `SET LOCAL` is not supported until
 transaction-local setting restoration is implemented.
+
+## PostgreSQL session compatibility
+
+The pgwire session exposes the startup values and compatibility queries issued
+by PostgreSQL drivers and ORM dialects:
+
+```sql
+SHOW server_version;
+SHOW client_encoding;
+SHOW integer_datetimes;
+SHOW standard_conforming_strings;
+SHOW timezone;
+
+SELECT current_schema();
+SELECT current_database();
+SELECT version();
+SELECT current_setting('jit') AS current_jit,
+       set_config('jit', 'off', false) AS new_jit;
+SELECT set_config('TimeZone', 'UTC', false);
+```
+
+`set_config` is connection-local and returns the applied value. It does not
+write a row, catalog entry, WAL record, or epoch mutation. The `local` form
+(`set_config(..., true)`) is rejected until transaction-local setting
+restoration is implemented.
 
 ## PostgreSQL catalog compatibility
 
@@ -977,6 +1175,7 @@ reflection paths:
 | `pg_catalog.pg_attrdef` | Default-expression reflection |
 | `pg_catalog.pg_proc` | Function lookup required by compatible clients |
 | `pg_catalog.pg_range` | Range/type startup probes |
+| `pg_catalog.pg_collation`, `pg_catalog.pg_description` | ORM comment and collation reflection projections |
 | `pg_catalog.pg_indexes` | Index view used by ORM inspection |
 | `information_schema` relations | Table, column, constraint, and schema inspection |
 
@@ -984,6 +1183,12 @@ Catalog rows are derived from live collection and SQL metadata. They are not a
 second storage engine and do not require separate user-data WAL or epoch state.
 Catalog definitions, collection metadata schemas, and indexed-field
 declarations are persisted and restored with the collection configuration.
+
+The type projection includes the standard OIDs used by the supported clients,
+including `bool` (16), `int8` (20), `text` (25), `json` (114), `jsonb` (3802),
+`uuid` (2950), and PostgreSQL float-array results such as `_float4` (1021).
+Result descriptions use these types for ordinary columns, expressions,
+aggregates, empty result sets, and prepared statements.
 
 ## PostgreSQL wire protocol
 
@@ -1007,6 +1212,9 @@ The documented wire path includes:
 - Simple and extended query protocol messages.
 - Parse, bind, describe, execute, sync, prepared statements, named portals,
   portal suspension, and statement reuse.
+- Positional `$1` parameters are the PostgreSQL wire convention; the
+  compatibility layer also recognizes named `$name` and `@name` markers and
+  maps them to the protocol's encounter-order parameter slots.
 - Text and supported binary parameter/result encodings.
 - PostgreSQL NULL encoding and typed result metadata.
 - Transactions, epoch aliases, savepoints, and connection-local settings.
@@ -1015,6 +1223,47 @@ The documented wire path includes:
 Driver compatibility depends on the SQL and type features used by the client.
 The wire server should not be treated as a complete PostgreSQL server
 implementation.
+
+## Literal and identifier syntax
+
+The lexer and parser support SQL comments, quoted identifiers, escaped string
+literals, scientific numeric notation, and the operators used by the SQL
+surface:
+
+```sql
+-- Line comments and /* block comments */ are ignored.
+INSERT INTO "order" ("key", "value", "select")
+VALUES ('a''b', 1.0e+2, E'line\\ntext');
+
+SELECT "select", value << 1 AS shifted
+FROM "order"
+WHERE "key" <> 'missing';
+```
+
+`1e0`, `1.0e+0`, and equivalent uppercase forms are parsed as numeric
+literals. Malformed scientific notation such as `1e` is rejected rather than
+being split into an integer and an identifier. Reserved words can be used as
+identifiers when quoted.
+
+## Result and parameter semantics
+
+The native and pgwire paths preserve the type and nullability information
+needed by Go drivers and ORMs:
+
+| Result value | Wire/native behavior |
+| --- | --- |
+| SQL `NULL` | Encoded as a PostgreSQL NULL, distinct from an empty string or zero |
+| `JSON` / `JSONB` | Text JSON results and PostgreSQL JSONB binary results are supported |
+| Vector values | Float-array-compatible results; vector distances are numeric |
+| `GRAPH_NODES.id` | Typed `BIGINT`/`int8`, including empty-result descriptions |
+| `ARRAY_AGG` | PostgreSQL text-array-compatible result with nullable elements |
+| `VECTOR_AVG` | PostgreSQL float-array-compatible centroid |
+
+Parameters are typed without SQL text substitution. They are supported in
+predicates, arithmetic, casts, aggregate arguments, `CASE`, `IN`, `BETWEEN`,
+`OFFSET`, `LIMIT`, JSON path/key operands, vector operators, graph edge
+predicates, temporal bounds, and DML values. Uninferable or invalid parameter
+types return an error during binding or description.
 
 ## Supported casts and functions
 
