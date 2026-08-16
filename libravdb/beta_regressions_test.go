@@ -269,6 +269,61 @@ func TestBetaJoinMatchProjectionAndSourceFilter(t *testing.T) {
 	}
 }
 
+func TestBetaJoinMatchFiltersDistinctEdgeKinds(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(t.TempDir() + "/join-match-edge-kinds"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	graph, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+
+	if !RegisterEdgeKind("BETA_FAMILY_OF", 247) {
+		t.Fatal("register BETA_FAMILY_OF")
+	}
+	if !RegisterEdgeKind("BETA_FRIEND_OF", 248) {
+		t.Fatal("register BETA_FRIEND_OF")
+	}
+	col, err := db.CreateCollection(ctx, "people", WithMetadataOnly(), WithGraph(graph))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"alice", "family", "friend"} {
+		if err := col.Insert(ctx, id, nil, nil); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	alice, _ := db.GetNodeID(ctx, "people", "alice")
+	family, _ := db.GetNodeID(ctx, "people", "family")
+	friend, _ := db.GetNodeID(ctx, "people", "friend")
+	txn := graph.BeginTxn()
+	if err := txn.AddEdge(alice, family, 1, 247); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.AddEdge(alice, friend, 1, 248); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query(ctx, "SELECT tgt.id FROM people src JOIN MATCH (src)-[:BETA_FAMILY_OF]->(tgt) WHERE src.id = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows.Results) != 1 || rows.Results[0].Metadata["id"] != "family" {
+		t.Fatalf("family JOIN MATCH rows=%#v, want only family", rows)
+	}
+	unknown, err := db.Query(ctx, "SELECT tgt.id FROM people src JOIN MATCH (src)-[:BETA_NOT_REGISTERED]->(tgt) WHERE src.id = 'alice'")
+	if err == nil {
+		t.Fatalf("unknown edge label unexpectedly succeeded with rows=%#v", unknown)
+	}
+}
+
 func TestBetaChainedJoinMatchAppliesTerminalFilter(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(WithStoragePath(":memory:chained-join-match-beta"))

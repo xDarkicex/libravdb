@@ -1297,6 +1297,9 @@ func (o *Optimizer) extractMatchPath(doc *parser.QueryDoc, src []byte, mp *parse
 		if e.TypeStart != e.TypeEnd {
 			gep.EdgeType = string(src[e.TypeStart:e.TypeEnd])
 			gep.EdgeKind = graph.ResolveEdgeKind(gep.EdgeType)
+			if gep.EdgeKind == 0 {
+				return nil, 0, fmt.Errorf("graph edge kind %q is not registered", gep.EdgeType)
+			}
 		}
 		if e.Predicate.Kind != parser.NodeKindUnknown {
 			filter, predicateKind, predicate, err := o.lowerEdgePredicates(doc, src, e)
