@@ -43,6 +43,35 @@ func recordsVisibleInContext(ctx context.Context, col *Collection) ([]Record, er
 	return records, err
 }
 
+// forEachVisibleRecord keeps the ordinary live aggregate path streaming. The
+// epoch and transaction paths still use their merged record snapshots because
+// those overlays are not represented by the collection's committed iterator.
+func forEachVisibleRecord(ctx context.Context, col *Collection, fn func(Record) error) error {
+	if epochFromContext(ctx) != nil || transactionFromContext(ctx) != nil {
+		records, err := recordsVisibleInContext(ctx, col)
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if err := fn(record); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	var examined int
+	err := col.Iterate(ctx, func(record Record) error {
+		examined++
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn(record)
+	})
+	trackSQLRowsExamined(ctx, examined)
+	return err
+}
+
 func newExecutor(db *Database) *Executor {
 	return &Executor{db: db}
 }
@@ -3948,12 +3977,38 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	if err != nil {
 		return nil, err
 	}
-	records, err := recordsVisibleInContext(ctx, col)
-	if err != nil {
-		return nil, err
-	}
 	if plan.AggregateFunc == uint8(parser.AggVectorAvg) {
+		records, err := recordsVisibleInContext(ctx, col)
+		if err != nil {
+			return nil, err
+		}
 		return e.executeVectorAverageAggregate(records, plan)
+	}
+	// COUNT(*) over the live committed collection is maintained by storage as
+	// LiveCount. Use it when there is no filter, grouping, or DISTINCT modifier
+	// instead of cloning every record merely to count it.
+	if plan.AggregateFunc == 0 && plan.AggregateColumn == "" && !plan.AggregateDistinct &&
+		len(plan.Predicates) == 0 && len(plan.PredicateAlternatives) == 0 && len(plan.FTSPredicates) == 0 &&
+		len(plan.GroupByColumns) == 0 && !plan.HavingAggregate && plan.HavingExpr == "" &&
+		epochFromContext(ctx) == nil && transactionFromContext(ctx) == nil {
+		count, err := col.Count(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resultValue := strconv.Itoa(count)
+		colName := plan.AggregateAlias
+		if colName == "" {
+			colName = aggregateColumnName(plan.AggregateFunc)
+		}
+		return &SearchResults{
+			Results: []*SearchResult{{
+				ID:       resultValue,
+				Score:    1.0,
+				Metadata: map[string]interface{}{colName: int64(count)},
+			}},
+			Total:   1,
+			Columns: []string{colName},
+		}, nil
 	}
 	// GROUP BY is executed as a real partitioned aggregate. The previous
 	// implementation populated GroupByColumns during planning but collapsed
@@ -3962,6 +4017,7 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	if len(plan.GroupByColumns) > 0 {
 		type aggregateGroup struct {
 			keyValues []string
+			singleKey string
 			count     int64
 			sum       float64
 			minVal    string
@@ -3969,22 +4025,37 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 			hasMinMax bool
 		}
 		groups := make(map[string]*aggregateGroup)
-		for _, record := range records {
+		if err := forEachVisibleRecord(ctx, col, func(record Record) error {
 			if !planMatchesRecord(plan, record) {
-				continue
+				return nil
 			}
-			keyValues := make([]string, len(plan.GroupByColumns))
-			for i, column := range plan.GroupByColumns {
-				value, ok := joinRecordValue(record, column)
+			var key string
+			var keyValues []string
+			if len(plan.GroupByColumns) == 1 {
+				value, ok := joinRecordValue(record, plan.GroupByColumns[0])
 				if !ok {
 					value = ""
 				}
-				keyValues[i] = value
+				key = value
+			} else {
+				keyValues = make([]string, len(plan.GroupByColumns))
+				for i, column := range plan.GroupByColumns {
+					value, ok := joinRecordValue(record, column)
+					if !ok {
+						value = ""
+					}
+					keyValues[i] = value
+				}
+				key = strings.Join(keyValues, "\x00")
 			}
-			key := strings.Join(keyValues, "\x00")
 			group := groups[key]
 			if group == nil {
-				group = &aggregateGroup{keyValues: append([]string(nil), keyValues...)}
+				group = &aggregateGroup{}
+				if len(plan.GroupByColumns) == 1 {
+					group.singleKey = key
+				} else {
+					group.keyValues = append([]string(nil), keyValues...)
+				}
 				groups[key] = group
 			}
 			group.count++
@@ -3994,7 +4065,7 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 				if aggregateValue, ok := joinRecordValue(record, plan.AggregateColumn); ok {
 					value = aggregateValue
 				} else {
-					continue
+					return nil
 				}
 			}
 			if plan.AggregateFunc != 0 {
@@ -4011,6 +4082,9 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 					group.sum += parsed
 				}
 			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 
 		aggregateName := plan.AggregateAlias
@@ -4029,12 +4103,18 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 			}
 			metadata := make(map[string]interface{}, len(columns))
 			for i, column := range plan.GroupByColumns {
-				metadata[column] = group.keyValues[i]
+				if len(plan.GroupByColumns) == 1 {
+					metadata[column] = group.singleKey
+				} else {
+					metadata[column] = group.keyValues[i]
+				}
 			}
 			metadata[aggregateName] = aggregateMetaValue(plan.AggregateFunc, group.count, group.sum, group.minVal, group.maxVal, resultValue)
 			id := ""
 			if len(group.keyValues) > 0 {
 				id = group.keyValues[0]
+			} else if len(plan.GroupByColumns) == 1 {
+				id = group.singleKey
 			}
 			out.Results = append(out.Results, &SearchResult{ID: id, Score: 1.0, Metadata: metadata})
 		}
@@ -4053,16 +4133,16 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	var sum float64
 	var minVal, maxVal string
 	hasMinMax := false
-	for _, record := range records {
+	if err := forEachVisibleRecord(ctx, col, func(record Record) error {
 		if !planMatchesRecord(plan, record) {
-			continue
+			return nil
 		}
 		value := record.ID
 		if plan.AggregateColumn != "" {
 			var ok bool
 			value, ok = joinRecordValue(record, plan.AggregateColumn)
 			if !ok {
-				continue
+				return nil
 			}
 		}
 		count++
@@ -4080,6 +4160,9 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 				sum += f
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	var resultValue string

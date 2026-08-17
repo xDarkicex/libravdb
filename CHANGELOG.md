@@ -54,6 +54,17 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   `database/sql`, alongside the existing Python, GORM, graph, and vector
   matrix.
 
+### SQL aggregates
+
+- Added allocation benchmarks covering scalar counts, grouped sums, JSON
+  expansion, and JSON membership workloads.
+- Unfiltered live `COUNT(*)` now uses the storage-maintained live count, and
+  grouped live aggregates stream committed records instead of first building
+  a full record slice. Epoch and transaction overlays retain their existing
+  merged-record path.
+- Aggregate result semantics are unchanged; native, pgwire, GORM, Python,
+  and Django compatibility coverage continues to pass.
+
 ### Batch profile projections
 
 - Parameterized primary-key membership queries such as
