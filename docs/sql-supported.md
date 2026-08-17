@@ -956,6 +956,48 @@ The bounded path's lower and upper hop limits are enforced during traversal.
 The executor does not expose a path object or shortest-path result expression;
 use a bounded traversal and project the terminal nodes when that is sufficient.
 
+### Stable graph row projections
+
+`JOIN MATCH` exposes deterministic virtual columns for applications that need a
+stable row shape over native SQL or pgwire. The columns are derived from the
+matched graph row and are not stored as vertex metadata:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `source_id` | `TEXT` | ID of the source vertex in the match pattern |
+| `target_id` | `TEXT` | ID of the terminal vertex in the match pattern |
+| `edge_type` | `TEXT` | Registered relationship kind name |
+| `edge_weight` | `REAL` | Durable edge weight |
+
+For a single-hop match, all four fields are available directly. `edge_type`
+and `edge_weight` may also be projected through the edge variable using
+`r.type`/`r.kind` and `r.weight`:
+
+```sql
+SELECT source_id,
+       target_id,
+       edge_type,
+       edge_weight
+FROM people AS src
+JOIN MATCH (src)-[r:FOLLOWS]->(tgt)
+WHERE src.id = $origin_id;
+
+SELECT src.id AS source_id,
+       tgt.id AS target_id,
+       r.type AS edge_type,
+       r.weight AS edge_weight
+FROM people AS src
+JOIN MATCH (src)-[r:FOLLOWS]->(tgt)
+WHERE src.id = $origin_id;
+```
+
+The result columns are emitted in the requested projection order with stable
+PostgreSQL-compatible types. Existing graph result IDs may retain the legacy
+`source|target` composite form for compatibility; consumers should use these
+projected columns instead of parsing that internal row ID. Edge projections
+are defined for single-hop rows so one returned row corresponds to one stored
+edge; bounded multi-hop traversal should project its vertex aliases.
+
 ### Common-neighbor traversal
 
 Two `JOIN MATCH` stages may use the same terminal alias to express a common

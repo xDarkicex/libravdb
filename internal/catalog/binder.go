@@ -90,7 +90,14 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		if gt.MatchPath.Kind == parser.NodeKindMatchPath && gt.MatchPath.ID >= 0 && int(gt.MatchPath.ID) < len(doc.MatchPaths) {
 			mp := &doc.MatchPaths[gt.MatchPath.ID]
 			for n := int32(0); n < mp.PathNodesCount; n++ {
-				bindMatchEdgePredicate(doc, doc.Nodes[mp.PathNodesStart+n])
+				ref := doc.Nodes[mp.PathNodesStart+n]
+				if ref.Kind == parser.NodeKindEdge && ref.ID >= 0 && int(ref.ID) < len(doc.Edges) {
+					edge := &doc.Edges[ref.ID]
+					if edge.AliasEnd > edge.Alias {
+						virtualQualifiers[hashIdentifier(b.src, edge.Alias, edge.AliasEnd)] = struct{}{}
+					}
+				}
+				bindMatchEdgePredicate(doc, ref)
 			}
 		}
 	}
@@ -182,6 +189,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			for n := int32(0); n < mp.PathNodesCount; n++ {
 				ref := doc.Nodes[mp.PathNodesStart+n]
 				if ref.Kind == parser.NodeKindEdge {
+					if ref.ID >= 0 && int(ref.ID) < len(doc.Edges) {
+						edge := &doc.Edges[ref.ID]
+						if edge.AliasEnd > edge.Alias {
+							virtualQualifiers[hashIdentifier(b.src, edge.Alias, edge.AliasEnd)] = struct{}{}
+						}
+					}
 					bindMatchEdgePredicate(doc, ref)
 					continue
 				}
@@ -463,6 +476,10 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		}
 
 		if !resolved {
+			if hasGraphProjectionScope(doc) && isStableGraphProjectionName(b.src[id.Start:id.End]) {
+				id.ResolvedKind = parser.ResolvedKindColumn
+				continue
+			}
 			// Check if it's a Vector Index
 			vec, err := b.catalog.GetVectorIndex(hash)
 			if err == nil {
@@ -529,6 +546,32 @@ func isGraphEdgeColumn(name []byte) bool {
 		bytes.EqualFold(name, []byte("target")) ||
 		bytes.EqualFold(name, []byte("tgt")) ||
 		bytes.EqualFold(name, []byte("weight"))
+}
+
+func isStableGraphProjectionName(name []byte) bool {
+	return bytes.EqualFold(name, []byte("source_id")) ||
+		bytes.EqualFold(name, []byte("target_id")) ||
+		bytes.EqualFold(name, []byte("edge_type")) ||
+		bytes.EqualFold(name, []byte("edge_weight"))
+}
+
+func hasGraphProjectionScope(doc *parser.QueryDoc) bool {
+	if doc == nil {
+		return false
+	}
+	for i := range doc.GraphTables {
+		if doc.GraphTables[i].MatchPath.Kind == parser.NodeKindMatchPath {
+			return true
+		}
+	}
+	for i := range doc.SelectStmts {
+		for j := range doc.SelectStmts[i].Joins {
+			if doc.SelectStmts[i].Joins[j].MatchPath.Kind == parser.NodeKindMatchPath {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // bindMatchEdgePredicate reserves the identifier used by an edge-local WHERE

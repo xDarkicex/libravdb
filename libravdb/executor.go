@@ -5708,8 +5708,14 @@ func joinResultMetadata(left, right Record) map[string]interface{} {
 // match-path edges. Each reached vertex emits a joined row (leftKey|vertexID).
 // LEFT JOIN emits left rows even when no vertex is reached.
 func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	if graphPlanHasEdgeProjection(plan) && !graphPlanSupportsSingleHopEdgeProjection(plan) {
+		return nil, fmt.Errorf("edge projections require a single-hop JOIN MATCH")
+	}
 	// Epoch guard: route JOIN MATCH through epoch-aware path when inside an epoch.
 	if epoch := epochFromContext(ctx); epoch != nil {
+		if len(plan.GraphProjections) > 0 && graphPlanSupportsSingleHopEdgeProjection(plan) {
+			return e.executeProjectedGraphJoinEpoch(ctx, plan, epoch)
+		}
 		if graphJoinsFormCommonNeighbor(plan.GraphJoins) {
 			return e.executeCommonNeighborGraphJoinEpoch(ctx, plan, epoch)
 		}
@@ -5717,6 +5723,9 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 			return e.executeChainedGraphJoinEpoch(ctx, plan, epoch)
 		}
 		return e.executeGraphJoinEpoch(ctx, plan, epoch)
+	}
+	if len(plan.GraphProjections) > 0 && graphPlanSupportsSingleHopEdgeProjection(plan) {
+		return e.executeProjectedGraphJoin(ctx, plan)
 	}
 	if graphJoinsFormCommonNeighbor(plan.GraphJoins) {
 		return e.executeCommonNeighborGraphJoin(ctx, plan)
@@ -5867,7 +5876,7 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 			break
 		}
 	}
-	out := &SearchResults{Results: results, Total: len(results), Columns: plan.Projections}
+	out := &SearchResults{Results: results, Total: len(results), Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}
 	if plan.Distinct {
 		out.Results = distinctSearchResults(out.Results, plan.Projections)
 	}
@@ -6565,7 +6574,7 @@ func (e *Executor) executeChainedGraphJoinEpoch(ctx context.Context, plan *optim
 
 func materializeChainedGraphJoinRows(rows []chainedGraphJoinRow, plan *optimizer.PhysicalPlan) *SearchResults {
 	finalJoin := plan.GraphJoins[len(plan.GraphJoins)-1]
-	out := &SearchResults{Columns: plan.Projections}
+	out := &SearchResults{Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}
 	for _, row := range rows {
 		if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, row.aliases, plan.GraphJoins[0].LeftAlias) {
 			continue
@@ -6608,8 +6617,8 @@ func graphJoinTerminalPredicates(predicates []optimizer.RelationalPredicate, joi
 }
 
 func chainedGraphJoinProjectionMetadata(aliases map[string]Record, resultID string, plan *optimizer.PhysicalPlan) map[string]interface{} {
-	metadata := make(map[string]interface{}, len(plan.ProjectionRefs))
-	if len(plan.ProjectionRefs) == 0 {
+	metadata := make(map[string]interface{}, len(plan.ProjectionRefs)+len(plan.GraphProjections))
+	if len(plan.ProjectionRefs) == 0 && len(plan.GraphProjections) == 0 {
 		metadata["id"] = resultID
 		return metadata
 	}
@@ -6643,6 +6652,15 @@ func chainedGraphJoinProjectionMetadata(aliases map[string]Record, resultID stri
 			metadata[ref.OutputName] = nil
 		}
 	}
+	var source, target *Record
+	if first, ok := aliases[plan.GraphJoins[0].LeftAlias]; ok {
+		source = &first
+	}
+	finalJoin := plan.GraphJoins[len(plan.GraphJoins)-1]
+	if final, ok := aliases[finalJoin.TerminalAlias]; ok {
+		target = &final
+	}
+	applyGraphProjectionMetadata(metadata, plan.GraphProjections, source, target, nil, "")
 	return metadata
 }
 
@@ -6657,8 +6675,8 @@ func graphJoinSourcePredicates(predicates []optimizer.RelationalPredicate, join 
 }
 
 func graphJoinProjectionMetadata(left Record, terminal *Record, resultID string, join optimizer.GraphJoinPlan, plan *optimizer.PhysicalPlan) map[string]interface{} {
-	metadata := make(map[string]interface{}, len(plan.ProjectionRefs))
-	if len(plan.ProjectionRefs) == 0 {
+	metadata := make(map[string]interface{}, len(plan.ProjectionRefs)+len(plan.GraphProjections))
+	if len(plan.ProjectionRefs) == 0 && len(plan.GraphProjections) == 0 {
 		metadata["id"] = resultID
 		return metadata
 	}
@@ -6681,7 +6699,324 @@ func graphJoinProjectionMetadata(left Record, terminal *Record, resultID string,
 			metadata[ref.OutputName] = nil
 		}
 	}
+	applyGraphProjectionMetadata(metadata, plan.GraphProjections, &left, terminal, nil, "")
 	return metadata
+}
+
+func applyGraphProjectionMetadata(metadata map[string]interface{}, projections []optimizer.GraphProjection, source, target *Record, edge *graph.Edge, fallbackType string) {
+	for _, projection := range projections {
+		switch projection.Kind {
+		case optimizer.GraphProjectionSourceID:
+			if source != nil {
+				metadata[projection.OutputName] = source.ID
+			} else {
+				metadata[projection.OutputName] = nil
+			}
+		case optimizer.GraphProjectionTargetID:
+			if target != nil {
+				metadata[projection.OutputName] = target.ID
+			} else {
+				metadata[projection.OutputName] = nil
+			}
+		case optimizer.GraphProjectionEdgeType:
+			typeName := fallbackType
+			if typeName == "" && edge != nil {
+				typeName = graph.EdgeKindName(edge.GetKind())
+			}
+			if typeName == "" {
+				metadata[projection.OutputName] = nil
+			} else {
+				metadata[projection.OutputName] = typeName
+			}
+		case optimizer.GraphProjectionEdgeWeight:
+			if edge != nil {
+				metadata[projection.OutputName] = edge.Weight
+			} else {
+				metadata[projection.OutputName] = nil
+			}
+		}
+	}
+}
+
+func graphProjectionColumnTypes(plan *optimizer.PhysicalPlan) []uint16 {
+	if plan == nil || len(plan.Projections) == 0 {
+		return nil
+	}
+	types := make([]uint16, len(plan.Projections))
+	for i, column := range plan.Projections {
+		for _, projection := range plan.GraphProjections {
+			if !strings.EqualFold(column, projection.OutputName) {
+				continue
+			}
+			switch projection.Kind {
+			case optimizer.GraphProjectionEdgeWeight:
+				types[i] = catalog.TypeFloat4
+			default:
+				types[i] = catalog.TypeString
+			}
+			break
+		}
+	}
+	return types
+}
+
+func graphPlanHasEdgeProjection(plan *optimizer.PhysicalPlan) bool {
+	if plan == nil {
+		return false
+	}
+	for _, projection := range plan.GraphProjections {
+		if projection.Kind == optimizer.GraphProjectionEdgeType || projection.Kind == optimizer.GraphProjectionEdgeWeight {
+			return true
+		}
+	}
+	return false
+}
+
+func graphPlanSupportsSingleHopEdgeProjection(plan *optimizer.PhysicalPlan) bool {
+	if plan == nil || len(plan.GraphJoins) != 1 || len(plan.GraphJoins[0].GraphEdges) != 1 {
+		return false
+	}
+	edge := graphEdgePlanForTraversal(plan.GraphJoins[0].GraphEdges[0])
+	return edge.Min == 1 && edge.Max == 1
+}
+
+func graphPatternNeighbors(g Graph, nodeID uint64, direction int8) ([]graph.EdgeView, error) {
+	if direction > 0 {
+		return g.NeighborsWithProperties(nodeID)
+	}
+	if direction < 0 {
+		return g.InboundNeighborsWithProperties(nodeID)
+	}
+	outbound, err := g.NeighborsWithProperties(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	inbound, err := g.InboundNeighborsWithProperties(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(outbound)+len(inbound))
+	result := make([]graph.EdgeView, 0, len(outbound)+len(inbound))
+	for _, view := range append(outbound, inbound...) {
+		key := fmt.Sprintf("%d/%d/%g/%x", view.Edge.Target, view.Edge.GetKind(), view.Edge.Weight, view.Properties)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, view)
+	}
+	return result, nil
+}
+
+func (e *Executor) executeProjectedGraphJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	if !graphPlanSupportsSingleHopEdgeProjection(plan) {
+		return nil, fmt.Errorf("edge projections require a single-hop JOIN MATCH")
+	}
+	records, err := recordsVisibleInContext(ctx, leftCol)
+	if err != nil {
+		return nil, err
+	}
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+	join := plan.GraphJoins[0]
+	edgePlan := graphEdgePlanForTraversal(join.GraphEdges[0])
+	sourcePredicates := graphJoinSourcePredicates(plan.Predicates, join, plan.CollectionName)
+	terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, join)
+	allowedLabels := map[uint64]struct{}(nil)
+	if join.TerminalLabel != "" {
+		allowedLabels = make(map[uint64]struct{})
+		for _, nodeID := range g.GetLabelNodes(join.TerminalLabel) {
+			allowedLabels[nodeID] = struct{}{}
+		}
+	}
+	results := make([]*SearchResult, 0)
+	for _, source := range records {
+		if len(sourcePredicates) > 0 && !recordMatchesPredicates(source, sourcePredicates) {
+			continue
+		}
+		sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
+		if lookupErr != nil {
+			continue
+		}
+		neighbors, neighborErr := graphPatternNeighbors(g, sourceNode, edgePlan.Dir)
+		if neighborErr != nil {
+			return nil, neighborErr
+		}
+		for _, view := range neighbors {
+			if !edgePlan.MatchesWithProperties(view.Edge, view.Properties) {
+				continue
+			}
+			collection, targetID, resolveErr := e.db.ResolveNodeID(ctx, view.Edge.Target)
+			if resolveErr != nil || collection != plan.CollectionName {
+				continue
+			}
+			target, ok := recordsByID[targetID]
+			if !ok || (len(allowedLabels) > 0 && !hasGraphLabel(allowedLabels, view.Edge.Target)) ||
+				(len(terminalPredicates) > 0 && !recordMatchesPredicates(target, terminalPredicates)) {
+				continue
+			}
+			aliases := map[string]Record{join.LeftAlias: source, join.TerminalAlias: target}
+			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, join.LeftAlias) {
+				continue
+			}
+			resultID := source.ID + "|" + target.ID
+			metadata := graphJoinProjectionMetadata(source, &target, resultID, join, plan)
+			applyGraphProjectionMetadata(metadata, plan.GraphProjections, &source, &target, &view.Edge, join.GraphEdges[0].EdgeType)
+			results = append(results, &SearchResult{ID: resultID, Score: 1, Metadata: metadata})
+		}
+	}
+	out := &SearchResults{Results: results, Total: len(results), Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}
+	if plan.Distinct {
+		out.Results = distinctSearchResults(out.Results, plan.Projections)
+	}
+	if plan.Offset > 0 {
+		if plan.Offset >= len(out.Results) {
+			out.Results = nil
+		} else {
+			out.Results = out.Results[plan.Offset:]
+		}
+	}
+	if plan.Limit > 0 && len(out.Results) > plan.Limit {
+		out.Results = out.Results[:plan.Limit]
+	}
+	out.Total = len(out.Results)
+	return out, nil
+}
+
+func hasGraphLabel(labels map[uint64]struct{}, nodeID uint64) bool {
+	if len(labels) == 0 {
+		return true
+	}
+	_, ok := labels[nodeID]
+	return ok
+}
+
+func (e *Executor) executeProjectedGraphJoinEpoch(ctx context.Context, plan *optimizer.PhysicalPlan, epoch *EpochTx) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	if !graphPlanSupportsSingleHopEdgeProjection(plan) {
+		return nil, fmt.Errorf("edge projections require a single-hop JOIN MATCH")
+	}
+	gtx, err := epoch.GraphTxn(plan.CollectionName)
+	if err != nil {
+		return nil, fmt.Errorf("epoch graph txn for projected JOIN MATCH: %w", err)
+	}
+	records, err := recordsVisibleInContext(ctx, leftCol)
+	if err != nil {
+		return nil, err
+	}
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+	join := plan.GraphJoins[0]
+	edgePlan := graphEdgePlanForTraversal(join.GraphEdges[0])
+	sourcePredicates := graphJoinSourcePredicates(plan.Predicates, join, plan.CollectionName)
+	terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, join)
+	allowedLabels := map[uint64]struct{}(nil)
+	if join.TerminalLabel != "" {
+		allowedLabels = make(map[uint64]struct{})
+		for _, nodeID := range g.GetLabelNodes(join.TerminalLabel) {
+			allowedLabels[nodeID] = struct{}{}
+		}
+	}
+	results := make([]*SearchResult, 0)
+	for _, source := range records {
+		if len(sourcePredicates) > 0 && !recordMatchesPredicates(source, sourcePredicates) {
+			continue
+		}
+		sourceNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, source.ID)
+		if lookupErr != nil {
+			continue
+		}
+		var neighbors []graph.EdgeView
+		if edgePlan.Dir > 0 {
+			neighbors, err = gtx.NeighborsOverlayWithProperties(sourceNode)
+		} else if edgePlan.Dir < 0 {
+			neighbors, err = gtx.InboundNeighborsOverlayWithProperties(sourceNode)
+		} else {
+			neighbors, err = graphPatternNeighborsEpoch(gtx, sourceNode)
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, view := range neighbors {
+			if !edgePlan.MatchesWithProperties(view.Edge, view.Properties) {
+				continue
+			}
+			collection, targetID, resolveErr := e.resolveNodeIDInContext(ctx, view.Edge.Target)
+			if resolveErr != nil || collection != plan.CollectionName {
+				continue
+			}
+			target, ok := recordsByID[targetID]
+			if !ok || !hasGraphLabel(allowedLabels, view.Edge.Target) ||
+				(len(terminalPredicates) > 0 && !recordMatchesPredicates(target, terminalPredicates)) {
+				continue
+			}
+			aliases := map[string]Record{join.LeftAlias: source, join.TerminalAlias: target}
+			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, join.LeftAlias) {
+				continue
+			}
+			resultID := source.ID + "|" + target.ID
+			metadata := graphJoinProjectionMetadata(source, &target, resultID, join, plan)
+			applyGraphProjectionMetadata(metadata, plan.GraphProjections, &source, &target, &view.Edge, join.GraphEdges[0].EdgeType)
+			results = append(results, &SearchResult{ID: resultID, Score: 1, Metadata: metadata})
+		}
+	}
+	out := &SearchResults{Results: results, Total: len(results), Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}
+	if plan.Distinct {
+		out.Results = distinctSearchResults(out.Results, plan.Projections)
+	}
+	if plan.Offset > 0 {
+		if plan.Offset >= len(out.Results) {
+			out.Results = nil
+		} else {
+			out.Results = out.Results[plan.Offset:]
+		}
+	}
+	if plan.Limit > 0 && len(out.Results) > plan.Limit {
+		out.Results = out.Results[:plan.Limit]
+	}
+	out.Total = len(out.Results)
+	return out, nil
+}
+
+func graphPatternNeighborsEpoch(txn *graph.Txn, nodeID uint64) ([]graph.EdgeView, error) {
+	outbound, err := txn.NeighborsOverlayWithProperties(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	inbound, err := txn.InboundNeighborsOverlayWithProperties(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(outbound)+len(inbound))
+	result := make([]graph.EdgeView, 0, len(outbound)+len(inbound))
+	for _, view := range append(outbound, inbound...) {
+		key := fmt.Sprintf("%d/%d/%g/%x", view.Edge.Target, view.Edge.GetKind(), view.Edge.Weight, view.Properties)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, view)
+	}
+	return result, nil
 }
 
 // aggregateColumnName returns the output column name for an aggregate function.

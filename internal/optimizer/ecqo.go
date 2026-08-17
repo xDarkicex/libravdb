@@ -259,6 +259,22 @@ type ProjectionRef struct {
 	SourceAlias string
 }
 
+// GraphProjection describes one of the stable graph-row fields exposed by
+// JOIN MATCH. These fields are query-local virtual columns; they are not
+// persisted metadata columns on the vertex collection.
+type GraphProjection struct {
+	OutputName string
+	Kind       uint8
+	EdgeAlias  string
+}
+
+const (
+	GraphProjectionSourceID uint8 = iota
+	GraphProjectionTargetID
+	GraphProjectionEdgeType
+	GraphProjectionEdgeWeight
+)
+
 const (
 	RRFComponentVectorDistance uint8 = iota
 	RRFComponentFTSRank
@@ -272,6 +288,7 @@ type GraphEdgePlan struct {
 	QuantMin  uint16              // minimum hops (0 for ->*)
 	QuantMax  uint16              // maximum hops (0=default→1, QuantUnbounded for ->+/->*)
 	EdgeType  string              // edge type name from source (e.g., "KNOWS"); empty if not specified
+	EdgeAlias string              // optional edge variable from the MATCH path (e.g., "r")
 	EdgeKind  uint8               // resolved kind number from registry; 0 if not specified/registered
 	Weight    graph.WeightFilter  // optional edge-local weight predicate
 	Predicate graph.EdgePredicate // optional full edge-property boolean predicate
@@ -383,6 +400,7 @@ type PhysicalPlan struct {
 	PredicateAlternatives PredicateAlternatives
 	Projections           []string // SELECT column list (empty = all columns)
 	ProjectionRefs        []ProjectionRef
+	GraphProjections      []GraphProjection
 	// Scoring expression — parser AST lowered to execution hints.
 	HasScoreExpr       bool
 	ScoreArithOp       uint8 // KindAsterisk(11), KindDash(18)
@@ -905,6 +923,11 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 			proj := &doc.Projections[stmt.ProjectionsStart+i]
 			if proj.Expr.Kind == parser.NodeKindIdentifier {
 				id := &doc.Identifiers[proj.Expr.ID]
+				if graphProjection, ok := lowerGraphProjection(doc, src, id, proj, plan); ok {
+					plan.Projections = append(plan.Projections, graphProjection.OutputName)
+					plan.GraphProjections = append(plan.GraphProjections, graphProjection)
+					continue
+				}
 				outputName := string(src[id.Start:id.End])
 				if proj.AliasEnd > proj.Alias {
 					outputName = string(src[proj.Alias:proj.AliasEnd])
@@ -1268,6 +1291,78 @@ func (o *Optimizer) findVectorFunc(doc *parser.QueryDoc, src []byte, node parser
 	}
 }
 
+func lowerGraphProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifier, proj *parser.Projection, plan *PhysicalPlan) (GraphProjection, bool) {
+	if id == nil || plan == nil || len(plan.GraphJoins) == 0 || id.ColumnOID != 0 {
+		return GraphProjection{}, false
+	}
+	field := strings.ToLower(string(src[id.Start:id.End]))
+	kind, ok := stableGraphProjectionKind(field)
+	edgeAlias := ""
+	if !ok && id.QualEnd > id.QualStart {
+		qualifier := string(src[id.QualStart:id.QualEnd])
+		kind, ok = stableGraphEdgeProjectionKind(field)
+		if ok {
+			edgeAlias = qualifier
+			found := false
+			for _, join := range plan.GraphJoins {
+				for _, edge := range join.GraphEdges {
+					if strings.EqualFold(edge.EdgeAlias, edgeAlias) {
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+			}
+			if !found {
+				return GraphProjection{}, false
+			}
+		}
+	}
+	if !ok {
+		return GraphProjection{}, false
+	}
+	name := field
+	if proj != nil && proj.AliasEnd > proj.Alias {
+		name = string(src[proj.Alias:proj.AliasEnd])
+	} else if edgeAlias != "" {
+		switch kind {
+		case GraphProjectionEdgeType:
+			name = "edge_type"
+		case GraphProjectionEdgeWeight:
+			name = "edge_weight"
+		}
+	}
+	return GraphProjection{OutputName: name, Kind: kind, EdgeAlias: edgeAlias}, true
+}
+
+func stableGraphProjectionKind(field string) (uint8, bool) {
+	switch strings.ToLower(field) {
+	case "source_id":
+		return GraphProjectionSourceID, true
+	case "target_id":
+		return GraphProjectionTargetID, true
+	case "edge_type":
+		return GraphProjectionEdgeType, true
+	case "edge_weight":
+		return GraphProjectionEdgeWeight, true
+	default:
+		return 0, false
+	}
+}
+
+func stableGraphEdgeProjectionKind(field string) (uint8, bool) {
+	switch strings.ToLower(field) {
+	case "type", "kind", "edge_type":
+		return GraphProjectionEdgeType, true
+	case "weight", "edge_weight":
+		return GraphProjectionEdgeWeight, true
+	default:
+		return 0, false
+	}
+}
+
 // setRelationalKind marks the plan as relational if no vector/graph kind is set.
 func (o *Optimizer) setRelationalKind(plan *PhysicalPlan) {
 	plan.HasRelationalQuery = true
@@ -1293,6 +1388,9 @@ func (o *Optimizer) extractMatchPath(doc *parser.QueryDoc, src []byte, mp *parse
 			Direction: e.Direction,
 			QuantMin:  e.QuantMin,
 			QuantMax:  e.QuantMax,
+		}
+		if e.AliasEnd > e.Alias {
+			gep.EdgeAlias = string(src[e.Alias:e.AliasEnd])
 		}
 		if e.TypeStart != e.TypeEnd {
 			gep.EdgeType = string(src[e.TypeStart:e.TypeEnd])

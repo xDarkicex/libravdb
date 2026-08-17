@@ -165,3 +165,64 @@ func TestPGWireSQLCommonNeighborJoinMatch(t *testing.T) {
 		t.Fatalf("common-neighbor pgwire IDs=%v, want bob and carol only", seen)
 	}
 }
+
+func TestPGWireSQLStableEndpointAndEdgeProjections(t *testing.T) {
+	ctx := context.Background()
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:pgwire-stable-graph-projections"), libravdb.WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := startTestServer(t, db)
+	defer srv.Close()
+	host, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := sql.Open("pgx", "postgres://test:test@"+net.JoinHostPort(host, port)+"/test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"CREATE GRAPH TABLE stable_people (metadata JSONB)",
+		"CREATE EDGE TYPE PGWIRE_STABLE_RELATES",
+		"INSERT INTO stable_people (id, metadata) VALUES ('alice', '{\"name\":\"Alice\"}')",
+		"INSERT INTO stable_people (id, metadata) VALUES ('bob', '{\"name\":\"Bob\"}')",
+		"INSERT INTO GRAPH_EDGES VALUES ('alice', 'PGWIRE_STABLE_RELATES', 'bob')",
+	} {
+		if _, err := sqlDB.ExecContext(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	var sourceID, targetID, edgeType string
+	var edgeWeight float32
+	query := `
+		SELECT source_id, target_id, r.type AS edge_type, r.weight AS edge_weight
+		FROM stable_people src
+		JOIN MATCH (src)-[r:PGWIRE_STABLE_RELATES]->(tgt)
+		WHERE src.id = $1`
+	if _, columns, err := describeStatement(db, query, 1); err != nil {
+		t.Fatalf("describe stable endpoint/edge projection: %v", err)
+	} else {
+		assertColumns(t, columns, []ColumnMeta{
+			{Name: "source_id", TypeOID: OIDText},
+			{Name: "target_id", TypeOID: OIDText},
+			{Name: "edge_type", TypeOID: OIDText},
+			{Name: "edge_weight", TypeOID: OIDFloat4},
+		})
+	}
+	native, err := db.QueryWithParams(ctx, query, libravdb.QueryParams{"1": "alice"})
+	if err != nil || native.Total != 1 {
+		t.Fatalf("stable endpoint/edge projection native rows=%d err=%v results=%#v", native.Total, err, native.Results)
+	}
+	if err := sqlDB.QueryRowContext(ctx, query, "alice").Scan(&sourceID, &targetID, &edgeType, &edgeWeight); err != nil {
+		t.Fatalf("stable endpoint/edge projection over pgwire: %v", err)
+	}
+	if sourceID != "alice" || targetID != "bob" || edgeType != "PGWIRE_STABLE_RELATES" || edgeWeight != 1 {
+		t.Fatalf("stable graph projection row=(%q,%q,%q,%v), want (alice,bob,PGWIRE_STABLE_RELATES,1)", sourceID, targetID, edgeType, edgeWeight)
+	}
+}

@@ -329,7 +329,11 @@ func describeSelect(doc *parser.QueryDoc, src []byte, cat *catalog.Catalog, stmt
 			if proj.AliasEnd > proj.Alias {
 				name = string(src[proj.Alias:proj.AliasEnd])
 			}
-			cols = append(cols, ColumnMeta{Name: name, TypeOID: oidForColumn(cat, byOID, id, src)})
+			oid := oidForGraphProjection(doc, src, id)
+			if oid == 0 {
+				oid = oidForColumn(cat, byOID, id, src)
+			}
+			cols = append(cols, ColumnMeta{Name: name, TypeOID: oid})
 		case parser.NodeKindVectorFunc:
 			vf := &doc.VectorFuncs[proj.Expr.ID]
 			name := "vector_distance"
@@ -407,6 +411,74 @@ func describeSelect(doc *parser.QueryDoc, src []byte, cat *catalog.Catalog, stmt
 		return defaultDescribeColumns()
 	}
 	return cols
+}
+
+func oidForGraphProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifier) uint32 {
+	if doc == nil || id == nil || id.ColumnOID != 0 || !describeHasGraphJoin(doc) {
+		return 0
+	}
+	field := strings.ToLower(string(src[id.Start:id.End]))
+	switch field {
+	case "source_id", "target_id", "edge_type":
+		return OIDText
+	case "edge_weight":
+		return OIDFloat4
+	}
+	if id.QualEnd <= id.QualStart {
+		return 0
+	}
+	qualifier := string(src[id.QualStart:id.QualEnd])
+	if !describeHasGraphEdgeAlias(doc, src, qualifier) {
+		return 0
+	}
+	switch field {
+	case "type", "kind", "edge_type":
+		return OIDText
+	case "weight", "edge_weight":
+		return OIDFloat4
+	default:
+		return 0
+	}
+}
+
+func describeHasGraphEdgeAlias(doc *parser.QueryDoc, src []byte, qualifier string) bool {
+	if doc == nil || qualifier == "" {
+		return false
+	}
+	for i := range doc.SelectStmts {
+		for j := range doc.SelectStmts[i].Joins {
+			match := doc.SelectStmts[i].Joins[j].MatchPath
+			if match.Kind != parser.NodeKindMatchPath || match.ID < 0 || int(match.ID) >= len(doc.MatchPaths) {
+				continue
+			}
+			path := doc.MatchPaths[match.ID]
+			for n := int32(0); n < path.PathNodesCount; n++ {
+				ref := doc.Nodes[path.PathNodesStart+n]
+				if ref.Kind != parser.NodeKindEdge || ref.ID < 0 || int(ref.ID) >= len(doc.Edges) {
+					continue
+				}
+				edge := doc.Edges[ref.ID]
+				if edge.AliasEnd > edge.Alias && strings.EqualFold(qualifier, string(src[edge.Alias:edge.AliasEnd])) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func describeHasGraphJoin(doc *parser.QueryDoc) bool {
+	if doc == nil {
+		return false
+	}
+	for i := range doc.SelectStmts {
+		for j := range doc.SelectStmts[i].Joins {
+			if doc.SelectStmts[i].Joins[j].MatchPath.Kind == parser.NodeKindMatchPath {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func selectHasAggregateProjection(doc *parser.QueryDoc, stmt *parser.SelectStmt) bool {

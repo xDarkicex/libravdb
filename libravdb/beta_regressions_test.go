@@ -269,6 +269,131 @@ func TestBetaJoinMatchProjectionAndSourceFilter(t *testing.T) {
 	}
 }
 
+func TestBetaJoinMatchStableEndpointAndEdgeProjections(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:stable-graph-projections"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	graph, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	if !RegisterEdgeKind("BETA_STABLE_RELATES", 250) {
+		t.Fatal("register BETA_STABLE_RELATES")
+	}
+	col, err := db.CreateCollection(ctx, "users", WithMetadataOnly(), WithGraph(graph))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"alice", "bob"} {
+		if err := col.Insert(ctx, id, nil, nil); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	alice, err := db.GetNodeID(ctx, "users", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := db.GetNodeID(ctx, "users", "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := graph.BeginTxn()
+	if err := txn.AddEdge(alice, bob, 0.75, 250); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	query := `SELECT source_id, target_id, edge_type, edge_weight
+		FROM users src
+		JOIN MATCH (src)-[r:BETA_STABLE_RELATES]->(tgt)
+		WHERE src.id = $1`
+	assertProjection := func(rows *SearchResults) {
+		t.Helper()
+		if rows.Total != 1 {
+			t.Fatalf("stable graph projection rows=%d, want 1: %#v", rows.Total, rows)
+		}
+		row := rows.Results[0]
+		if got := row.Metadata["source_id"]; got != "alice" {
+			t.Fatalf("source_id=%#v, want alice; metadata=%#v", got, row.Metadata)
+		}
+		if got := row.Metadata["target_id"]; got != "bob" {
+			t.Fatalf("target_id=%#v, want bob; metadata=%#v", got, row.Metadata)
+		}
+		if got := row.Metadata["edge_type"]; got != "BETA_STABLE_RELATES" {
+			t.Fatalf("edge_type=%#v, want BETA_STABLE_RELATES; metadata=%#v", got, row.Metadata)
+		}
+		weight, ok := row.Metadata["edge_weight"].(float32)
+		if !ok || weight != 0.75 {
+			t.Fatalf("edge_weight=%#v (%T), want float32(0.75); metadata=%#v", row.Metadata["edge_weight"], row.Metadata["edge_weight"], row.Metadata)
+		}
+	}
+	rows, err := db.QueryWithParams(ctx, query, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("stable graph projection query: %v", err)
+	}
+	assertProjection(rows)
+
+	aliasRows, err := db.QueryWithParams(ctx, `
+		SELECT src.id AS source_id, tgt.id AS target_id,
+		       r.type AS edge_type, r.weight AS edge_weight
+		FROM users src
+		JOIN MATCH (src)-[r:BETA_STABLE_RELATES]->(tgt)
+		WHERE src.id = $1`, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("edge-variable graph projection query: %v", err)
+	}
+	assertProjection(aliasRows)
+
+	epoch, err := db.BeginEpochTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochRows, err := epoch.Query(ctx, query, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("epoch stable graph projection query: %v", err)
+	}
+	assertProjection(epochRows)
+	if err := epoch.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBetaSQLDDLStableEndpointAndEdgeProjectionsNative(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:sql-stable-graph-projections"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{
+		"CREATE GRAPH TABLE sql_stable_people (id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+		"CREATE EDGE TYPE SQL_STABLE_RELATES",
+		"INSERT INTO sql_stable_people (id, name) VALUES ('alice', 'Alice'), ('bob', 'Bob')",
+		"INSERT INTO GRAPH_EDGES VALUES ('alice', 'SQL_STABLE_RELATES', 'bob')",
+	} {
+		if _, err := db.Query(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	rows, err := db.QueryWithParams(ctx, `
+		SELECT source_id, target_id, edge_type, edge_weight
+		FROM sql_stable_people src
+		JOIN MATCH (src)-[r:SQL_STABLE_RELATES]->(tgt)
+		WHERE src.id = $1`, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Total != 1 {
+		t.Fatalf("native SQL DDL stable graph projection rows=%d, want 1: %#v", rows.Total, rows)
+	}
+}
+
 func TestBetaJoinMatchFiltersDistinctEdgeKinds(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(WithStoragePath(t.TempDir() + "/join-match-edge-kinds"))
