@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,59 @@ func selectHasTemporalRange(doc *parser.QueryDoc, stmt *parser.SelectStmt) bool 
 	}
 	ref := stmt.FromTable
 	return ref.ID >= 0 && int(ref.ID) < len(doc.TableExprs) && doc.TableExprs[ref.ID].TemporalRange
+}
+
+func selectHasTemporalSnapshot(doc *parser.QueryDoc, stmt *parser.SelectStmt) bool {
+	if doc == nil || stmt == nil || stmt.FromTable.Kind != parser.NodeKindTableExpr {
+		return false
+	}
+	ref := stmt.FromTable
+	if ref.ID < 0 || int(ref.ID) >= len(doc.TableExprs) {
+		return false
+	}
+	table := &doc.TableExprs[ref.ID]
+	return table.Temporal || table.TemporalLSN || table.TemporalRange
+}
+
+func parseTemporalLSN(src []byte, start, end uint32, params *optimizer.ParameterSet) (uint64, error) {
+	if start >= end || end > uint32(len(src)) {
+		return 0, fmt.Errorf("empty LSN bound")
+	}
+	text := strings.TrimSpace(string(src[start:end]))
+	if len(text) > 1 && (text[0] == '$' || text[0] == '@') {
+		if params == nil {
+			return 0, fmt.Errorf("LSN parameter %q is not bound", text)
+		}
+		value, ok := params.Lookup(src, start, end)
+		if !ok {
+			return 0, fmt.Errorf("LSN parameter %q is not bound", text)
+		}
+		switch value.Kind {
+		case optimizer.ScalarInt:
+			if value.Int < 0 {
+				return 0, fmt.Errorf("LSN parameter %q must be non-negative", text)
+			}
+			if value.Int == 0 {
+				return 0, fmt.Errorf("AS OF LSN must be greater than zero")
+			}
+			return uint64(value.Int), nil
+		case optimizer.ScalarString, optimizer.ScalarBytes:
+			text = strings.TrimSpace(string(value.BytesData))
+		default:
+			return 0, fmt.Errorf("LSN parameter %q must be an integer", text)
+		}
+	}
+	if len(text) >= 2 && text[0] == '\'' && text[len(text)-1] == '\'' {
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	lsn, err := strconv.ParseUint(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid AS OF LSN %q: %w", text, err)
+	}
+	if lsn == 0 {
+		return 0, fmt.Errorf("AS OF LSN must be greater than zero")
+	}
+	return lsn, nil
 }
 
 func parseTemporalRangeTime(src []byte, start, end uint32, params *optimizer.ParameterSet) (time.Time, error) {

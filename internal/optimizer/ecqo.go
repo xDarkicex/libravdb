@@ -666,7 +666,13 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 		t := &doc.TableExprs[stmt.FromTable.ID]
 		plan.CollectionOID = t.TableOID
 		plan.CollectionName = string(src[t.Start:t.End])
-		if t.Temporal {
+		if t.TemporalLSN {
+			lsn, err := o.resolveSnapshotLSN(doc, src, t.LSNStart, t.LSNEnd)
+			if err != nil {
+				return nil, err
+			}
+			plan.SnapshotLSN = lsn
+		} else if t.Temporal {
 			ts := string(src[t.TimestampStart:t.TimestampEnd])
 			// AS OF TIMESTAMP accepts a native bound $N/@name parameter in
 			// addition to a quoted literal. Resolve it at the typed execution
@@ -1237,6 +1243,50 @@ func scalarNonNegativeInt(value ScalarValue) (int, bool) {
 		return 0, false
 	}
 	return int(n), true
+}
+
+// resolveSnapshotLSN resolves the exact commit LSN used by AS OF LSN. Unlike
+// timestamp snapshots, the value is already the storage snapshot identity, so
+// it must remain an integer all the way to SnapshotAtLSN.
+func (o *Optimizer) resolveSnapshotLSN(doc *parser.QueryDoc, src []byte, start, end uint32) (uint64, error) {
+	if start >= end || end > uint32(len(src)) {
+		return 0, fmt.Errorf("AS OF LSN has an empty bound")
+	}
+	raw := strings.TrimSpace(string(src[start:end]))
+	if len(raw) > 1 && (raw[0] == '$' || raw[0] == '@') {
+		if o.boundParams == nil {
+			return 0, fmt.Errorf("AS OF LSN parameter %q is not bound", raw)
+		}
+		value, found := o.boundParams.Lookup(src, start, end)
+		if !found {
+			return 0, fmt.Errorf("AS OF LSN parameter %q is not bound", raw)
+		}
+		switch value.Kind {
+		case ScalarInt:
+			if value.Int < 0 {
+				return 0, fmt.Errorf("AS OF LSN parameter %q must be non-negative", raw)
+			}
+			if value.Int == 0 {
+				return 0, fmt.Errorf("AS OF LSN must be greater than zero")
+			}
+			return uint64(value.Int), nil
+		case ScalarString, ScalarBytes:
+			raw = strings.TrimSpace(string(value.BytesData))
+		default:
+			return 0, fmt.Errorf("AS OF LSN parameter %q must be an integer", raw)
+		}
+	}
+	if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	}
+	lsn, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid AS OF LSN %q: %w", raw, err)
+	}
+	if lsn == 0 {
+		return 0, fmt.Errorf("AS OF LSN must be greater than zero")
+	}
+	return lsn, nil
 }
 
 // extractVectorAnchor detects a vector predicate in the WHERE clause of a graph query

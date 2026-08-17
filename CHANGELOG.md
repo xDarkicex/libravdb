@@ -9,6 +9,10 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 - Added native and pgwire support for common-neighbor graph queries using chained `JOIN MATCH` clauses that converge on the same terminal node.
 - The optimized execution path materializes the origin-side terminals once, intersects source-side traversals by shared terminal, applies predicates, and preserves `DISTINCT` and projection semantics.
 - Added equivalent epoch-snapshot execution and regression coverage for parameterized native and pgwire queries.
+- Added a graph-to-relational semijoin for common-neighbor `JOIN MATCH`
+  subqueries inside `WHERE ... IN (...)`. The graph subquery executes once,
+  candidate IDs are deduplicated, and the outer relation is probed by ID with
+  epoch and exact `AS OF LSN` snapshot propagation.
 - Added stable `JOIN MATCH` projections for `source_id`, `target_id`, `edge_type`, and `edge_weight`, including edge-variable aliases such as `r.type` and `r.weight`.
 - Added deterministic pgwire type metadata and native, epoch, pgwire, and external end-to-end regression coverage for the stable graph row shape.
 

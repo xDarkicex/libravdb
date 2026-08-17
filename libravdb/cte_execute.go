@@ -234,6 +234,9 @@ func (db *Database) executeSubquerySelect(ctx context.Context, src []byte, doc *
 		return nil, fmt.Errorf("subquery query has no outer SELECT")
 	}
 	stmt := &doc.SelectStmts[root]
+	if result, handled, err := db.tryExecuteGraphSemijoin(ctx, src, doc, stmt, params, legacy); handled {
+		return result, err
+	}
 	rows, columns, err := db.evaluateVirtualSelectRows(ctx, src, doc, stmt, nil, params, legacy)
 	if err != nil {
 		return nil, err
@@ -368,7 +371,7 @@ func (db *Database) virtualIndexedSourceRows(ctx context.Context, src []byte, do
 		return nil, false, nil
 	}
 	t := &doc.TableExprs[stmt.FromTable.ID]
-	if t.IsDerived || t.Temporal || t.TemporalRange {
+	if t.IsDerived || t.Temporal || t.TemporalLSN || t.TemporalRange {
 		return nil, false, nil
 	}
 	table := sourceSpan(src, t.Start, t.End)
@@ -563,7 +566,10 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 	if err != nil {
 		return nil, err
 	}
-	if t.Temporal {
+	if state, ok := virtualGraphSemijoinFromContext(ctx); ok && outer == nil && strings.EqualFold(state.collection, table) {
+		return db.virtualGraphSemijoinSourceRows(ctx, src, t, state, outer)
+	}
+	if t.Temporal || t.TemporalLSN {
 		return db.virtualTemporalSourceRows(ctx, src, t, col, params, outer)
 	}
 	records, err := recordsVisibleInContext(ctx, col)
@@ -592,16 +598,29 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 }
 
 // virtualTemporalSourceRows materializes a table source at its AS OF
-// TIMESTAMP snapshot. This is intentionally query-local so a temporal source
+// TIMESTAMP or AS OF LSN snapshot. This is intentionally query-local so a temporal source
 // inside a CTE can be bounded before its rows feed an outer aggregate.
 func (db *Database) virtualTemporalSourceRows(ctx context.Context, src []byte, table *parser.TableExpr, col *Collection, params *optimizer.ParameterSet, outer *virtualSQLRow) ([]virtualSQLRow, error) {
-	when, err := parseTemporalRangeTime(src, table.TimestampStart, table.TimestampEnd, params)
-	if err != nil {
-		return nil, fmt.Errorf("AS OF TIMESTAMP: %w", err)
-	}
-	snapshot, err := db.SnapshotAt(ctx, when)
-	if err != nil {
-		return nil, fmt.Errorf("AS OF TIMESTAMP: %w", err)
+	var snapshot *TemporalSnapshot
+	var err error
+	if table.TemporalLSN {
+		lsn, lsnErr := parseTemporalLSN(src, table.LSNStart, table.LSNEnd, params)
+		if lsnErr != nil {
+			return nil, fmt.Errorf("AS OF LSN: %w", lsnErr)
+		}
+		snapshot, err = db.SnapshotAtLSN(ctx, lsn)
+		if err != nil {
+			return nil, fmt.Errorf("AS OF LSN %d: %w", lsn, err)
+		}
+	} else {
+		when, timeErr := parseTemporalRangeTime(src, table.TimestampStart, table.TimestampEnd, params)
+		if timeErr != nil {
+			return nil, fmt.Errorf("AS OF TIMESTAMP: %w", timeErr)
+		}
+		snapshot, err = db.SnapshotAt(ctx, when)
+		if err != nil {
+			return nil, fmt.Errorf("AS OF TIMESTAMP: %w", err)
+		}
 	}
 	defer snapshot.Close()
 	alias := sourceSpan(src, table.Alias, table.AliasEnd)
@@ -2243,16 +2262,23 @@ func (db *Database) evalVirtualExpr(ctx context.Context, src []byte, doc *parser
 		}
 		matched := false
 		if in.HasSubquery {
-			candidate, exists, err := db.virtualSubqueryRows(ctx, src, doc, in.Subquery, row, params, legacy)
-			if err != nil {
-				return false, err
-			}
-			if exists {
-				for _, subrow := range candidate {
-					candidateValue, candidateOK := firstVirtualValue(subrow, nil)
-					if candidateOK && candidateValue != nil && sqlValueEqual(value, candidateValue) {
-						matched = true
-						break
+			if semijoin, optimized := virtualGraphSemijoinFromContext(ctx); optimized && semijoin.subqueryID == in.Subquery.ID {
+				_, matched = semijoin.candidateSet[recordMetaToString(value)]
+				if in.Not && !matched && semijoin.subqueryHasNull {
+					return false, nil
+				}
+			} else {
+				candidate, exists, err := db.virtualSubqueryRows(ctx, src, doc, in.Subquery, row, params, legacy)
+				if err != nil {
+					return false, err
+				}
+				if exists {
+					for _, subrow := range candidate {
+						candidateValue, candidateOK := firstVirtualValue(subrow, nil)
+						if candidateOK && candidateValue != nil && sqlValueEqual(value, candidateValue) {
+							matched = true
+							break
+						}
 					}
 				}
 			}

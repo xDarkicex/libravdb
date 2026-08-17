@@ -14,6 +14,8 @@ type temporalWireFixture struct {
 	db      *libravdb.Database
 	oldTime time.Time
 	oldID   string
+	oldLSN  uint64
+	liveLSN uint64
 }
 
 func newTemporalWireFixture(t *testing.T) temporalWireFixture {
@@ -34,6 +36,11 @@ func newTemporalWireFixture(t *testing.T) temporalWireFixture {
 		db.Close()
 		t.Fatalf("insert old: %v", err)
 	}
+	oldLSN, err := db.LatestCommitLSN(context.Background())
+	if err != nil {
+		db.Close()
+		t.Fatalf("LatestCommitLSN(old): %v", err)
+	}
 	snap, err := db.SnapshotAt(context.Background(), time.Now().UTC().Add(time.Second))
 	if err != nil {
 		db.Close()
@@ -45,7 +52,12 @@ func newTemporalWireFixture(t *testing.T) temporalWireFixture {
 		db.Close()
 		t.Fatalf("insert future: %v", err)
 	}
-	return temporalWireFixture{db: db, oldTime: oldTime, oldID: "old"}
+	liveLSN, err := db.LatestCommitLSN(context.Background())
+	if err != nil {
+		db.Close()
+		t.Fatalf("LatestCommitLSN(live): %v", err)
+	}
+	return temporalWireFixture{db: db, oldTime: oldTime, oldID: "old", oldLSN: oldLSN, liveLSN: liveLSN}
 }
 
 func temporalWireQuery(ts time.Time) string {
@@ -124,6 +136,66 @@ func TestTemporalAcceptance_PgwireExtendedProtocol(t *testing.T) {
 	status := readReadyStatus(t, conn)
 	if status != 'I' {
 		t.Fatalf("extended temporal ReadyForQuery status=%q, want idle", status)
+	}
+}
+
+func TestTemporalAcceptance_PgwireASOFLSNExtendedProtocol(t *testing.T) {
+	fixture := newTemporalWireFixture(t)
+	defer fixture.db.Close()
+
+	srv := startTestServer(t, fixture.db)
+	defer srv.Close()
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+	doTestStartup(t, conn)
+
+	query := "SELECT id FROM docs AS OF LSN $snapshot_lsn ORDER BY id"
+	sendParse(t, conn, "lsn-stmt", query, nil)
+	assertMessageType(t, conn, msgParseComplete, "AS OF LSN ParseComplete")
+	sendDescribe(t, conn, 'S', "lsn-stmt")
+	msgType, payload, err := ReadMessage(conn)
+	if err != nil {
+		t.Fatalf("AS OF LSN ParameterDescription: %v", err)
+	}
+	if msgType != msgParameterDescription {
+		t.Fatalf("AS OF LSN parameter message=%q, want ParameterDescription", msgType)
+	}
+	if got := decodeParameterDescription(t, payload); len(got) != 1 || got[0] != OIDInt8 {
+		t.Fatalf("AS OF LSN parameter OIDs=%v, want [%d]", got, OIDInt8)
+	}
+	msgType, payload, err = ReadMessage(conn)
+	if err != nil {
+		t.Fatalf("AS OF LSN RowDescription: %v", err)
+	}
+	if msgType != msgRowDescription {
+		t.Fatalf("AS OF LSN row message=%q, want RowDescription", msgType)
+	}
+	if cols := decodeRowDescription(t, payload); len(cols) != 1 || cols[0].Name != "id" {
+		t.Fatalf("AS OF LSN columns=%+v, want id", cols)
+	}
+
+	sendBindParams(t, conn, "old-portal", "lsn-stmt", [][]byte{[]byte(fmt.Sprint(fixture.oldLSN))})
+	assertMessageType(t, conn, msgBindComplete, "AS OF LSN old BindComplete")
+	sendExecute(t, conn, "old-portal", 0)
+	rows := readDataRowsUntilComplete(t, conn)
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != fixture.oldID {
+		t.Fatalf("AS OF LSN old rows=%v, want [[%s]]", rows, fixture.oldID)
+	}
+	sendSync(t, conn)
+	if status := readReadyStatus(t, conn); status != 'I' {
+		t.Fatalf("AS OF LSN old ReadyForQuery status=%q, want idle", status)
+	}
+
+	sendBindParams(t, conn, "live-portal", "lsn-stmt", [][]byte{[]byte(fmt.Sprint(fixture.liveLSN))})
+	assertMessageType(t, conn, msgBindComplete, "AS OF LSN live BindComplete")
+	sendExecute(t, conn, "live-portal", 0)
+	rows = readDataRowsUntilComplete(t, conn)
+	if len(rows) != 2 || rows[0][0] != "old" || rows[1][0] != "future" {
+		t.Fatalf("AS OF LSN live rows=%v, want old and future", rows)
+	}
+	sendSync(t, conn)
+	if status := readReadyStatus(t, conn); status != 'I' {
+		t.Fatalf("AS OF LSN live ReadyForQuery status=%q, want idle", status)
 	}
 }
 

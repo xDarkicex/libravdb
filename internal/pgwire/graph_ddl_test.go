@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
@@ -163,6 +164,63 @@ func TestPGWireSQLCommonNeighborJoinMatch(t *testing.T) {
 	}
 	if len(seen) != 2 || !seen["bob"] || !seen["carol"] || seen["alice"] || seen["dave"] {
 		t.Fatalf("common-neighbor pgwire IDs=%v, want bob and carol only", seen)
+	}
+
+	semijoinRows, err := sqlDB.QueryContext(ctx, `
+		SELECT p.id, p.metadata
+		FROM people p
+		WHERE p.id IN (
+			SELECT src.id
+			FROM people src
+			JOIN MATCH (src)-[]->(shared)
+			JOIN MATCH (origin)-[]->(shared)
+			WHERE origin.id = $1 AND src.id != $1
+		)
+		ORDER BY p.id`, "alice")
+	if err != nil {
+		t.Fatalf("graph-to-relational semijoin over pgwire: %v", err)
+	}
+	semijoinSeen := map[string]bool{}
+	for semijoinRows.Next() {
+		var id string
+		var metadata []byte
+		if err := semijoinRows.Scan(&id, &metadata); err != nil {
+			_ = semijoinRows.Close()
+			t.Fatalf("scan graph-to-relational semijoin: %v", err)
+		}
+		semijoinSeen[id] = true
+	}
+	if err := semijoinRows.Close(); err != nil {
+		t.Fatalf("close graph-to-relational semijoin: %v", err)
+	}
+	if len(semijoinSeen) != 2 || !semijoinSeen["bob"] || !semijoinSeen["carol"] || semijoinSeen["alice"] || semijoinSeen["dave"] {
+		t.Fatalf("graph-to-relational semijoin pgwire IDs=%v, want bob and carol only", semijoinSeen)
+	}
+
+	var explainJSON []byte
+	if err := sqlDB.QueryRowContext(ctx, `EXPLAIN ANALYZE
+		SELECT DISTINCT src.id
+		FROM people src
+		JOIN MATCH (src)-[]->(shared)
+		JOIN MATCH (origin)-[]->(shared)
+		WHERE origin.id = $1 AND src.id != $1
+		ORDER BY src.id`, "alice").Scan(&explainJSON); err != nil {
+		t.Fatalf("EXPLAIN ANALYZE graph over pgwire: %v", err)
+	}
+	var explain struct {
+		Strategy            string `json:"strategy"`
+		ActualRows          int    `json:"actual_rows"`
+		GraphExpansions     int    `json:"graph_expansions"`
+		PredicateRejections int    `json:"predicate_rejections"`
+		IndexHits           int    `json:"index_hits"`
+		ExecutionTimeNS     int    `json:"execution_time_ns"`
+		PlanReused          bool   `json:"plan_reused"`
+	}
+	if err := json.Unmarshal(explainJSON, &explain); err != nil {
+		t.Fatalf("decode EXPLAIN ANALYZE JSON %q: %v", explainJSON, err)
+	}
+	if explain.Strategy != "graph_join_match" || explain.ActualRows != 2 || explain.GraphExpansions == 0 || explain.ExecutionTimeNS == 0 {
+		t.Fatalf("EXPLAIN ANALYZE payload=%s", explainJSON)
 	}
 }
 

@@ -79,6 +79,9 @@ func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, s
 	if err := parser.Parse(src, doc); err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
+	if doc.Explain {
+		return db.executeSQLExplain(ctx, src, doc, boundParams, legacyParams, sessionConfig, tracker)
+	}
 	// Expose the existing durable commit LSN as a scalar SQL function. This
 	// route is intentionally before catalog binding because the function has no
 	// FROM relation and must work on an otherwise empty database.

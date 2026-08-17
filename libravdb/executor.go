@@ -92,6 +92,8 @@ func (e *Executor) ExecuteAtLSN(ctx context.Context, plan *optimizer.PhysicalPla
 // temporal execution path.
 func (e *Executor) executeTemporal(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
 	switch {
+	case graphJoinsFormCommonNeighbor(plan.GraphJoins):
+		return e.executeCommonNeighborGraphJoinAtLSN(ctx, plan)
 	case plan.Kind == optimizer.QueryKindMultiModal:
 		if plan.HasRRF {
 			return e.executeRRF(ctx, plan, plan.SnapshotLSN)
@@ -315,18 +317,25 @@ func (e *Executor) executeGraphAtLSN(ctx context.Context, plan *optimizer.Physic
 }
 
 // Execute routes a physical plan to the appropriate execution engine.
-// Temporal queries (AS OF TIMESTAMP) are resolved to an LSN and routed
-// through the temporal execution path.
+// Temporal queries (AS OF TIMESTAMP and AS OF LSN) are routed through the
+// temporal execution path. Exact LSN sources are pinned and validated here so
+// unknown and retention-expired snapshots use the same storage classification
+// as native SnapshotAtLSN callers.
 func (e *Executor) Execute(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
 	// Resolve temporal snapshot before any data access.
 	var temporalHandle *TemporalSnapshot
-	if !plan.SnapshotTimestamp.IsZero() && plan.SnapshotLSN == 0 {
+	if plan.SnapshotLSN != 0 && plan.SnapshotTimestamp.IsZero() {
+		snap, err := e.db.SnapshotAtLSN(ctx, plan.SnapshotLSN)
+		if err != nil {
+			return nil, fmt.Errorf("AS OF LSN %d: %w", plan.SnapshotLSN, err)
+		}
+		temporalHandle = snap
+	} else if !plan.SnapshotTimestamp.IsZero() && plan.SnapshotLSN == 0 {
 		snap, err := e.db.SnapshotAt(ctx, plan.SnapshotTimestamp)
 		if err != nil {
 			return nil, fmt.Errorf("AS OF TIMESTAMP %s: %w",
 				plan.SnapshotTimestamp.Format(time.RFC3339), err)
 		}
-		defer snap.Close()
 		temporalHandle = snap
 		plan.SnapshotLSN = snap.LSN
 	}
@@ -2019,7 +2028,7 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 			}
 		}
 		for _, rec := range records {
-			if len(sourcePreds) > 0 && !recordMatchesPredicates(rec, sourcePreds) {
+			if len(sourcePreds) > 0 && !recordMatchesPredicatesTracked(ctx, rec, sourcePreds) {
 				continue
 			}
 			nodeID, err := e.db.GetNodeID(ctx, plan.CollectionName, rec.ID)
@@ -2130,7 +2139,7 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 						if gerr != nil {
 							return true
 						}
-						if !recordMatchesPredicates(rec, terminalPredicates) {
+						if !recordMatchesPredicatesTracked(ctx, rec, terminalPredicates) {
 							return true
 						}
 					}
@@ -5977,7 +5986,7 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 
 		for _, leftRecord := range leftRecords {
 			leftKey := leftRecord.ID
-			if len(sourcePredicates) > 0 && !recordMatchesPredicates(leftRecord, sourcePredicates) {
+			if len(sourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, leftRecord, sourcePredicates) {
 				continue
 			}
 
@@ -6039,10 +6048,10 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 				if !terminalOK {
 					continue
 				}
-				if len(gjp.TerminalPredicates) > 0 && !recordMatchesPredicates(terminal, gjp.TerminalPredicates) {
+				if len(gjp.TerminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, gjp.TerminalPredicates) {
 					continue
 				}
-				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, map[string]Record{
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, map[string]Record{
 					gjp.LeftAlias:     leftRecord,
 					gjp.TerminalAlias: terminal,
 				}, gjp.LeftAlias) {
@@ -6189,14 +6198,14 @@ func (e *Executor) executeCommonNeighborGraphJoin(ctx context.Context, plan *opt
 	originTerminals := make(map[uint64][]Record)
 	originEdges := graphJoinEdges(second)
 	for _, origin := range records {
-		if len(originSourcePredicates) > 0 && !recordMatchesPredicates(origin, originSourcePredicates) {
+		if len(originSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, origin, originSourcePredicates) {
 			continue
 		}
 		originNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, origin.ID)
 		if lookupErr != nil {
 			continue
 		}
-		terminalIDs, traverseErr := collectGraphJoinTerminals(g, originNode, originEdges, second.MaxHops, second.TerminalLabel, bitset, frontier)
+		terminalIDs, traverseErr := collectGraphJoinTerminals(ctx, g, originNode, originEdges, second.MaxHops, second.TerminalLabel, bitset, frontier)
 		if traverseErr != nil {
 			return nil, traverseErr
 		}
@@ -6211,14 +6220,14 @@ func (e *Executor) executeCommonNeighborGraphJoin(ctx context.Context, plan *opt
 	rows := make([]chainedGraphJoinRow, 0)
 	sourceEdges := graphJoinEdges(first)
 	for _, source := range records {
-		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(source, firstSourcePredicates) {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, firstSourcePredicates) {
 			continue
 		}
 		sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
 		if lookupErr != nil {
 			continue
 		}
-		terminalIDs, traverseErr := collectGraphJoinTerminals(g, sourceNode, sourceEdges, first.MaxHops, first.TerminalLabel, bitset, frontier)
+		terminalIDs, traverseErr := collectGraphJoinTerminals(ctx, g, sourceNode, sourceEdges, first.MaxHops, first.TerminalLabel, bitset, frontier)
 		if traverseErr != nil {
 			return nil, traverseErr
 		}
@@ -6232,7 +6241,7 @@ func (e *Executor) executeCommonNeighborGraphJoin(ctx context.Context, plan *opt
 				continue
 			}
 			terminal, ok := recordsByID[terminalID]
-			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
 				continue
 			}
 			for _, origin := range origins {
@@ -6241,7 +6250,7 @@ func (e *Executor) executeCommonNeighborGraphJoin(ctx context.Context, plan *opt
 					second.LeftAlias:    origin,
 					first.TerminalAlias: terminal,
 				}
-				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, first.LeftAlias) {
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, first.LeftAlias) {
 					continue
 				}
 				rows = append(rows, chainedGraphJoinRow{base: source, aliases: aliases})
@@ -6259,7 +6268,7 @@ func graphJoinEdges(join optimizer.GraphJoinPlan) []EdgePlan {
 	return edges
 }
 
-func collectGraphJoinTerminals(g Graph, start uint64, edges []EdgePlan, maxHops int, label string, bitset *graph.Bitset, frontier *graph.FrontierBuf) ([]uint64, error) {
+func collectGraphJoinTerminals(ctx context.Context, g Graph, start uint64, edges []EdgePlan, maxHops int, label string, bitset *graph.Bitset, frontier *graph.FrontierBuf) ([]uint64, error) {
 	if len(edges) == 0 {
 		return nil, nil
 	}
@@ -6273,6 +6282,7 @@ func collectGraphJoinTerminals(g Graph, start uint64, edges []EdgePlan, maxHops 
 	terminals := make([]uint64, 0)
 	seen := make(map[uint64]struct{})
 	err := g.BFSPattern(start, edges, maxHops, func(nodeID uint64, band int, step int) bool {
+		trackSQLGraphExpansion(ctx, 1)
 		if band != len(edges)-1 || step < edges[band].Min ||
 			(nodeID == start && band == 0 && step == 0 && edges[0].Min > 0) {
 			return true
@@ -6291,6 +6301,211 @@ func collectGraphJoinTerminals(g Graph, start uint64, edges []EdgePlan, maxHops 
 	bitset.Clear()
 	frontier.Clear()
 	return terminals, err
+}
+
+type temporalGraphNeighbor interface {
+	NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]graph.EdgeView, error)
+	InboundNeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]graph.EdgeView, error)
+}
+
+func graphLabelNodeSet(g Graph, label string) map[uint64]struct{} {
+	if g == nil || label == "" {
+		return nil
+	}
+	ids := g.GetLabelNodes(label)
+	if len(ids) == 0 {
+		return map[uint64]struct{}{}
+	}
+	labels := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		labels[id] = struct{}{}
+	}
+	return labels
+}
+
+func collectGraphJoinTerminalsAtLSN(ctx context.Context, g temporalGraphNeighbor, start uint64, edges []EdgePlan, maxHops int, labelNodes map[uint64]struct{}, snapshotLSN uint64) ([]uint64, error) {
+	if g == nil || len(edges) == 0 {
+		return nil, nil
+	}
+	allowed := labelNodes
+	type state struct {
+		node       uint64
+		band, step int
+	}
+	queue := []state{{node: start, band: 0, step: 0}}
+	visited := make(map[[3]uint64]struct{})
+	terminals := make([]uint64, 0)
+	seenTerminals := make(map[uint64]struct{})
+	lastBand := len(edges) - 1
+	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		current := queue[0]
+		queue = queue[1:]
+		if current.band < 0 || current.band >= len(edges) {
+			continue
+		}
+		key := [3]uint64{current.node, uint64(current.band), uint64(current.step)}
+		if _, seen := visited[key]; seen {
+			continue
+		}
+		visited[key] = struct{}{}
+		band := edges[current.band]
+		trackSQLGraphExpansion(ctx, 1)
+		if current.band == lastBand && current.step >= band.Min &&
+			!(current.node == start && current.band == 0 && current.step == 0 && band.Min > 0) {
+			if len(allowed) == 0 {
+				if _, seen := seenTerminals[current.node]; !seen {
+					seenTerminals[current.node] = struct{}{}
+					terminals = append(terminals, current.node)
+				}
+			} else if _, ok := allowed[current.node]; ok {
+				if _, seen := seenTerminals[current.node]; !seen {
+					seenTerminals[current.node] = struct{}{}
+					terminals = append(terminals, current.node)
+				}
+			}
+		}
+		if current.step >= band.Max {
+			continue
+		}
+		if current.step >= band.Min && current.band+1 < len(edges) {
+			queue = append(queue, state{node: current.node, band: current.band + 1})
+		}
+
+		outbound, err := g.NeighborsAtLSNWithProperties(current.node, snapshotLSN)
+		if err != nil {
+			return nil, err
+		}
+		neighbors := outbound
+		if band.Dir < 0 {
+			neighbors, err = g.InboundNeighborsAtLSNWithProperties(current.node, snapshotLSN)
+			if err != nil {
+				return nil, err
+			}
+		} else if band.Dir == 0 {
+			inbound, inboundErr := g.InboundNeighborsAtLSNWithProperties(current.node, snapshotLSN)
+			if inboundErr != nil {
+				return nil, inboundErr
+			}
+			neighbors = append(neighbors, inbound...)
+		}
+		for _, view := range neighbors {
+			if !band.MatchesWithProperties(view.Edge, view.Properties) {
+				continue
+			}
+			nextBand := current.band
+			nextStep := current.step + 1
+			if current.band < lastBand && current.step >= band.Min && current.step >= band.Max-1 {
+				nextBand++
+				nextStep = 0
+			}
+			queue = append(queue, state{node: view.Edge.Target, band: nextBand, step: nextStep})
+		}
+	}
+	return terminals, nil
+}
+
+func (e *Executor) executeCommonNeighborGraphJoinAtLSN(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	temporalGraph, ok := g.(temporalGraphNeighbor)
+	if !ok {
+		return nil, fmt.Errorf("collection %q graph does not support temporal traversal", plan.CollectionName)
+	}
+	records := make([]Record, 0)
+	if err := leftCol.ListVisibleAtLSN(ctx, plan.SnapshotLSN, func(record *Record) bool {
+		if record != nil {
+			records = append(records, *record)
+		}
+		return ctx.Err() == nil
+	}); err != nil {
+		return nil, err
+	}
+	trackSQLRowsExamined(ctx, len(records))
+	if len(records) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+	first, second := plan.GraphJoins[0], plan.GraphJoins[1]
+	firstSourcePredicates := graphJoinSourcePredicates(plan.Predicates, first, plan.CollectionName)
+	originSourcePredicates := graphJoinSourcePredicates(plan.Predicates, second, plan.CollectionName)
+	terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, first)
+	if len(terminalPredicates) == 0 {
+		terminalPredicates = graphJoinTerminalPredicates(plan.Predicates, second)
+	}
+	originTerminals := make(map[uint64][]Record)
+	for _, origin := range records {
+		if len(originSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, origin, originSourcePredicates) {
+			continue
+		}
+		originNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, origin.ID)
+		if lookupErr != nil {
+			continue
+		}
+		originLabels := graphLabelNodeSet(g, second.TerminalLabel)
+		terminalIDs, traverseErr := collectGraphJoinTerminalsAtLSN(ctx, temporalGraph, originNode, graphJoinEdges(second), second.MaxHops, originLabels, plan.SnapshotLSN)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			originTerminals[terminalNode] = append(originTerminals[terminalNode], origin)
+		}
+	}
+	if len(originTerminals) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+	rows := make([]chainedGraphJoinRow, 0)
+	for _, source := range records {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, firstSourcePredicates) {
+			continue
+		}
+		sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
+		if lookupErr != nil {
+			continue
+		}
+		sourceLabels := graphLabelNodeSet(g, first.TerminalLabel)
+		terminalIDs, traverseErr := collectGraphJoinTerminalsAtLSN(ctx, temporalGraph, sourceNode, graphJoinEdges(first), first.MaxHops, sourceLabels, plan.SnapshotLSN)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			origins := originTerminals[terminalNode]
+			if len(origins) == 0 {
+				continue
+			}
+			collection, terminalID, resolveErr := e.db.ResolveNodeID(ctx, terminalNode)
+			if resolveErr != nil || collection != plan.CollectionName {
+				continue
+			}
+			terminal, ok := recordsByID[terminalID]
+			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
+				continue
+			}
+			for _, origin := range origins {
+				aliases := map[string]Record{
+					first.LeftAlias:     source,
+					second.LeftAlias:    origin,
+					first.TerminalAlias: terminal,
+				}
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, first.LeftAlias) {
+					continue
+				}
+				rows = append(rows, chainedGraphJoinRow{base: source, aliases: aliases})
+			}
+		}
+	}
+	return materializeChainedGraphJoinRows(rows, plan), nil
 }
 
 func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan *optimizer.PhysicalPlan, epoch *EpochTx) (*SearchResults, error) {
@@ -6328,7 +6543,7 @@ func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan
 
 	originTerminals := make(map[uint64][]Record)
 	for _, origin := range records {
-		if len(originSourcePredicates) > 0 && !recordMatchesPredicates(origin, originSourcePredicates) {
+		if len(originSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, origin, originSourcePredicates) {
 			continue
 		}
 		originNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, origin.ID)
@@ -6349,7 +6564,7 @@ func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan
 
 	rows := make([]chainedGraphJoinRow, 0)
 	for _, source := range records {
-		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(source, firstSourcePredicates) {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, firstSourcePredicates) {
 			continue
 		}
 		sourceNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, source.ID)
@@ -6370,7 +6585,7 @@ func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan
 				continue
 			}
 			terminal, ok := recordsByID[terminalID]
-			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
 				continue
 			}
 			for _, origin := range origins {
@@ -6379,7 +6594,7 @@ func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan
 					second.LeftAlias:    origin,
 					first.TerminalAlias: terminal,
 				}
-				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, first.LeftAlias) {
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, first.LeftAlias) {
 					continue
 				}
 				rows = append(rows, chainedGraphJoinRow{base: source, aliases: aliases})
@@ -6500,7 +6715,7 @@ func (e *Executor) executeChainedGraphJoin(ctx context.Context, plan *optimizer.
 	first := plan.GraphJoins[0]
 	firstSourcePredicates := graphJoinSourcePredicates(plan.Predicates, first, plan.CollectionName)
 	for _, record := range leftRecords {
-		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(record, firstSourcePredicates) {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, record, firstSourcePredicates) {
 			continue
 		}
 		rows = append(rows, chainedGraphJoinRow{
@@ -6547,7 +6762,7 @@ func (e *Executor) executeChainedGraphJoin(ctx context.Context, plan *optimizer.
 				continue
 			}
 			stageSourcePredicates := graphJoinSourcePredicates(plan.Predicates, join, plan.CollectionName)
-			if len(stageSourcePredicates) > 0 && !recordMatchesPredicates(anchor, stageSourcePredicates) {
+			if len(stageSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, anchor, stageSourcePredicates) {
 				continue
 			}
 			anchorID, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, anchor.ID)
@@ -6589,7 +6804,7 @@ func (e *Executor) executeChainedGraphJoin(ctx context.Context, plan *optimizer.
 					continue
 				}
 				terminal, getErr := leftCol.Get(ctx, terminalID)
-				if getErr != nil || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+				if getErr != nil || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
 					continue
 				}
 				aliases := make(map[string]Record, len(row.aliases)+1)
@@ -6638,7 +6853,7 @@ func (e *Executor) executeChainedGraphJoinEpoch(ctx context.Context, plan *optim
 	first := plan.GraphJoins[0]
 	firstSourcePredicates := graphJoinSourcePredicates(plan.Predicates, first, plan.CollectionName)
 	for _, record := range leftRecords {
-		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(record, firstSourcePredicates) {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, record, firstSourcePredicates) {
 			continue
 		}
 		rows = append(rows, chainedGraphJoinRow{base: record, aliases: map[string]Record{first.LeftAlias: record}})
@@ -6671,7 +6886,7 @@ func (e *Executor) executeChainedGraphJoinEpoch(ctx context.Context, plan *optim
 				continue
 			}
 			stageSourcePredicates := graphJoinSourcePredicates(plan.Predicates, join, plan.CollectionName)
-			if len(stageSourcePredicates) > 0 && !recordMatchesPredicates(anchor, stageSourcePredicates) {
+			if len(stageSourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, anchor, stageSourcePredicates) {
 				continue
 			}
 			anchorID, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, anchor.ID)
@@ -6748,7 +6963,7 @@ func (e *Executor) executeChainedGraphJoinEpoch(ctx context.Context, plan *optim
 					continue
 				}
 				terminal, ok := recordsByID[terminalID]
-				if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+				if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
 					continue
 				}
 				aliases := make(map[string]Record, len(row.aliases)+1)
@@ -7040,7 +7255,7 @@ func (e *Executor) executeProjectedGraphJoin(ctx context.Context, plan *optimize
 	}
 	results := make([]*SearchResult, 0)
 	for _, source := range records {
-		if len(sourcePredicates) > 0 && !recordMatchesPredicates(source, sourcePredicates) {
+		if len(sourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, sourcePredicates) {
 			continue
 		}
 		sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
@@ -7061,11 +7276,11 @@ func (e *Executor) executeProjectedGraphJoin(ctx context.Context, plan *optimize
 			}
 			target, ok := recordsByID[targetID]
 			if !ok || (len(allowedLabels) > 0 && !hasGraphLabel(allowedLabels, view.Edge.Target)) ||
-				(len(terminalPredicates) > 0 && !recordMatchesPredicates(target, terminalPredicates)) {
+				(len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, target, terminalPredicates)) {
 				continue
 			}
 			aliases := map[string]Record{join.LeftAlias: source, join.TerminalAlias: target}
-			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, join.LeftAlias) {
+			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, join.LeftAlias) {
 				continue
 			}
 			resultID := source.ID + "|" + target.ID
@@ -7137,7 +7352,7 @@ func (e *Executor) executeProjectedGraphJoinEpoch(ctx context.Context, plan *opt
 	}
 	results := make([]*SearchResult, 0)
 	for _, source := range records {
-		if len(sourcePredicates) > 0 && !recordMatchesPredicates(source, sourcePredicates) {
+		if len(sourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, sourcePredicates) {
 			continue
 		}
 		sourceNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, source.ID)
@@ -7165,11 +7380,11 @@ func (e *Executor) executeProjectedGraphJoinEpoch(ctx context.Context, plan *opt
 			}
 			target, ok := recordsByID[targetID]
 			if !ok || !hasGraphLabel(allowedLabels, view.Edge.Target) ||
-				(len(terminalPredicates) > 0 && !recordMatchesPredicates(target, terminalPredicates)) {
+				(len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, target, terminalPredicates)) {
 				continue
 			}
 			aliases := map[string]Record{join.LeftAlias: source, join.TerminalAlias: target}
-			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, join.LeftAlias) {
+			if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, join.LeftAlias) {
 				continue
 			}
 			resultID := source.ID + "|" + target.ID
@@ -7310,7 +7525,7 @@ func (e *Executor) executeGraphJoinEpoch(ctx context.Context, plan *optimizer.Ph
 								aliases[join.LeftAlias] = leftRec
 								aliases[join.TerminalAlias] = r
 							}
-							if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, plan.CollectionName) {
+							if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, plan.CollectionName) {
 								break
 							}
 							results = append(results, &SearchResult{

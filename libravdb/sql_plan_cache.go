@@ -154,7 +154,7 @@ func sqlPlanCacheEligible(src []byte, doc *parser.QueryDoc) (bool, []sqlPlanPara
 	if stmt.FromTable.Kind != parser.NodeKindTableExpr || len(stmt.Joins) != 0 ||
 		stmt.CTEsCount != 0 || len(stmt.GroupBy) != 0 ||
 		stmt.HavingExpr.Kind != parser.NodeKindUnknown || stmt.UnionNext.Kind != parser.NodeKindUnknown ||
-		stmt.SetOp != parser.SetOpNone || selectHasTemporalRange(doc, stmt) {
+		stmt.SetOp != parser.SetOpNone || selectHasTemporalSnapshot(doc, stmt) {
 		return false, nil
 	}
 	if stmt.LimitExpr.Kind != parser.NodeKindUnknown || stmt.OffsetExpr.Kind != parser.NodeKindUnknown {

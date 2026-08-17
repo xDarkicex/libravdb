@@ -295,6 +295,26 @@ func analyzeParamsBytes(query []byte) paramInfo {
 			pi.namedOrder = append(pi.namedOrder, name)
 		}
 	}
+	// Temporal table bounds are stored as spans on TableExpr rather than as
+	// expression Identifier nodes. Merge the lexer-authoritative parameter
+	// inventory so AS OF TIMESTAMP/LSN parameters participate in Parse/Bind
+	// just like parameters in predicates and projections.
+	lexical := analyzeParamsLexical(query)
+	if lexical.numPositional > pi.numPositional {
+		pi.numPositional = lexical.numPositional
+	}
+	for _, name := range lexical.namedOrder {
+		seen := false
+		for _, existing := range pi.namedOrder {
+			if strings.EqualFold(existing, name) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			pi.namedOrder = append(pi.namedOrder, name)
+		}
+	}
 	return pi
 }
 
@@ -773,7 +793,8 @@ func executePortalRows(w io.Writer, portal *Portal, maxRows uint32) error {
 func isRowProducingSQL(query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	return strings.HasPrefix(upper, "SELECT ") || upper == "SELECT" ||
-		strings.HasPrefix(upper, "WITH ") || strings.HasPrefix(upper, "COMPUTE ")
+		strings.HasPrefix(upper, "WITH ") || strings.HasPrefix(upper, "COMPUTE ") ||
+		strings.HasPrefix(upper, "EXPLAIN ") || upper == "EXPLAIN"
 }
 
 func isDMLSQL(query string) bool {

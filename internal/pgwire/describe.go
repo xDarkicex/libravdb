@@ -71,6 +71,21 @@ func describeStatement(db *libravdb.Database, query string, paramCount int) ([]u
 	if cat == nil {
 		return nil, nil, fmt.Errorf("catalog not initialized")
 	}
+	if doc.Explain {
+		if !doc.ExplainAnalyze {
+			return nil, nil, fmt.Errorf("EXPLAIN without ANALYZE is not supported; use EXPLAIN ANALYZE")
+		}
+		if !describeHasGraphJoin(doc) {
+			return nil, nil, fmt.Errorf("EXPLAIN ANALYZE currently supports graph queries only")
+		}
+		markParams(doc, src)
+		binder := catalog.NewBinder(cat, src)
+		if err := binder.Bind(doc); err != nil {
+			return nil, nil, fmt.Errorf("bind error: %w", err)
+		}
+		paramOIDs := inferParamOIDs(doc, src, cat, nil, paramCount)
+		return paramOIDs, []ColumnMeta{{Name: libravdb.SQLExplainColumn, TypeOID: OIDJSONB}}, nil
+	}
 	if dmlColumns, dml := describeDMLReturning(db, doc, src); dml {
 		return inferParamOIDs(doc, src, cat, nil, paramCount), dmlColumns, nil
 	}
@@ -1352,11 +1367,42 @@ func inferParamOIDs(doc *parser.QueryDoc, src []byte, cat *catalog.Catalog, byOI
 			oids[idx] = OIDTimestamptz
 		}
 	}
+	setLSNBoundOID := func(start, end uint32) {
+		if start >= end || end > uint32(len(src)) {
+			return
+		}
+		for i := range doc.Identifiers {
+			id := &doc.Identifiers[i]
+			if id.Start == start && id.End == end {
+				setOID(id.ID, OIDInt8)
+			}
+		}
+		text := string(src[start:end])
+		if len(text) < 2 || (text[0] != '$' && text[0] != '@') {
+			return
+		}
+		idx := -1
+		if text[0] == '$' {
+			if n, err := strconv.Atoi(text[1:]); err == nil && n > 0 {
+				idx = n - 1
+			} else if n, ok := namedOrdinals[strings.ToLower(text[1:])]; ok {
+				idx = n
+			}
+		} else if n, ok := namedOrdinals[strings.ToLower(text[1:])]; ok {
+			idx = n
+		}
+		if idx >= 0 && idx < len(oids) && oids[idx] == 0 {
+			oids[idx] = OIDInt8
+		}
+	}
 	for i := range doc.TableExprs {
 		table := &doc.TableExprs[i]
 		if table.TemporalRange {
 			setTemporalBoundOID(table.RangeStartStart, table.RangeStartEnd)
 			setTemporalBoundOID(table.RangeEndStart, table.RangeEndEnd)
+		}
+		if table.TemporalLSN {
+			setLSNBoundOID(table.LSNStart, table.LSNEnd)
 		}
 	}
 	var isParam func(parser.NodeRef) (int32, bool)

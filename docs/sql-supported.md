@@ -419,6 +419,55 @@ harness verifies scalar parameter-slot reuse through native `QueryWithParams`
 and pgx-backed `database/sql`, catalog-generation invalidation after
 `ALTER TABLE`, and JSONB stats retrieval over pgwire.
 
+### `EXPLAIN ANALYZE` for graph queries
+
+`EXPLAIN ANALYZE` executes a graph query and returns one JSONB plan row instead
+of the query's ordinary result rows. It is available through native SQL and
+pgwire and is intended for query-local observability:
+
+```sql
+EXPLAIN ANALYZE
+SELECT DISTINCT src.id
+FROM people AS src
+JOIN MATCH (src)-[]->(shared)
+JOIN MATCH (origin)-[]->(shared)
+WHERE origin.id = $1
+  AND src.id <> $1;
+```
+
+The stable output column is `libravdb_explain`. Its JSON object contains:
+
+| Field | Meaning |
+| --- | --- |
+| `strategy` | Graph execution strategy, such as `graph_join_match` |
+| `anchor` | Starting graph vertex alias when one is present |
+| `actual_rows` | Rows produced by the inner graph query |
+| `graph_expansions` | Graph states visited during traversal |
+| `predicate_rejections` | Candidate rows rejected by graph-side SQL predicates |
+| `index_hits` | Existing indexed lookup hits used by the query |
+| `execution_time_ns` | Inner query execution time in nanoseconds |
+| `plan_reused` | Whether an eligible compiled plan was reused |
+
+For example, the value has this shape:
+
+```json
+{
+  "strategy": "graph_join_match",
+  "anchor": "src",
+  "actual_rows": 2,
+  "graph_expansions": 12,
+  "predicate_rejections": 3,
+  "index_hits": 0,
+  "execution_time_ns": 160500,
+  "plan_reused": false
+}
+```
+
+`EXPLAIN ANALYZE` does not add estimated rows: the graph planner does not yet
+have a cardinality estimator, so no estimate is presented as fact. It does
+not change the underlying query's data or result semantics. Plain `EXPLAIN`
+without `ANALYZE` is not currently supported.
+
 ### `COPY` over PostgreSQL wire
 
 The pgwire server supports `COPY FROM STDIN` and `COPY TO STDOUT` for supported
@@ -1085,6 +1134,30 @@ endpoint; it is not two independent traversals whose results are combined as
 a Cartesian product. `DISTINCT` is recommended when multiple origin rows or
 multiple matching paths can produce the same projected source row.
 
+The common-neighbor result can also feed an ordinary relational query through
+an `IN` semijoin. LibraVDB recognizes this form and executes the graph
+subquery once, deduplicates its source IDs, and probes the outer collection by
+ID. This keeps profile projection and final filtering inside SQL:
+
+```sql
+SELECT p.id, p.metadata
+FROM people AS p
+WHERE p.id IN (
+    SELECT src.id
+    FROM people AS src
+    JOIN MATCH (src)-[]->(shared)
+    JOIN MATCH (origin)-[]->(shared)
+    WHERE origin.id = $origin_id
+      AND src.id <> $origin_id
+)
+ORDER BY p.id;
+```
+
+The semijoin preserves duplicate elimination, outer predicates, ordering,
+limits, and the active epoch or `AS OF LSN` snapshot. It is specialized for a
+single common-neighbor `JOIN MATCH` subquery; other correlated or boolean
+subquery forms continue through the general virtual-relation evaluator.
+
 ### Edge properties
 
 Edges may carry arbitrary JSON-compatible fields in addition to their durable
@@ -1278,6 +1351,49 @@ retention-expired error rather than silently returning current data.
 `AS OF TIMESTAMP` is not allowed inside an active epoch transaction. Use a
 normal database query for historical reads and an epoch transaction for staged
 current-state work.
+
+### Exact-LSN relation snapshots
+
+SQL can select a relation at an exact durable commit position with `AS OF LSN`:
+
+```sql
+SELECT id, title
+FROM documents AS OF LSN $snapshot_lsn
+ORDER BY id;
+```
+
+The bound may be a decimal LSN literal or a typed integer/text parameter. The
+same syntax works with vector operators and graph traversal, so one token
+selects a coherent record, vector, and graph snapshot:
+
+```sql
+SELECT d.id,
+       d.embedding <-> $query_vector AS distance
+FROM documents AS OF LSN $snapshot_lsn d
+WHERE MATCH (d)-[:RELATES]->(target)
+ORDER BY distance
+LIMIT 10;
+```
+
+An exact-LSN source can also be used inside a bounded CTE. The input limit is
+applied to the historical rows before the outer query runs:
+
+```sql
+WITH bounded AS (
+    SELECT id, title
+    FROM documents AS OF LSN $snapshot_lsn
+    ORDER BY id
+    LIMIT $input_limit
+)
+SELECT id, title
+FROM bounded
+ORDER BY id;
+```
+
+`AS OF LSN` validates the requested commit against retention and recovery
+state. An unknown or future LSN returns an unknown-snapshot error; a previously
+valid LSN below the retained history returns the normal retention-expired
+error. The syntax is not available inside an active epoch transaction.
 
 ### Exact commit LSN tokens
 

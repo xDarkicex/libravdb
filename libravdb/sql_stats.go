@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync/atomic"
 	"time"
+
+	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
 // SQLQueryStats is a cumulative snapshot of SQL execution activity for one
@@ -76,11 +78,14 @@ func (s *sqlStatsCounters) reset() {
 // sqlQueryTracker is request-local. Nested query-local evaluators share the
 // outer tracker so one public SQL request produces one stats sample.
 type sqlQueryTracker struct {
-	planCacheHits   uint64
-	planCacheMisses uint64
-	rowsExamined    uint64
-	graphExpansions uint64
-	indexHits       uint64
+	planCacheHits        uint64
+	planCacheMisses      uint64
+	rowsExamined         uint64
+	graphExpansions      uint64
+	indexHits            uint64
+	predicateRejections  uint64
+	rowsReturned         uint64
+	rowsReturnedOverride bool
 }
 
 type sqlQueryTrackerContextKey struct{}
@@ -111,6 +116,36 @@ func trackSQLIndexHit(ctx context.Context, count int) {
 	}
 }
 
+func trackSQLPredicateRejection(ctx context.Context, count int) {
+	if tracker := sqlTrackerFromContext(ctx); tracker != nil && count > 0 {
+		tracker.predicateRejections += uint64(count)
+	}
+}
+
+func recordMatchesPredicatesTracked(ctx context.Context, record Record, predicates []optimizer.RelationalPredicate) bool {
+	if recordMatchesPredicates(record, predicates) {
+		return true
+	}
+	trackSQLPredicateRejection(ctx, 1)
+	return false
+}
+
+func recordMatchesPredicatesSnapshotTracked(ctx context.Context, record *Record, predicates []optimizer.RelationalPredicate) bool {
+	if recordMatchesPredicatesSnapshot(record, predicates) {
+		return true
+	}
+	trackSQLPredicateRejection(ctx, 1)
+	return false
+}
+
+func graphJoinMatchesAlternativesTracked(ctx context.Context, plan *optimizer.PhysicalPlan, aliases map[string]Record, defaultAlias string) bool {
+	if graphJoinMatchesAlternatives(plan, aliases, defaultAlias) {
+		return true
+	}
+	trackSQLPredicateRejection(ctx, 1)
+	return false
+}
+
 func (db *Database) recordSQLQuery(duration time.Duration, results *SearchResults, err error, tracker *sqlQueryTracker) {
 	if db == nil || db.sqlStats == nil {
 		return
@@ -129,6 +164,9 @@ func (db *Database) recordSQLQuery(duration time.Duration, results *SearchResult
 		rows := results.Total
 		if rows < len(results.Results) {
 			rows = len(results.Results)
+		}
+		if tracker != nil && tracker.rowsReturnedOverride {
+			rows = int(tracker.rowsReturned)
 		}
 		if rows > 0 {
 			db.sqlStats.rowsReturned.Add(uint64(rows))
