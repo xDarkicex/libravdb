@@ -147,6 +147,32 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			ah := hashIdentifier(b.src, v.Alias, v.AliasEnd)
 			anchorDef, ok := aliasScope[ah]
 			if !ok {
+				// A second MATCH stage may anchor from another vertex in the
+				// same graph relation without introducing a second SQL FROM
+				// relation.  For example:
+				//
+				//   FROM people src
+				//   JOIN MATCH (src)-[]->(shared)
+				//   JOIN MATCH (origin)-[]->(shared)
+				//
+				// `origin` is a graph-scoped alias whose record is selected by
+				// the query predicates (normally origin.id = $1).  It has the
+				// same catalog schema as the base FROM relation, but must not
+				// be added to the unqualified SQL scope.
+				if stmt.FromTable.Kind == parser.NodeKindTableExpr && stmt.FromTable.ID >= 0 && int(stmt.FromTable.ID) < len(doc.TableExprs) {
+					from := &doc.TableExprs[stmt.FromTable.ID]
+					fromHash := hashIdentifier(b.src, from.Start, from.End)
+					anchorDef = aliasScope[fromHash]
+					if anchorDef == nil && from.AliasEnd > from.Alias {
+						anchorDef = aliasScope[hashIdentifier(b.src, from.Alias, from.AliasEnd)]
+					}
+					if anchorDef != nil {
+						aliasScope[ah] = anchorDef
+						ok = true
+					}
+				}
+			}
+			if !ok {
 				return fmt.Errorf("JOIN MATCH anchor vertex '%s' does not match any FROM alias", string(b.src[v.Alias:v.AliasEnd]))
 			}
 			// Graph vertex aliases name records in the graph relation. Registering

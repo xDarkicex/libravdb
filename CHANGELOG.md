@@ -1,6 +1,15 @@
 # Changelog
 
 All releases follow [Go module versioning](https://go.dev/doc/modules/version-numbers). The Go module path is `github.com/xDarkicex/libravdb` (major version 1). Human release numbers are mapped to Go module versions below.
+
+## Unreleased
+
+### Graph SQL
+
+- Added native and pgwire support for common-neighbor graph queries using chained `JOIN MATCH` clauses that converge on the same terminal node.
+- The optimized execution path materializes the origin-side terminals once, intersects source-side traversals by shared terminal, applies predicates, and preserves `DISTINCT` and projection semantics.
+- Added equivalent epoch-snapshot execution and regression coverage for parameterized native and pgwire queries.
+
 ## [v1.4.0] / Go v1.4.0 — 2026-08-03
 
 34 files changed, 3,731 insertions, 77 deletions. This release adds a SQL execution engine, PostgreSQL wire protocol (pgwire), full DDL grammar with constraint parsing, and catalog persistence.

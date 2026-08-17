@@ -396,3 +396,109 @@ func TestBetaChainedJoinMatchAppliesTerminalFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBetaCommonNeighborJoinMatchIntersectsSharedTerminals(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:common-neighbor-join-match-beta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	graph, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	if !RegisterEdgeKind("COMMON_NEIGHBOR_FOLLOWS", 249) {
+		t.Fatal("register COMMON_NEIGHBOR_FOLLOWS")
+	}
+
+	people, err := db.CreateCollection(ctx, "people", WithMetadataOnly(), WithGraph(graph), WithMetadataSchema(MetadataSchema{
+		"metadata": JSONBField,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, person := range []struct {
+		id   string
+		name string
+	}{
+		{id: "alice", name: "Origin"},
+		{id: "bob", name: "Bob"},
+		{id: "carol", name: "Carol"},
+		{id: "dave", name: "Dave"},
+		{id: "shared-1", name: "Shared One"},
+		{id: "shared-2", name: "Shared Two"},
+		{id: "shared-3", name: "Unshared"},
+	} {
+		if err := people.Insert(ctx, person.id, nil, map[string]interface{}{
+			"metadata": map[string]interface{}{"name": person.name},
+		}); err != nil {
+			t.Fatalf("insert %s: %v", person.id, err)
+		}
+	}
+	node := func(id string) uint64 { return mustNodeID(t, db, ctx, "people", id) }
+	txn := graph.BeginTxn()
+	for _, edge := range [][2]string{
+		{"alice", "shared-1"},
+		{"alice", "shared-2"},
+		{"bob", "shared-1"},
+		{"carol", "shared-2"},
+		{"dave", "shared-3"},
+	} {
+		if err := txn.AddEdge(node(edge[0]), node(edge[1]), 1, 249); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := txn.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.QueryWithParams(ctx, `
+		SELECT DISTINCT src.id, src.metadata
+		FROM people src
+		JOIN MATCH (src)-[]->(shared)
+		JOIN MATCH (origin)-[]->(shared)
+		WHERE origin.id = $1
+		  AND src.id != $1
+		ORDER BY src.id`, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("common-neighbor JOIN MATCH: %v", err)
+	}
+	if rows.Total != 2 {
+		t.Fatalf("common-neighbor rows=%d, want 2: %#v", rows.Total, rows)
+	}
+	seen := make(map[string]bool, rows.Total)
+	for _, row := range rows.Results {
+		value, ok := row.Metadata["id"]
+		if !ok {
+			t.Fatalf("common-neighbor row missing projected id: %#v", row.Metadata)
+		}
+		seen[recordMetaToString(value)] = true
+	}
+	if !seen["bob"] || !seen["carol"] || seen["alice"] || seen["dave"] {
+		t.Fatalf("common-neighbor IDs=%v, want bob and carol only", seen)
+	}
+
+	epoch, err := db.BeginEpochTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochRows, err := epoch.Query(ctx, `
+		SELECT DISTINCT src.id
+		FROM people src
+		JOIN MATCH (src)-[]->(shared)
+		JOIN MATCH (origin)-[]->(shared)
+		WHERE origin.id = $1
+		  AND src.id != $1
+		ORDER BY src.id`, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("epoch common-neighbor JOIN MATCH: %v", err)
+	}
+	if epochRows.Total != 2 {
+		t.Fatalf("epoch common-neighbor rows=%d, want 2: %#v", epochRows.Total, epochRows)
+	}
+	if err := epoch.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

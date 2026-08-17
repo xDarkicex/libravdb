@@ -5710,10 +5710,16 @@ func joinResultMetadata(left, right Record) map[string]interface{} {
 func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
 	// Epoch guard: route JOIN MATCH through epoch-aware path when inside an epoch.
 	if epoch := epochFromContext(ctx); epoch != nil {
+		if graphJoinsFormCommonNeighbor(plan.GraphJoins) {
+			return e.executeCommonNeighborGraphJoinEpoch(ctx, plan, epoch)
+		}
 		if len(plan.GraphJoins) > 1 && graphJoinsFormChain(plan.GraphJoins) {
 			return e.executeChainedGraphJoinEpoch(ctx, plan, epoch)
 		}
 		return e.executeGraphJoinEpoch(ctx, plan, epoch)
+	}
+	if graphJoinsFormCommonNeighbor(plan.GraphJoins) {
+		return e.executeCommonNeighborGraphJoin(ctx, plan)
 	}
 	if len(plan.GraphJoins) > 1 && graphJoinsFormChain(plan.GraphJoins) {
 		return e.executeChainedGraphJoin(ctx, plan)
@@ -5898,6 +5904,366 @@ func graphJoinsFormChain(joins []optimizer.GraphJoinPlan) bool {
 		}
 	}
 	return true
+}
+
+// graphJoinsFormCommonNeighbor identifies the two-stage graph join used for
+// common-neighbor recommendations:
+//
+//	FROM people src
+//	JOIN MATCH (src)-[]->(shared)
+//	JOIN MATCH (origin)-[]->(shared)
+//
+// This is deliberately separate from graphJoinsFormChain. The second stage
+// starts at an independent graph anchor and joins on the repeated terminal
+// alias; treating it as a chain would traverse from the first shared node and
+// produce the wrong semantics.
+func graphJoinsFormCommonNeighbor(joins []optimizer.GraphJoinPlan) bool {
+	if len(joins) != 2 {
+		return false
+	}
+	first, second := joins[0], joins[1]
+	if first.JoinType != 0 || second.JoinType != 0 {
+		return false
+	}
+	if first.LeftAlias == "" || second.LeftAlias == "" ||
+		first.TerminalAlias == "" || second.TerminalAlias == "" {
+		return false
+	}
+	return !strings.EqualFold(first.LeftAlias, second.LeftAlias) &&
+		strings.EqualFold(first.TerminalAlias, second.TerminalAlias) &&
+		strings.EqualFold(first.LeftCollection, second.LeftCollection)
+}
+
+// executeCommonNeighborGraphJoin evaluates two independent one-hop (or
+// bounded-path) traversals as a relational intersection. The origin-side
+// terminal set is materialized once, then each source-side terminal is tested
+// against that set. This preserves the repeated `shared` alias semantics and
+// avoids the old N+1 application traversal pattern.
+func (e *Executor) executeCommonNeighborGraphJoin(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	records, err := recordsVisibleInContext(ctx, leftCol)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+
+	first, second := plan.GraphJoins[0], plan.GraphJoins[1]
+	firstSourcePredicates := graphJoinSourcePredicates(plan.Predicates, first, plan.CollectionName)
+	originSourcePredicates := graphJoinSourcePredicates(plan.Predicates, second, plan.CollectionName)
+	terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, first)
+	if len(terminalPredicates) == 0 {
+		terminalPredicates = graphJoinTerminalPredicates(plan.Predicates, second)
+	}
+
+	bitset, err := g.GetBitset()
+	if err != nil {
+		return nil, err
+	}
+	defer g.PutBitset(bitset)
+	frontier, err := g.GetFrontierBuf()
+	if err != nil {
+		return nil, err
+	}
+	defer g.PutFrontierBuf(frontier)
+
+	originTerminals := make(map[uint64][]Record)
+	originEdges := graphJoinEdges(second)
+	for _, origin := range records {
+		if len(originSourcePredicates) > 0 && !recordMatchesPredicates(origin, originSourcePredicates) {
+			continue
+		}
+		originNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, origin.ID)
+		if lookupErr != nil {
+			continue
+		}
+		terminalIDs, traverseErr := collectGraphJoinTerminals(g, originNode, originEdges, second.MaxHops, second.TerminalLabel, bitset, frontier)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			originTerminals[terminalNode] = append(originTerminals[terminalNode], origin)
+		}
+	}
+	if len(originTerminals) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+
+	rows := make([]chainedGraphJoinRow, 0)
+	sourceEdges := graphJoinEdges(first)
+	for _, source := range records {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(source, firstSourcePredicates) {
+			continue
+		}
+		sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
+		if lookupErr != nil {
+			continue
+		}
+		terminalIDs, traverseErr := collectGraphJoinTerminals(g, sourceNode, sourceEdges, first.MaxHops, first.TerminalLabel, bitset, frontier)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			origins := originTerminals[terminalNode]
+			if len(origins) == 0 {
+				continue
+			}
+			_, terminalID, resolveErr := e.db.ResolveNodeID(ctx, terminalNode)
+			if resolveErr != nil {
+				continue
+			}
+			terminal, ok := recordsByID[terminalID]
+			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+				continue
+			}
+			for _, origin := range origins {
+				aliases := map[string]Record{
+					first.LeftAlias:     source,
+					second.LeftAlias:    origin,
+					first.TerminalAlias: terminal,
+				}
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, first.LeftAlias) {
+					continue
+				}
+				rows = append(rows, chainedGraphJoinRow{base: source, aliases: aliases})
+			}
+		}
+	}
+	return materializeChainedGraphJoinRows(rows, plan), nil
+}
+
+func graphJoinEdges(join optimizer.GraphJoinPlan) []EdgePlan {
+	edges := make([]EdgePlan, len(join.GraphEdges))
+	for i, edge := range join.GraphEdges {
+		edges[i] = graphEdgePlanForTraversal(edge)
+	}
+	return edges
+}
+
+func collectGraphJoinTerminals(g Graph, start uint64, edges []EdgePlan, maxHops int, label string, bitset *graph.Bitset, frontier *graph.FrontierBuf) ([]uint64, error) {
+	if len(edges) == 0 {
+		return nil, nil
+	}
+	allowed := map[uint64]struct{}(nil)
+	if label != "" {
+		allowed = make(map[uint64]struct{})
+		for _, nodeID := range g.GetLabelNodes(label) {
+			allowed[nodeID] = struct{}{}
+		}
+	}
+	terminals := make([]uint64, 0)
+	seen := make(map[uint64]struct{})
+	err := g.BFSPattern(start, edges, maxHops, func(nodeID uint64, band int, step int) bool {
+		if band != len(edges)-1 || step < edges[band].Min ||
+			(nodeID == start && band == 0 && step == 0 && edges[0].Min > 0) {
+			return true
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[nodeID]; !ok {
+				return true
+			}
+		}
+		if _, ok := seen[nodeID]; !ok {
+			seen[nodeID] = struct{}{}
+			terminals = append(terminals, nodeID)
+		}
+		return true
+	}, bitset, frontier)
+	bitset.Clear()
+	frontier.Clear()
+	return terminals, err
+}
+
+func (e *Executor) executeCommonNeighborGraphJoinEpoch(ctx context.Context, plan *optimizer.PhysicalPlan, epoch *EpochTx) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	gtx, err := epoch.GraphTxn(plan.CollectionName)
+	if err != nil {
+		return nil, fmt.Errorf("epoch graph txn for common-neighbor JOIN MATCH: %w", err)
+	}
+	records, err := recordsVisibleInContext(ctx, leftCol)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+
+	first, second := plan.GraphJoins[0], plan.GraphJoins[1]
+	firstSourcePredicates := graphJoinSourcePredicates(plan.Predicates, first, plan.CollectionName)
+	originSourcePredicates := graphJoinSourcePredicates(plan.Predicates, second, plan.CollectionName)
+	terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, first)
+	if len(terminalPredicates) == 0 {
+		terminalPredicates = graphJoinTerminalPredicates(plan.Predicates, second)
+	}
+
+	originTerminals := make(map[uint64][]Record)
+	for _, origin := range records {
+		if len(originSourcePredicates) > 0 && !recordMatchesPredicates(origin, originSourcePredicates) {
+			continue
+		}
+		originNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, origin.ID)
+		if lookupErr != nil {
+			continue
+		}
+		terminalIDs, traverseErr := collectEpochGraphJoinTerminals(gtx, g, originNode, graphJoinEdges(second), second.MaxHops, second.TerminalLabel)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			originTerminals[terminalNode] = append(originTerminals[terminalNode], origin)
+		}
+	}
+	if len(originTerminals) == 0 {
+		return materializeChainedGraphJoinRows(nil, plan), nil
+	}
+
+	rows := make([]chainedGraphJoinRow, 0)
+	for _, source := range records {
+		if len(firstSourcePredicates) > 0 && !recordMatchesPredicates(source, firstSourcePredicates) {
+			continue
+		}
+		sourceNode, lookupErr := e.lookupNodeIDInContext(ctx, plan.CollectionName, source.ID)
+		if lookupErr != nil {
+			continue
+		}
+		terminalIDs, traverseErr := collectEpochGraphJoinTerminals(gtx, g, sourceNode, graphJoinEdges(first), first.MaxHops, first.TerminalLabel)
+		if traverseErr != nil {
+			return nil, traverseErr
+		}
+		for _, terminalNode := range terminalIDs {
+			origins := originTerminals[terminalNode]
+			if len(origins) == 0 {
+				continue
+			}
+			collection, terminalID, resolveErr := e.resolveNodeIDInContext(ctx, terminalNode)
+			if resolveErr != nil || collection != plan.CollectionName {
+				continue
+			}
+			terminal, ok := recordsByID[terminalID]
+			if !ok || (len(terminalPredicates) > 0 && !recordMatchesPredicates(terminal, terminalPredicates)) {
+				continue
+			}
+			for _, origin := range origins {
+				aliases := map[string]Record{
+					first.LeftAlias:     source,
+					second.LeftAlias:    origin,
+					first.TerminalAlias: terminal,
+				}
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternatives(plan, aliases, first.LeftAlias) {
+					continue
+				}
+				rows = append(rows, chainedGraphJoinRow{base: source, aliases: aliases})
+			}
+		}
+	}
+	return materializeChainedGraphJoinRows(rows, plan), nil
+}
+
+func collectEpochGraphJoinTerminals(gtx *graph.Txn, g Graph, start uint64, edges []EdgePlan, maxHops int, label string) ([]uint64, error) {
+	if gtx == nil || len(edges) == 0 {
+		return nil, nil
+	}
+	allowed := map[uint64]struct{}(nil)
+	if label != "" {
+		allowed = make(map[uint64]struct{})
+		for _, nodeID := range g.GetLabelNodes(label) {
+			allowed[nodeID] = struct{}{}
+		}
+	}
+	type state struct {
+		node       uint64
+		band, step int
+	}
+	queue := []state{{node: start, band: 0, step: 0}}
+	visited := make(map[[3]uint64]struct{})
+	terminals := make([]uint64, 0)
+	seenTerminals := make(map[uint64]struct{})
+	lastBand := len(edges) - 1
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current.band < 0 || current.band >= len(edges) {
+			continue
+		}
+		key := [3]uint64{current.node, uint64(current.band), uint64(current.step)}
+		if _, seen := visited[key]; seen {
+			continue
+		}
+		visited[key] = struct{}{}
+		band := edges[current.band]
+		if current.band == lastBand && current.step >= band.Min &&
+			!(current.node == start && current.band == 0 && current.step == 0 && band.Min > 0) {
+			if len(allowed) == 0 {
+				if _, seen := seenTerminals[current.node]; !seen {
+					seenTerminals[current.node] = struct{}{}
+					terminals = append(terminals, current.node)
+				}
+			} else if _, ok := allowed[current.node]; ok {
+				if _, seen := seenTerminals[current.node]; !seen {
+					seenTerminals[current.node] = struct{}{}
+					terminals = append(terminals, current.node)
+				}
+			}
+		}
+		if current.step >= band.Min && current.band+1 < len(edges) {
+			queue = append(queue, state{node: current.node, band: current.band + 1})
+		}
+		if current.step >= band.Max {
+			continue
+		}
+		var neighbors []Edge
+		if band.Dir < 0 {
+			neighbors, _ = gtx.InboundNeighborsOverlay(current.node)
+		} else if band.Dir > 0 {
+			neighbors, _ = gtx.NeighborsOverlay(current.node)
+		} else {
+			outbound, outErr := gtx.NeighborsOverlay(current.node)
+			if outErr != nil {
+				return nil, outErr
+			}
+			inbound, inErr := gtx.InboundNeighborsOverlay(current.node)
+			if inErr != nil {
+				return nil, inErr
+			}
+			neighbors = append(outbound, inbound...)
+		}
+		for _, edge := range neighbors {
+			if !band.Matches(edge) {
+				continue
+			}
+			nextBand := current.band
+			nextStep := current.step + 1
+			if current.band < lastBand && current.step >= band.Min && current.step >= band.Max-1 {
+				nextBand++
+				nextStep = 0
+			}
+			queue = append(queue, state{node: edge.Target, band: nextBand, step: nextStep})
+		}
+	}
+	return terminals, nil
 }
 
 type chainedGraphJoinRow struct {

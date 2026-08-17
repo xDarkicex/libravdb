@@ -956,6 +956,30 @@ The bounded path's lower and upper hop limits are enforced during traversal.
 The executor does not expose a path object or shortest-path result expression;
 use a bounded traversal and project the terminal nodes when that is sufficient.
 
+### Common-neighbor traversal
+
+Two `JOIN MATCH` stages may use the same terminal alias to express a common
+neighbor without issuing one query per neighbor. The second graph anchor is
+resolved from the same graph-backed collection and is constrained by ordinary
+SQL predicates:
+
+```sql
+SELECT DISTINCT src.id, src.metadata
+FROM people AS src
+JOIN MATCH (src)-[]->(shared)
+JOIN MATCH (origin)-[]->(shared)
+WHERE origin.id = $origin_id
+  AND src.id <> $origin_id
+ORDER BY src.id;
+```
+
+LibraVDB materializes the origin-side terminal set, intersects it with each
+source-side terminal set, and then applies the remaining predicates and
+projection. The repeated `shared` alias is an equality join on the graph
+endpoint; it is not two independent traversals whose results are combined as
+a Cartesian product. `DISTINCT` is recommended when multiple origin rows or
+multiple matching paths can produce the same projected source row.
+
 ### Edge properties
 
 Edges may carry arbitrary JSON-compatible fields in addition to their durable
