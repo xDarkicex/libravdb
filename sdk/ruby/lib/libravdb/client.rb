@@ -261,6 +261,14 @@ module LibraVDB
       parse_result(res_ptr, "QueryWithParams")
     end
 
+    def latest_commit_lsn
+      res_ptr = Core.DatabaseLatestCommitLSN(@handle)
+      json_str = parse_result(res_ptr, "LatestCommitLSN")
+      payload = JSON.parse(json_str)
+      raise "LatestCommitLSN failed: response did not contain lsn" unless payload.key?("lsn")
+      payload["lsn"].to_i
+    end
+
     def set_memory_limit(limit)
       err_ptr = Core.SetGlobalMemoryLimit(@handle, limit)
       check_error(err_ptr, "Set memory limit")

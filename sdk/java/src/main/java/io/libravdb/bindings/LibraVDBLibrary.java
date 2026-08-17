@@ -22,6 +22,7 @@ public interface LibraVDBLibrary extends Library {
 
     Pointer DatabaseQuery(int dbID, String sql);
     Pointer DatabaseQueryWithParams(int dbID, String sql, String params);
+    Pointer DatabaseLatestCommitLSN(int dbID);
 
     Pointer InsertVector(int colID, String id, float[] vec, int dim, String metadataJSON);
     Pointer UpdateVector(int colID, String id, float[] vec, int dim, String metadataJSON);

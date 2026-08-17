@@ -34,6 +34,7 @@ class LibraVDB {
                 void* DropDatabase(int dbID);
                 void* DatabaseQuery(int dbID, const char* sql);
                 void* DatabaseQueryWithParams(int dbID, const char* sql, const char* params);
+                void* DatabaseLatestCommitLSN(int dbID);
                 void* InsertBatch(int colID, const char** ids, float* vectors, int count, int dimension, const char** metadata);
                 void* DeleteVector(int colID, const char* id);
                 void* DeleteBatch(int colID, const char** ids, int count);

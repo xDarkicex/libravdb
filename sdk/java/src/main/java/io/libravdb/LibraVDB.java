@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.jna.Pointer;
 import io.libravdb.bindings.LibraVDBLibrary;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -50,6 +51,22 @@ public class LibraVDB implements AutoCloseable {
     public String queryWithParams(String sql, String params) {
         Pointer resPtr = LibraVDBLibrary.INSTANCE.DatabaseQueryWithParams(handle, sql, params == null ? "" : params);
         return parseQueryResult(resPtr, "QueryWithParams");
+    }
+
+    public BigInteger latestCommitLSN() {
+        Pointer resPtr = LibraVDBLibrary.INSTANCE.DatabaseLatestCommitLSN(handle);
+        String result = parseQueryResult(resPtr, "LatestCommitLSN");
+        try {
+            JsonNode lsn = mapper.readTree(result).get("lsn");
+            if (lsn == null) {
+                throw new LibraException("LatestCommitLSN failed: response did not contain lsn");
+            }
+            return new BigInteger(lsn.asText());
+        } catch (LibraException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new LibraException("LatestCommitLSN failed: invalid response: " + e.getMessage());
+        }
     }
 
     public void ping() {

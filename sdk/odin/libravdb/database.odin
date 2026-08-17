@@ -158,3 +158,26 @@ query_with_params :: proc(db: ^Database, sql: string, params: string) -> (string
     res_ptr := DatabaseQueryWithParams(db.id, c_sql, c_params)
     return extract_query_result(res_ptr)
 }
+
+// Return the exact latest durable commit LSN as a decimal string.
+latest_commit_lsn :: proc(db: ^Database) -> (string, LibraError) {
+    res_ptr := DatabaseLatestCommitLSN(db.id)
+    result, err := extract_query_result(res_ptr)
+    if err != .None {
+        return "", err
+    }
+    marker := "{\"lsn\":\""
+    if !strings.has_prefix(result, marker) || !strings.has_suffix(result, "\"}") {
+        delete(result)
+        return "", .NativeError
+    }
+    start := len(marker)
+    end := strings.index(result[start:], "\"}")
+    if end < 0 {
+        delete(result)
+        return "", .NativeError
+    }
+    lsn := strings.clone(result[start:start+end])
+    delete(result)
+    return lsn, .None
+}

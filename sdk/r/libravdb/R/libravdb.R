@@ -113,6 +113,14 @@ LibraVDB <- R6Class("LibraVDB",
             fromJSON(res)
         },
 
+        latest_commit_lsn = function() {
+            res <- r_DatabaseLatestCommitLSN(self$handle)
+            if (res == "") return(NULL)
+            payload <- fromJSON(res, simplifyVector = FALSE)
+            if (is.null(payload$lsn)) stop("LatestCommitLSN failed: response did not contain lsn")
+            as.character(payload$lsn)
+        },
+
         close = function() {
             if (!is.null(self$handle) && self$handle >= 0) {
                 r_CloseDB(self$handle)

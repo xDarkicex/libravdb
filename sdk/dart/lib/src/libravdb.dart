@@ -61,6 +61,18 @@ class LibraVDB {
     return _parseQueryResult(resPtr, 'QueryWithParams');
   }
 
+  /// Returns the exact latest durable commit LSN as a decimal string.
+  String latestCommitLSN() {
+    final resPtr = lib.databaseLatestCommitLSN(_handle);
+    final result = _parseQueryResult(resPtr, 'LatestCommitLSN');
+    final payload = jsonDecode(result);
+    final lsn = payload['lsn'];
+    if (lsn == null) {
+      throw LibraException('LatestCommitLSN failed: response did not contain lsn');
+    }
+    return lsn.toString();
+  }
+
   void ping() {
     final errPtr = lib.ping(_handle);
     _checkError(errPtr, 'Ping');

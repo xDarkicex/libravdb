@@ -23,8 +23,11 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 ### Snapshot LSNs
 
 - Exposed the existing exact durable commit LSN through the native SDK bridge,
-  Python/Rust/TypeScript SDKs, pgwire startup metadata, and the
-  `LIBRAVDB_LATEST_COMMIT_LSN()` SQL function.
+  pgwire startup metadata, and the `LIBRAVDB_LATEST_COMMIT_LSN()` SQL
+  function.
+- Added the same `latestCommitLSN`/`latest_commit_lsn` convenience getter to
+  every official SDK wrapper, preserving the exact decimal-string ABI for
+  runtimes that cannot safely represent all `uint64` values.
 - Added native SQL and pgwire regression coverage, including exact LSN
   equality after reopen. The feature reuses `LatestCommitLSN` and
   `SnapshotAtLSN`; it does not introduce a second snapshot-token model.

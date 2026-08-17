@@ -90,6 +90,22 @@ sub query_with_params {
     return JSON::PP::decode_json($res_str);
 }
 
+sub latest_commit_lsn {
+    my ($self) = @_;
+    require JSON::PP;
+    my $res_str = LibraVDB::DatabaseLatestCommitLSN($self->{db_id});
+    return {} unless defined $res_str;
+    if ($res_str =~ /^\{"error"/) {
+        my $err = JSON::PP::decode_json($res_str);
+        die "LatestCommitLSN failed: " . $err->{error} . "\n";
+    }
+    my $payload = JSON::PP::decode_json($res_str);
+    die "LatestCommitLSN failed: response did not contain lsn\n"
+        unless exists $payload->{lsn};
+    # Keep this as a string so Perl never rounds a uint64 value.
+    return "$payload->{lsn}";
+}
+
 sub DESTROY {
     my ($self) = @_;
     if (defined $self->{db_id} && $self->{db_id} >= 0) {

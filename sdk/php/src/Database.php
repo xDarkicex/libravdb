@@ -65,6 +65,19 @@ class Database {
         return LibraVDB::extractQueryResult($resPtr);
     }
 
+    public function latestCommitLSN(): string {
+        $ffi = LibraVDB::getFFI();
+        $resPtr = $ffi->DatabaseLatestCommitLSN($this->dbID);
+        $result = LibraVDB::extractQueryResult($resPtr);
+        $payload = json_decode($result, true);
+        if (!is_array($payload) || !array_key_exists('lsn', $payload)) {
+            throw new \Exception("LatestCommitLSN failed: response did not contain lsn");
+        }
+        // Return the decimal string to preserve uint64 precision on 32-bit and
+        // signed-64-bit PHP builds.
+        return (string)$payload['lsn'];
+    }
+
     public function close(): void {
         if ($this->dbID >= 0) {
             LibraVDB::getFFI()->CloseDB($this->dbID);

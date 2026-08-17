@@ -54,6 +54,17 @@ class LibraVDB(path: String) {
         }
     }
 
+    fun latestCommitLSN(): ULong {
+        return memScoped {
+            val resPtr = DatabaseLatestCommitLSN(handle)
+            val result = parseQueryResult(resPtr, "LatestCommitLSN")
+            val element = Json.parseToJsonElement(result)
+            val lsn = element.jsonObject["lsn"]?.jsonPrimitive?.content
+                ?: throw LibraException("LatestCommitLSN failed: response did not contain lsn")
+            lsn.toULong()
+        }
+    }
+
     fun ping() {
         val errPtr = Ping(handle)
         checkError(errPtr, "Ping")

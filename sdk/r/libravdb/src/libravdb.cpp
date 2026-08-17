@@ -138,3 +138,9 @@ String r_DatabaseQueryWithParams(int dbID, std::string sql, std::string paramsSt
     char* res = DatabaseQueryWithParams(dbID, (char*)sql.c_str(), (char*)paramsStr.c_str());
     return parse_query_result(res, "DatabaseQueryWithParams");
 }
+
+// [[Rcpp::export]]
+String r_DatabaseLatestCommitLSN(int dbID) {
+    char* res = DatabaseLatestCommitLSN(dbID);
+    return parse_query_result(res, "LatestCommitLSN");
+}

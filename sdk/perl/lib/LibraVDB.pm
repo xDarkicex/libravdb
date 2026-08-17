@@ -19,6 +19,7 @@ our @EXPORT_OK = qw(
     DeleteBatch
     DatabaseQuery
     DatabaseQueryWithParams
+    DatabaseLatestCommitLSN
     FreeString
 );
 
@@ -54,6 +55,7 @@ $ffi->attach( 'DeleteVector'     => ['int', 'string'] => 'string' );
 $ffi->attach( 'DeleteBatch'      => ['int', 'string[]', 'int'] => 'string' );
 $ffi->attach( 'DatabaseQuery'    => ['int', 'string'] => 'string' );
 $ffi->attach( 'DatabaseQueryWithParams' => ['int', 'string', 'string'] => 'string' );
+$ffi->attach( 'DatabaseLatestCommitLSN' => ['int'] => 'string' );
 $ffi->attach( 'FreeString'       => ['opaque'] => 'void' );
 
 1;

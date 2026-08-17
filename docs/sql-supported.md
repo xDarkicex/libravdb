@@ -1251,9 +1251,33 @@ second timestamp- or application-generated token.
 | --- | --- | --- |
 | Native Go | `db.LatestCommitLSN(ctx)` | `uint64` exact latest commit LSN |
 | Native Go snapshot | `db.SnapshotAtLSN(ctx, lsn)` | Pinned `TemporalSnapshot` at that exact commit |
-| Native SDKs | `latest_commit_lsn()` / `latestCommitLSN()` | Python `int`, Rust `u64`, or TypeScript `bigint` |
+| Native SDKs | `latest_commit_lsn()` / `latestCommitLSN()` | Available in every official SDK; exact numeric type where safe, otherwise the decimal LSN string |
 | SQL | `SELECT LIBRAVDB_LATEST_COMMIT_LSN()` | One `BIGINT` value |
 | PostgreSQL wire | Startup `ParameterStatus` key `libravdb_latest_commit_lsn` | Exact LSN observed when the connection started |
+
+The dedicated SDK getter is available with the following idiomatic spelling
+and exact return representation:
+
+| SDK | Method | Return type |
+| --- | --- | --- |
+| Python | `latest_commit_lsn()` | `int` |
+| Rust | `latest_commit_lsn()` | `u64` |
+| TypeScript | `latestCommitLSN()` | `bigint` |
+| C++ | `latest_commit_lsn()` | `uint64_t` |
+| C# | `LatestCommitLSN()` | `ulong` |
+| Dart | `latestCommitLSN()` | decimal `String` |
+| Java | `latestCommitLSN()` | `BigInteger` |
+| Kotlin Native | `latestCommitLSN()` | `ULong` |
+| Lua | `latest_commit_lsn()` | decimal string |
+| Perl | `latest_commit_lsn()` | decimal string |
+| PHP | `latestCommitLSN()` | decimal `string` |
+| R | `latest_commit_lsn()` | decimal character string |
+| Ruby | `latest_commit_lsn()` | `Integer` |
+| Swift | `latestCommitLSN()` | `UInt64` |
+| Odin | `latest_commit_lsn()` | decimal string |
+
+All wrappers call the same `DatabaseLatestCommitLSN` C ABI export. The string
+forms preserve values above the signed 64-bit range without rounding.
 
 ```go
 lsn, err := db.LatestCommitLSN(ctx)

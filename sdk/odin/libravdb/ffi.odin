@@ -24,5 +24,6 @@ foreign libravdb {
     DeleteBatch :: proc(colID: i32, ids: ^cstring, count: i32) -> cstring ---
     DatabaseQuery :: proc(dbID: i32, sql: cstring) -> cstring ---
     DatabaseQueryWithParams :: proc(dbID: i32, sql: cstring, paramsJSON: cstring) -> cstring ---
+    DatabaseLatestCommitLSN :: proc(dbID: i32) -> cstring ---
     FreeString :: proc(ptr: cstring) ---
 }

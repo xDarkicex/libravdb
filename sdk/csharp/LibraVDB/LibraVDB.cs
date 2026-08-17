@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
+using System.Text.Json;
 
 namespace LibraVDB
 {
@@ -115,6 +116,18 @@ namespace LibraVDB
         {
             IntPtr resPtr = Bindings.DatabaseQueryWithParams(_dbID, sql, parameters);
             return ParseQueryResult(resPtr, "QueryWithParams");
+        }
+
+        public ulong LatestCommitLSN()
+        {
+            IntPtr resPtr = Bindings.DatabaseLatestCommitLSN(_dbID);
+            string result = ParseQueryResult(resPtr, "LatestCommitLSN");
+            using JsonDocument document = JsonDocument.Parse(result);
+            if (!document.RootElement.TryGetProperty("lsn", out JsonElement lsn))
+            {
+                throw new LibraVDBException("LatestCommitLSN failed: response did not contain lsn");
+            }
+            return ulong.Parse(lsn.GetString() ?? lsn.GetRawText());
         }
 
         public void Dispose()

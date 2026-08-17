@@ -340,4 +340,16 @@ json LibraVDB::query_with_params(const std::string& sql, const std::optional<jso
     return parse_query_result(res_ptr, "QueryWithParams");
 }
 
+uint64_t LibraVDB::latest_commit_lsn() const {
+    char* res_ptr = DatabaseLatestCommitLSN(handle);
+    json result = parse_query_result(res_ptr, "LatestCommitLSN");
+    if (!result.contains("lsn")) {
+        throw LibraException("LatestCommitLSN failed: response did not contain lsn");
+    }
+    if (result.at("lsn").is_string()) {
+        return std::stoull(result.at("lsn").get<std::string>());
+    }
+    return result.at("lsn").get<uint64_t>();
+}
+
 } // namespace libravdb

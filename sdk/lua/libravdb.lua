@@ -22,6 +22,7 @@ ffi.cdef[[
 
     char* DatabaseQuery(int dbID, const char* sql);
     char* DatabaseQueryWithParams(int dbID, const char* sql, const char* paramsStr);
+    char* DatabaseLatestCommitLSN(int dbID);
 
     char* InsertVector(int colID, const char* id, float* vector, int dim, const char* metadataJSON);
     char* UpdateVector(int colID, const char* id, float* vector, int dim, const char* metadataJSON);
@@ -218,6 +219,15 @@ function LibraVDB:query_with_params(sql, params)
     local params_str = params and json.encode(params) or ""
     local res_ptr = lib.DatabaseQueryWithParams(self.handle, sql, params_str)
     return parse_query_result(res_ptr, "QueryWithParams")
+end
+
+function LibraVDB:latest_commit_lsn()
+    local res_ptr = lib.DatabaseLatestCommitLSN(self.handle)
+    local result = parse_query_result(res_ptr, "LatestCommitLSN")
+    if type(result) ~= "table" or result.lsn == nil then
+        error("LatestCommitLSN failed: response did not contain lsn")
+    end
+    return tostring(result.lsn)
 end
 
 function LibraVDB:close()

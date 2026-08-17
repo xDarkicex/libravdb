@@ -238,6 +238,17 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// r_DatabaseLatestCommitLSN
+String r_DatabaseLatestCommitLSN(int dbID);
+RcppExport SEXP _libravdb_r_DatabaseLatestCommitLSN(SEXP dbIDSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< int >::type dbID(dbIDSEXP);
+    rcpp_result_gen = Rcpp::wrap(r_DatabaseLatestCommitLSN(dbID));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_libravdb_r_OpenDB", (DL_FUNC) &_libravdb_r_OpenDB, 1},
@@ -259,6 +270,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_libravdb_r_ScanCollection", (DL_FUNC) &_libravdb_r_ScanCollection, 3},
     {"_libravdb_r_DatabaseQuery", (DL_FUNC) &_libravdb_r_DatabaseQuery, 2},
     {"_libravdb_r_DatabaseQueryWithParams", (DL_FUNC) &_libravdb_r_DatabaseQueryWithParams, 3},
+    {"_libravdb_r_DatabaseLatestCommitLSN", (DL_FUNC) &_libravdb_r_DatabaseLatestCommitLSN, 1},
     {NULL, NULL, 0}
 };
 

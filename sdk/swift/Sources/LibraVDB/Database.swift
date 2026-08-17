@@ -72,6 +72,24 @@ public class Database {
         return try extractQueryResult(resPtr)
     }
 
+    public func latestCommitLSN() throws -> UInt64 {
+        let resPtr = DatabaseLatestCommitLSN(dbID)
+        let result = try extractQueryResult(resPtr)
+        let prefix = "{\"lsn\":\""
+        guard result.hasPrefix(prefix), result.hasSuffix("\"}") else {
+            throw LibraVDBError.nativeError("LatestCommitLSN failed: response did not contain lsn")
+        }
+        let start = result.index(result.startIndex, offsetBy: prefix.count)
+        let end = result.index(result.endIndex, offsetBy: -2)
+        guard start <= end else {
+            throw LibraVDBError.nativeError("LatestCommitLSN failed: invalid lsn")
+        }
+        guard let lsn = UInt64(result[start..<end]) else {
+            throw LibraVDBError.nativeError("LatestCommitLSN failed: invalid lsn")
+        }
+        return lsn
+    }
+
     deinit {
         if dbID >= 0 {
             CloseDB(dbID)

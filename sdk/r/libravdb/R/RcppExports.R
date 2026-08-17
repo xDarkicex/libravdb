@@ -76,3 +76,7 @@ r_DatabaseQuery <- function(dbID, sql) {
 r_DatabaseQueryWithParams <- function(dbID, sql, paramsStr) {
     .Call(`_libravdb_r_DatabaseQueryWithParams`, dbID, sql, paramsStr)
 }
+
+r_DatabaseLatestCommitLSN <- function(dbID) {
+    .Call(`_libravdb_r_DatabaseLatestCommitLSN`, dbID)
+}
