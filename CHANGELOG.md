@@ -54,6 +54,16 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   `database/sql`, alongside the existing Python, GORM, graph, and vector
   matrix.
 
+### Batch profile projections
+
+- Parameterized primary-key membership queries such as
+  `WHERE id IN ($1, $2, $3)` now execute as one direct B-tree probe per
+  requested ID instead of collapsing the list to its first value.
+- Missing and duplicate IDs are handled without duplicate result rows, and
+  SQL metrics report the individual index probes and rows examined.
+- Native Go SQL, pgwire, and the external compatibility harness cover the
+  batched projection path.
+
 ## [v1.4.0] / Go v1.4.0 — 2026-08-03
 
 34 files changed, 3,731 insertions, 77 deletions. This release adds a SQL execution engine, PostgreSQL wire protocol (pgwire), full DDL grammar with constraint parsing, and catalog persistence.

@@ -2270,19 +2270,41 @@ func (e *Executor) executeRelational(ctx context.Context, plan *optimizer.Physic
 		}
 	}
 
-	// If there's an exact-match predicate, use B-tree Search directly
+	// Exact primary-key equality and IN predicates can use direct B-tree
+	// probes. IN is represented as one equality predicate with InValues; do
+	// not collapse it to PredicateValue(), which would silently return only
+	// the first requested ID.
 	if len(plan.Predicates) == 1 && plan.Predicates[0].Operator == 12 &&
-		strings.EqualFold(plan.Predicates[0].Column, "id") { // KindEquals on physical key
+		strings.EqualFold(plan.Predicates[0].Column, "id") {
 		pred := plan.Predicates[0]
-		key := pred.PredicateValue().Bytes()
-		trackSQLIndexHit(ctx, 1)
-		trackSQLRowsExamined(ctx, 1)
-		val, err := tree.Tree().Search(ctx, key)
-		if err == nil {
-			ord, ver, _ := btree.DecodeValue(val)
-			return e.buildSelectResult(ctx, col, &SearchResult{ID: string(key), Version: uint64(ver), Score: 1.0, Ordinal: ord}, plan), nil
+		values := pred.InValues
+		if len(values) == 0 {
+			values = []optimizer.ScalarValue{pred.PredicateValue()}
 		}
-		return &SearchResults{}, nil
+		if pred.Not {
+			return e.executeRelationalFullScan(ctx, col, plan)
+		}
+		results := make([]*SearchResult, 0, len(values))
+		seen := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			if value.IsNull() {
+				continue
+			}
+			key := value.Bytes()
+			if _, exists := seen[string(key)]; exists {
+				continue
+			}
+			seen[string(key)] = struct{}{}
+			trackSQLIndexHit(ctx, 1)
+			trackSQLRowsExamined(ctx, 1)
+			val, err := tree.Tree().Search(ctx, key)
+			if err != nil {
+				continue
+			}
+			ord, ver, _ := btree.DecodeValue(val)
+			results = append(results, &SearchResult{ID: string(key), Version: uint64(ver), Score: 1.0, Ordinal: ord})
+		}
+		return e.buildSelectResults(ctx, col, results, plan), nil
 	}
 	for _, pred := range plan.Predicates {
 		if !strings.EqualFold(pred.Column, "id") {
