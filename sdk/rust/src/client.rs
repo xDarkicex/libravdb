@@ -312,6 +312,19 @@ impl LibraVDB {
         };
         self.parse_query_result(res_ptr, "QueryWithParams")
     }
+
+    pub fn latest_commit_lsn(&self) -> Result<u64, LibraError> {
+        let res_ptr = unsafe { bindings::DatabaseLatestCommitLSN(self.handle) };
+        let value = self.parse_query_result(res_ptr, "LatestCommitLSN")?;
+        if let Some(lsn) = value["lsn"].as_u64() {
+            return Ok(lsn);
+        }
+        value["lsn"]
+            .as_str()
+            .ok_or_else(|| LibraError("LatestCommitLSN response did not contain a valid u64 lsn".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| LibraError("LatestCommitLSN response did not contain a valid u64 lsn".to_string()))
+    }
 }
 
 impl Drop for LibraVDB {

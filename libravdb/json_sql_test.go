@@ -223,6 +223,221 @@ func TestSQLJSONSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestSQLJSONBMutationDML(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/jsonb_dml"
+	db, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Query(ctx, "CREATE TABLE jsonb_dml (id TEXT PRIMARY KEY, payload JSONB)"); err != nil {
+		db.Close()
+		t.Fatalf("create JSONB table: %v", err)
+	}
+	for _, row := range []struct {
+		id      string
+		payload string
+	}{
+		{id: "d1", payload: `{"name":"Ada","career":"engineer"}`},
+		{id: "d2", payload: `{"name":"Grace","career":"scientist"}`},
+	} {
+		if _, err := db.QueryWithParams(ctx,
+			"INSERT INTO jsonb_dml (id, payload) VALUES ($1, $2::jsonb)",
+			QueryParams{"1": row.id, "2": row.payload}); err != nil {
+			db.Close()
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+	matching, err := db.Query(ctx, `SELECT id FROM jsonb_dml
+		WHERE jsonb_typeof(payload->'career') = 'string' ORDER BY id`)
+	if err != nil || matching.Total != 2 {
+		db.Close()
+		t.Fatalf("JSON predicate before UPDATE: result=%#v err=%v", matching, err)
+	}
+
+	// The JSON mutation is evaluated against each row and stored as a
+	// structured JSON value, rather than as an escaped string.
+	if _, err := db.Query(ctx, `UPDATE jsonb_dml
+		SET payload = jsonb_set(payload, '{career}', '[]'::jsonb, true)
+		WHERE jsonb_typeof(payload->'career') = 'string'`); err != nil {
+		db.Close()
+		t.Fatalf("jsonb_set UPDATE: %v", err)
+	}
+	updated, err := db.Query(ctx, "SELECT payload FROM jsonb_dml ORDER BY id")
+	if err != nil {
+		db.Close()
+		t.Fatalf("read jsonb_set UPDATE: %v", err)
+	}
+	if updated.Total != 2 {
+		db.Close()
+		t.Fatalf("updated rows: %#v", updated)
+	}
+	for _, row := range updated.Results {
+		payload, ok := row.Metadata["payload"].(map[string]interface{})
+		if !ok {
+			db.Close()
+			t.Fatalf("payload %s is not an object: %#v", row.ID, row.Metadata["payload"])
+		}
+		career, ok := payload["career"].([]interface{})
+		if !ok || len(career) != 0 {
+			db.Close()
+			t.Fatalf("payload %s career: %#v", row.ID, payload["career"])
+		}
+	}
+
+	// Parameterized JSON replacements use the same DML path as literal
+	// replacements and retain their JSON type through the cast.
+	if _, err := db.QueryWithParams(ctx, `UPDATE jsonb_dml
+		SET payload = jsonb_set(payload, '{skills}', $1::jsonb, true)
+		WHERE id = $2`, QueryParams{
+		"1": []interface{}{"go", "sql"},
+		"2": "d1",
+	}); err != nil {
+		db.Close()
+		t.Fatalf("parameterized jsonb_set UPDATE: %v", err)
+	}
+	parameterized, err := db.Query(ctx, "SELECT payload FROM jsonb_dml WHERE id = 'd1'")
+	if err != nil {
+		db.Close()
+		t.Fatalf("read parameterized jsonb_set: %v", err)
+	}
+	if parameterized.Total != 1 {
+		db.Close()
+		t.Fatalf("parameterized result: %#v", parameterized)
+	}
+	if skills := parameterized.Results[0].Metadata["payload"].(map[string]interface{})["skills"].([]interface{}); len(skills) != 2 {
+		db.Close()
+		t.Fatalf("parameterized skills: %#v", skills)
+	}
+	if _, err := db.Query(ctx, `UPDATE jsonb_dml
+		SET payload = jsonb_insert(payload, '{skills,1}', '"db"'::jsonb)
+		WHERE id = 'd1'`); err != nil {
+		db.Close()
+		t.Fatalf("jsonb_insert UPDATE: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	after, err := reopened.Query(ctx, "SELECT payload FROM jsonb_dml WHERE id = 'd1'")
+	if err != nil {
+		t.Fatalf("read JSONB after reopen: %v", err)
+	}
+	if after.Total != 1 {
+		t.Fatalf("JSONB after reopen: %#v", after)
+	}
+	afterPayload, ok := after.Results[0].Metadata["payload"].(map[string]interface{})
+	if !ok || len(afterPayload["skills"].([]interface{})) != 3 {
+		t.Fatalf("JSONB structure after reopen: %#v", after.Results[0].Metadata["payload"])
+	}
+}
+
+func TestSQLJSONBMutationDMLInEpoch(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:jsonb_dml_epoch"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Query(ctx, "CREATE TABLE jsonb_epoch (id TEXT PRIMARY KEY, payload JSONB)"); err != nil {
+		t.Fatalf("create JSONB epoch table: %v", err)
+	}
+	if _, err := db.Query(ctx, `INSERT INTO jsonb_epoch (id, payload)
+		VALUES ('d1', '{"career":"engineer"}')`); err != nil {
+		t.Fatalf("insert JSONB epoch row: %v", err)
+	}
+	if _, err := db.Query(ctx, `INSERT INTO jsonb_epoch (id, payload)
+		VALUES ('d2', '{"career":"scientist"}')`); err != nil {
+		t.Fatalf("insert second JSONB epoch row: %v", err)
+	}
+
+	// Assignment evaluation is completed for every row before an epoch is
+	// staged. The second branch is intentionally invalid; d1 must remain
+	// unchanged when d2 fails.
+	invalidEpoch, err := db.BeginEpochTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := invalidEpoch.Query(ctx, `UPDATE jsonb_epoch
+		SET payload = jsonb_set(payload, '{career}',
+			CASE WHEN id = 'd2' THEN 'not-json'::jsonb ELSE '[]'::jsonb END, true)
+		WHERE id IN ('d1', 'd2')`, nil); err == nil {
+		invalidEpoch.Rollback(ctx)
+		t.Fatal("invalid JSONB assignment unexpectedly succeeded")
+	}
+	unchangedInEpoch, err := invalidEpoch.Query(ctx, "SELECT payload FROM jsonb_epoch WHERE id = 'd1'", nil)
+	if err != nil {
+		invalidEpoch.Rollback(ctx)
+		t.Fatalf("read JSONB after failed epoch assignment: %v", err)
+	}
+	if got := unchangedInEpoch.Results[0].Metadata["payload"].(map[string]interface{})["career"]; got != "engineer" {
+		invalidEpoch.Rollback(ctx)
+		t.Fatalf("failed epoch assignment partially changed d1: %#v", got)
+	}
+	if err := invalidEpoch.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	epoch, err := db.BeginEpochTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := epoch.Query(ctx, `UPDATE jsonb_epoch
+		SET payload = jsonb_set(payload, '{career}', '[]'::jsonb, true)
+		WHERE id = 'd1'`, nil); err != nil {
+		epoch.Rollback(ctx)
+		t.Fatalf("epoch jsonb_set UPDATE: %v", err)
+	}
+	inEpoch, err := epoch.Query(ctx, "SELECT payload FROM jsonb_epoch WHERE id = 'd1'", nil)
+	if err != nil {
+		epoch.Rollback(ctx)
+		t.Fatalf("read JSONB in epoch: %v", err)
+	}
+	if got := inEpoch.Results[0].Metadata["payload"].(map[string]interface{})["career"].([]interface{}); len(got) != 0 {
+		epoch.Rollback(ctx)
+		t.Fatalf("epoch JSONB value: %#v", got)
+	}
+	if err := epoch.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	unchanged, err := db.Query(ctx, "SELECT payload FROM jsonb_epoch WHERE id = 'd1'")
+	if err != nil {
+		t.Fatalf("read JSONB after rollback: %v", err)
+	}
+	if got := unchanged.Results[0].Metadata["payload"].(map[string]interface{})["career"]; got != "engineer" {
+		t.Fatalf("rollback changed JSONB: %#v", got)
+	}
+
+	committed, err := db.BeginEpochTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := committed.Query(ctx, `UPDATE jsonb_epoch
+		SET payload = jsonb_set(payload, '{career}', '[]'::jsonb, true)
+		WHERE id = 'd1'`, nil); err != nil {
+		committed.Rollback(ctx)
+		t.Fatalf("committed epoch jsonb_set UPDATE: %v", err)
+	}
+	if err := committed.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	afterCommit, err := db.Query(ctx, "SELECT payload FROM jsonb_epoch WHERE id = 'd1'")
+	if err != nil {
+		t.Fatalf("read JSONB after epoch commit: %v", err)
+	}
+	if got := afterCommit.Results[0].Metadata["payload"].(map[string]interface{})["career"].([]interface{}); len(got) != 0 {
+		t.Fatalf("committed epoch JSONB value: %#v", got)
+	}
+}
+
 func TestJSONBCanonicalNumericComparison(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(WithStoragePath(":memory:json_canonical"), WithMetrics(false))

@@ -3,6 +3,7 @@ package pgwire
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,7 +53,7 @@ func interceptSystemQueryWithParams(query string, db *libravdb.Database, params 
 	}
 
 	// System functions: SELECT version(), SELECT current_database(), etc.
-	if results, columns, ok := handleSystemFunction(upper); ok {
+	if results, columns, ok := handleSystemFunction(upper, db); ok {
 		return results, columns, true
 	}
 	// asyncpg resolves codecs for explicitly typed parameters with a recursive
@@ -271,7 +272,7 @@ func handleShowSetting(sql string) (*libravdb.SearchResults, []ColumnMeta, bool)
 }
 
 // handleSystemFunction intercepts common system function calls.
-func handleSystemFunction(sql string) (*libravdb.SearchResults, []ColumnMeta, bool) {
+func handleSystemFunction(sql string, db *libravdb.Database) (*libravdb.SearchResults, []ColumnMeta, bool) {
 	trimmed := strings.TrimSpace(sql)
 	upper := strings.ToUpper(trimmed)
 	// These are compatibility shims for standalone system-function queries.
@@ -281,6 +282,7 @@ func handleSystemFunction(sql string) (*libravdb.SearchResults, []ColumnMeta, bo
 		return nil, nil, false
 	}
 	var result string
+	var resultValue interface{}
 	var columns []ColumnMeta
 
 	switch {
@@ -304,6 +306,21 @@ func handleSystemFunction(sql string) (*libravdb.SearchResults, []ColumnMeta, bo
 		result = time.Now().UTC().Format(time.RFC3339Nano)
 		columns = []ColumnMeta{{Name: "now", TypeOID: OIDTimestamptz}}
 
+	case standaloneSystemFunction(sql, "LIBRAVDB_LATEST_COMMIT_LSN()"):
+		// Keep the wire value in the existing int8 column contract. The
+		// connection's database is always present on the network path; nil is
+		// retained for in-process startup/function tests and represents an empty
+		// state rather than inventing another token source.
+		var lsn uint64
+		if db != nil {
+			if current, err := db.LatestCommitLSN(context.Background()); err == nil {
+				lsn = current
+			}
+		}
+		result = strconv.FormatUint(lsn, 10)
+		resultValue = result
+		columns = []ColumnMeta{{Name: "libravdb_latest_commit_lsn", TypeOID: OIDInt8}}
+
 	default:
 		return nil, nil, false
 	}
@@ -314,7 +331,11 @@ func handleSystemFunction(sql string) (*libravdb.SearchResults, []ColumnMeta, bo
 		// pgwire encoder uses column names to project DataRow fields; leaving
 		// metadata nil silently encoded a SQL NULL even though the function
 		// returned a value, which breaks database/sql/GORM scans.
-		metadata[columns[0].Name] = result
+		if resultValue != nil {
+			metadata[columns[0].Name] = resultValue
+		} else {
+			metadata[columns[0].Name] = result
+		}
 	}
 	return &libravdb.SearchResults{
 		Results: []*libravdb.SearchResult{{ID: result, Score: 1.0, Metadata: metadata}},

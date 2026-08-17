@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -177,7 +178,7 @@ func handleStartupWithConfigContext(ctx context.Context, rw io.ReadWriter, db *l
 		return rw, nil, err
 	}
 
-	if err := sendStartupReady(rw); err != nil {
+	if err := sendStartupReady(rw, db); err != nil {
 		return rw, nil, err
 	}
 	return rw, result, nil
@@ -283,7 +284,7 @@ func readStartupField(payload []byte, offset int) (string, int, error) {
 	return string(payload[offset:end]), end + 1, nil
 }
 
-func sendStartupReady(w io.Writer) error {
+func sendStartupReady(w io.Writer, db *libravdb.Database) error {
 	// PostgreSQL exposes the numeric server_version parameter separately from
 	// the verbose version() function result. Drivers such as Django's psycopg
 	// backend parse this startup value as an integer version.
@@ -302,6 +303,19 @@ func sendStartupReady(w io.Writer) error {
 	// the wire contract explicit and prevents clients from rejecting the
 	// connection before issuing a query.
 	if err := sendParameterStatus(w, "standard_conforming_strings", "on"); err != nil {
+		return err
+	}
+	// This is the exact durable commit position observed when the connection
+	// starts. Clients can retain it as a snapshot token and use the existing
+	// native SnapshotAtLSN API or the documented temporal SQL surfaces. The
+	// SQL function returns the live value when a later refresh is required.
+	latestLSN := uint64(0)
+	if db != nil {
+		if lsn, err := db.LatestCommitLSN(context.Background()); err == nil {
+			latestLSN = lsn
+		}
+	}
+	if err := sendParameterStatus(w, "libravdb_latest_commit_lsn", strconv.FormatUint(latestLSN, 10)); err != nil {
 		return err
 	}
 	// BackendKeyData: PID and secret key (zeroed — cancel support is not yet

@@ -391,5 +391,16 @@ class LibraVDB:
             raise RuntimeError(f"QueryWithParams failed: {err.get('error')}")
         return json.loads(res_json)
 
+    def latest_commit_lsn(self) -> int:
+        """Return the exact latest durable commit LSN for this database."""
+        res_ptr = _lib.DatabaseLatestCommitLSN(self._handle)
+        res_json = _from_c_string(res_ptr)
+        if not res_json:
+            raise RuntimeError("LatestCommitLSN returned no response")
+        response = json.loads(res_json)
+        if "error" in response:
+            raise RuntimeError(f"LatestCommitLSN failed: {response['error']}")
+        return int(response["lsn"])
+
     def __del__(self):
         self.close()

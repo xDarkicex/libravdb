@@ -70,8 +70,8 @@ func TestServerStartupAndQuery(t *testing.T) {
 		t.Fatalf("sendStartupPacket: %v", err)
 	}
 
-	// 5. Read server responses: AuthOK, ParameterStatus x4, BackendKeyData, ReadyForQuery
-	for i := 0; i < 7; i++ {
+	// 5. Read server responses: AuthOK, ParameterStatus x5, BackendKeyData, ReadyForQuery
+	for i := 0; i < 8; i++ {
 		msgType, _, err := ReadMessage(conn)
 		if err != nil {
 			t.Fatalf("expected server message %d: %v", i, err)
@@ -219,8 +219,8 @@ func TestExtendedQueryProtocol(t *testing.T) {
 	if err := sendStartupPacket(conn, "test", "test"); err != nil {
 		t.Fatalf("sendStartupPacket: %v", err)
 	}
-	// Drain startup responses (AuthOK, ParameterStatus x4, BackendKeyData, ReadyForQuery)
-	for i := 0; i < 7; i++ {
+	// Drain startup responses (AuthOK, ParameterStatus x5, BackendKeyData, ReadyForQuery)
+	for i := 0; i < 8; i++ {
 		if _, _, err := ReadMessage(conn); err != nil {
 			t.Fatalf("startup message %d: %v", i, err)
 		}
@@ -713,8 +713,8 @@ func doTestStartup(t *testing.T, conn net.Conn) {
 	if err := sendStartupPacket(conn, "test", "test"); err != nil {
 		t.Fatalf("startup: %v", err)
 	}
-	// AuthOK + 4×ParameterStatus + BackendKeyData + ReadyForQuery = 7 messages.
-	for i := 0; i < 7; i++ {
+	// AuthOK + 5×ParameterStatus + BackendKeyData + ReadyForQuery = 8 messages.
+	for i := 0; i < 8; i++ {
 		msgType, _, err := ReadMessage(conn)
 		if err != nil {
 			t.Fatalf("startup msg %d: %v", i, err)

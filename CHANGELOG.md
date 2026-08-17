@@ -12,6 +12,26 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 - Added stable `JOIN MATCH` projections for `source_id`, `target_id`, `edge_type`, and `edge_weight`, including edge-variable aliases such as `r.type` and `r.weight`.
 - Added deterministic pgwire type metadata and native, epoch, pgwire, and external end-to-end regression coverage for the stable graph row shape.
 
+### JSONB DML
+
+- Added atomic `UPDATE SET` support for `jsonb_set`/`jsonb_insert` and their
+  `json_set`/`json_insert` aliases, including parameterized JSON replacements.
+- JSON-aware `WHERE` predicates now use the decoded document evaluator during
+  updates, and native, epoch, pgwire, and external end-to-end coverage verifies
+  profile-repair mutations through reopen.
+
+### Snapshot LSNs
+
+- Exposed the existing exact durable commit LSN through the native SDK bridge,
+  Python/Rust/TypeScript SDKs, pgwire startup metadata, and the
+  `LIBRAVDB_LATEST_COMMIT_LSN()` SQL function.
+- Added native SQL and pgwire regression coverage, including exact LSN
+  equality after reopen. The feature reuses `LatestCommitLSN` and
+  `SnapshotAtLSN`; it does not introduce a second snapshot-token model.
+- The external PostgreSQL compatibility harness passes with the LSN check,
+  including native SQL, pgx, GORM, psycopg, asyncpg, SQLAlchemy/Alembic, and
+  Django clients.
+
 ## [v1.4.0] / Go v1.4.0 — 2026-08-03
 
 34 files changed, 3,731 insertions, 77 deletions. This release adds a SQL execution engine, PostgreSQL wire protocol (pgwire), full DDL grammar with constraint parsing, and catalog persistence.

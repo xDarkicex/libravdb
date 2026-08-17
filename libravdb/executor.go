@@ -3635,9 +3635,64 @@ func evalConflictExpr(plan *optimizer.PhysicalPlan, root int32, current Record, 
 		default:
 			return "", false, fmt.Errorf("unsupported cast target type %q", typ)
 		}
+	case optimizer.ConflictExprJSONFunction:
+		value, isNull, err := evalConflictExprValue(plan, root, current, proposed)
+		if err != nil || isNull {
+			return "", isNull, err
+		}
+		encoded, err := encodeJSONValue(value)
+		if err != nil {
+			return "", false, err
+		}
+		return encoded, false, nil
 	default:
 		return "", false, fmt.Errorf("unsupported ON CONFLICT expression kind %d", expr.Kind)
 	}
+}
+
+// evalConflictExprValue preserves structured JSON values for UPDATE SET
+// expressions. The legacy conflict evaluator intentionally returns strings
+// for scalar arithmetic and casts; JSON mutation functions need the decoded
+// tree so Collection validation can store it atomically as JSONB metadata.
+func evalConflictExprValue(plan *optimizer.PhysicalPlan, root int32, current Record, proposed VectorEntry) (interface{}, bool, error) {
+	if plan == nil || root < 0 || int(root) >= len(plan.InsertConflictExprs) {
+		return nil, false, fmt.Errorf("invalid JSON expression root %d", root)
+	}
+	expr := plan.InsertConflictExprs[root]
+	if expr.Kind != optimizer.ConflictExprJSONFunction {
+		value, isNull, err := evalConflictExpr(plan, root, current, proposed)
+		if err != nil || isNull {
+			return nil, isNull, err
+		}
+		return value, false, nil
+	}
+
+	children := [...]int32{expr.Left, expr.Right, expr.Third, expr.Fourth}
+	args := make([]interface{}, 0, len(children))
+	for _, child := range children {
+		if child < 0 {
+			break
+		}
+		value, isNull, err := evalConflictExprValue(plan, child, current, proposed)
+		if err != nil {
+			return nil, false, err
+		}
+		if isNull {
+			return nil, true, nil
+		}
+		args = append(args, value)
+	}
+	value, handled, err := evaluateJSONFunction(expr.Function, args)
+	if err != nil {
+		return nil, false, err
+	}
+	if !handled {
+		return nil, false, fmt.Errorf("unsupported JSON mutation function %q", expr.Function)
+	}
+	if value == nil {
+		return nil, true, nil
+	}
+	return value, false, nil
 }
 
 func evalConflictBinary(left, right string, operator uint8) (string, bool, error) {
@@ -4950,6 +5005,14 @@ func (e *Executor) executeUpdate(ctx context.Context, plan *optimizer.PhysicalPl
 	if err != nil {
 		return nil, fmt.Errorf("UPDATE resolve phase: %w", err)
 	}
+	return e.executeUpdateRows(ctx, plan, results)
+}
+
+// executeUpdateRows applies an UPDATE to an already-resolved row set. The
+// virtual SQL path uses this entry point for predicates such as
+// jsonb_typeof(payload->'career') = 'string' that require expression-aware
+// row evaluation instead of the column-predicate fast path.
+func (e *Executor) executeUpdateRows(ctx context.Context, plan *optimizer.PhysicalPlan, results *SearchResults) (*SearchResults, error) {
 	if len(results.Results) == 0 {
 		if hasReturning(plan) {
 			return materializeReturning(plan, nil), nil
@@ -4957,32 +5020,55 @@ func (e *Executor) executeUpdate(ctx context.Context, plan *optimizer.PhysicalPl
 		return results, nil
 	}
 
-	// Phase 2: all-or-nothing write via epoch or direct transaction.
+	// Phase 2a: evaluate every assignment before staging or writing any row.
+	// This is important for JSONB mutations: a malformed path/replacement on a
+	// later row must not leave an earlier row updated when the caller is using
+	// an EpochTx (the direct path also has a storage transaction below).
+	type preparedUpdate struct {
+		row        *SearchResult
+		metadata   map[string]interface{}
+		newID      string
+		keyChanged bool
+		returnMeta map[string]interface{}
+	}
+	prepared := make([]preparedUpdate, len(results.Results))
+	for i, r := range results.Results {
+		meta, err := e.evaluateUpdateMetadata(plan, r)
+		if err != nil {
+			return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
+		}
+		newID, keyChanged, err := e.updatedPrimaryKeyID(ctx, plan.CollectionName, r.ID, r.Metadata, meta)
+		if err != nil {
+			return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
+		}
+		prepared[i] = preparedUpdate{
+			row:        r,
+			metadata:   meta,
+			newID:      newID,
+			keyChanged: keyChanged,
+			returnMeta: mergeMetadata(r.Metadata, meta),
+		}
+	}
+
+	// Phase 2b: all-or-nothing write via epoch or direct transaction.
 	if epoch := epochFromContext(ctx); epoch != nil {
-		ids := make([]string, len(results.Results))
-		returnRows := make([]*SearchResult, 0, len(results.Results))
-		for i, r := range results.Results {
+		ids := make([]string, len(prepared))
+		returnRows := make([]*SearchResult, 0, len(prepared))
+		for i, item := range prepared {
+			r := item.row
 			ids[i] = r.ID
-			meta, err := e.evaluateUpdateMetadata(plan, r)
-			if err != nil {
-				return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
-			}
-			newID, keyChanged, err := e.updatedPrimaryKeyID(ctx, plan.CollectionName, r.ID, r.Metadata, meta)
-			if err != nil {
-				return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
-			}
+			var err error
 			returnID := r.ID
-			returnMeta := mergeMetadata(r.Metadata, meta)
-			if keyChanged {
-				err = epoch.Rename(ctx, plan.CollectionName, r.ID, newID, nil, mergeMetadata(r.Metadata, meta))
-				returnID = newID
+			if item.keyChanged {
+				err = epoch.Rename(ctx, plan.CollectionName, r.ID, item.newID, nil, item.returnMeta)
+				returnID = item.newID
 			} else {
-				err = epoch.Update(ctx, plan.CollectionName, r.ID, nil, meta)
+				err = epoch.Update(ctx, plan.CollectionName, r.ID, nil, item.metadata)
 			}
 			if err != nil {
 				return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
 			}
-			returnRows = append(returnRows, &SearchResult{ID: returnID, Vector: cloneVector(r.Vector), Score: r.Score, Metadata: returnMeta})
+			returnRows = append(returnRows, &SearchResult{ID: returnID, Vector: cloneVector(r.Vector), Score: r.Score, Metadata: item.returnMeta})
 		}
 		if hasReturning(plan) {
 			return materializeReturning(plan, returnRows), nil
@@ -4994,32 +5080,23 @@ func (e *Executor) executeUpdate(ctx context.Context, plan *optimizer.PhysicalPl
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, len(results.Results))
-	returnRows := make([]*SearchResult, 0, len(results.Results))
-	for i, r := range results.Results {
+	ids := make([]string, len(prepared))
+	returnRows := make([]*SearchResult, 0, len(prepared))
+	for i, item := range prepared {
+		r := item.row
 		ids[i] = r.ID
-		meta, err := e.evaluateUpdateMetadata(plan, r)
-		if err != nil {
-			_ = tx.Rollback(ctx)
-			return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
-		}
-		newID, keyChanged, err := e.updatedPrimaryKeyID(ctx, plan.CollectionName, r.ID, r.Metadata, meta)
-		if err != nil {
-			_ = tx.Rollback(ctx)
-			return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
-		}
 		returnID := r.ID
-		returnMeta := mergeMetadata(r.Metadata, meta)
-		if keyChanged {
-			err = tx.Rename(ctx, plan.CollectionName, r.ID, newID, nil, mergeMetadata(r.Metadata, meta))
-			returnID = newID
+		if item.keyChanged {
+			err = tx.Rename(ctx, plan.CollectionName, r.ID, item.newID, nil, item.returnMeta)
+			returnID = item.newID
 		} else {
-			err = tx.Update(ctx, plan.CollectionName, r.ID, nil, meta)
+			err = tx.Update(ctx, plan.CollectionName, r.ID, nil, item.metadata)
 		}
 		if err != nil {
+			_ = tx.Rollback(ctx)
 			return nil, fmt.Errorf("UPDATE row %q: %w", r.ID, err)
 		}
-		returnRows = append(returnRows, &SearchResult{ID: returnID, Vector: cloneVector(r.Vector), Score: r.Score, Metadata: returnMeta})
+		returnRows = append(returnRows, &SearchResult{ID: returnID, Vector: cloneVector(r.Vector), Score: r.Score, Metadata: item.returnMeta})
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -5045,7 +5122,7 @@ func (e *Executor) evaluateUpdateMetadata(plan *optimizer.PhysicalPlan, row *Sea
 	exprPlan.InsertConflictCases = plan.SetExprCases
 	for j, col := range plan.SetColumns {
 		if j < len(plan.SetExprRoots) && plan.SetExprRoots[j] >= 0 {
-			value, isNull, err := evalConflictExpr(&exprPlan, plan.SetExprRoots[j], current, VectorEntry{ID: row.ID, Metadata: row.Metadata})
+			value, isNull, err := evalConflictExprValue(&exprPlan, plan.SetExprRoots[j], current, VectorEntry{ID: row.ID, Metadata: row.Metadata})
 			if err != nil {
 				return nil, fmt.Errorf("evaluate assignment %q: %w", col, err)
 			}

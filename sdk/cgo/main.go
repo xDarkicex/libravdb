@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -46,17 +47,17 @@ func OpenDB(path *C.char) C.int {
 func CloseDB(dbID C.int) C.int {
 	mu.Lock()
 	defer mu.Unlock()
-	
+
 	id := int(dbID)
 	db, ok := dbs[id]
 	if !ok {
 		return -1
 	}
-	
+
 	if err := db.Close(); err != nil {
 		return -1
 	}
-	
+
 	delete(dbs, id)
 	return 0
 }
@@ -75,7 +76,7 @@ func CreateCollection(dbID C.int, name *C.char, dim C.int) C.int {
 	ctx := context.Background()
 
 	// Using cosine distance as default for the MVP
-	col, err := db.CreateCollection(ctx, goName, 
+	col, err := db.CreateCollection(ctx, goName,
 		libravdb.WithDimension(int(dim)),
 		libravdb.WithMetric(libravdb.CosineDistance),
 	)
@@ -130,7 +131,7 @@ func InsertVector(colID C.int, id *C.char, vec *C.float, dim C.int, metadataJSON
 
 	goID := C.GoString(id)
 	goDim := int(dim)
-	
+
 	// Convert C float array to Go slice safely
 	slice := unsafe.Slice(vec, goDim)
 	goVec := make([]float32, goDim)
@@ -188,7 +189,7 @@ func UpsertVector(colID C.int, id *C.char, vec *C.float, dim C.int, metadataJSON
 
 	goID := C.GoString(id)
 	goDim := int(dim)
-	
+
 	slice := unsafe.Slice(vec, goDim)
 	goVec := make([]float32, goDim)
 	for i := 0; i < goDim; i++ {
@@ -245,7 +246,7 @@ func GetCollectionStats(colID C.int) *C.char {
 
 	ctx := context.Background()
 	stats := col.Stats(ctx)
-	
+
 	bytes, err := json.Marshal(stats)
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "failed to marshal stats: %v"}`, err))
@@ -273,7 +274,7 @@ func QueryVector(colID C.int, vec *C.float, dim C.int, limit C.int, filterJSON *
 
 	ctx := context.Background()
 	q := col.Query(ctx).WithVector(goVec).Limit(int(limit))
-	
+
 	if filterJSON != nil {
 		goFilterJSON := C.GoString(filterJSON)
 		if goFilterJSON != "" {
@@ -288,7 +289,7 @@ func QueryVector(colID C.int, vec *C.float, dim C.int, limit C.int, filterJSON *
 	}
 
 	results, err := q.Execute()
-		
+
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "%v"}`, err))
 	}
@@ -408,7 +409,7 @@ func InsertBatch(colID C.int, ids **C.char, vecs *C.float, count C.int, dim C.in
 
 	idsSlice := unsafe.Slice(ids, goCount)
 	vecsSlice := unsafe.Slice(vecs, goCount*goDim)
-	
+
 	var metasSlice []*C.char
 	if metas != nil {
 		metasSlice = unsafe.Slice(metas, goCount)
@@ -458,7 +459,7 @@ func DeleteBatch(colID C.int, ids **C.char, count C.int) *C.char {
 
 	goCount := int(count)
 	idsSlice := unsafe.Slice(ids, goCount)
-	
+
 	goIDs := make([]string, goCount)
 	for i := 0; i < goCount; i++ {
 		goIDs[i] = C.GoString(idsSlice[i])
@@ -499,7 +500,7 @@ func DeleteCollection(dbID C.int, name *C.char) *C.char {
 	if !ok {
 		return C.CString("error: database not found")
 	}
-	
+
 	goName := C.GoString(name)
 	err := db.DeleteCollection(context.Background(), goName)
 	if err != nil {
@@ -962,6 +963,28 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 		return C.CString(string(errBytes))
 	}
 	return C.CString(string(bytes))
+}
+
+//export DatabaseLatestCommitLSN
+func DatabaseLatestCommitLSN(dbID C.int) *C.char {
+	mu.RLock()
+	db, ok := dbs[int(dbID)]
+	mu.RUnlock()
+
+	if !ok {
+		return C.CString(`{"error":"database not found"}`)
+	}
+
+	lsn, err := db.LatestCommitLSN(context.Background())
+	if err != nil {
+		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return C.CString(string(errBytes))
+	}
+	// Keep the value as a decimal string in the C ABI. JSON numbers are not
+	// exact for all uint64 values in JavaScript, while the SDK wrappers convert
+	// this one representation to Python int, Rust u64, or TypeScript bigint.
+	result, _ := json.Marshal(map[string]string{"lsn": strconv.FormatUint(lsn, 10)})
+	return C.CString(string(result))
 }
 
 func main() {

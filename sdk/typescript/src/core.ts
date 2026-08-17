@@ -64,6 +64,7 @@ export const _lib = {
 
     DatabaseQuery: lib.func('DatabaseQuery', CString, ['int', 'str']),
     DatabaseQueryWithParams: lib.func('DatabaseQueryWithParams', CString, ['int', 'str', 'str']),
+    DatabaseLatestCommitLSN: lib.func('DatabaseLatestCommitLSN', CString, ['int']),
 
     FreeString: lib.func('FreeString', 'void', [CString]),
 };

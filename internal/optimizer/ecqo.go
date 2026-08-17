@@ -322,6 +322,8 @@ type ConflictExpr struct {
 	Operator      uint8
 	Left          int32
 	Right         int32
+	Third         int32
+	Fourth        int32
 	CaseWhenStart int32
 	CaseWhenCount int32
 	CaseElse      int32
@@ -346,6 +348,7 @@ const (
 	ConflictExprFunction
 	ConflictExprCast
 	ConflictExprUnary
+	ConflictExprJSONFunction
 )
 
 // PhysicalPlan represents the executable operations derived from the AST.
@@ -2780,6 +2783,31 @@ func (o *Optimizer) lowerConflictExpr(doc *parser.QueryDoc, src []byte, ref pars
 		}
 		fn := doc.FunctionExprs[ref.ID]
 		name := string(src[fn.NameStart:fn.NameEnd])
+		if isJSONMutationFunction(name) {
+			if fn.ArgsStart < 0 || fn.ArgsCount < 3 || fn.ArgsCount > 4 ||
+				fn.ArgsStart+fn.ArgsCount > int32(len(doc.FunctionArgs)) {
+				return -1, fmt.Errorf("function %q expects three or four arguments", name)
+			}
+			expr := ConflictExpr{
+				Kind:     ConflictExprJSONFunction,
+				Function: name,
+				Left:     -1,
+				Right:    -1,
+				Third:    -1,
+				Fourth:   -1,
+			}
+			roots := [4]*int32{&expr.Left, &expr.Right, &expr.Third, &expr.Fourth}
+			for i := int32(0); i < fn.ArgsCount; i++ {
+				root, err := o.lowerConflictExpr(doc, src, doc.FunctionArgs[fn.ArgsStart+i], out, cases)
+				if err != nil {
+					return -1, err
+				}
+				*roots[i] = root
+			}
+			root := int32(len(*out))
+			*out = append(*out, expr)
+			return root, nil
+		}
 		if !strings.EqualFold(name, "NOW") && !strings.EqualFold(name, "NULLIF") {
 			return -1, fmt.Errorf("unsupported ON CONFLICT function %q", name)
 		}
@@ -2816,6 +2844,13 @@ func (o *Optimizer) lowerConflictExpr(doc *parser.QueryDoc, src []byte, ref pars
 	default:
 		return -1, fmt.Errorf("expression kind %d is unsupported", ref.Kind)
 	}
+}
+
+func isJSONMutationFunction(name string) bool {
+	return strings.EqualFold(name, "jsonb_set") ||
+		strings.EqualFold(name, "json_set") ||
+		strings.EqualFold(name, "jsonb_insert") ||
+		strings.EqualFold(name, "json_insert")
 }
 
 func bytesEqualFold(a, b []byte) bool {

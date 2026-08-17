@@ -433,6 +433,30 @@ func TestPGWireJSON_DDLAndDML(t *testing.T) {
 	if patched != `{"kind":"document"}` {
 		t.Fatalf("pgwire jsonb_set value=%q", patched)
 	}
+	if _, err := sqlDB.ExecContext(ctx, `CREATE TABLE jsonb_dml (id TEXT PRIMARY KEY, payload JSONB)`); err != nil {
+		t.Fatalf("pgwire JSONB DML CREATE TABLE: %v", err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `INSERT INTO jsonb_dml (id, payload) VALUES
+		('d1', '{"career":"engineer"}'), ('d2', '{"career":"scientist"}')`); err != nil {
+		t.Fatalf("pgwire JSONB DML INSERT: %v", err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE jsonb_dml
+		SET payload = jsonb_set(payload, '{career}', '[]'::jsonb, true)
+		WHERE jsonb_typeof(payload->'career') = 'string'`); err != nil {
+		t.Fatalf("pgwire JSONB DML jsonb_set: %v", err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE jsonb_dml
+		SET payload = jsonb_set(payload, '{skills}', $1::jsonb, true)
+		WHERE id = $2`, `["go","sql"]`, "d1"); err != nil {
+		t.Fatalf("pgwire parameterized JSONB DML jsonb_set: %v", err)
+	}
+	var updatedPayload string
+	if err := sqlDB.QueryRowContext(ctx, `SELECT payload FROM jsonb_dml WHERE id = 'd1'`).Scan(&updatedPayload); err != nil {
+		t.Fatalf("pgwire JSONB DML SELECT: %v", err)
+	}
+	if updatedPayload != `{"career":[],"skills":["go","sql"]}` {
+		t.Fatalf("pgwire JSONB DML payload=%q", updatedPayload)
+	}
 }
 
 func TestPGWireJSONMutationAndRecordExpansion(t *testing.T) {

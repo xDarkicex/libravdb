@@ -61,6 +61,12 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	if err := parser.Parse(src, doc); err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
+	// Expose the existing durable commit LSN as a scalar SQL function. This
+	// route is intentionally before catalog binding because the function has no
+	// FROM relation and must work on an otherwise empty database.
+	if results, handled, err := db.executeLatestCommitLSNQuery(ctx, src, doc); handled {
+		return results, err
+	}
 
 	// 3. Bind OIDs (Modifies doc in place)
 	db.mu.RLock()
@@ -171,6 +177,14 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	if len(doc.SubqueryExprs) > 0 && len(doc.SelectStmts) > 0 {
 		return db.executeSubquerySelect(ctx, src, doc, boundParams, legacyParams)
 	}
+	// JSON predicates in UPDATE WHERE clauses need the same row-aware
+	// evaluator used by JSON SELECTs. The physical UPDATE plan still owns the
+	// assignment lowering and transaction, but row selection must evaluate the
+	// expression against the decoded document rather than discard it as an
+	// unsupported catalog-column predicate.
+	if len(doc.UpdateStmts) > 0 && updateHasVirtualJSONPredicate(src, doc) {
+		return db.executeVirtualJSONUpdate(ctx, src, doc, boundParams, legacyParams)
+	}
 
 	// Empty statement list is a valid no-op.
 	if len(doc.SelectStmts) == 0 && len(doc.InsertStmts) == 0 &&
@@ -207,6 +221,82 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 
 	// 5. Execute Physical Plan
 	return newExecutor(db).Execute(ctx, plan)
+}
+
+func updateHasVirtualJSONPredicate(src []byte, doc *parser.QueryDoc) bool {
+	if doc == nil {
+		return false
+	}
+	for i := range doc.UpdateStmts {
+		where := doc.UpdateStmts[i].WhereExpr
+		if where.Kind != parser.NodeKindUnknown && nodeHasJSON(src, doc, where) {
+			return true
+		}
+	}
+	return false
+}
+
+// executeVirtualJSONUpdate resolves the target rows with the query-local
+// expression evaluator, then delegates all assignments and writes to the
+// normal Executor transaction path. No update is staged until every matching
+// row has been selected and the assignment expressions can be evaluated.
+func (db *Database) executeVirtualJSONUpdate(ctx context.Context, src []byte, doc *parser.QueryDoc, boundParams *optimizer.ParameterSet, legacyParams QueryParams) (*SearchResults, error) {
+	db.mu.RLock()
+	cat := db.catalog
+	db.mu.RUnlock()
+	if cat == nil {
+		return nil, fmt.Errorf("catalog not initialized")
+	}
+	binder := catalog.NewBinder(cat, src)
+	if err := binder.Bind(doc); err != nil {
+		return nil, fmt.Errorf("bind error: %w", err)
+	}
+	opt := optimizer.NewOptimizer(cat)
+	var (
+		plan *optimizer.PhysicalPlan
+		err  error
+	)
+	if boundParams != nil {
+		plan, err = opt.OptimizeWithBoundParams(doc, src, boundParams)
+	} else {
+		plan, err = opt.OptimizeWithParams(doc, src, legacyParams)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("optimize error: %w", err)
+	}
+	if plan == nil || plan.Kind != optimizer.QueryKindUpdate || len(doc.UpdateStmts) == 0 {
+		return nil, fmt.Errorf("UPDATE JSON predicate did not produce an UPDATE plan")
+	}
+	col, err := db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	records, err := recordsVisibleInContext(ctx, col)
+	if err != nil {
+		return nil, err
+	}
+	stmt := &doc.UpdateStmts[0]
+	rows := &SearchResults{Results: make([]*SearchResult, 0, len(records))}
+	for _, record := range records {
+		values := cloneMetadata(record.Metadata)
+		if values == nil {
+			values = make(map[string]interface{})
+		}
+		values["id"] = record.ID
+		matched, evalErr := db.evalVirtualExpr(ctx, src, doc, stmt.WhereExpr,
+			virtualSQLRow{ID: record.ID, Values: values}, boundParams, legacyParams)
+		if evalErr != nil {
+			return nil, fmt.Errorf("UPDATE WHERE row %q: %w", record.ID, evalErr)
+		}
+		if !matched {
+			continue
+		}
+		rows.Results = append(rows.Results, &SearchResult{
+			ID: record.ID, Vector: cloneVector(record.Vector), Metadata: cloneMetadata(record.Metadata),
+		})
+	}
+	rows.Total = len(rows.Results)
+	return newExecutor(db).executeUpdateRows(ctx, plan, rows)
 }
 
 // executeComputeLeiden runs the full COMPUTE LEIDEN pipeline:

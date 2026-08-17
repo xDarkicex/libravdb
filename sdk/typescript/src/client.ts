@@ -348,4 +348,12 @@ export class LibraVDB {
         const jsonStr = this.checkError(resPtr, "QueryWithParams");
         return jsonStr ? JSON.parse(jsonStr) : {};
     }
+
+    latestCommitLSN(): bigint {
+        const resPtr = _lib.DatabaseLatestCommitLSN(this.handle);
+        const jsonStr = this.checkError(resPtr, "LatestCommitLSN");
+        if (!jsonStr) throw new Error("LatestCommitLSN returned no response");
+        const response = JSON.parse(jsonStr);
+        return BigInt(response.lsn);
+    }
 }

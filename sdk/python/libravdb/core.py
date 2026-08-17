@@ -184,6 +184,10 @@ _lib.DatabaseQuery.restype = ctypes.POINTER(ctypes.c_char)
 _lib.DatabaseQueryWithParams.argtypes = [c_int, c_char_p, c_char_p]
 _lib.DatabaseQueryWithParams.restype = ctypes.POINTER(ctypes.c_char)
 
+# char* DatabaseLatestCommitLSN(int dbID)
+_lib.DatabaseLatestCommitLSN.argtypes = [c_int]
+_lib.DatabaseLatestCommitLSN.restype = ctypes.POINTER(ctypes.c_char)
+
 # void FreeString(char* str)
 _lib.FreeString.argtypes = [ctypes.POINTER(ctypes.c_char)]
 _lib.FreeString.restype = None

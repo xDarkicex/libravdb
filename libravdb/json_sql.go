@@ -818,6 +818,14 @@ func jsonBuildObject(args []interface{}) (interface{}, error) {
 
 func jsonbTypeof(value interface{}) (string, bool) {
 	node, ok := decodeJSONValue(value)
+	// JSON extraction returns a native Go string for a JSON string member.
+	// It is already decoded JSON at that point, so do not require it to be
+	// re-encoded as a JSON text literal before reporting its JSONB type.
+	if !ok {
+		if _, isString := value.(string); isString {
+			return "string", true
+		}
+	}
 	if !ok {
 		return "", false
 	}
@@ -848,11 +856,11 @@ func evaluateJSONFunction(name string, args []interface{}) (interface{}, bool, e
 		}
 		createMissing := true
 		if len(args) == 4 {
-			if flag, ok := args[3].(bool); ok {
-				createMissing = flag
-			} else {
+			flag, ok := jsonFunctionBool(args[3])
+			if !ok {
 				return nil, false, fmt.Errorf("%s create_missing must be boolean", name)
 			}
+			createMissing = flag
 		}
 		value, err := jsonbSet(args[0], args[1], args[2], createMissing)
 		return value, true, err
@@ -865,7 +873,7 @@ func evaluateJSONFunction(name string, args []interface{}) (interface{}, bool, e
 		}
 		insertAfter := false
 		if len(args) == 4 {
-			flag, ok := args[3].(bool)
+			flag, ok := jsonFunctionBool(args[3])
 			if !ok {
 				return nil, false, fmt.Errorf("%s insert_after must be boolean", name)
 			}
@@ -946,6 +954,18 @@ func evaluateJSONFunction(name string, args []interface{}) (interface{}, bool, e
 		return value, ok, nil
 	default:
 		return nil, false, nil
+	}
+}
+
+func jsonFunctionBool(value interface{}) (bool, bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		return parsed, err == nil
+	default:
+		return false, false
 	}
 }
 

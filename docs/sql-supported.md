@@ -270,6 +270,26 @@ WHERE id = 'd2';
 Unary boolean expressions are available in `SET` expressions as well as
 predicates.
 
+JSONB mutation functions are also valid in `UPDATE SET` expressions. The
+mutation is evaluated against each visible row and committed through the same
+atomic transaction path as other updates; a parameter may supply the JSON
+replacement value:
+
+```sql
+UPDATE people
+SET metadata = jsonb_set(metadata, '{career}', '[]'::jsonb, true)
+WHERE jsonb_typeof(metadata->'career') = 'string';
+
+UPDATE people
+SET metadata = jsonb_set(metadata, '{skills}', $1::jsonb, true)
+WHERE id = $2;
+```
+
+`jsonb_set`, `json_set`, `jsonb_insert`, and `json_insert` preserve the JSON
+document shape through native Go SQL, epoch transactions, pgwire, WAL
+recovery, and reopen. JSON-aware predicates in the `WHERE` clause use the
+same decoded document evaluator as JSON projections.
+
 ### DELETE
 
 ```sql
@@ -831,6 +851,11 @@ The supported function families include:
 - `jsonb_set`, `jsonb_insert`
 - `jsonb_build_object`, `jsonb_build_array`, `to_jsonb`
 
+`jsonb_set` and `jsonb_insert` may be used in both `SELECT` expressions and
+`UPDATE SET`; the JSON mutation forms are evaluated atomically with the row
+update. `json_set` and `json_insert` are accepted aliases for the same
+operations.
+
 Set-returning JSON functions can be used as query sources, including lateral
 expansion of a row's JSON array:
 
@@ -1215,6 +1240,44 @@ retention-expired error rather than silently returning current data.
 `AS OF TIMESTAMP` is not allowed inside an active epoch transaction. Use a
 normal database query for historical reads and an epoch transaction for staged
 current-state work.
+
+### Exact commit LSN tokens
+
+LibraVDB exposes the storage engine's exact durable commit LSN as the snapshot
+token. This is the same value used by the native snapshot APIs; there is no
+second timestamp- or application-generated token.
+
+| Surface | Access | Result |
+| --- | --- | --- |
+| Native Go | `db.LatestCommitLSN(ctx)` | `uint64` exact latest commit LSN |
+| Native Go snapshot | `db.SnapshotAtLSN(ctx, lsn)` | Pinned `TemporalSnapshot` at that exact commit |
+| Native SDKs | `latest_commit_lsn()` / `latestCommitLSN()` | Python `int`, Rust `u64`, or TypeScript `bigint` |
+| SQL | `SELECT LIBRAVDB_LATEST_COMMIT_LSN()` | One `BIGINT` value |
+| PostgreSQL wire | Startup `ParameterStatus` key `libravdb_latest_commit_lsn` | Exact LSN observed when the connection started |
+
+```go
+lsn, err := db.LatestCommitLSN(ctx)
+if err != nil {
+    return err
+}
+snapshot, err := db.SnapshotAtLSN(ctx, lsn)
+if err != nil {
+    return err
+}
+defer snapshot.Close()
+```
+
+The SQL function reads the live latest commit position and is therefore useful
+when a long-lived pgwire connection needs to refresh its token:
+
+```sql
+SELECT LIBRAVDB_LATEST_COMMIT_LSN() AS snapshot_lsn;
+```
+
+The token is an exact commit position, not a wall-clock timestamp. It can be
+used with `SnapshotAtLSN` for native historical reads and compared with commit
+receipts. Retention still applies: after temporal compaction, an expired LSN
+returns the normal retention-expired error.
 
 ### Version ranges
 
