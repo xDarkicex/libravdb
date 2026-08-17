@@ -754,6 +754,11 @@ func metadataValueToString(v interface{}) string {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
+	case libravdb.SQLQueryStats:
+		if encoded, err := json.Marshal(t); err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprintf("%v", t)
 	default:
 		return fmt.Sprintf("%v", t)
 	}

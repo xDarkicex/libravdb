@@ -321,6 +321,18 @@ func handleSystemFunction(sql string, db *libravdb.Database) (*libravdb.SearchRe
 		resultValue = result
 		columns = []ColumnMeta{{Name: "libravdb_latest_commit_lsn", TypeOID: OIDInt8}}
 
+	case standaloneSystemFunction(sql, "LIBRAVDB_SQL_STATS()"):
+		// Keep the metrics payload structured at the database boundary. The
+		// JSONB result encoder serializes the public SQLQueryStats snapshot for
+		// native pgwire clients without exposing internal atomics.
+		result = "1"
+		if db != nil {
+			resultValue = db.SQLStats()
+		} else {
+			resultValue = libravdb.SQLQueryStats{}
+		}
+		columns = []ColumnMeta{{Name: "libravdb_sql_stats", TypeOID: OIDJSONB}}
+
 	default:
 		return nil, nil, false
 	}

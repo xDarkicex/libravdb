@@ -26,13 +26,21 @@ type Executor struct {
 }
 
 func recordsVisibleInContext(ctx context.Context, col *Collection) ([]Record, error) {
+	var (
+		records []Record
+		err     error
+	)
 	if epoch := epochFromContext(ctx); epoch != nil {
-		return epoch.ListRecords(ctx, col.name)
+		records, err = epoch.ListRecords(ctx, col.name)
+	} else if tx := transactionFromContext(ctx); tx != nil {
+		records, err = tx.visibleRecords(ctx, col.name)
+	} else {
+		records, err = col.ListAll(ctx)
 	}
-	if tx := transactionFromContext(ctx); tx != nil {
-		return tx.visibleRecords(ctx, col.name)
+	if err == nil {
+		trackSQLRowsExamined(ctx, len(records))
 	}
-	return col.ListAll(ctx)
+	return records, err
 }
 
 func newExecutor(db *Database) *Executor {
@@ -1319,6 +1327,7 @@ func (e *Executor) multiModalGraphCandidates(ctx context.Context, col *Collectio
 			}
 			matched := false
 			if err := g.BFSPattern(nodeID, edges, join.MaxHops, func(vertexID uint64, band int, step int) bool {
+				trackSQLGraphExpansion(ctx, 1)
 				if band == len(edges)-1 && !(vertexID == nodeID && step == 0 && edges[0].Min > 0) {
 					if returnsSource {
 						matched = true
@@ -2071,6 +2080,7 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 	for _, seed := range seeds {
 		matched := false
 		if err := g.BFSPattern(seed, edges, plan.MaxHops, func(nodeID uint64, band int, step int) bool {
+			trackSQLGraphExpansion(ctx, 1)
 			if returnsSource {
 				if band == len(edges)-1 && !(nodeID == seed && step == 0 && edges[0].Min > 0) {
 					// Validate terminal label if required.
@@ -2265,6 +2275,8 @@ func (e *Executor) executeRelational(ctx context.Context, plan *optimizer.Physic
 		strings.EqualFold(plan.Predicates[0].Column, "id") { // KindEquals on physical key
 		pred := plan.Predicates[0]
 		key := pred.PredicateValue().Bytes()
+		trackSQLIndexHit(ctx, 1)
+		trackSQLRowsExamined(ctx, 1)
 		val, err := tree.Tree().Search(ctx, key)
 		if err == nil {
 			ord, ver, _ := btree.DecodeValue(val)
@@ -5879,6 +5891,7 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 			seen := make(map[uint64]bool) // nodeID → reached via traversal
 
 			if err := g.BFSPattern(nodeID, edges, gjp.MaxHops, func(vid uint64, band int, step int) bool {
+				trackSQLGraphExpansion(ctx, 1)
 				// BFSPattern visits intermediate states as well as final
 				// matches. Keep valid intermediate-band rows (the existing
 				// JOIN MATCH contract exposes them), but exclude states below
@@ -6440,6 +6453,7 @@ func (e *Executor) executeChainedGraphJoin(ctx context.Context, plan *optimizer.
 			terminalIDs := make([]uint64, 0)
 			seenTerminals := make(map[uint64]struct{})
 			if err := g.BFSPattern(anchorID, edges, join.MaxHops, func(nodeID uint64, band int, step int) bool {
+				trackSQLGraphExpansion(ctx, 1)
 				if band != len(edges)-1 || step < edges[band].Min ||
 					(nodeID == anchorID && band == 0 && step == 0 && edges[0].Min > 0) {
 					return true

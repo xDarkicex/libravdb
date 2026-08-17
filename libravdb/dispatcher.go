@@ -343,6 +343,7 @@ func (e *Executor) materializeGraphCandidateIDs(ctx context.Context, plan *optim
 
 		err := g.BFSPattern(seed, edges, plan.MaxHops, func(nodeID uint64, band int, step int) bool {
 			m.GraphVertices++
+			trackSQLGraphExpansion(ctx, 1)
 			// Only endpoints satisfying the complete path are candidates.
 			// Seeds, partial paths, and intermediate bands are traversal state,
 			// not successful MATCH rows.
@@ -592,6 +593,7 @@ func (e *Executor) executeFilteredANN(ctx context.Context, plan *optimizer.Physi
 	// the result set. The selectivity-aware ef supplies enough candidates for
 	// sparse filters without disconnecting traversal.
 	qb := col.Query(ctx)
+	trackSQLIndexHit(ctx, 1)
 	qb.WithVector(plan.QueryVector)
 	qb.WithGraphFilter(predicateBitmap)
 	qb.WithEfSearch(searchEf)

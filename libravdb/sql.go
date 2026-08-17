@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
@@ -53,7 +54,24 @@ func (db *Database) queryWithBoundParams(ctx context.Context, sql string, boundP
 	return db.queryWithBoundParamsAndConfig(ctx, sql, boundParams, legacyParams, nil)
 }
 
-func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams, sessionConfig *SessionConfig) (*SearchResults, error) {
+func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams, sessionConfig *SessionConfig) (results *SearchResults, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tracker := sqlTrackerFromContext(ctx)
+	root := tracker == nil
+	started := time.Now()
+	if root {
+		tracker = &sqlQueryTracker{}
+		ctx = context.WithValue(ctx, sqlQueryTrackerContextKey{}, tracker)
+		defer func() {
+			db.recordSQLQuery(time.Since(started), results, err, tracker)
+		}()
+	}
+	return db.queryWithBoundParamsAndConfigInternal(ctx, sql, boundParams, legacyParams, sessionConfig, tracker)
+}
+
+func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams, sessionConfig *SessionConfig, tracker *sqlQueryTracker) (*SearchResults, error) {
 	src := []byte(sql)
 
 	// 1 & 2. Lex & Parse
@@ -67,10 +85,14 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	if results, handled, err := db.executeLatestCommitLSNQuery(ctx, src, doc); handled {
 		return results, err
 	}
+	if results, handled, err := db.executeSQLStatsQuery(ctx, src, doc); handled {
+		return results, err
+	}
 
 	// 3. Bind OIDs (Modifies doc in place)
 	db.mu.RLock()
 	cat := db.catalog
+	generation := db.catalogGeneration.Load()
 	db.mu.RUnlock()
 
 	if cat == nil {
@@ -201,6 +223,20 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 		return &SearchResults{}, nil
 	}
 
+	cacheable, parameterSlots := sqlPlanCacheEligible(src, doc)
+	cacheKey := normalizeSQLPlanKey(sql)
+	if cacheable && db.sqlPlanCache != nil {
+		if cached, ok := db.sqlPlanCache.get(cacheKey, generation, cat, boundParams, src); ok {
+			if tracker != nil {
+				tracker.planCacheHits++
+			}
+			return newExecutor(db).Execute(ctx, cached)
+		}
+		if tracker != nil {
+			tracker.planCacheMisses++
+		}
+	}
+
 	binder := catalog.NewBinder(cat, src)
 	if err := binder.Bind(doc); err != nil {
 		return nil, fmt.Errorf("bind error: %w", err)
@@ -217,6 +253,9 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	}
 	if err != nil {
 		return nil, fmt.Errorf("optimize error: %w", err)
+	}
+	if cacheable && plan.Kind == optimizer.QueryKindRelational && db.sqlPlanCache != nil {
+		db.sqlPlanCache.put(cacheKey, generation, cat, plan, parameterSlots)
 	}
 
 	// 5. Execute Physical Plan

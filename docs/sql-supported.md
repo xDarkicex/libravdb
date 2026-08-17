@@ -381,6 +381,44 @@ portals. Extended-protocol prepared statements support typed parameters,
 statement reuse, `Describe`, and portal execution independently of this SQL
 syntax.
 
+### Physical plan reuse and SQL metrics
+
+The database maintains a bounded cache of compiled physical plans for ordinary
+relational `SELECT` statements whose plan contains no request-bound parameter
+values or virtual execution state. Cache entries are keyed by SQL text and the
+catalog generation used during binding. Creating or altering a table publishes
+a new immutable catalog generation, which makes older entries ineligible
+immediately; the old plan is never used against the new schema.
+
+Parameterized statements remain fully supported. Common scalar `WHERE`
+parameters are rebound into cached predicate slots, so repeated prepared reads
+reuse the physical plan without carrying stale values between executions.
+More complex parameterized virtual, aggregate, graph, and vector shapes still
+bind and optimize per execution until they have equivalent explicit slots.
+
+Native applications can read cumulative, concurrency-safe SQL counters:
+
+```go
+stats := db.SQLStats()
+fmt.Println(stats.Queries, stats.PlanCacheHits, stats.LastExecutionNanos)
+db.ResetSQLStats()
+```
+
+The same snapshot is available to SQL and pgwire clients as a JSONB scalar:
+
+```sql
+SELECT LIBRAVDB_SQL_STATS();
+```
+
+The JSON object includes `queries`, `errors`, `plan_cache_hits`,
+`plan_cache_misses`, `total_execution_nanos`, `last_execution_nanos`,
+`rows_returned`, `rows_examined`, `graph_expansions`, and `index_hits`.
+Counters are process-local observability state; they are not persisted in WAL
+or included in temporal snapshots. The external PostgreSQL compatibility
+harness verifies scalar parameter-slot reuse through native `QueryWithParams`
+and pgx-backed `database/sql`, catalog-generation invalidation after
+`ALTER TABLE`, and JSONB stats retrieval over pgwire.
+
 ### `COPY` over PostgreSQL wire
 
 The pgwire server supports `COPY FROM STDIN` and `COPY TO STDOUT` for supported

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xDarkicex/libravdb/internal/catalog"
@@ -45,6 +46,9 @@ type Database struct {
 	costModelStats    *costModelStats
 	activeSnaps       activeSnapshots
 	temporalCache     *temporalIndexCache
+	sqlPlanCache      *sqlPlanCache
+	sqlStats          *sqlStatsCounters
+	catalogGeneration atomic.Uint64
 	autoIncrementMu   sync.Mutex
 	autoIncrementNext map[string]uint64
 	mu                sync.RWMutex
@@ -172,6 +176,8 @@ func Open(opts ...Option) (*Database, error) {
 		quantRegistry:     quant.NewRegistry(),
 		costModelStats:    newCostModelStats(2048),
 		autoIncrementNext: make(map[string]uint64),
+		sqlPlanCache:      newSQLPlanCache(256),
+		sqlStats:          newSQLStatsCounters(),
 		scratchPool: &sync.Pool{
 			New: func() interface{} {
 				arena, err := memory.NewArena(1024*1024, 64)
@@ -236,6 +242,10 @@ func Open(opts ...Option) (*Database, error) {
 			db.catalog = cat
 		}
 	}
+	// Catalog objects are immutable snapshots. The generation lets compiled
+	// SQL plans be reused only while the schema they were bound against is
+	// still current.
+	db.catalogGeneration.Store(1)
 
 	// Wire the bridge back to the database so SerializeIndex can access
 	// collection indexes during checkpoint.
@@ -572,6 +582,7 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 		return
 	}
 	db.catalog = cat
+	db.catalogGeneration.Add(1)
 
 	// Push to storage engine for persistence across restarts
 	if e, ok := db.storage.(interface{ SetCatalogData([]byte) }); ok {

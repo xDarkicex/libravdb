@@ -35,6 +35,25 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   including native SQL, pgx, GORM, psycopg, asyncpg, SQLAlchemy/Alembic, and
   Django clients.
 
+### SQL plan reuse and metrics
+
+- Added a bounded physical-plan cache for ordinary relational SQL. Entries are
+  keyed by normalized SQL text and the immutable catalog generation, so DDL
+  catalog publication invalidates plans without serving stale column bindings.
+- Added concurrency-safe cumulative SQL statistics through
+  `Database.SQLStats`, `Database.ResetSQLStats`, and
+  `SELECT LIBRAVDB_SQL_STATS()`, including execution time, rows returned and
+  examined, cache hits/misses, graph expansions, and index hits.
+- Common scalar `WHERE` parameters are rebound into cached predicate slots, so
+  repeated prepared reads reuse the physical plan without carrying stale values
+  between executions. More complex parameterized virtual, aggregate, graph,
+  and vector shapes still optimize per execution until they have equivalent
+  explicit parameter slots.
+- The external PostgreSQL compatibility harness verifies the cache and JSONB
+  metrics function through native `QueryWithParams` and pgx-backed
+  `database/sql`, alongside the existing Python, GORM, graph, and vector
+  matrix.
+
 ## [v1.4.0] / Go v1.4.0 — 2026-08-03
 
 34 files changed, 3,731 insertions, 77 deletions. This release adds a SQL execution engine, PostgreSQL wire protocol (pgwire), full DDL grammar with constraint parsing, and catalog persistence.
