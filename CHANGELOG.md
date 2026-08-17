@@ -62,6 +62,9 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   grouped live aggregates stream committed records instead of first building
   a full record slice. Epoch and transaction overlays retain their existing
   merged-record path.
+- Virtual projections precompute identifier names and size result maps up
+  front; a lone `*` reuses its query-local row map. Multi-column grouped
+  aggregates also transfer newly built group keys without a second copy.
 - Aggregate result semantics are unchanged; native, pgwire, GORM, Python,
   and Django compatibility coverage continues to pass.
 

@@ -4054,7 +4054,10 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 				if len(plan.GroupByColumns) == 1 {
 					group.singleKey = key
 				} else {
-					group.keyValues = append([]string(nil), keyValues...)
+					// keyValues is newly allocated for this input row and is no
+					// longer used after the group is created, so transfer ownership
+					// instead of copying it a second time.
+					group.keyValues = keyValues
 				}
 				groups[key] = group
 			}

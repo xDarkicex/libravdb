@@ -68,6 +68,20 @@ func BenchmarkSQLAggregateGroupedSum(b *testing.B) {
 	}
 }
 
+func BenchmarkSQLAggregateGroupedMultiKey(b *testing.B) {
+	db := newSQLAggregateBenchmarkDB(b)
+	defer db.Close()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, err := db.Query(ctx, "SELECT category, amount, COUNT(*) FROM aggregate_bench GROUP BY category, amount")
+		if err != nil || result.Total != 512 {
+			b.Fatalf("multi-key grouped result=%#v err=%v", result, err)
+		}
+	}
+}
+
 func BenchmarkSQLJSONExpansion(b *testing.B) {
 	db := newSQLAggregateBenchmarkDB(b)
 	defer db.Close()

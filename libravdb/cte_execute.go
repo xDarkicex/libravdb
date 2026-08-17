@@ -2896,11 +2896,15 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 		return rows, nil, nil
 	}
 	columns := make([]string, 0, stmt.ProjectionsCount)
+	projectionNames := make([]string, stmt.ProjectionsCount)
+	nonStarProjections := 0
+	hasStar := false
 	// Derive the RowDescription independently of the row count.  Empty CTEs
 	// must still expose their selected column names through pgwire.
 	for j := int32(0); j < stmt.ProjectionsCount; j++ {
 		projection := &doc.Projections[stmt.ProjectionsStart+j]
 		if projection.Star {
+			hasStar = true
 			if len(rows) > 0 {
 				for key := range rows[0].Values {
 					columns = append(columns, key)
@@ -2917,11 +2921,28 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 		if projection.AliasEnd > projection.Alias {
 			name = sourceSpan(src, projection.Alias, projection.AliasEnd)
 		}
+		projectionNames[j] = name
+		nonStarProjections++
 		columns = append(columns, name)
+	}
+	// A lone star already describes the complete row map.  The source rows
+	// are query-local and are not reused after projection, so returning them
+	// directly avoids one map allocation and one key copy per row.
+	if hasStar && stmt.ProjectionsCount == 1 {
+		for i := range rows {
+			if rows[i].Values == nil {
+				rows[i].Values = make(map[string]interface{})
+			}
+		}
+		return rows, columns, nil
 	}
 	out := make([]virtualSQLRow, 0, len(rows))
 	for i := range rows {
-		values := make(map[string]interface{})
+		valueCapacity := nonStarProjections
+		if hasStar {
+			valueCapacity += len(rows[i].Values)
+		}
+		values := make(map[string]interface{}, valueCapacity)
 		for j := int32(0); j < stmt.ProjectionsCount; j++ {
 			projection := &doc.Projections[stmt.ProjectionsStart+j]
 			if projection.Star {
@@ -2930,16 +2951,9 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 				}
 				continue
 			}
-			if projection.Expr.Kind != parser.NodeKindIdentifier {
-				return nil, nil, fmt.Errorf("generic CTE projection supports identifiers and * only")
-			}
 			id := &doc.Identifiers[projection.Expr.ID]
-			name := sourceSpan(src, id.Start, id.End)
-			if projection.AliasEnd > projection.Alias {
-				name = sourceSpan(src, projection.Alias, projection.AliasEnd)
-			}
 			if value, ok := virtualIdentifierValue(src, id, rows[i]); ok {
-				values[name] = value
+				values[projectionNames[j]] = value
 			}
 		}
 		out = append(out, virtualSQLRow{ID: rows[i].ID, Values: values})
