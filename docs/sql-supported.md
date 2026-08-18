@@ -234,6 +234,21 @@ existing WAL configuration path. They are restored on reopen and remain
 distinct from native collection declarations such as `WithIndexedFields`;
 dropping a named SQL index does not remove an unrelated native metadata index.
 
+Index declarations are available through the native SQL catalog as well as
+pgwire:
+
+```sql
+SELECT schemaname, tablename, indexname, tablespace, indexdef
+FROM pg_catalog.pg_indexes
+WHERE tablename = 'documents'
+ORDER BY indexname;
+```
+
+`pg_indexes` is a read-only virtual view. Its rows are derived from the
+durable primary-key, named-constraint, and `CREATE INDEX` declarations; the
+view does not introduce a second index or storage catalog. The native SQL
+path accepts both `pg_indexes` and `pg_catalog.pg_indexes`.
+
 ## Data manipulation language
 
 ### INSERT
@@ -1589,8 +1604,8 @@ restoration is implemented.
 
 ## PostgreSQL catalog compatibility
 
-The pgwire layer exposes live virtual catalog projections used by drivers and
-ORMs. The following relations and views are supported for the documented
+Native SQL and pgwire expose live virtual catalog projections used by drivers
+and ORMs. The following relations and views are supported for the documented
 reflection paths:
 
 | Catalog surface | Purpose |
@@ -1605,7 +1620,7 @@ reflection paths:
 | `pg_catalog.pg_proc` | Function lookup required by compatible clients |
 | `pg_catalog.pg_range` | Range/type startup probes |
 | `pg_catalog.pg_collation`, `pg_catalog.pg_description` | ORM comment and collation reflection projections |
-| `pg_catalog.pg_indexes` | Index view used by ORM inspection |
+| `pg_catalog.pg_indexes` | Durable primary-key, named-constraint, and ordinary SQL index view |
 | `information_schema` relations | Table, column, constraint, and schema inspection |
 
 Catalog rows are derived from live collection and SQL metadata. They are not a

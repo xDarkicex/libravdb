@@ -533,6 +533,12 @@ func handlePgIndexesQuery(sql string, db *libravdb.Database, params *optimizer.P
 					break
 				}
 			}
+			for _, index := range cfg.SQLIndexes {
+				if strings.EqualFold(index.Name, indexName) {
+					found = true
+					break
+				}
+			}
 		}
 	}
 	if strings.Contains(strings.ToUpper(sql), "COUNT(") {

@@ -31,6 +31,10 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   native collection metadata indexes.
 - Added reopen coverage for catalog metadata, indexed-field routing, and
   equality queries.
+- Added native `pg_indexes` catalog introspection, including primary-key,
+  named-constraint, and ordinary SQL index definitions. Native SQL accepts
+  both `pg_indexes` and `pg_catalog.pg_indexes`; rows are derived from the
+  existing durable collection configuration.
 
 ### SQL errors
 

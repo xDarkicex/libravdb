@@ -143,15 +143,66 @@ func TestSQL_PgNamespaceRows(t *testing.T) {
 	t.Logf("pg_namespace names: %v", seen)
 }
 
-// TestSQL_PgCatalogViaSchemaPrefix validates that pg_catalog. prefix
-// rewriting works end-to-end through a pgwire connection.
-// The prefix stripping happens in the pgwire layer (handleQuery), so
-// this test exercises the full pgwire protocol path.
+func TestSQL_PgIndexesRows(t *testing.T) {
+	db, err := Open(WithStoragePath(":memory:pgindexes_test"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.Query(ctx, `CREATE TABLE index_catalog_rows (id TEXT PRIMARY KEY, location TEXT, age INTEGER)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := db.Query(ctx, `CREATE INDEX index_catalog_location_idx ON index_catalog_rows (location)`); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+
+	results, err := db.Query(ctx, `
+		SELECT schemaname, tablename, indexname, tablespace, indexdef
+		FROM pg_catalog.pg_indexes
+		WHERE tablename = 'index_catalog_rows'
+		ORDER BY indexname`)
+	if err != nil {
+		t.Fatalf("Query pg_indexes: %v", err)
+	}
+	if len(results.Results) != 2 {
+		t.Fatalf("pg_indexes rows=%d, want primary key and secondary index: %#v", len(results.Results), results.Results)
+	}
+
+	seen := make(map[string]map[string]interface{}, len(results.Results))
+	for _, row := range results.Results {
+		name, _ := row.Metadata["indexname"].(string)
+		seen[name] = row.Metadata
+	}
+	for _, name := range []string{"index_catalog_rows_pkey", "index_catalog_location_idx"} {
+		metadata, ok := seen[name]
+		if !ok {
+			t.Fatalf("pg_indexes missing %q: %#v", name, seen)
+		}
+		if metadata["schemaname"] != "public" || metadata["tablename"] != "index_catalog_rows" {
+			t.Fatalf("pg_indexes identity for %q = %#v", name, metadata)
+		}
+		if metadata["tablespace"] != nil {
+			t.Fatalf("pg_indexes tablespace for %q = %#v, want NULL", name, metadata["tablespace"])
+		}
+		definition, _ := metadata["indexdef"].(string)
+		if definition == "" {
+			t.Fatalf("pg_indexes indexdef for %q is empty", name)
+		}
+	}
+
+	results, err = db.QueryWithParams(ctx,
+		`SELECT indexname FROM pg_indexes WHERE indexname = $name`,
+		QueryParams{"name": "index_catalog_location_idx"})
+	if err != nil || len(results.Results) != 1 {
+		t.Fatalf("parameterized pg_indexes lookup rows=%#v err=%v", results, err)
+	}
+}
+
+// TestSQL_PgCatalogViaSchemaPrefix validates that native SQL accepts the
+// PostgreSQL-qualified catalog relation form as well as the bare form.
 func TestSQL_PgCatalogViaSchemaPrefix(t *testing.T) {
-	// This test exercises the pgwire path — see pgwire tests for the
-	// full protocol-level verification. The SQL engine path (db.Query)
-	// does not strip pg_catalog. prefix; that's a pgwire-layer concern.
-	// We verify the underlying system table works with bare names.
 	db, err := Open(WithStoragePath(":memory:pgcatschema_test"), WithMetrics(false))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -164,9 +215,8 @@ func TestSQL_PgCatalogViaSchemaPrefix(t *testing.T) {
 		t.Fatalf("CreateCollection: %v", err)
 	}
 
-	// pg_class without prefix works through the SQL engine.
 	results, err := db.Query(ctx,
-		"SELECT relname FROM pg_class WHERE relname = 'products'")
+		"SELECT relname FROM pg_catalog.pg_class WHERE relname = 'products'")
 	if err != nil {
 		t.Fatalf("Query pg_class: %v", err)
 	}

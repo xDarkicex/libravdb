@@ -25,6 +25,7 @@ const (
 	sysOIDPgConstraint = 8
 	sysOIDPgIndex      = 9
 	sysOIDPgAttrdef    = 10
+	sysOIDPgIndexes    = 11
 
 	// pg_class column OIDs
 	sysColOIDOID          = 10
@@ -49,6 +50,13 @@ const (
 	sysColOIDNspOID   = 50
 	sysColOIDNspname  = 51
 	sysColOIDNspowner = 52
+
+	// pg_indexes view column OIDs
+	sysColOIDIdxSchema     = 60
+	sysColOIDIdxTable      = 61
+	sysColOIDIdxName       = 62
+	sysColOIDIdxTablespace = 63
+	sysColOIDIdxDef        = 64
 
 	// GRAPH_NODES column OIDs
 	sysColOIDGNID         = 20
@@ -196,6 +204,34 @@ var systemTables = func() map[uint32]*SystemTableInfo {
 		m[oid] = &SystemTableInfo{Table: TableDef{OID: oid, NameHash: hashString(name)}, Columns: make(map[uint64]*ColumnDef)}
 	}
 
+	// pg_indexes is a read-only view over durable SQL index declarations. Its
+	// rows are materialized from live collection configuration by the SQL
+	// executor rather than persisted as a separate catalog relation.
+	pgIndexes := &SystemTableInfo{
+		Table: TableDef{
+			OID:          sysOIDPgIndexes,
+			NameHash:     hashString("pg_indexes"),
+			ColumnsCount: 5,
+		},
+		Columns: make(map[uint64]*ColumnDef),
+	}
+	pgIndexes.Columns[hashString("schemaname")] = &ColumnDef{
+		OID: sysColOIDIdxSchema, NameHash: hashString("schemaname"), Type: TypeName,
+	}
+	pgIndexes.Columns[hashString("tablename")] = &ColumnDef{
+		OID: sysColOIDIdxTable, NameHash: hashString("tablename"), Type: TypeName,
+	}
+	pgIndexes.Columns[hashString("indexname")] = &ColumnDef{
+		OID: sysColOIDIdxName, NameHash: hashString("indexname"), Type: TypeName,
+	}
+	pgIndexes.Columns[hashString("tablespace")] = &ColumnDef{
+		OID: sysColOIDIdxTablespace, NameHash: hashString("tablespace"), Type: TypeName,
+	}
+	pgIndexes.Columns[hashString("indexdef")] = &ColumnDef{
+		OID: sysColOIDIdxDef, NameHash: hashString("indexdef"), Type: TypeString,
+	}
+	m[sysOIDPgIndexes] = pgIndexes
+
 	return m
 }()
 
@@ -212,6 +248,7 @@ var systemTableByName = func() map[uint64]uint32 {
 	m[hashString("pg_constraint")] = sysOIDPgConstraint
 	m[hashString("pg_index")] = sysOIDPgIndex
 	m[hashString("pg_attrdef")] = sysOIDPgAttrdef
+	m[hashString("pg_indexes")] = sysOIDPgIndexes
 	m[hashString("graph_nodes")] = sysOIDGraphNodes
 	return m
 }()

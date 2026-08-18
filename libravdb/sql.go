@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/xDarkicex/lexer/parser"
@@ -77,6 +78,11 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 }
 
 func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, sql string, boundParams *optimizer.ParameterSet, legacyParams QueryParams, sessionConfig *SessionConfig, tracker *sqlQueryTracker) (*SearchResults, error) {
+	// Keep native SQL consistent with pgwire for PostgreSQL catalog names.
+	// The lexer accepts bare system relations (pg_indexes, pg_class, ...), but
+	// does not represent schema-qualified table expressions. Strip only the
+	// pg_catalog qualifier outside quoted SQL text before parsing.
+	sql = rewriteNativePgCatalogPrefix(sql)
 	src := []byte(sql)
 
 	// 1 & 2. Lex & Parse
@@ -268,6 +274,73 @@ func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, s
 
 	// 5. Execute Physical Plan
 	return newExecutor(db).Execute(ctx, plan)
+}
+
+func rewriteNativePgCatalogPrefix(query string) string {
+	const prefix = "pg_catalog."
+	var rewritten strings.Builder
+	rewritten.Grow(len(query))
+	inSingleQuote := false
+	inDoubleQuote := false
+	replaced := false
+	for i := 0; i < len(query); {
+		if inSingleQuote {
+			rewritten.WriteByte(query[i])
+			if query[i] == '\'' {
+				if i+1 < len(query) && query[i+1] == '\'' {
+					rewritten.WriteByte(query[i+1])
+					i += 2
+					continue
+				}
+				inSingleQuote = false
+			}
+			i++
+			continue
+		}
+		if inDoubleQuote {
+			rewritten.WriteByte(query[i])
+			if query[i] == '"' {
+				if i+1 < len(query) && query[i+1] == '"' {
+					rewritten.WriteByte(query[i+1])
+					i += 2
+					continue
+				}
+				inDoubleQuote = false
+			}
+			i++
+			continue
+		}
+
+		switch query[i] {
+		case '\'':
+			inSingleQuote = true
+			rewritten.WriteByte(query[i])
+			i++
+			continue
+		case '"':
+			inDoubleQuote = true
+			rewritten.WriteByte(query[i])
+			i++
+			continue
+		}
+		if i+len(prefix) <= len(query) && strings.EqualFold(query[i:i+len(prefix)], prefix) &&
+			(i == 0 || !isSQLIdentifierByte(query[i-1])) {
+			replaced = true
+			i += len(prefix)
+			continue
+		}
+		rewritten.WriteByte(query[i])
+		i++
+	}
+	if !replaced {
+		return query
+	}
+	return rewritten.String()
+}
+
+func isSQLIdentifierByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_' || b == '$'
 }
 
 func updateHasVirtualJSONPredicate(src []byte, doc *parser.QueryDoc) bool {

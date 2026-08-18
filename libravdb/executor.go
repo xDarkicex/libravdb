@@ -8070,6 +8070,8 @@ func (e *Executor) materializeSystemTableRows(ctx context.Context, tableName str
 		return e.materializePgType(ctx)
 	case "pg_namespace":
 		return e.materializePgNamespace(ctx)
+	case "pg_indexes":
+		return e.materializePgIndexes(ctx)
 	case "pg_range", "pg_proc", "pg_constraint", "pg_index", "pg_attrdef":
 		return []*SearchResult{}, nil
 	case "graph_nodes":
@@ -8103,6 +8105,110 @@ func (e *Executor) materializePgClass(ctx context.Context) ([]*SearchResult, err
 			},
 		})
 	}
+	return rows, nil
+}
+
+type pgCatalogIndex struct {
+	name    string
+	columns []string
+	unique  bool
+}
+
+// collectionPgCatalogIndexes returns the logical indexes PostgreSQL exposes
+// through pg_indexes. The declarations are sourced from the same durable
+// collection configuration used by CREATE INDEX and conflict enforcement;
+// no second index catalog is maintained.
+func collectionPgCatalogIndexes(tableName string, cfg CollectionConfig) []pgCatalogIndex {
+	indexes := make([]pgCatalogIndex, 0, 1+len(cfg.NamedUniqueConstraints)+len(cfg.SQLIndexes))
+	seen := make(map[string]struct{}, cap(indexes))
+	add := func(name string, columns []string, unique bool) {
+		name = strings.TrimSpace(name)
+		if name == "" || len(columns) == 0 {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		indexes = append(indexes, pgCatalogIndex{
+			name:    name,
+			columns: append([]string(nil), columns...),
+			unique:  unique,
+		})
+	}
+
+	primaryColumns := append([]string(nil), cfg.PrimaryKeyColumns...)
+	if len(primaryColumns) == 0 && cfg.ColumnConstraints != nil {
+		if flags := cfg.ColumnConstraints["id"]; flags&catalog.ColFlagPrimaryKey != 0 {
+			primaryColumns = []string{"id"}
+		}
+	}
+	primaryName := tableName + "_pkey"
+	for name, columns := range cfg.NamedUniqueConstraints {
+		if sameColumnSet(columns, primaryColumns) {
+			primaryName = name
+			break
+		}
+	}
+	add(primaryName, primaryColumns, true)
+
+	for name, columns := range cfg.NamedUniqueConstraints {
+		add(name, columns, true)
+	}
+	for _, index := range cfg.SQLIndexes {
+		add(index.Name, index.Columns, index.Unique)
+	}
+
+	sort.Slice(indexes, func(i, j int) bool {
+		if indexes[i].name == indexes[j].name {
+			return strings.Join(indexes[i].columns, "\x00") < strings.Join(indexes[j].columns, "\x00")
+		}
+		return indexes[i].name < indexes[j].name
+	})
+	return indexes
+}
+
+func (e *Executor) materializePgIndexes(ctx context.Context) ([]*SearchResult, error) {
+	names, err := e.db.ListCollectionsWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pg_indexes: listing collections: %w", err)
+	}
+	rows := make([]*SearchResult, 0)
+	for _, tableName := range names {
+		col, err := e.db.GetCollection(tableName)
+		if err != nil {
+			continue
+		}
+		for _, index := range collectionPgCatalogIndexes(tableName, col.Config()) {
+			prefix := "CREATE INDEX "
+			if index.unique {
+				prefix = "CREATE UNIQUE INDEX "
+			}
+			definition := prefix + index.name + " ON " + tableName + " (" + strings.Join(index.columns, ", ") + ")"
+			rows = append(rows, &SearchResult{
+				ID:    index.name,
+				Score: 1.0,
+				Metadata: map[string]interface{}{
+					"schemaname": "public",
+					"tablename":  tableName,
+					"indexname":  index.name,
+					"tablespace": nil,
+					"indexdef":   definition,
+				},
+			})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		leftTable, _ := rows[i].Metadata["tablename"].(string)
+		rightTable, _ := rows[j].Metadata["tablename"].(string)
+		if leftTable == rightTable {
+			leftName, _ := rows[i].Metadata["indexname"].(string)
+			rightName, _ := rows[j].Metadata["indexname"].(string)
+			return leftName < rightName
+		}
+		return leftTable < rightTable
+	})
 	return rows, nil
 }
 
