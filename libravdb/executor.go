@@ -101,6 +101,8 @@ func (e *Executor) executeTemporal(ctx context.Context, plan *optimizer.Physical
 		return e.executeMultiModalAtLSN(ctx, plan)
 	case plan.Kind == optimizer.QueryKindGraph:
 		return e.executeGraphAtLSN(ctx, plan)
+	case len(plan.GraphJoins) > 0:
+		return e.executeGraphJoinAtLSN(ctx, plan)
 	case plan.Kind == optimizer.QueryKindRelational:
 		return e.executeRelationalAtLSN(ctx, plan)
 	case plan.Kind == optimizer.QueryKindVectorProjection:
@@ -1173,7 +1175,11 @@ func (e *Executor) executeRelationalAtLSN(ctx context.Context, plan *optimizer.P
 			return true
 		}
 		results = append(results, &SearchResult{ID: r.ID, Score: 1.0, Metadata: r.Metadata})
-		return plan.Limit <= 0 || len(results) < plan.Limit
+		// Historical rows must be fully materialized before SQL ORDER BY,
+		// OFFSET, and LIMIT are applied. Storage iteration order is not SQL
+		// result order, so stopping during the snapshot scan can return the
+		// wrong rows for ordered queries.
+		return true
 	}); err != nil {
 		return nil, err
 	}
@@ -1181,12 +1187,27 @@ func (e *Executor) executeRelationalAtLSN(ctx context.Context, plan *optimizer.P
 	if len(columns) == 0 {
 		columns = collectionColumns(col)
 	}
-	return &SearchResults{
+	out := &SearchResults{
 		Results:     results,
 		Total:       len(results),
 		Columns:     columns,
 		ColumnTypes: collectionColumnTypes(col, columns),
-	}, nil
+	}
+	if plan.OrderBy != "" {
+		e.applyOrderBy(out, plan)
+	}
+	if plan.Offset > 0 {
+		if plan.Offset >= len(out.Results) {
+			out.Results = nil
+		} else {
+			out.Results = out.Results[plan.Offset:]
+		}
+	}
+	if plan.Limit > 0 && len(out.Results) > plan.Limit {
+		out.Results = out.Results[:plan.Limit]
+	}
+	out.Total = len(out.Results)
+	return out, nil
 }
 
 func recordMatchesPredicatesSnapshot(r *Record, predicates []optimizer.RelationalPredicate) bool {
@@ -6405,6 +6426,138 @@ func collectGraphJoinTerminalsAtLSN(ctx context.Context, g temporalGraphNeighbor
 		}
 	}
 	return terminals, nil
+}
+
+// executeGraphJoinAtLSN evaluates ordinary JOIN MATCH queries against the
+// historical graph view. Common-neighbor joins use the specialized executor
+// below; this path covers the normal single-source JOIN MATCH form used by
+// graph projections and temporal EXPLAIN probes.
+func (e *Executor) executeGraphJoinAtLSN(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	leftCol, err := e.db.GetCollection(plan.CollectionName)
+	if err != nil {
+		return nil, err
+	}
+	g := leftCol.GetGraph()
+	if g == nil {
+		return nil, fmt.Errorf("JOIN MATCH left collection %q has no graph", plan.CollectionName)
+	}
+	temporalGraph, ok := g.(temporalGraphNeighbor)
+	if !ok {
+		return nil, fmt.Errorf("collection %q graph does not support temporal traversal", plan.CollectionName)
+	}
+	if len(plan.GraphJoins) == 0 {
+		return &SearchResults{Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}, nil
+	}
+	records := make([]Record, 0)
+	if err := leftCol.ListVisibleAtLSN(ctx, plan.SnapshotLSN, func(record *Record) bool {
+		if record != nil {
+			records = append(records, *record)
+		}
+		return ctx.Err() == nil
+	}); err != nil {
+		return nil, err
+	}
+	trackSQLRowsExamined(ctx, len(records))
+	recordsByID := make(map[string]Record, len(records))
+	for _, record := range records {
+		recordsByID[record.ID] = record
+	}
+
+	results := make([]*SearchResult, 0)
+	for _, join := range plan.GraphJoins {
+		if len(join.GraphEdges) == 0 {
+			continue
+		}
+		if graphPlanHasEdgeProjection(plan) && !graphPlanSupportsSingleHopEdgeProjection(plan) {
+			return nil, fmt.Errorf("edge projections require a single-hop JOIN MATCH")
+		}
+		edges := make([]EdgePlan, len(join.GraphEdges))
+		for i, graphEdge := range join.GraphEdges {
+			edges[i] = graphEdgePlanForTraversal(graphEdge)
+		}
+		sourcePredicates := graphJoinSourcePredicates(plan.Predicates, join, plan.CollectionName)
+		terminalPredicates := graphJoinTerminalPredicates(plan.Predicates, join)
+		allowedLabels := graphLabelNodeSet(g, join.TerminalLabel)
+		isLeftJoin := join.JoinType == 1
+
+		for _, source := range records {
+			if len(sourcePredicates) > 0 && !recordMatchesPredicatesTracked(ctx, source, sourcePredicates) {
+				continue
+			}
+			sourceNode, lookupErr := e.db.GetNodeID(ctx, plan.CollectionName, source.ID)
+			if lookupErr != nil {
+				if isLeftJoin {
+					resultID := source.ID + "|"
+					results = append(results, &SearchResult{ID: resultID, Score: 1, Metadata: graphJoinProjectionMetadata(source, nil, resultID, join, plan)})
+				}
+				continue
+			}
+			terminalIDs, traverseErr := collectGraphJoinTerminalsAtLSN(ctx, temporalGraph, sourceNode, edges, join.MaxHops, allowedLabels, plan.SnapshotLSN)
+			if traverseErr != nil {
+				return nil, traverseErr
+			}
+			emitted := false
+			for _, terminalNode := range terminalIDs {
+				collection, terminalID, resolveErr := e.db.ResolveNodeID(ctx, terminalNode)
+				if resolveErr != nil || collection != plan.CollectionName {
+					continue
+				}
+				terminal, terminalOK := recordsByID[terminalID]
+				if !terminalOK || (len(terminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, terminalPredicates)) {
+					continue
+				}
+				aliases := map[string]Record{join.LeftAlias: source, join.TerminalAlias: terminal}
+				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, aliases, join.LeftAlias) {
+					continue
+				}
+				resultID := source.ID + "|" + terminal.ID
+				metadata := graphJoinProjectionMetadata(source, &terminal, resultID, join, plan)
+				if len(plan.GraphProjections) > 0 {
+					if len(edges) != 1 {
+						return nil, fmt.Errorf("edge projections require a single-hop JOIN MATCH")
+					}
+					views, viewErr := temporalGraph.NeighborsAtLSNWithProperties(sourceNode, plan.SnapshotLSN)
+					if edges[0].Dir < 0 {
+						views, viewErr = temporalGraph.InboundNeighborsAtLSNWithProperties(sourceNode, plan.SnapshotLSN)
+					}
+					if viewErr != nil {
+						return nil, viewErr
+					}
+					for _, view := range views {
+						if view.Edge.Target == terminalNode && edges[0].MatchesWithProperties(view.Edge, view.Properties) {
+							applyGraphProjectionMetadata(metadata, plan.GraphProjections, &source, &terminal, &view.Edge, join.GraphEdges[0].EdgeType)
+							break
+						}
+					}
+				}
+				results = append(results, &SearchResult{ID: resultID, Score: 1, Metadata: metadata})
+				emitted = true
+			}
+			if !emitted && isLeftJoin {
+				resultID := source.ID + "|"
+				results = append(results, &SearchResult{ID: resultID, Score: 1, Metadata: graphJoinProjectionMetadata(source, nil, resultID, join, plan)})
+			}
+		}
+	}
+	out := &SearchResults{Results: results, Total: len(results), Columns: plan.Projections, ColumnTypes: graphProjectionColumnTypes(plan)}
+	if plan.Distinct {
+		out.Results = distinctSearchResults(out.Results, plan.Projections)
+	}
+	if plan.OrderBy != "" {
+		e.applyOrderBy(out, plan)
+	}
+	if plan.Offset > 0 {
+		if plan.Offset >= len(out.Results) {
+			out.Results = nil
+		} else {
+			out.Results = out.Results[plan.Offset:]
+		}
+	}
+	if plan.Limit > 0 && len(out.Results) > plan.Limit {
+		out.Results = out.Results[:plan.Limit]
+	}
+	out.Total = len(out.Results)
+	return out, nil
 }
 
 func (e *Executor) executeCommonNeighborGraphJoinAtLSN(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {

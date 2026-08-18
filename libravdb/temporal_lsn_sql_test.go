@@ -190,3 +190,62 @@ func TestTemporalSQLAsOfLSNGraphVisibility(t *testing.T) {
 		t.Fatalf("graph at edge LSN=%+v, want source", after.Results)
 	}
 }
+
+func TestTemporalSQLAsOfLSNRelationalOrderOffsetLimit(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/as-of-lsn-order.libravdb"
+	db, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	col, err := db.CreateCollection(ctx, "docs", WithDimension(1), WithMetadataSchema(MetadataSchema{"title": StringField}))
+	if err != nil {
+		db.Close()
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	for _, row := range []struct {
+		id    string
+		title string
+	}{
+		{id: "z", title: "zulu"},
+		{id: "a", title: "alpha"},
+		{id: "m", title: "middle"},
+	} {
+		if err := col.Insert(ctx, row.id, []float32{0}, map[string]interface{}{"title": row.title}); err != nil {
+			db.Close()
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+	snapshotLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil {
+		db.Close()
+		t.Fatalf("LatestCommitLSN: %v", err)
+	}
+
+	query := "SELECT id, title FROM docs AS OF LSN $snapshot_lsn ORDER BY title LIMIT $limit OFFSET $offset"
+	params := QueryParams{
+		"snapshot_lsn": int64(snapshotLSN),
+		"limit":        int64(1),
+		"offset":       int64(1),
+	}
+	assertOrdered := func(label string, current *Database) {
+		t.Helper()
+		result, queryErr := current.QueryWithParams(ctx, query, params)
+		if queryErr != nil {
+			t.Fatalf("%s query: %v", label, queryErr)
+		}
+		if result.Total != 1 || len(result.Results) != 1 || result.Results[0].ID != "m" {
+			t.Fatalf("%s rows=%+v, want the second title-ordered row m", label, result.Results)
+		}
+	}
+	assertOrdered("before reopen", db)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db, err = Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	assertOrdered("after reopen", db)
+}

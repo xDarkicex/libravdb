@@ -49,6 +49,16 @@ func TestSQLExplainAnalyzeGraphJoin(t *testing.T) {
 	if err := txn.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	snapshotLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil {
+		t.Fatalf("LatestCommitLSN: %v", err)
+	}
+	if _, err := db.QueryWithParams(ctx,
+		"EXPLAIN ANALYZE SELECT target_id FROM people AS OF LSN $snapshot_lsn src "+
+			"JOIN MATCH (src)-[]->(tgt) WHERE src.id = $probe_id",
+		QueryParams{"snapshot_lsn": int64(snapshotLSN), "probe_id": "__libravdb_v155_probe__"}); err != nil {
+		t.Fatalf("EXPLAIN ANALYZE AS OF LSN: %v", err)
+	}
 
 	db.ResetSQLStats()
 	rows, err := db.QueryWithParams(ctx, `EXPLAIN ANALYZE

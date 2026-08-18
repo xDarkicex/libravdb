@@ -26,6 +26,8 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ### Snapshot LSNs
 
+- Historical relational reads now materialize the full visible snapshot before applying SQL `ORDER BY`, `OFFSET`, and `LIMIT`, preserving query semantics across storage iteration order and reopen.
+- Ordinary temporal `JOIN MATCH` queries, graph projections, and temporal `EXPLAIN ANALYZE` probes now execute against the exact requested LSN.
 - Exposed the existing exact durable commit LSN through the native SDK bridge,
   pgwire startup metadata, and the `LIBRAVDB_LATEST_COMMIT_LSN()` SQL
   function.

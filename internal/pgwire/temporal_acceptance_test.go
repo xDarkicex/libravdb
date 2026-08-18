@@ -190,8 +190,8 @@ func TestTemporalAcceptance_PgwireASOFLSNExtendedProtocol(t *testing.T) {
 	assertMessageType(t, conn, msgBindComplete, "AS OF LSN live BindComplete")
 	sendExecute(t, conn, "live-portal", 0)
 	rows = readDataRowsUntilComplete(t, conn)
-	if len(rows) != 2 || rows[0][0] != "old" || rows[1][0] != "future" {
-		t.Fatalf("AS OF LSN live rows=%v, want old and future", rows)
+	if len(rows) != 2 || rows[0][0] != "future" || rows[1][0] != "old" {
+		t.Fatalf("AS OF LSN live rows=%v, want future and old in ORDER BY id order", rows)
 	}
 	sendSync(t, conn)
 	if status := readReadyStatus(t, conn); status != 'I' {
