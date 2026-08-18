@@ -15,6 +15,32 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
   epoch and exact `AS OF LSN` snapshot propagation.
 - Added stable `JOIN MATCH` projections for `source_id`, `target_id`, `edge_type`, and `edge_weight`, including edge-variable aliases such as `r.type` and `r.weight`.
 - Added deterministic pgwire type metadata and native, epoch, pgwire, and external end-to-end regression coverage for the stable graph row shape.
+- Added the explicit `GRAPH_SEMIJOIN(...)` virtual relation for evidence-aware
+  common-neighbor results: `candidate_id`, `evidence_id`, `edge_type`, and
+  `shared_count`, with edge-type, expansion, and candidate limits. The
+  candidate-only `IN` semijoin remains available for ordinary profile reads.
+- Added epoch APIs for record-and-graph mutations by stable record ID,
+  including edge replacement that removes stale edges of one relationship
+  kind while preserving unrelated kinds in the same atomic commit.
+
+### Durable SQL indexes
+
+- Ordinary `CREATE INDEX` and `CREATE UNIQUE INDEX` declarations now persist
+  in the existing collection configuration/WAL path and are restored after
+  reopen. `DROP INDEX` removes only SQL-owned declarations and preserves
+  native collection metadata indexes.
+- Added reopen coverage for catalog metadata, indexed-field routing, and
+  equality queries.
+
+### SQL errors
+
+- Added typed native `SQLError` classification for syntax, unsupported
+  features, temporal aggregate limitations, missing tables/columns, invalid
+  parameters, integrity failures, and storage failures while preserving the
+  existing human-readable messages and pgwire SQLSTATE mapping.
+- CGO/SDK responses now carry structured `code` and `sqlstate` details without
+  breaking clients that still read the legacy error string; the Python SDK
+  exposes these as `SQLError` attributes.
 
 ### JSONB DML
 

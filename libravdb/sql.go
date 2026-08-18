@@ -61,6 +61,11 @@ func (db *Database) queryWithBoundParamsAndConfig(ctx context.Context, sql strin
 	tracker := sqlTrackerFromContext(ctx)
 	root := tracker == nil
 	started := time.Now()
+	defer func() {
+		if err != nil {
+			err = normalizeSQLError(err)
+		}
+	}()
 	if root {
 		tracker = &sqlQueryTracker{}
 		ctx = context.WithValue(ctx, sqlQueryTrackerContextKey{}, tracker)
@@ -257,7 +262,7 @@ func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, s
 	if err != nil {
 		return nil, fmt.Errorf("optimize error: %w", err)
 	}
-	if cacheable && plan.Kind == optimizer.QueryKindRelational && db.sqlPlanCache != nil {
+	if cacheable && (plan.Kind == optimizer.QueryKindRelational || plan.Kind == optimizer.QueryKindAggregate) && db.sqlPlanCache != nil {
 		db.sqlPlanCache.put(cacheKey, generation, cat, plan, parameterSlots)
 	}
 

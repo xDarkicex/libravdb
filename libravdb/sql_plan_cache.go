@@ -7,6 +7,7 @@ import (
 	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
+	graph "github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
@@ -27,10 +28,18 @@ type sqlPlanCacheEntry struct {
 }
 
 type sqlPlanParameterSlot struct {
+	kind           uint8
 	predicateIndex int
 	start          uint32
 	end            uint32
 }
+
+const (
+	sqlPlanParameterPredicate uint8 = iota
+	sqlPlanParameterSnapshotLSN
+	sqlPlanParameterLimit
+	sqlPlanParameterOffset
+)
 
 func newSQLPlanCache(maxEntries int) *sqlPlanCache {
 	if maxEntries < 1 {
@@ -66,13 +75,37 @@ func (c *sqlPlanCache) get(key string, generation uint64, cat *catalog.Catalog, 
 			return nil, false
 		}
 		value, found := params.Lookup(src, slot.start, slot.end)
-		if !found || slot.predicateIndex < 0 || slot.predicateIndex >= len(clone.Predicates) {
+		if !found {
 			return nil, false
 		}
-		predicate := &clone.Predicates[slot.predicateIndex]
-		predicate.TypedValue = value
-		predicate.ValueIsNull = value.IsNull()
-		predicate.Value = value.Bytes()
+		switch slot.kind {
+		case sqlPlanParameterSnapshotLSN:
+			lsn, err := parseTemporalLSN(src, slot.start, slot.end, params)
+			if err != nil {
+				return nil, false
+			}
+			clone.SnapshotLSN = lsn
+		case sqlPlanParameterLimit:
+			limit, ok := sqlPlanIntegerValue(value)
+			if !ok {
+				return nil, false
+			}
+			clone.Limit = limit
+		case sqlPlanParameterOffset:
+			offset, ok := sqlPlanIntegerValue(value)
+			if !ok {
+				return nil, false
+			}
+			clone.Offset = offset
+		default:
+			if slot.predicateIndex < 0 || slot.predicateIndex >= len(clone.Predicates) {
+				return nil, false
+			}
+			predicate := &clone.Predicates[slot.predicateIndex]
+			predicate.TypedValue = value
+			predicate.ValueIsNull = value.IsNull()
+			predicate.Value = value.Bytes()
+		}
 	}
 	return clone, true
 }
@@ -112,13 +145,14 @@ func (c *sqlPlanCache) reset() {
 	c.mu.Unlock()
 }
 
-// cloneCachedSQLPlan copies the mutable plan slices used by ordinary
-// relational execution. The eligibility check below excludes graph, vector,
-// aggregate, DML, temporal, and virtual-expression plans, keeping this clone
-// deliberately narrow and auditable.
+// cloneCachedSQLPlan copies the mutable plan slices used by relational,
+// aggregate, and the specialized graph-semijoin execution paths. The cache
+// never stores execution cursors or snapshot pins; those remain query-local.
 func cloneCachedSQLPlan(plan *optimizer.PhysicalPlan) *optimizer.PhysicalPlan {
 	clone := *plan
 	clone.QueryVector = append([]float32(nil), plan.QueryVector...)
+	clone.GraphAnchorVector = append([]float32(nil), plan.GraphAnchorVector...)
+	clone.GraphEdges = cloneCachedGraphEdges(plan.GraphEdges)
 	clone.Predicates = append([]optimizer.RelationalPredicate(nil), plan.Predicates...)
 	clone.PredicateAlternatives = make(optimizer.PredicateAlternatives, len(plan.PredicateAlternatives))
 	for i := range plan.PredicateAlternatives {
@@ -126,7 +160,24 @@ func cloneCachedSQLPlan(plan *optimizer.PhysicalPlan) *optimizer.PhysicalPlan {
 	}
 	clone.Projections = append([]string(nil), plan.Projections...)
 	clone.ProjectionRefs = append([]optimizer.ProjectionRef(nil), plan.ProjectionRefs...)
+	clone.GraphJoins = make([]optimizer.GraphJoinPlan, len(plan.GraphJoins))
+	for i, join := range plan.GraphJoins {
+		clone.GraphJoins[i] = join
+		clone.GraphJoins[i].GraphEdges = cloneCachedGraphEdges(join.GraphEdges)
+		clone.GraphJoins[i].TerminalPredicates = append([]optimizer.RelationalPredicate(nil), join.TerminalPredicates...)
+	}
 	return &clone
+}
+
+func cloneCachedGraphEdges(edges []optimizer.GraphEdgePlan) []optimizer.GraphEdgePlan {
+	if len(edges) == 0 {
+		return nil
+	}
+	clone := append([]optimizer.GraphEdgePlan(nil), edges...)
+	for i := range clone {
+		clone[i].Predicate.Nodes = append([]graph.EdgePredicateNode(nil), edges[i].Predicate.Nodes...)
+	}
+	return clone
 }
 
 func normalizeSQLPlanKey(sql string) string {
@@ -152,12 +203,9 @@ func sqlPlanCacheEligible(src []byte, doc *parser.QueryDoc) (bool, []sqlPlanPara
 	}
 	stmt := &doc.SelectStmts[0]
 	if stmt.FromTable.Kind != parser.NodeKindTableExpr || len(stmt.Joins) != 0 ||
-		stmt.CTEsCount != 0 || len(stmt.GroupBy) != 0 ||
+		stmt.CTEsCount != 0 ||
 		stmt.HavingExpr.Kind != parser.NodeKindUnknown || stmt.UnionNext.Kind != parser.NodeKindUnknown ||
-		stmt.SetOp != parser.SetOpNone || selectHasTemporalSnapshot(doc, stmt) {
-		return false, nil
-	}
-	if stmt.LimitExpr.Kind != parser.NodeKindUnknown || stmt.OffsetExpr.Kind != parser.NodeKindUnknown {
+		stmt.SetOp != parser.SetOpNone {
 		return false, nil
 	}
 	// These routes intentionally execute against virtual rows or post-process
@@ -175,7 +223,7 @@ func sqlPlanCacheEligible(src []byte, doc *parser.QueryDoc) (bool, []sqlPlanPara
 		if projection.Star {
 			continue
 		}
-		if projection.Expr.Kind != parser.NodeKindIdentifier {
+		if projection.Expr.Kind != parser.NodeKindIdentifier && projection.Expr.Kind != parser.NodeKindAggregateExpr {
 			return false, nil
 		}
 	}
@@ -191,9 +239,6 @@ func sqlPlanCacheEligible(src []byte, doc *parser.QueryDoc) (bool, []sqlPlanPara
 // intentionally limited to AND-connected binary predicates with an ordinary
 // column on the left and a scalar literal or parameter on the right.
 func sqlPlanParameterSlots(src []byte, doc *parser.QueryDoc, stmt *parser.SelectStmt) ([]sqlPlanParameterSlot, bool) {
-	if stmt.WhereExpr.Kind == parser.NodeKindUnknown {
-		return nil, true
-	}
 	slots := make([]sqlPlanParameterSlot, 0, 2)
 	predicateIndex := 0
 	var walk func(parser.NodeRef) bool
@@ -237,8 +282,56 @@ func sqlPlanParameterSlots(src []byte, doc *parser.QueryDoc, stmt *parser.Select
 			return false
 		}
 	}
-	if !walk(stmt.WhereExpr) {
+	if stmt.WhereExpr.Kind != parser.NodeKindUnknown && !walk(stmt.WhereExpr) {
 		return nil, false
 	}
+	if stmt.LimitExpr.Kind != parser.NodeKindUnknown {
+		slot, ok := sqlPlanParameterRef(src, doc, stmt.LimitExpr, sqlPlanParameterLimit)
+		if !ok {
+			return nil, false
+		}
+		slots = append(slots, slot)
+	}
+	if stmt.OffsetExpr.Kind != parser.NodeKindUnknown {
+		slot, ok := sqlPlanParameterRef(src, doc, stmt.OffsetExpr, sqlPlanParameterOffset)
+		if !ok {
+			return nil, false
+		}
+		slots = append(slots, slot)
+	}
+	if stmt.FromTable.Kind == parser.NodeKindTableExpr && stmt.FromTable.ID >= 0 && int(stmt.FromTable.ID) < len(doc.TableExprs) {
+		table := doc.TableExprs[stmt.FromTable.ID]
+		if table.TemporalLSN {
+			// LSNStart/LSNEnd are source offsets, not identifier IDs.
+			raw := strings.TrimSpace(string(src[table.LSNStart:table.LSNEnd]))
+			if len(raw) > 1 && (raw[0] == '$' || raw[0] == '@') {
+				slots = append(slots, sqlPlanParameterSlot{kind: sqlPlanParameterSnapshotLSN, start: table.LSNStart, end: table.LSNEnd})
+			}
+		}
+	}
 	return slots, true
+}
+
+func sqlPlanParameterRef(src []byte, doc *parser.QueryDoc, ref parser.NodeRef, kind uint8) (sqlPlanParameterSlot, bool) {
+	if ref.Kind != parser.NodeKindIdentifier || ref.ID < 0 || int(ref.ID) >= len(doc.Identifiers) {
+		return sqlPlanParameterSlot{}, false
+	}
+	id := doc.Identifiers[ref.ID]
+	if id.Start >= uint32(len(src)) || id.End > uint32(len(src)) || id.End <= id.Start || (src[id.Start] != '$' && src[id.Start] != '@') {
+		return sqlPlanParameterSlot{}, false
+	}
+	return sqlPlanParameterSlot{kind: kind, start: id.Start, end: id.End}, true
+}
+
+func sqlPlanIntegerValue(value optimizer.ScalarValue) (int, bool) {
+	if value.IsNull() {
+		return 0, false
+	}
+	if value.Kind == optimizer.ScalarInt {
+		if value.Int < 0 || uint64(value.Int) > uint64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(value.Int), true
+	}
+	return 0, false
 }

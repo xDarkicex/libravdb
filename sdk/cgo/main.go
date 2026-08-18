@@ -16,6 +16,37 @@ import (
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
+type sqlFFIError struct {
+	Code     string `json:"code"`
+	SQLState string `json:"sqlstate"`
+	Message  string `json:"message"`
+}
+
+func sqlErrorJSON(err error) string {
+	message := "unknown SQL error"
+	if err != nil {
+		message = err.Error()
+	}
+	details := sqlFFIError{Message: message}
+	if structured := libravdb.AsSQLError(err); structured != nil {
+		details.Code = structured.Code
+		details.SQLState = structured.SQLState
+		details.Message = structured.Message
+	}
+	payload := map[string]interface{}{
+		// Keep the legacy string field so existing SDKs remain source- and
+		// binary-compatible while new SDKs can consume error_details.
+		"error":         message,
+		"error_details": details,
+	}
+	encoded, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		fallback, _ := json.Marshal(map[string]string{"error": message})
+		return string(fallback)
+	}
+	return string(encoded)
+}
+
 var (
 	mu          sync.RWMutex
 	dbs         = make(map[int]*libravdb.Database)
@@ -480,7 +511,7 @@ func ListCollections(dbID C.int) *C.char {
 	mu.RUnlock()
 
 	if !ok {
-		return C.CString(`{"error": "database not found"}`)
+		return C.CString(sqlErrorJSON(fmt.Errorf("database not found")))
 	}
 
 	names := db.ListCollections()
@@ -898,14 +929,12 @@ func DatabaseQuery(dbID C.int, sql *C.char) *C.char {
 
 	results, err := db.Query(context.Background(), goSQL)
 	if err != nil {
-		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
-		return C.CString(string(errBytes))
+		return C.CString(sqlErrorJSON(err))
 	}
 
 	bytes, err := json.Marshal(results)
 	if err != nil {
-		errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to marshal results: %v", err)})
-		return C.CString(string(errBytes))
+		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal results: %w", err)))
 	}
 	return C.CString(string(bytes))
 }
@@ -917,7 +946,7 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 	mu.RUnlock()
 
 	if !ok {
-		return C.CString(`{"error": "database not found"}`)
+		return C.CString(sqlErrorJSON(fmt.Errorf("database not found")))
 	}
 
 	goSQL := C.GoString(sql)
@@ -927,8 +956,7 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 		goParamsJSON := C.GoString(paramsJSON)
 		if goParamsJSON != "" {
 			if err := json.Unmarshal([]byte(goParamsJSON), &params); err != nil {
-				errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to parse params: %v", err)})
-				return C.CString(string(errBytes))
+				return C.CString(sqlErrorJSON(fmt.Errorf("failed to parse params: %w", err)))
 			}
 			// Normalize []interface{} to []float32 for vectors
 			for k, v := range params {
@@ -953,14 +981,12 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 
 	results, err := db.QueryWithParams(context.Background(), goSQL, params)
 	if err != nil {
-		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
-		return C.CString(string(errBytes))
+		return C.CString(sqlErrorJSON(err))
 	}
 
 	bytes, err := json.Marshal(results)
 	if err != nil {
-		errBytes, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("failed to marshal results: %v", err)})
-		return C.CString(string(errBytes))
+		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal results: %w", err)))
 	}
 	return C.CString(string(bytes))
 }

@@ -3,10 +3,28 @@ package libravdb
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	internalgraph "github.com/xDarkicex/libravdb/internal/graph"
 )
+
+func temporalNumericValue(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	default:
+		return 0, false
+	}
+}
 
 func TestTemporalSQLAsOfLSNRecordsCTEVectorAndReopen(t *testing.T) {
 	ctx := context.Background()
@@ -248,4 +266,101 @@ func TestTemporalSQLAsOfLSNRelationalOrderOffsetLimit(t *testing.T) {
 	}
 	defer db.Close()
 	assertOrdered("after reopen", db)
+}
+
+func TestTemporalSQLAsOfLSNAggregatesRemainHistoricalAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/as-of-lsn-aggregate.libravdb"
+	db, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	col, err := db.CreateCollection(ctx, "events", WithDimension(1), WithMetadataSchema(MetadataSchema{
+		"category": StringField,
+		"amount":   IntField,
+	}))
+	if err != nil {
+		db.Close()
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	for _, row := range []struct {
+		id       string
+		category string
+		amount   int
+	}{
+		{id: "a1", category: "alpha", amount: 2},
+		{id: "a2", category: "alpha", amount: 3},
+	} {
+		if err := col.Insert(ctx, row.id, []float32{0}, map[string]interface{}{
+			"category": row.category,
+			"amount":   row.amount,
+		}); err != nil {
+			db.Close()
+			t.Fatalf("insert %s: %v", row.id, err)
+		}
+	}
+	baseLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil {
+		db.Close()
+		t.Fatalf("base LSN: %v", err)
+	}
+	if err := col.Insert(ctx, "b1", []float32{0}, map[string]interface{}{
+		"category": "beta",
+		"amount":   100,
+	}); err != nil {
+		db.Close()
+		t.Fatalf("future insert: %v", err)
+	}
+
+	queryParams := QueryParams{"snapshot_lsn": int64(baseLSN)}
+	count, err := db.QueryWithParams(ctx,
+		"SELECT COUNT(*) AS total FROM events AS OF LSN $snapshot_lsn", queryParams)
+	if err != nil {
+		db.Close()
+		t.Fatalf("historical count: %v", err)
+	}
+	countValue, countOK := temporalNumericValue(count.Results[0].Metadata["total"])
+	if count.Total != 1 || len(count.Results) != 1 || !countOK || countValue != 2 {
+		db.Close()
+		t.Fatalf("historical count=%+v, want 2", count.Results)
+	}
+
+	grouped, err := db.QueryWithParams(ctx, `
+		SELECT category, SUM(amount) AS amount_total
+		FROM events AS OF LSN $snapshot_lsn
+		GROUP BY category
+		ORDER BY category`, queryParams)
+	if err != nil {
+		db.Close()
+		t.Fatalf("historical grouped aggregate: %v", err)
+	}
+	if grouped.Total != 1 || len(grouped.Results) != 1 {
+		db.Close()
+		t.Fatalf("historical groups=%+v, want one alpha group", grouped.Results)
+	}
+	amountValue, amountOK := temporalNumericValue(grouped.Results[0].Metadata["amount_total"])
+	if grouped.Results[0].Metadata["category"] != "alpha" || !amountOK || math.Abs(amountValue-5) > 1e-9 {
+		db.Close()
+		t.Fatalf("historical aggregate row=%+v, want alpha/5", grouped.Results[0].Metadata)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db, err = Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	reopened, err := db.QueryWithParams(ctx, `
+		SELECT category, SUM(amount) AS amount_total
+		FROM events AS OF LSN $snapshot_lsn
+		GROUP BY category`, queryParams)
+	if err != nil {
+		t.Fatalf("reopened grouped aggregate: %v", err)
+	}
+	reopenedAmount, reopenedAmountOK := temporalNumericValue(reopened.Results[0].Metadata["amount_total"])
+	if reopened.Total != 1 || len(reopened.Results) != 1 || !reopenedAmountOK || math.Abs(reopenedAmount-5) > 1e-9 {
+		t.Fatalf("reopened aggregate=%+v, want alpha/5", reopened.Results)
+	}
 }

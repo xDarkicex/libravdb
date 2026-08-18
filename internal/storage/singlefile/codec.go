@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/xDarkicex/libravdb/internal/storage"
 	"github.com/xDarkicex/libravdb/internal/util"
@@ -656,7 +657,7 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 // inside the existing optional config block. It carries declarations only;
 // metadata posting lists remain derived from records and are rebuilt on load.
 func encodeCollectionDeclarations(config storage.CollectionConfig) []byte {
-	if len(config.MetadataSchema) == 0 && len(config.IndexedFields) == 0 {
+	if len(config.MetadataSchema) == 0 && len(config.IndexedFields) == 0 && len(config.SQLIndexes) == 0 {
 		return nil
 	}
 
@@ -676,6 +677,23 @@ func encodeCollectionDeclarations(config storage.CollectionConfig) []byte {
 	for _, field := range config.IndexedFields {
 		enc.WriteString(field)
 	}
+	enc.WriteUint32(uint32(len(config.SQLIndexedFields)))
+	for _, field := range config.SQLIndexedFields {
+		enc.WriteString(field)
+	}
+	indexes := append([]storage.SQLIndexDefinition(nil), config.SQLIndexes...)
+	sort.Slice(indexes, func(i, j int) bool {
+		return strings.ToLower(indexes[i].Name) < strings.ToLower(indexes[j].Name)
+	})
+	enc.WriteUint32(uint32(len(indexes)))
+	for _, index := range indexes {
+		enc.WriteString(index.Name)
+		enc.WriteBool(index.Unique)
+		enc.WriteUint32(uint32(len(index.Columns)))
+		for _, column := range index.Columns {
+			enc.WriteString(column)
+		}
+	}
 	data := append([]byte(nil), enc.Bytes()...)
 	util.ReleaseBinaryEncoder(enc)
 	return data
@@ -689,17 +707,28 @@ func estimateCollectionDeclarationsSize(config storage.CollectionConfig) int {
 	for _, field := range config.IndexedFields {
 		size += 4 + len(field)
 	}
+	size += 4
+	for _, field := range config.SQLIndexedFields {
+		size += 4 + len(field)
+	}
+	size += 4
+	for _, index := range config.SQLIndexes {
+		size += 4 + len(index.Name) + 1 + 4
+		for _, column := range index.Columns {
+			size += 4 + len(column)
+		}
+	}
 	return size
 }
 
-func decodeCollectionDeclarations(data []byte) (map[string]uint8, []string, error) {
+func decodeCollectionDeclarations(data []byte) (map[string]uint8, []string, []storage.SQLIndexDefinition, []string, error) {
 	if len(data) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	dec := &util.BinaryDecoder{Data: data}
 	schemaCount, err := dec.ReadUint32()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	var schema map[string]uint8
 	if schemaCount > 0 {
@@ -708,17 +737,17 @@ func decodeCollectionDeclarations(data []byte) (map[string]uint8, []string, erro
 	for i := uint32(0); i < schemaCount; i++ {
 		field, err := dec.ReadString()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		fieldType, err := dec.ReadByte()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		schema[field] = fieldType
 	}
 	indexedCount, err := dec.ReadUint32()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	var indexed []string
 	if indexedCount > 0 {
@@ -727,14 +756,67 @@ func decodeCollectionDeclarations(data []byte) (map[string]uint8, []string, erro
 	for i := uint32(0); i < indexedCount; i++ {
 		field, err := dec.ReadString()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		indexed = append(indexed, field)
 	}
-	if dec.Off != len(dec.Data) {
-		return nil, nil, fmt.Errorf("trailing bytes in collection declarations: %d", len(dec.Data)-dec.Off)
+	var sqlIndexes []storage.SQLIndexDefinition
+	var sqlIndexedFields []string
+	// The SQL index section was appended after the original declaration
+	// payload. Older snapshots end here and remain fully readable.
+	if dec.Off < len(dec.Data) {
+		sqlIndexedCount, readErr := dec.ReadUint32()
+		if readErr != nil {
+			return nil, nil, nil, nil, readErr
+		}
+		if sqlIndexedCount > 0 {
+			sqlIndexedFields = make([]string, 0, sqlIndexedCount)
+		}
+		for i := uint32(0); i < sqlIndexedCount; i++ {
+			field, readErr := dec.ReadString()
+			if readErr != nil {
+				return nil, nil, nil, nil, readErr
+			}
+			sqlIndexedFields = append(sqlIndexedFields, field)
+		}
+		indexCount, readErr := dec.ReadUint32()
+		if readErr != nil {
+			return nil, nil, nil, nil, readErr
+		}
+		if indexCount > 0 {
+			sqlIndexes = make([]storage.SQLIndexDefinition, 0, indexCount)
+		}
+		for i := uint32(0); i < indexCount; i++ {
+			name, readErr := dec.ReadString()
+			if readErr != nil {
+				return nil, nil, nil, nil, readErr
+			}
+			unique, readErr := dec.ReadBool()
+			if readErr != nil {
+				return nil, nil, nil, nil, readErr
+			}
+			columnCount, readErr := dec.ReadUint32()
+			if readErr != nil {
+				return nil, nil, nil, nil, readErr
+			}
+			definition := storage.SQLIndexDefinition{Name: name, Unique: unique}
+			if columnCount > 0 {
+				definition.Columns = make([]string, 0, columnCount)
+			}
+			for j := uint32(0); j < columnCount; j++ {
+				column, readErr := dec.ReadString()
+				if readErr != nil {
+					return nil, nil, nil, nil, readErr
+				}
+				definition.Columns = append(definition.Columns, column)
+			}
+			sqlIndexes = append(sqlIndexes, definition)
+		}
 	}
-	return schema, indexed, nil
+	if dec.Off != len(dec.Data) {
+		return nil, nil, nil, nil, fmt.Errorf("trailing bytes in collection declarations: %d", len(dec.Data)-dec.Off)
+	}
+	return schema, indexed, sqlIndexes, sqlIndexedFields, nil
 }
 
 func writeCollection(enc *util.BinaryEncoder, collection *persistedCollection) error {
@@ -887,6 +969,8 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	var costModelStats []byte
 	var metadataSchema map[string]uint8
 	var indexedFields []string
+	var sqlIndexes []storage.SQLIndexDefinition
+	var sqlIndexedFields []string
 	var graphEnabled bool
 
 	if version >= 2 {
@@ -929,7 +1013,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 				if readErr != nil {
 					return storage.CollectionConfig{}, readErr
 				}
-				metadataSchema, indexedFields, readErr = decodeCollectionDeclarations(declarationBytes)
+				metadataSchema, indexedFields, sqlIndexes, sqlIndexedFields, readErr = decodeCollectionDeclarations(declarationBytes)
 				if readErr != nil {
 					return storage.CollectionConfig{}, fmt.Errorf("decode collection declarations: %w", readErr)
 				}
@@ -964,23 +1048,25 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	}
 
 	return storage.CollectionConfig{
-		Dimension:      int(dimension),
-		Metric:         int(metric),
-		IndexType:      int(indexType),
-		M:              int(m),
-		EfConstruction: int(efConstruction),
-		EfSearch:       int(efSearch),
-		NClusters:      int(nClusters),
-		NProbes:        int(nProbes),
-		ML:             ml,
-		Version:        int(version),
-		RawVectorStore: rawVectorStore,
-		RawStoreCap:    int(rawStoreCap),
-		IDMapCapacity:  int(idMapCapacity),
-		CostModelStats: costModelStats,
-		MetadataSchema: metadataSchema,
-		IndexedFields:  indexedFields,
-		GraphEnabled:   graphEnabled,
+		Dimension:        int(dimension),
+		Metric:           int(metric),
+		IndexType:        int(indexType),
+		M:                int(m),
+		EfConstruction:   int(efConstruction),
+		EfSearch:         int(efSearch),
+		NClusters:        int(nClusters),
+		NProbes:          int(nProbes),
+		ML:               ml,
+		Version:          int(version),
+		RawVectorStore:   rawVectorStore,
+		RawStoreCap:      int(rawStoreCap),
+		IDMapCapacity:    int(idMapCapacity),
+		CostModelStats:   costModelStats,
+		MetadataSchema:   metadataSchema,
+		IndexedFields:    indexedFields,
+		SQLIndexes:       sqlIndexes,
+		SQLIndexedFields: sqlIndexedFields,
+		GraphEnabled:     graphEnabled,
 	}, nil
 }
 

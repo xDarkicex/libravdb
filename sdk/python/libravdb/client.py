@@ -5,6 +5,37 @@ from .core import _to_c_string, _from_c_string, _lib, c_float_p
 from .filters import Filter
 import ctypes
 
+
+class SQLError(RuntimeError):
+    """Structured SQL execution error returned by the native LibraVDB API."""
+
+    def __init__(self, operation: str, message: str, code: str = "", sqlstate: str = ""):
+        self.operation = operation
+        self.code = code
+        self.sqlstate = sqlstate
+        super().__init__(f"{operation} failed [{code or sqlstate or 'sql.error'}]: {message}")
+
+
+def _raise_query_error(res_json: str, operation: str):
+    try:
+        payload = json.loads(res_json)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict) or "error" not in payload:
+        return
+    details = payload.get("error_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    message = payload.get("error")
+    if isinstance(message, dict):
+        message = message.get("message", "SQL execution failed")
+    raise SQLError(
+        operation,
+        str(message or details.get("message") or "SQL execution failed"),
+        str(details.get("code") or ""),
+        str(details.get("sqlstate") or ""),
+    )
+
 class Collection:
     def __init__(self, handle: int, dim: int):
         self._handle = handle
@@ -371,9 +402,7 @@ class LibraVDB:
         res_json = _from_c_string(res_ptr)
         if not res_json:
             return {}
-        if res_json.startswith('{"error"'):
-            err = json.loads(res_json)
-            raise RuntimeError(f"Query failed: {err.get('error')}")
+        _raise_query_error(res_json, "Query")
         return json.loads(res_json)
 
     def query_with_params(self, sql: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -386,9 +415,7 @@ class LibraVDB:
         res_json = _from_c_string(res_ptr)
         if not res_json:
             return {}
-        if res_json.startswith('{"error"'):
-            err = json.loads(res_json)
-            raise RuntimeError(f"QueryWithParams failed: {err.get('error')}")
+        _raise_query_error(res_json, "QueryWithParams")
         return json.loads(res_json)
 
     def latest_commit_lsn(self) -> int:

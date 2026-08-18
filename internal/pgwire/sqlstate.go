@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/xDarkicex/libravdb/internal/catalog"
+	"github.com/xDarkicex/libravdb/libravdb"
 )
 
 // PostgreSQL SQLSTATE error codes used by the pgwire protocol.
@@ -38,6 +39,9 @@ const (
 func errorToSQLState(err error) string {
 	if err == nil {
 		return SQLStateInternalError
+	}
+	if structured := libravdb.AsSQLError(err); structured != nil && structured.SQLState != "" {
+		return structured.SQLState
 	}
 
 	// Check catalog sentinel errors

@@ -346,6 +346,9 @@ func describeSelect(doc *parser.QueryDoc, src []byte, cat *catalog.Catalog, stmt
 			}
 			oid := oidForGraphProjection(doc, src, id)
 			if oid == 0 {
+				oid = oidForGraphSemijoinProjection(doc, src, id)
+			}
+			if oid == 0 {
 				oid = oidForColumn(cat, byOID, id, src)
 			}
 			cols = append(cols, ColumnMeta{Name: name, TypeOID: oid})
@@ -454,6 +457,46 @@ func oidForGraphProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifi
 	default:
 		return 0
 	}
+}
+
+func oidForGraphSemijoinProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifier) uint32 {
+	if doc == nil || id == nil || !describeHasGraphSemijoin(doc, src) {
+		return 0
+	}
+	switch strings.ToLower(string(src[id.Start:id.End])) {
+	case "candidate_id", "evidence_id", "edge_type":
+		return OIDText
+	case "shared_count":
+		return OIDInt8
+	default:
+		return 0
+	}
+}
+
+func describeHasGraphSemijoin(doc *parser.QueryDoc, src []byte) bool {
+	if doc == nil {
+		return false
+	}
+	isSemijoin := func(ref parser.NodeRef) bool {
+		if ref.Kind != parser.NodeKindFunctionExpr || ref.ID < 0 || int(ref.ID) >= len(doc.FunctionExprs) {
+			return false
+		}
+		fn := doc.FunctionExprs[ref.ID]
+		return fn.NameEnd <= uint32(len(src)) && fn.NameStart < fn.NameEnd && strings.EqualFold(string(src[fn.NameStart:fn.NameEnd]), "GRAPH_SEMIJOIN")
+	}
+	for i := range doc.TableExprs {
+		if doc.TableExprs[i].IsFunction && isSemijoin(doc.TableExprs[i].Function) {
+			return true
+		}
+	}
+	for i := range doc.SelectStmts {
+		for j := range doc.SelectStmts[i].Joins {
+			if doc.SelectStmts[i].Joins[j].IsFunction && isSemijoin(doc.SelectStmts[i].Joins[j].Function) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func describeHasGraphEdgeAlias(doc *parser.QueryDoc, src []byte, qualifier string) bool {
@@ -1158,6 +1201,10 @@ func oidForName(name string) uint32 {
 		return OIDInt8
 	case "collection", "record_id", "scope":
 		return OIDText
+	case "candidate_id", "evidence_id", "edge_type":
+		return OIDText
+	case "shared_count":
+		return OIDInt8
 	case "truncated":
 		return OIDBool
 	case "modularity":

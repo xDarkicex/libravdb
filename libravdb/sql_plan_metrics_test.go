@@ -128,6 +128,83 @@ func TestSQLParameterizedPlansReuseScalarSlotsWithoutStaleValues(t *testing.T) {
 	}
 }
 
+func TestSQLPlanCacheReusesTemporalAndAggregatePlans(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:sql-plan-cache-temporal"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Query(ctx, `CREATE TABLE plan_events (id TEXT PRIMARY KEY, category TEXT, amount FLOAT)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := db.Query(ctx, `INSERT INTO plan_events (id, category, amount) VALUES ('a', 'alpha', 2), ('b', 'alpha', 3)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	snapshotLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil {
+		t.Fatalf("LatestCommitLSN: %v", err)
+	}
+	db.ResetSQLStats()
+
+	temporalSQL := `SELECT id FROM plan_events AS OF LSN $snapshot_lsn WHERE id = $id`
+	for _, id := range []string{"a", "b"} {
+		rows, queryErr := db.QueryWithParams(ctx, temporalSQL, QueryParams{
+			"snapshot_lsn": int64(snapshotLSN),
+			"id":           id,
+		})
+		if queryErr != nil || rows.Total != 1 || rows.Results[0].ID != id {
+			t.Fatalf("temporal plan id=%q rows=%+v err=%v", id, rows, queryErr)
+		}
+	}
+	aggregateSQL := `SELECT category, SUM(amount) AS total FROM plan_events GROUP BY category`
+	for i := 0; i < 2; i++ {
+		rows, queryErr := db.Query(ctx, aggregateSQL)
+		if queryErr != nil || rows.Total != 1 {
+			t.Fatalf("aggregate plan rows=%+v err=%v", rows, queryErr)
+		}
+	}
+	stats := db.SQLStats()
+	if stats.PlanCacheMisses != 2 || stats.PlanCacheHits != 2 {
+		t.Fatalf("temporal/aggregate plan reuse stats=%+v, want misses=2 hits=2", stats)
+	}
+}
+
+func TestSQLPlanCacheRebindsTemporalSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:sql-plan-cache-snapshot"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Query(ctx, `CREATE TABLE snapshot_rows (id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := db.Query(ctx, `INSERT INTO snapshot_rows (id) VALUES ('old')`); err != nil {
+		t.Fatalf("insert old: %v", err)
+	}
+	oldLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil {
+		t.Fatalf("old LSN: %v", err)
+	}
+	if _, err := db.Query(ctx, `INSERT INTO snapshot_rows (id) VALUES ('future')`); err != nil {
+		t.Fatalf("insert future: %v", err)
+	}
+	liveLSN, err := db.LatestCommitLSN(ctx)
+	if err != nil || liveLSN <= oldLSN {
+		t.Fatalf("live LSN=%d old=%d err=%v", liveLSN, oldLSN, err)
+	}
+	query := `SELECT id FROM snapshot_rows AS OF LSN $snapshot_lsn ORDER BY id`
+	oldRows, err := db.QueryWithParams(ctx, query, QueryParams{"snapshot_lsn": int64(oldLSN)})
+	if err != nil || oldRows.Total != 1 || oldRows.Results[0].ID != "old" {
+		t.Fatalf("old snapshot rows=%+v err=%v", oldRows, err)
+	}
+	liveRows, err := db.QueryWithParams(ctx, query, QueryParams{"snapshot_lsn": int64(liveLSN)})
+	if err != nil || liveRows.Total != 2 {
+		t.Fatalf("live snapshot rows=%+v err=%v", liveRows, err)
+	}
+}
+
 func TestSQLPlanCacheConcurrentReuse(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(WithStoragePath(":memory:sql-plan-cache-concurrent"), WithMetrics(false))

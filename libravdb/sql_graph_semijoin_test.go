@@ -49,7 +49,8 @@ func TestSQLGraphToRelationalSemijoin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := db.QueryWithParams(ctx, `
+	db.ResetSQLStats()
+	semijoinSQL := `
 		SELECT p.id, p.metadata
 		FROM people p
 		WHERE p.id IN (
@@ -59,7 +60,8 @@ func TestSQLGraphToRelationalSemijoin(t *testing.T) {
 			JOIN MATCH (origin)-[]->(shared)
 			WHERE origin.id = $1 AND src.id != $1
 		)
-		ORDER BY p.id`, QueryParams{"1": "alice"})
+		ORDER BY p.id`
+	rows, err := db.QueryWithParams(ctx, semijoinSQL, QueryParams{"1": "alice"})
 	if err != nil {
 		t.Fatalf("graph semijoin: %v", err)
 	}
@@ -68,6 +70,28 @@ func TestSQLGraphToRelationalSemijoin(t *testing.T) {
 	}
 	if rows.Results[0].Metadata["id"] != "bob" || rows.Results[1].Metadata["id"] != "carol" {
 		t.Fatalf("graph semijoin results=%#v, want bob and carol", rows.Results)
+	}
+	otherOrigin, err := db.QueryWithParams(ctx, semijoinSQL, QueryParams{"1": "bob"})
+	if err != nil || otherOrigin.Total != 1 || otherOrigin.Results[0].Metadata["id"] != "alice" {
+		t.Fatalf("reused graph semijoin rows=%+v err=%v, want alice", otherOrigin, err)
+	}
+	if stats := db.SQLStats(); stats.PlanCacheMisses == 0 || stats.PlanCacheHits == 0 {
+		t.Fatalf("graph semijoin plan cache stats=%+v, want a miss followed by a hit", stats)
+	}
+
+	evidence, err := db.QueryWithParams(ctx, `
+		SELECT candidate_id, evidence_id, edge_type, shared_count
+		FROM GRAPH_SEMIJOIN('people', $1, 'SQL_SEMIJOIN_FOLLOWS') AS sj
+		WHERE candidate_id <> $1
+		ORDER BY candidate_id, evidence_id`, QueryParams{"1": "alice"})
+	if err != nil {
+		t.Fatalf("evidence graph semijoin: %v", err)
+	}
+	if evidence.Total != 2 || len(evidence.Columns) != 4 {
+		t.Fatalf("evidence graph semijoin shape=%#v", evidence)
+	}
+	if evidence.Results[0].Metadata["candidate_id"] != "bob" || evidence.Results[0].Metadata["evidence_id"] != "shared-1" || evidence.Results[0].Metadata["edge_type"] != "SQL_SEMIJOIN_FOLLOWS" || evidence.Results[0].Metadata["shared_count"] != int64(1) {
+		t.Fatalf("evidence graph semijoin rows=%#v", evidence.Results)
 	}
 }
 

@@ -49,6 +49,7 @@ const (
 	recordTypeCollectionCreate = uint16(10)
 	recordTypeCollectionDelete = uint16(11)
 	recordTypeCollectionStats  = uint16(12)
+	recordTypeCollectionConfig = uint16(13)
 	recordTypeRecordPut        = uint16(20)
 	recordTypeRecordDelete     = uint16(21)
 	recordTypeGraphEdgeAdd     = uint16(22)
@@ -1902,6 +1903,12 @@ func (e *Engine) applyCommittedFrames(
 				return err
 			}
 			e.applyCollectionCostModelStats(payload.Name, payload.Stats)
+		case recordTypeCollectionConfig:
+			payload, err := decodeCollectionCreatePayloadBinary(record.Payload)
+			if err != nil {
+				return err
+			}
+			e.applyCollectionConfig(payload.Name, payload.Config, record.Header.LSN)
 		case recordTypeEdgeKindCreate:
 			payload, err := decodeEdgeKindCreatePayload(record.Payload)
 			if err != nil {
@@ -2032,6 +2039,15 @@ func (e *Engine) applyCreateCollection(name string, config storage.CollectionCon
 	}
 	e.collectionsByID[newCol.ID] = name
 	e.state.NextCollectionID++
+}
+
+func (e *Engine) applyCollectionConfig(name string, config storage.CollectionConfig, lsn uint64) {
+	collection := e.state.Collections[name]
+	if collection == nil || collection.Deleted {
+		return
+	}
+	collection.Config = config
+	collection.UpdatedLSN = lsn
 }
 
 func (e *Engine) applyDeleteCollection(name string, lsn uint64) {
@@ -5734,6 +5750,57 @@ func (e *Engine) GetCollectionWithConfig(name string) (storage.Collection, *stor
 func (e *Engine) SetCollectionCostModelStats(ctx context.Context, name string, stats []byte) error {
 	_, err := e.setCollectionCostModelStats(ctx, name, stats, nil)
 	return err
+}
+
+// UpdateCollectionConfig durably replaces logical collection declarations.
+// It uses the same WAL transaction framing as collection creation so a crash
+// cannot leave metadata/index declarations half-published.
+func (e *Engine) UpdateCollectionConfig(ctx context.Context, name string, config *storage.CollectionConfig) error {
+	if config == nil {
+		return fmt.Errorf("collection config must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.writesAvailable(); err != nil {
+		return err
+	}
+	if e.closed.Load() {
+		return fmt.Errorf("database is closed")
+	}
+	if collection := e.state.Collections[name]; collection == nil || collection.Deleted {
+		return fmt.Errorf("collection %s not found", name)
+	}
+	payload, err := encodeCollectionCreatePayloadBinary(collectionCreatePayload{Name: name, Config: *config})
+	if err != nil {
+		return err
+	}
+	txID := e.nextTxID()
+	beginLSN := e.nextLSN()
+	opLSN := e.nextLSN()
+	commitLSN := e.nextLSN()
+	frames := []walRecord{
+		newFrame(recordTypeTxBegin, beginLSN, txID, 0, emptyPayload()),
+		newFrame(recordTypeCollectionConfig, opLSN, txID, beginLSN, payload),
+		e.makeTxCommitFrame(commitLSN, txID, opLSN),
+	}
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return err
+	}
+	e.recordPendingCommitLocked()
+	e.applyCollectionConfig(name, *config, opLSN)
+	e.markDirtyLocked(written, 1)
+	return e.maybeCheckpointLocked()
 }
 
 // SetCollectionCostModelStatsIfDataLSN publishes statistics only when no base

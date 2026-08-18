@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -711,6 +712,33 @@ func (e *EpochTx) AddGraphEdge(collection string, src, tgt uint64, weight float3
 	return e.AddGraphEdgeWithPropertiesJSON(collection, src, tgt, weight, kind, nil)
 }
 
+// GraphEdgeMutation describes one desired outgoing relationship using stable
+// record IDs rather than internal graph node IDs.
+type GraphEdgeMutation struct {
+	TargetID string
+	EdgeType string
+	Weight   float32
+}
+
+// AddGraphEdgeByID stages a graph mutation using application record IDs. It
+// resolves the IDs inside the epoch so staged inserts and ordinary committed
+// records participate in the same atomic graph/record commit.
+func (e *EpochTx) AddGraphEdgeByID(ctx context.Context, collection, sourceID, targetID, edgeType string, weight float32) error {
+	kind := ResolveEdgeKind(edgeType)
+	if kind == 0 {
+		return fmt.Errorf("unknown edge kind %q", edgeType)
+	}
+	source, err := e.LookupNodeID(ctx, collection, sourceID)
+	if err != nil {
+		return err
+	}
+	target, err := e.LookupNodeID(ctx, collection, targetID)
+	if err != nil {
+		return err
+	}
+	return e.AddGraphEdge(collection, source, target, weight, kind)
+}
+
 // AddGraphEdgeWithPropertiesJSON stages an edge property envelope through the
 // same ordered epoch operation log as ordinary graph edges.
 func (e *EpochTx) AddGraphEdgeWithPropertiesJSON(collection string, src, tgt uint64, weight float32, kind uint8, properties []byte) error {
@@ -735,6 +763,77 @@ func (e *EpochTx) RemoveGraphEdge(collection string, src, tgt uint64, kind uint8
 		return err
 	}
 	e.generation++
+	return nil
+}
+
+// RemoveGraphEdgeByID stages an edge removal using stable record IDs.
+func (e *EpochTx) RemoveGraphEdgeByID(ctx context.Context, collection, sourceID, targetID, edgeType string) error {
+	kind := ResolveEdgeKind(edgeType)
+	if kind == 0 {
+		return fmt.Errorf("unknown edge kind %q", edgeType)
+	}
+	source, err := e.LookupNodeID(ctx, collection, sourceID)
+	if err != nil {
+		return err
+	}
+	target, err := e.LookupNodeID(ctx, collection, targetID)
+	if err != nil {
+		return err
+	}
+	return e.RemoveGraphEdge(collection, source, target, kind)
+}
+
+// ReplaceGraphEdgesByID atomically reconciles one source's outgoing edges of
+// one type. Existing edges of that type are removed and the desired set is
+// staged in their place; unrelated edge types remain untouched.
+func (e *EpochTx) ReplaceGraphEdgesByID(ctx context.Context, collection, sourceID, edgeType string, desired []GraphEdgeMutation) error {
+	kind := ResolveEdgeKind(edgeType)
+	if kind == 0 {
+		return fmt.Errorf("unknown edge kind %q", edgeType)
+	}
+	source, err := e.LookupNodeID(ctx, collection, sourceID)
+	if err != nil {
+		return err
+	}
+	gtx, err := e.GraphTxn(collection)
+	if err != nil {
+		return err
+	}
+	col, err := e.db.GetCollection(collection)
+	if err != nil {
+		return err
+	}
+	var existing []Edge
+	if e.epochLSN != 0 {
+		existing, err = col.GetGraph().NeighborsAtLSN(source, e.epochLSN)
+	} else {
+		existing, err = col.GetGraph().Neighbors(source)
+	}
+	if err != nil {
+		return err
+	}
+	for _, edge := range existing {
+		if edge.GetKind() == kind {
+			if err := gtx.RemoveEdge(source, edge.Target, kind); err != nil {
+				return err
+			}
+		}
+	}
+	for _, mutation := range desired {
+		if mutation.EdgeType != "" && !strings.EqualFold(mutation.EdgeType, edgeType) {
+			return fmt.Errorf("replacement edge type %q does not match %q", mutation.EdgeType, edgeType)
+		}
+		target, lookupErr := e.LookupNodeID(ctx, collection, mutation.TargetID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if err := gtx.AddEdge(source, target, mutation.Weight, kind); err != nil {
+			return err
+		}
+	}
+	e.mu.Lock()
+	e.generation++
+	e.mu.Unlock()
 	return nil
 }
 

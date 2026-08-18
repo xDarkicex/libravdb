@@ -82,6 +82,8 @@ type CollectionConfig struct {
 	RawVectorStore         string                         `json:"raw_vector_store,omitempty"`
 	SavePath               string                         `json:"save_path"`
 	IndexedFields          []string                       `json:"indexed_fields,omitempty"`
+	SQLIndexes             []SQLIndexDefinition           `json:"sql_indexes,omitempty"`
+	SQLIndexedFields       []string                       `json:"sql_indexed_fields,omitempty"`
 	JSONIndexes            []JSONIndexDefinition          `json:"json_indexes,omitempty"`
 	BatchConfig            BatchConfig                    `json:"batch_config,omitempty"`
 	AutoIndexThresholds    struct {
@@ -110,6 +112,15 @@ type CollectionConfig struct {
 	AutoSave           bool           `json:"auto_save"`
 }
 
+// SQLIndexDefinition describes a named ordinary SQL index declared with
+// CREATE INDEX. It is persisted as a logical declaration; posting lists are
+// still derived from the collection records.
+type SQLIndexDefinition struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"unique,omitempty"`
+}
+
 // metadataSchemaToStorage converts the public field-type enum into the
 // storage-neutral representation carried by the persisted collection config.
 // Keeping this conversion at the package boundary avoids coupling the storage
@@ -132,6 +143,48 @@ func metadataSchemaFromStorage(schema map[string]uint8) MetadataSchema {
 	converted := make(MetadataSchema, len(schema))
 	for field, fieldType := range schema {
 		converted[field] = FieldType(fieldType)
+	}
+	return converted
+}
+
+func cloneSQLIndexDefinitions(indexes []SQLIndexDefinition) []SQLIndexDefinition {
+	if len(indexes) == 0 {
+		return nil
+	}
+	cloned := make([]SQLIndexDefinition, len(indexes))
+	for i, definition := range indexes {
+		cloned[i] = definition
+		cloned[i].Columns = append([]string(nil), definition.Columns...)
+	}
+	return cloned
+}
+
+func sqlIndexesToStorage(indexes []SQLIndexDefinition) []storage.SQLIndexDefinition {
+	if len(indexes) == 0 {
+		return nil
+	}
+	converted := make([]storage.SQLIndexDefinition, len(indexes))
+	for i, definition := range indexes {
+		converted[i] = storage.SQLIndexDefinition{
+			Name:    definition.Name,
+			Columns: append([]string(nil), definition.Columns...),
+			Unique:  definition.Unique,
+		}
+	}
+	return converted
+}
+
+func sqlIndexesFromStorage(indexes []storage.SQLIndexDefinition) []SQLIndexDefinition {
+	if len(indexes) == 0 {
+		return nil
+	}
+	converted := make([]SQLIndexDefinition, len(indexes))
+	for i, definition := range indexes {
+		converted[i] = SQLIndexDefinition{
+			Name:    definition.Name,
+			Columns: append([]string(nil), definition.Columns...),
+			Unique:  definition.Unique,
+		}
 	}
 	return converted
 }
@@ -178,6 +231,8 @@ func (c *Collection) Config() CollectionConfig {
 	config := *c.config
 	config.Graph = nil
 	config.IndexedFields = append([]string(nil), c.config.IndexedFields...)
+	config.SQLIndexes = cloneSQLIndexDefinitions(c.config.SQLIndexes)
+	config.SQLIndexedFields = append([]string(nil), c.config.SQLIndexedFields...)
 	config.JSONIndexes = append([]JSONIndexDefinition(nil), c.config.JSONIndexes...)
 	config.PrimaryKeyColumns = append([]string(nil), c.config.PrimaryKeyColumns...)
 	if c.config.NamedUniqueConstraints != nil {
@@ -589,22 +644,24 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 
 	// Convert to LSM config format
 	engineConfig := &storage.CollectionConfig{
-		Dimension:      config.Dimension,
-		Metric:         int(config.Metric),
-		IndexType:      int(config.IndexType),
-		M:              config.M,
-		EfConstruction: config.EfConstruction,
-		EfSearch:       config.EfSearch,
-		NClusters:      config.NClusters,
-		NProbes:        config.NProbes,
-		ML:             config.ML,
-		Version:        2,
-		RawVectorStore: config.RawVectorStore,
-		RawStoreCap:    config.RawStoreCap,
-		IDMapCapacity:  config.IDMapCapacity,
-		MetadataSchema: metadataSchemaToStorage(config.MetadataSchema),
-		IndexedFields:  append([]string(nil), config.IndexedFields...),
-		GraphEnabled:   config.Graph != nil,
+		Dimension:        config.Dimension,
+		Metric:           int(config.Metric),
+		IndexType:        int(config.IndexType),
+		M:                config.M,
+		EfConstruction:   config.EfConstruction,
+		EfSearch:         config.EfSearch,
+		NClusters:        config.NClusters,
+		NProbes:          config.NProbes,
+		ML:               config.ML,
+		Version:          2,
+		RawVectorStore:   config.RawVectorStore,
+		RawStoreCap:      config.RawStoreCap,
+		IDMapCapacity:    config.IDMapCapacity,
+		MetadataSchema:   metadataSchemaToStorage(config.MetadataSchema),
+		IndexedFields:    append([]string(nil), config.IndexedFields...),
+		SQLIndexes:       sqlIndexesToStorage(config.SQLIndexes),
+		SQLIndexedFields: append([]string(nil), config.SQLIndexedFields...),
+		GraphEnabled:     config.Graph != nil,
 	}
 
 	// Initialize memory manager if memory management is configured
@@ -691,22 +748,24 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 	}
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
-		Dimension:      engineConfig.Dimension,
-		Metric:         DistanceMetric(engineConfig.Metric),
-		IndexType:      IndexType(engineConfig.IndexType),
-		M:              engineConfig.M,
-		EfConstruction: engineConfig.EfConstruction,
-		EfSearch:       engineConfig.EfSearch,
-		NClusters:      engineConfig.NClusters,
-		NProbes:        engineConfig.NProbes,
-		ML:             engineConfig.ML,
-		Version:        engineConfig.Version,
-		RawVectorStore: engineConfig.RawVectorStore,
-		RawStoreCap:    engineConfig.RawStoreCap,
-		IDMapCapacity:  engineConfig.IDMapCapacity,
-		MetadataSchema: metadataSchemaFromStorage(engineConfig.MetadataSchema),
-		IndexedFields:  append([]string(nil), engineConfig.IndexedFields...),
-		Graph:          graphLayer,
+		Dimension:        engineConfig.Dimension,
+		Metric:           DistanceMetric(engineConfig.Metric),
+		IndexType:        IndexType(engineConfig.IndexType),
+		M:                engineConfig.M,
+		EfConstruction:   engineConfig.EfConstruction,
+		EfSearch:         engineConfig.EfSearch,
+		NClusters:        engineConfig.NClusters,
+		NProbes:          engineConfig.NProbes,
+		ML:               engineConfig.ML,
+		Version:          engineConfig.Version,
+		RawVectorStore:   engineConfig.RawVectorStore,
+		RawStoreCap:      engineConfig.RawStoreCap,
+		IDMapCapacity:    engineConfig.IDMapCapacity,
+		MetadataSchema:   metadataSchemaFromStorage(engineConfig.MetadataSchema),
+		IndexedFields:    append([]string(nil), engineConfig.IndexedFields...),
+		SQLIndexes:       sqlIndexesFromStorage(engineConfig.SQLIndexes),
+		SQLIndexedFields: append([]string(nil), engineConfig.SQLIndexedFields...),
+		Graph:            graphLayer,
 	}
 	if config.NClusters <= 0 {
 		config.NClusters = 100
@@ -860,23 +919,25 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 	}
 	// Convert LSM config to libravdb config
 	config := &CollectionConfig{
-		Dimension:      engineConfig.Dimension,
-		Metric:         DistanceMetric(engineConfig.Metric),
-		IndexType:      IndexType(engineConfig.IndexType),
-		M:              engineConfig.M,
-		EfConstruction: engineConfig.EfConstruction,
-		EfSearch:       engineConfig.EfSearch,
-		NClusters:      engineConfig.NClusters,
-		NProbes:        engineConfig.NProbes,
-		ML:             engineConfig.ML,
-		Version:        engineConfig.Version,
-		RawVectorStore: engineConfig.RawVectorStore,
-		RawStoreCap:    engineConfig.RawStoreCap,
-		IDMapCapacity:  engineConfig.IDMapCapacity,
-		MetadataSchema: metadataSchemaFromStorage(engineConfig.MetadataSchema),
-		IndexedFields:  append([]string(nil), engineConfig.IndexedFields...),
-		Graph:          graphLayer,
-		Sharded:        true, // Mark as sharded so lifecycle methods work correctly
+		Dimension:        engineConfig.Dimension,
+		Metric:           DistanceMetric(engineConfig.Metric),
+		IndexType:        IndexType(engineConfig.IndexType),
+		M:                engineConfig.M,
+		EfConstruction:   engineConfig.EfConstruction,
+		EfSearch:         engineConfig.EfSearch,
+		NClusters:        engineConfig.NClusters,
+		NProbes:          engineConfig.NProbes,
+		ML:               engineConfig.ML,
+		Version:          engineConfig.Version,
+		RawVectorStore:   engineConfig.RawVectorStore,
+		RawStoreCap:      engineConfig.RawStoreCap,
+		IDMapCapacity:    engineConfig.IDMapCapacity,
+		MetadataSchema:   metadataSchemaFromStorage(engineConfig.MetadataSchema),
+		IndexedFields:    append([]string(nil), engineConfig.IndexedFields...),
+		SQLIndexes:       sqlIndexesFromStorage(engineConfig.SQLIndexes),
+		SQLIndexedFields: append([]string(nil), engineConfig.SQLIndexedFields...),
+		Graph:            graphLayer,
+		Sharded:          true, // Mark as sharded so lifecycle methods work correctly
 	}
 	if config.NClusters <= 0 {
 		config.NClusters = 100

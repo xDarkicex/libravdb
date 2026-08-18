@@ -501,6 +501,19 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 			}
 			args = append(args, value)
 		}
+		if strings.EqualFold(sourceSpan(src, fn.NameStart, fn.NameEnd), "GRAPH_SEMIJOIN") {
+			rows, err := db.virtualGraphSemijoinRelationRows(ctx, args)
+			if err != nil {
+				return nil, err
+			}
+			alias := sourceSpan(src, t.Alias, t.AliasEnd)
+			if alias != "" {
+				for i := range rows {
+					qualifyVirtualRow(&rows[i], alias)
+				}
+			}
+			return rows, nil
+		}
 		items, handled, err := evaluateJSONArrayExpansion(sourceSpan(src, fn.NameStart, fn.NameEnd), args)
 		if err != nil {
 			return nil, err

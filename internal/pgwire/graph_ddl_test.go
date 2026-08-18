@@ -197,6 +197,40 @@ func TestPGWireSQLCommonNeighborJoinMatch(t *testing.T) {
 		t.Fatalf("graph-to-relational semijoin pgwire IDs=%v, want bob and carol only", semijoinSeen)
 	}
 
+	evidenceRows, err := sqlDB.QueryContext(ctx, `
+		SELECT candidate_id, evidence_id, edge_type, shared_count
+		FROM GRAPH_SEMIJOIN('people', $1, 'PGWIRE_COMMON_NEIGHBOR', 100, 100, 10) AS sj
+		WHERE candidate_id <> $1
+		ORDER BY candidate_id, evidence_id`, "alice")
+	if err != nil {
+		t.Fatalf("evidence graph semijoin over pgwire: %v", err)
+	}
+	var evidence []struct {
+		candidate string
+		evidence  string
+		edgeType  string
+		shared    int64
+	}
+	for evidenceRows.Next() {
+		var row struct {
+			candidate string
+			evidence  string
+			edgeType  string
+			shared    int64
+		}
+		if err := evidenceRows.Scan(&row.candidate, &row.evidence, &row.edgeType, &row.shared); err != nil {
+			_ = evidenceRows.Close()
+			t.Fatalf("scan evidence graph semijoin: %v", err)
+		}
+		evidence = append(evidence, row)
+	}
+	if err := evidenceRows.Close(); err != nil {
+		t.Fatalf("close evidence graph semijoin: %v", err)
+	}
+	if len(evidence) != 2 || evidence[0].candidate != "bob" || evidence[0].evidence != "shared-1" || evidence[0].edgeType != "PGWIRE_COMMON_NEIGHBOR" || evidence[0].shared != 1 || evidence[1].candidate != "carol" || evidence[1].evidence != "shared-2" {
+		t.Fatalf("evidence graph semijoin rows=%+v, want bob/shared-1 and carol/shared-2", evidence)
+	}
+
 	var explainJSON []byte
 	if err := sqlDB.QueryRowContext(ctx, `EXPLAIN ANALYZE
 		SELECT DISTINCT src.id

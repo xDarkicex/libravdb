@@ -37,10 +37,25 @@ type CollectionConfig struct {
 	// IndexedFields contains the metadata fields whose derived posting lists
 	// should be used for equality lookups.
 	IndexedFields []string
+	// SQLIndexes contains durable ordinary SQL index declarations. The
+	// physical posting lists remain derived from records; these declarations
+	// are the source of truth for DDL replay and DROP INDEX.
+	SQLIndexes []SQLIndexDefinition
+	// SQLIndexedFields records which IndexedFields were introduced by SQL DDL,
+	// so DROP INDEX can remove only its own declarations and preserve fields
+	// configured through the native API.
+	SQLIndexedFields []string
 	// GraphEnabled persists that the collection owns a graph layer. The graph
 	// object itself is runtime state and is recreated by libravdb on reopen.
 	GraphEnabled bool
 	DataLSN      uint64
+}
+
+// SQLIndexDefinition is the storage-neutral form of a named SQL index.
+type SQLIndexDefinition struct {
+	Name    string
+	Columns []string
+	Unique  bool
 }
 
 // EdgeKindStore is the optional database-level durable registry used by the
@@ -74,6 +89,14 @@ type EdgeKindDefinitionStore interface {
 type CostModelStatisticsStore interface {
 	SetCollectionCostModelStatsIfDataLSN(ctx context.Context, name string, expectedDataLSN uint64, stats []byte) (bool, error)
 	CollectionDataLSN(name string) (uint64, error)
+}
+
+// CollectionConfigStore provides an atomic WAL-backed update for durable
+// logical collection declarations such as metadata/index fields. It is
+// optional so alternate engines can continue implementing the base Engine
+// interface without adopting SQL DDL immediately.
+type CollectionConfigStore interface {
+	UpdateCollectionConfig(ctx context.Context, name string, config *CollectionConfig) error
 }
 
 // Engine defines the storage engine interface

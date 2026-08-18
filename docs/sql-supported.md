@@ -229,6 +229,11 @@ The index definition is durable. Its candidate postings are derived from the
 authoritative records and can be rebuilt after reopen; the executor performs a
 final JSON predicate check for correctness.
 
+SQL-created ordinary indexes are recorded in the collection declaration and
+existing WAL configuration path. They are restored on reopen and remain
+distinct from native collection declarations such as `WithIndexedFields`;
+dropping a named SQL index does not remove an unrelated native metadata index.
+
 ## Data manipulation language
 
 ### INSERT
@@ -1158,6 +1163,30 @@ limits, and the active epoch or `AS OF LSN` snapshot. It is specialized for a
 single common-neighbor `JOIN MATCH` subquery; other correlated or boolean
 subquery forms continue through the general virtual-relation evaluator.
 
+When the application needs relationship evidence as well as the candidate,
+use the explicit `GRAPH_SEMIJOIN` virtual relation. It executes the
+common-neighbor traversal once and returns one deterministic row per
+candidate/evidence pair:
+
+```sql
+SELECT candidate_id, evidence_id, edge_type, shared_count
+FROM GRAPH_SEMIJOIN(
+    'people', $origin_id, 'FOLLOWS',
+    $source_expansion_limit,
+    $origin_expansion_limit,
+    $candidate_limit
+) AS sj
+WHERE candidate_id <> $origin_id
+ORDER BY candidate_id, evidence_id;
+```
+
+The first two arguments are required: the graph-backed collection and origin
+record ID. The edge type and three limits are optional. The expansion limits
+bound traversal work; `candidate_limit` limits distinct candidates after
+deterministic ordering. `shared_count` is the number of shared terminal nodes
+for that candidate. The relation is available through native SQL and pgwire
+and carries the active epoch or historical LSN visibility context.
+
 ### Edge properties
 
 Edges may carry arbitrary JSON-compatible fields in addition to their durable
@@ -1664,6 +1693,27 @@ predicates, arithmetic, casts, aggregate arguments, `CASE`, `IN`, `BETWEEN`,
 `OFFSET`, `LIMIT`, JSON path/key operands, vector operators, graph edge
 predicates, temporal bounds, and DML values. Uninferable or invalid parameter
 types return an error during binding or description.
+
+## Structured SQL errors
+
+Native Go callers can classify a query failure with `AsSQLError` without
+matching human-readable text:
+
+```go
+if _, err := db.Query(ctx, query); err != nil {
+	var sqlErr *libravdb.SQLError
+	if errors.As(err, &sqlErr) {
+		fmt.Println(sqlErr.Code, sqlErr.SQLState, sqlErr.Message)
+	}
+}
+```
+
+The stable classes include syntax, unsupported feature, unsupported temporal
+aggregate, undefined table/column, invalid parameter, integrity, and storage
+errors. The original error text remains available. pgwire maps the same
+classification to PostgreSQL SQLSTATE values; the CGO envelope adds
+`error_details.code`, `error_details.sqlstate`, and `error_details.message`
+while retaining the legacy `error` string for existing SDK clients.
 
 ## Supported casts and functions
 

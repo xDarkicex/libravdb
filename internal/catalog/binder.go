@@ -33,6 +33,24 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	// not by a catalog table, so qualified references are marked as virtual
 	// columns and resolved by the query-local executor.
 	virtualQualifiers := make(map[uint64]struct{})
+	// virtualColumns are the known unqualified columns exported by virtual
+	// table functions whose row shape is fixed by the engine rather than by a
+	// catalog relation. GRAPH_SEMIJOIN is a table-valued graph operator, not a
+	// physical table; its evidence columns must bind during pgwire Describe as
+	// well as during native virtual execution.
+	virtualColumns := make(map[uint64]struct{})
+	markGraphSemijoinColumns := func(ref parser.NodeRef) {
+		if ref.Kind != parser.NodeKindFunctionExpr || ref.ID < 0 || int(ref.ID) >= len(doc.FunctionExprs) {
+			return
+		}
+		fn := doc.FunctionExprs[ref.ID]
+		if !bytes.EqualFold(b.src[fn.NameStart:fn.NameEnd], []byte("GRAPH_SEMIJOIN")) {
+			return
+		}
+		for _, name := range []string{"candidate_id", "evidence_id", "edge_type", "shared_count"} {
+			virtualColumns[hashIdentifier([]byte(name), 0, uint32(len(name)))] = struct{}{}
+		}
+	}
 
 	// 1. Resolve tables in FROM clauses and build scope stack.
 	for i := 0; i < len(doc.TableExprs); i++ {
@@ -40,6 +58,9 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		if t.IsDerived || t.IsFunction {
 			if t.IsFunction && t.AliasEnd > t.Alias {
 				virtualQualifiers[hashIdentifier(b.src, t.Alias, t.AliasEnd)] = struct{}{}
+			}
+			if t.IsFunction {
+				markGraphSemijoinColumns(t.Function)
 			}
 			// Derived SELECTs are bound/executed by the virtual-relation path;
 			// they have no catalog table identity to resolve here.
@@ -112,6 +133,9 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			if jc.IsFunction || jc.MatchPath.Kind == parser.NodeKindMatchPath || jc.Derived.Kind == parser.NodeKindTableExpr || jc.TableEnd <= jc.TableStart {
 				if jc.IsFunction && jc.AliasEnd > jc.Alias {
 					virtualQualifiers[hashIdentifier(b.src, jc.Alias, jc.AliasEnd)] = struct{}{}
+				}
+				if jc.IsFunction {
+					markGraphSemijoinColumns(jc.Function)
 				}
 				continue
 			}
@@ -398,6 +422,10 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 
 		// ORDER BY alias: resolve against the SELECT list before catalog lookup.
 		if _, isAlias := aliasSet[hash]; isAlias {
+			id.ResolvedKind = parser.ResolvedKindColumn
+			continue
+		}
+		if _, virtual := virtualColumns[hash]; virtual {
 			id.ResolvedKind = parser.ResolvedKindColumn
 			continue
 		}

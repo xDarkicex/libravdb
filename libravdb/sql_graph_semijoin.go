@@ -279,9 +279,26 @@ func (db *Database) executeGraphSemijoinSubquery(ctx context.Context, sql string
 	}
 	db.mu.RLock()
 	cat := db.catalog
+	generation := db.catalogGeneration.Load()
 	db.mu.RUnlock()
 	if cat == nil {
 		return nil, fmt.Errorf("catalog not initialized")
+	}
+	cacheable, parameterSlots := graphSemijoinPlanCacheEligible(src, doc)
+	cacheKey := "__graph_semijoin__:" + normalizeSQLPlanKey(sql)
+	if cacheable && db.sqlPlanCache != nil {
+		if cached, ok := db.sqlPlanCache.get(cacheKey, generation, cat, params, src); ok {
+			if tracker := sqlTrackerFromContext(ctx); tracker != nil {
+				tracker.planCacheHits++
+			}
+			if snapshotLSN != 0 {
+				return newExecutor(db).ExecuteAtLSN(ctx, cached, snapshotLSN)
+			}
+			return newExecutor(db).Execute(ctx, cached)
+		}
+		if tracker := sqlTrackerFromContext(ctx); tracker != nil {
+			tracker.planCacheMisses++
+		}
 	}
 	if err := catalog.NewBinder(cat, src).Bind(doc); err != nil {
 		return nil, fmt.Errorf("bind graph semijoin subquery: %w", err)
@@ -290,10 +307,30 @@ func (db *Database) executeGraphSemijoinSubquery(ctx context.Context, sql string
 	if err != nil {
 		return nil, fmt.Errorf("optimize graph semijoin subquery: %w", err)
 	}
+	if cacheable && db.sqlPlanCache != nil {
+		db.sqlPlanCache.put(cacheKey, generation, cat, plan, parameterSlots)
+	}
 	if snapshotLSN != 0 {
 		return newExecutor(db).ExecuteAtLSN(ctx, plan, snapshotLSN)
 	}
 	return newExecutor(db).Execute(ctx, plan)
+}
+
+func graphSemijoinPlanCacheEligible(src []byte, doc *parser.QueryDoc) (bool, []sqlPlanParameterSlot) {
+	if doc == nil || len(doc.SelectStmts) != 1 {
+		return false, nil
+	}
+	stmt := &doc.SelectStmts[0]
+	if stmt.FromTable.Kind != parser.NodeKindTableExpr || len(stmt.Joins) != 2 {
+		return false, nil
+	}
+	for i := range stmt.Joins {
+		if stmt.Joins[i].MatchPath.Kind != parser.NodeKindMatchPath {
+			return false, nil
+		}
+	}
+	slots, ok := sqlPlanParameterSlots(src, doc, stmt)
+	return ok, slots
 }
 
 func (db *Database) graphSemijoinSnapshotLSN(ctx context.Context, src []byte, doc *parser.QueryDoc, table *parser.TableExpr, params *optimizer.ParameterSet) (uint64, error) {

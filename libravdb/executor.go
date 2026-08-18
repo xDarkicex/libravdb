@@ -72,6 +72,33 @@ func forEachVisibleRecord(ctx context.Context, col *Collection, fn func(Record) 
 	return err
 }
 
+// forEachAggregateRecord selects the authoritative row source for aggregate
+// execution. A temporal plan must never enter the live iterator: doing so
+// would make historical COUNT/GROUP BY results depend on post-snapshot writes.
+func forEachAggregateRecord(ctx context.Context, col *Collection, plan *optimizer.PhysicalPlan, fn func(Record) error) error {
+	if plan != nil && plan.SnapshotLSN != 0 {
+		examined := 0
+		var callbackErr error
+		err := col.ListVisibleAtLSN(ctx, plan.SnapshotLSN, func(record *Record) bool {
+			examined++
+			if err := ctx.Err(); err != nil {
+				return false
+			}
+			if err := fn(*record); err != nil {
+				callbackErr = err
+				return false
+			}
+			return true
+		})
+		trackSQLRowsExamined(ctx, examined)
+		if err != nil {
+			return err
+		}
+		return callbackErr
+	}
+	return forEachVisibleRecord(ctx, col, fn)
+}
+
 func newExecutor(db *Database) *Executor {
 	return &Executor{db: db}
 }
@@ -105,6 +132,8 @@ func (e *Executor) executeTemporal(ctx context.Context, plan *optimizer.Physical
 		return e.executeGraphJoinAtLSN(ctx, plan)
 	case plan.Kind == optimizer.QueryKindRelational:
 		return e.executeRelationalAtLSN(ctx, plan)
+	case plan.Kind == optimizer.QueryKindAggregate:
+		return e.executeAggregate(ctx, plan)
 	case plan.Kind == optimizer.QueryKindVectorProjection:
 		return e.executeVectorProjectionAtLSN(ctx, plan)
 	default:
@@ -4020,7 +4049,7 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	if plan.AggregateFunc == 0 && plan.AggregateColumn == "" && !plan.AggregateDistinct &&
 		len(plan.Predicates) == 0 && len(plan.PredicateAlternatives) == 0 && len(plan.FTSPredicates) == 0 &&
 		len(plan.GroupByColumns) == 0 && !plan.HavingAggregate && plan.HavingExpr == "" &&
-		epochFromContext(ctx) == nil && transactionFromContext(ctx) == nil {
+		epochFromContext(ctx) == nil && transactionFromContext(ctx) == nil && plan.SnapshotLSN == 0 {
 		count, err := col.Count(ctx)
 		if err != nil {
 			return nil, err
@@ -4055,7 +4084,7 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 			hasMinMax bool
 		}
 		groups := make(map[string]*aggregateGroup)
-		if err := forEachVisibleRecord(ctx, col, func(record Record) error {
+		if err := forEachAggregateRecord(ctx, col, plan, func(record Record) error {
 			if !planMatchesRecord(plan, record) {
 				return nil
 			}
@@ -4166,7 +4195,7 @@ func (e *Executor) executeAggregate(ctx context.Context, plan *optimizer.Physica
 	var sum float64
 	var minVal, maxVal string
 	hasMinMax := false
-	if err := forEachVisibleRecord(ctx, col, func(record Record) error {
+	if err := forEachAggregateRecord(ctx, col, plan, func(record Record) error {
 		if !planMatchesRecord(plan, record) {
 			return nil
 		}
@@ -4926,6 +4955,17 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 			col.mu.Unlock()
 			updatedCfg := col.Config()
 			e.db.registerCollectionInCatalog(plan.DDLTableName, &updatedCfg)
+		} else {
+			columns := append([]string(nil), plan.DDLIndexColumns...)
+			if len(columns) == 0 && plan.DDLColName != "" {
+				columns = []string{plan.DDLColName}
+			}
+			if len(columns) == 0 || plan.DDLIndexName == "" {
+				return nil, fmt.Errorf("CREATE INDEX requires a name and at least one column")
+			}
+			if err := e.persistSQLIndexFields(ctx, col, plan.DDLIndexName, columns, false); err != nil {
+				return nil, err
+			}
 		}
 		return &SearchResults{}, nil
 
@@ -4942,6 +4982,14 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 			e.db.mu.RUnlock()
 			for collectionName, col := range collections {
 				cfg := col.Config()
+				storedReader, hasReader := e.db.storage.(interface {
+					GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
+				})
+				storedUpdater, hasUpdater := e.db.storage.(storage.CollectionConfigStore)
+				var stored *storage.CollectionConfig
+				if hasReader {
+					_, stored, _ = storedReader.GetCollectionWithConfig(collectionName)
+				}
 				filtered := cfg.JSONIndexes[:0]
 				removed := false
 				for _, index := range cfg.JSONIndexes {
@@ -4960,6 +5008,64 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 					col.jsonContainmentIndex = nil
 					col.jsonContainmentBuiltAt = 0
 					col.mu.Unlock()
+					e.db.registerCollectionInCatalog(collectionName, &cfg)
+				}
+
+				filteredSQL := cfg.SQLIndexes[:0]
+				removedSQL := false
+				for _, index := range cfg.SQLIndexes {
+					if strings.EqualFold(index.Name, plan.DDLIndexName) {
+						removedSQL = true
+						continue
+					}
+					filteredSQL = append(filteredSQL, index)
+				}
+				if removedSQL {
+					cfg.SQLIndexes = cloneSQLIndexDefinitions(filteredSQL)
+					remainingFields := make(map[string]struct{})
+					for _, index := range cfg.SQLIndexes {
+						for _, column := range index.Columns {
+							remainingFields[strings.ToLower(column)] = struct{}{}
+						}
+					}
+					for _, sqlField := range cfg.SQLIndexedFields {
+						if _, stillUsed := remainingFields[strings.ToLower(sqlField)]; stillUsed {
+							continue
+						}
+						for i, indexed := range cfg.IndexedFields {
+							if strings.EqualFold(indexed, sqlField) {
+								cfg.IndexedFields = append(cfg.IndexedFields[:i], cfg.IndexedFields[i+1:]...)
+								break
+							}
+						}
+					}
+					filteredSQLFields := cfg.SQLIndexedFields[:0]
+					for _, field := range cfg.SQLIndexedFields {
+						if _, stillUsed := remainingFields[strings.ToLower(field)]; stillUsed {
+							filteredSQLFields = append(filteredSQLFields, field)
+						}
+					}
+					cfg.SQLIndexedFields = append([]string(nil), filteredSQLFields...)
+					if stored != nil && hasUpdater {
+						stored.SQLIndexes = make([]storage.SQLIndexDefinition, len(cfg.SQLIndexes))
+						for i, index := range cfg.SQLIndexes {
+							stored.SQLIndexes[i] = storage.SQLIndexDefinition{Name: index.Name, Columns: append([]string(nil), index.Columns...), Unique: index.Unique}
+						}
+						stored.IndexedFields = append([]string(nil), cfg.IndexedFields...)
+						stored.SQLIndexedFields = append([]string(nil), cfg.SQLIndexedFields...)
+						if err := storedUpdater.UpdateCollectionConfig(ctx, collectionName, stored); err != nil {
+							return nil, err
+						}
+					}
+					col.mu.Lock()
+					col.config.SQLIndexes = cloneSQLIndexDefinitions(cfg.SQLIndexes)
+					col.config.SQLIndexedFields = append([]string(nil), cfg.SQLIndexedFields...)
+					col.config.IndexedFields = append([]string(nil), cfg.IndexedFields...)
+					col.mu.Unlock()
+					col.metadataIndexMu.Lock()
+					col.metadataIndex = nil
+					col.metadataIndexBuiltAt = 0
+					col.metadataIndexMu.Unlock()
 					e.db.registerCollectionInCatalog(collectionName, &cfg)
 				}
 			}
@@ -5095,6 +5201,102 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 	default:
 		return nil, fmt.Errorf("unknown DDL kind %d", plan.DDLKind)
 	}
+}
+
+// persistSQLIndexFields routes ordinary SQL secondary-index declarations to
+// the same durable metadata posting machinery used by WithIndexedFields. The
+// posting lists remain derived state; only the declaration is WAL-persisted.
+func (e *Executor) persistSQLIndexFields(ctx context.Context, col *Collection, indexName string, columns []string, unique bool) error {
+	if e == nil || e.db == nil || col == nil {
+		return fmt.Errorf("CREATE INDEX: invalid collection")
+	}
+	reader, ok := e.db.storage.(interface {
+		GetCollectionWithConfig(name string) (storage.Collection, *storage.CollectionConfig, error)
+	})
+	updater, okUpdater := e.db.storage.(storage.CollectionConfigStore)
+	if !ok || !okUpdater {
+		return fmt.Errorf("CREATE INDEX: storage engine does not support durable collection declarations")
+	}
+	_, stored, err := reader.GetCollectionWithConfig(col.name)
+	if err != nil {
+		return err
+	}
+	if stored == nil {
+		return fmt.Errorf("CREATE INDEX: collection %q has no persisted configuration", col.name)
+	}
+	indexed := append([]string(nil), stored.IndexedFields...)
+	for _, column := range columns {
+		column = strings.TrimSpace(column)
+		if column == "" {
+			return fmt.Errorf("CREATE INDEX: column name must not be empty")
+		}
+		if !e.sqlCollectionColumnExists(col.name, column) {
+			return fmt.Errorf("CREATE INDEX: column %q does not exist on table %q", column, col.name)
+		}
+		found := false
+		for _, existing := range indexed {
+			if strings.EqualFold(existing, column) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			indexed = append(indexed, column)
+		}
+	}
+	stored.IndexedFields = indexed
+	for _, existing := range stored.SQLIndexes {
+		if strings.EqualFold(existing.Name, indexName) {
+			if existing.Unique != unique || !sameColumnSet(existing.Columns, columns) {
+				return fmt.Errorf("CREATE INDEX %q already exists with a different definition", indexName)
+			}
+			return nil
+		}
+	}
+	stored.SQLIndexes = append(stored.SQLIndexes, storage.SQLIndexDefinition{
+		Name: indexName, Columns: append([]string(nil), columns...), Unique: unique,
+	})
+	for _, column := range columns {
+		found := false
+		for _, existing := range stored.SQLIndexedFields {
+			if strings.EqualFold(existing, column) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			stored.SQLIndexedFields = append(stored.SQLIndexedFields, column)
+		}
+	}
+	if err := updater.UpdateCollectionConfig(ctx, col.name, stored); err != nil {
+		return err
+	}
+	col.mu.Lock()
+	col.config.IndexedFields = append([]string(nil), indexed...)
+	col.config.SQLIndexes = sqlIndexesFromStorage(stored.SQLIndexes)
+	col.config.SQLIndexedFields = append([]string(nil), stored.SQLIndexedFields...)
+	col.mu.Unlock()
+	col.metadataIndexMu.Lock()
+	col.metadataIndex = nil
+	col.metadataIndexBuiltAt = 0
+	col.metadataIndexMu.Unlock()
+	e.db.registerCollectionInCatalog(col.name, col.config)
+	return nil
+}
+
+func (e *Executor) sqlCollectionColumnExists(table, column string) bool {
+	e.db.mu.RLock()
+	cat := e.db.catalog
+	e.db.mu.RUnlock()
+	if cat == nil {
+		return false
+	}
+	def, err := cat.GetTable(catalog.HashIdentifier(table))
+	if err != nil {
+		return false
+	}
+	_, err = cat.GetColumn(def, catalog.HashIdentifier(column))
+	return err == nil
 }
 
 func parseVectorLiteral(s string) []float32 {
