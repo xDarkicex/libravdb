@@ -2757,7 +2757,7 @@ func (c *Collection) lookupJSONContainment(ctx context.Context, column string, o
 	node := value
 	if operator != lexer.KindJSONExists {
 		var valid bool
-		node, valid = decodeJSONValue(value)
+		node, valid = decodeJSONReadValue(value)
 		if !valid {
 			return nil, true, nil
 		}
@@ -2979,13 +2979,16 @@ func (c *Collection) rebuildJSONIndexLocked(ctx context.Context, epoch uint64) e
 			}
 		}
 		for column := range containment {
-			node, ok := decodeJSONValue(entry.Metadata[column])
+			// Index construction only reads the JSON tree. Avoid cloning stored
+			// metadata here; mutation paths retain decodeJSONValue's ownership
+			// boundary.
+			node, ok := decodeJSONReadValue(entry.Metadata[column])
 			if !ok {
 				// Metadata keys preserve user casing; locate the field once if
 				// the schema spelling differs from the canonical index key.
 				for name, candidate := range entry.Metadata {
 					if strings.EqualFold(name, column) {
-						node, ok = decodeJSONValue(candidate)
+						node, ok = decodeJSONReadValue(candidate)
 						break
 					}
 				}

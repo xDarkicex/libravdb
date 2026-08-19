@@ -2,7 +2,6 @@ package pgwire
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/internal/util"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
@@ -750,17 +750,17 @@ func metadataValueToString(v interface{}) string {
 	case bool:
 		return strconv.FormatBool(t)
 	case map[string]interface{}, []interface{}, map[string]string:
-		if encoded, err := json.Marshal(jsonWireValue(t)); err == nil {
+		if encoded, err := apexjson.Marshal(jsonWireValue(t)); err == nil {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLQueryStats:
-		if encoded, err := json.Marshal(t); err == nil {
+		if encoded, err := apexjson.Marshal(t); err == nil {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLExplainPlan:
-		if encoded, err := json.Marshal(t); err == nil {
+		if encoded, err := apexjson.Marshal(t); err == nil {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)

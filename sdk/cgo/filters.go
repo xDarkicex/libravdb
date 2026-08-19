@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/internal/filter"
 )
 
@@ -22,7 +22,7 @@ func parseFilterJSON(jsonStr string) (filter.Filter, error) {
 	}
 
 	var root ASTNode
-	if err := json.Unmarshal([]byte(jsonStr), &root); err != nil {
+	if err := apexjson.Unmarshal([]byte(jsonStr), &root); err != nil {
 		return nil, fmt.Errorf("failed to parse filter json: %v", err)
 	}
 

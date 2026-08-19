@@ -184,6 +184,18 @@ _lib.DatabaseQuery.restype = ctypes.POINTER(ctypes.c_char)
 _lib.DatabaseQueryWithParams.argtypes = [c_int, c_char_p, c_char_p]
 _lib.DatabaseQueryWithParams.restype = ctypes.POINTER(ctypes.c_char)
 
+# char* DatabaseOpenSQLSession(int dbID)
+_lib.DatabaseOpenSQLSession.argtypes = [c_int]
+_lib.DatabaseOpenSQLSession.restype = ctypes.POINTER(ctypes.c_char)
+
+# char* DatabaseSessionQuery(int sessionID, char* sql, char* paramsJSON)
+_lib.DatabaseSessionQuery.argtypes = [c_int, c_char_p, c_char_p]
+_lib.DatabaseSessionQuery.restype = ctypes.POINTER(ctypes.c_char)
+
+# char* DatabaseCloseSQLSession(int sessionID)
+_lib.DatabaseCloseSQLSession.argtypes = [c_int]
+_lib.DatabaseCloseSQLSession.restype = ctypes.POINTER(ctypes.c_char)
+
 # char* DatabaseLatestCommitLSN(int dbID)
 _lib.DatabaseLatestCommitLSN.argtypes = [c_int]
 _lib.DatabaseLatestCommitLSN.restype = ctypes.POINTER(ctypes.c_char)

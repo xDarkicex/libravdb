@@ -36,6 +36,53 @@ def _raise_query_error(res_json: str, operation: str):
         str(details.get("sqlstate") or ""),
     )
 
+
+class SQLSession:
+    """Connection-local SQL session, including epoch transactions."""
+
+    def __init__(self, session_id: int):
+        self._session_id = session_id
+        self._closed = False
+
+    def query(self, sql: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("SQL session is closed")
+        params_str = json.dumps(params) if params else ""
+        res_ptr = _lib.DatabaseSessionQuery(
+            self._session_id,
+            _to_c_string(sql),
+            _to_c_string(params_str),
+        )
+        res_json = _from_c_string(res_ptr)
+        if not res_json:
+            return {}
+        _raise_query_error(res_json, "SessionQuery")
+        return json.loads(res_json)
+
+    def close(self):
+        if self._closed:
+            return
+        err_ptr = _lib.DatabaseCloseSQLSession(self._session_id)
+        err_json = _from_c_string(err_ptr)
+        if err_json:
+            _raise_query_error(err_json, "SessionClose")
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.query("COMMIT")
+            else:
+                self.query("ROLLBACK")
+        finally:
+            # Closing an active session also rolls back in the native engine;
+            # always release the bridge handle even if COMMIT/ROLLBACK fails.
+            self.close()
+        return False
+
 class Collection:
     def __init__(self, handle: int, dim: int):
         self._handle = handle
@@ -417,6 +464,24 @@ class LibraVDB:
             return {}
         _raise_query_error(res_json, "QueryWithParams")
         return json.loads(res_json)
+
+    def open_session(self) -> SQLSession:
+        res_ptr = _lib.DatabaseOpenSQLSession(self._handle)
+        res_json = _from_c_string(res_ptr)
+        if not res_json:
+            raise RuntimeError("DatabaseOpenSQLSession returned no response")
+        _raise_query_error(res_json, "SessionOpen")
+        payload = json.loads(res_json)
+        return SQLSession(int(payload["session_id"]))
+
+    def begin_epoch(self) -> SQLSession:
+        session = self.open_session()
+        try:
+            session.query("BEGIN EPOCH TRANSACTION")
+        except SQLError:
+            session.close()
+            raise
+        return session
 
     def latest_commit_lsn(self) -> int:
         """Return the exact latest durable commit LSN for this database."""

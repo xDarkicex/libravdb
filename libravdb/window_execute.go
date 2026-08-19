@@ -42,12 +42,7 @@ func (db *Database) projectVirtualWindowRows(ctx context.Context, src []byte, do
 		projection := &doc.Projections[stmt.ProjectionsStart+i]
 		if projection.Star {
 			if len(rows) > 0 {
-				starColumns := make([]string, 0, len(rows[0].Values))
-				for key := range rows[0].Values {
-					if !strings.Contains(key, ".") {
-						starColumns = append(starColumns, key)
-					}
-				}
+				starColumns := rows[0].visibleVirtualKeys()
 				sort.Strings(starColumns)
 				columns = append(columns, starColumns...)
 			}
@@ -93,11 +88,9 @@ func (db *Database) projectVirtualWindowRows(ctx context.Context, src []byte, do
 		for i := int32(0); i < stmt.ProjectionsCount; i++ {
 			projection := &doc.Projections[stmt.ProjectionsStart+i]
 			if projection.Star {
-				for key, value := range row.Values {
-					if !strings.Contains(key, ".") {
-						values[key] = value
-					}
-				}
+				row.forEachVisibleVirtualValue(func(key string, value interface{}) {
+					values[key] = value
+				})
 				continue
 			}
 			name := projectionNames[i]
@@ -115,7 +108,7 @@ func (db *Database) projectVirtualWindowRows(ctx context.Context, src []byte, do
 					value = windowValues[i][rowIndex]
 					ok = value != nil
 				} else {
-					value, ok = row.Values[name]
+					value, ok = row.lookup("", name)
 					if !ok {
 						value, ok, _ = db.virtualExprValue(ctx, src, doc, projection.Expr, row, params, legacy)
 					}

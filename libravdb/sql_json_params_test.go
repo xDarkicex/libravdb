@@ -2,9 +2,10 @@ package libravdb
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"testing"
+
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 )
 
 func TestSQLParameterizedJSONBUpsert(t *testing.T) {
@@ -73,8 +74,8 @@ RETURNING id, metadata`
 		db.Close()
 		t.Fatal(err)
 	}
-	gotJSON, _ := json.Marshal(record.Metadata["metadata"])
-	wantJSON, _ := json.Marshal(second)
+	gotJSON, _ := apexjson.Marshal(record.Metadata["metadata"])
+	wantJSON, _ := apexjson.Marshal(second)
 	if string(gotJSON) != string(wantJSON) {
 		t.Fatalf("stored JSONB=%#v, want %#v", record.Metadata["metadata"], second)
 	}
@@ -105,7 +106,7 @@ RETURNING id, metadata`
 	if err != nil {
 		t.Fatalf("reopen JSONB read: %v", err)
 	}
-	afterJSON, _ := json.Marshal(after.Results[0].Metadata["metadata"])
+	afterJSON, _ := apexjson.Marshal(after.Results[0].Metadata["metadata"])
 	if after.Total != 1 || string(afterJSON) != string(wantJSON) {
 		t.Fatalf("reopened JSONB=%#v, want %#v", after, second)
 	}

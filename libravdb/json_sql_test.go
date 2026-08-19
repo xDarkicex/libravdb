@@ -572,6 +572,18 @@ func TestSQLJSONArrayExpansion(t *testing.T) {
 	if err != nil || lateral.Total != 2 {
 		t.Fatalf("lateral JSON expansion: result=%#v err=%v", lateral, err)
 	}
+	chained, err := db.Query(ctx, `SELECT '{"profile":{"active":true}}'::jsonb->'profile'->>'active' AS active`)
+	if err != nil || chained.Total != 1 || chained.Results[0].Metadata["active"] != "true" {
+		t.Fatalf("lazy chained JSON extraction: result=%#v err=%v", chained, err)
+	}
+	rawObject, err := db.Query(ctx, `SELECT '{"profile":{"active":true}}'::jsonb->'profile' AS profile`)
+	if err != nil || rawObject.Total != 1 {
+		t.Fatalf("lazy JSON object extraction: result=%#v err=%v", rawObject, err)
+	}
+	profile, ok := rawObject.Results[0].Metadata["profile"].(map[string]interface{})
+	if !ok || profile["active"] != true {
+		t.Fatalf("lazy JSON object materialization: %#v", rawObject.Results[0].Metadata["profile"])
+	}
 }
 
 func TestSQLJSONMutationConstructionAndRecords(t *testing.T) {

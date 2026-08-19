@@ -7,12 +7,12 @@ import "C"
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync"
 	"unsafe"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -39,21 +39,28 @@ func sqlErrorJSON(err error) string {
 		"error":         message,
 		"error_details": details,
 	}
-	encoded, marshalErr := json.Marshal(payload)
+	encoded, marshalErr := apexjson.Marshal(payload)
 	if marshalErr != nil {
-		fallback, _ := json.Marshal(map[string]string{"error": message})
+		fallback, _ := apexjson.Marshal(map[string]string{"error": message})
 		return string(fallback)
 	}
 	return string(encoded)
 }
 
 var (
-	mu          sync.RWMutex
-	dbs         = make(map[int]*libravdb.Database)
-	collections = make(map[int]*libravdb.Collection)
-	nextDBID    = 1
-	nextColID   = 1
+	mu            sync.RWMutex
+	dbs           = make(map[int]*libravdb.Database)
+	collections   = make(map[int]*libravdb.Collection)
+	sessions      = make(map[int]sessionHandle)
+	nextDBID      = 1
+	nextColID     = 1
+	nextSessionID = 1
 )
+
+type sessionHandle struct {
+	dbID    int
+	session *libravdb.SQLSession
+}
 
 //export OpenDB
 func OpenDB(path *C.char) C.int {
@@ -77,19 +84,29 @@ func OpenDB(path *C.char) C.int {
 //export CloseDB
 func CloseDB(dbID C.int) C.int {
 	mu.Lock()
-	defer mu.Unlock()
-
 	id := int(dbID)
 	db, ok := dbs[id]
 	if !ok {
+		mu.Unlock()
 		return -1
+	}
+	active := make([]*libravdb.SQLSession, 0)
+	for sessionID, handle := range sessions {
+		if handle.dbID == id {
+			active = append(active, handle.session)
+			delete(sessions, sessionID)
+		}
+	}
+	delete(dbs, id)
+	mu.Unlock()
+
+	for _, tx := range active {
+		_ = tx.Close()
 	}
 
 	if err := db.Close(); err != nil {
 		return -1
 	}
-
-	delete(dbs, id)
 	return 0
 }
 
@@ -174,7 +191,7 @@ func InsertVector(colID C.int, id *C.char, vec *C.float, dim C.int, metadataJSON
 	if metadataJSON != nil {
 		goMetaJSON := C.GoString(metadataJSON)
 		if goMetaJSON != "" {
-			if err := json.Unmarshal([]byte(goMetaJSON), &metadata); err != nil {
+			if err := apexjson.Unmarshal([]byte(goMetaJSON), &metadata); err != nil {
 				return C.CString(fmt.Sprintf("error parsing metadata: %v", err))
 			}
 		}
@@ -231,7 +248,7 @@ func UpsertVector(colID C.int, id *C.char, vec *C.float, dim C.int, metadataJSON
 	if metadataJSON != nil {
 		goMetaJSON := C.GoString(metadataJSON)
 		if goMetaJSON != "" {
-			if err := json.Unmarshal([]byte(goMetaJSON), &metadata); err != nil {
+			if err := apexjson.Unmarshal([]byte(goMetaJSON), &metadata); err != nil {
 				return C.CString(fmt.Sprintf("error parsing metadata: %v", err))
 			}
 		}
@@ -278,7 +295,7 @@ func GetCollectionStats(colID C.int) *C.char {
 	ctx := context.Background()
 	stats := col.Stats(ctx)
 
-	bytes, err := json.Marshal(stats)
+	bytes, err := apexjson.Marshal(stats)
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "failed to marshal stats: %v"}`, err))
 	}
@@ -341,7 +358,7 @@ func QueryVector(colID C.int, vec *C.float, dim C.int, limit C.int, filterJSON *
 		})
 	}
 
-	bytes, err := json.Marshal(formattedResults)
+	bytes, err := apexjson.Marshal(formattedResults)
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "failed to marshal results: %v"}`, err))
 	}
@@ -384,7 +401,7 @@ func ScanCollection(colID C.int, offset C.int, limit C.int) *C.char {
 		return nil
 	})
 
-	bytes, err := json.Marshal(results)
+	bytes, err := apexjson.Marshal(results)
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "failed to marshal results: %v"}`, err))
 	}
@@ -413,7 +430,7 @@ func UpdateVector(colID C.int, id *C.char, vec *C.float, dim C.int, metadataJSON
 	if metadataJSON != nil {
 		goMetaJSON := C.GoString(metadataJSON)
 		if goMetaJSON != "" {
-			_ = json.Unmarshal([]byte(goMetaJSON), &metadata)
+			_ = apexjson.Unmarshal([]byte(goMetaJSON), &metadata)
 		}
 	}
 
@@ -459,7 +476,7 @@ func InsertBatch(colID C.int, ids **C.char, vecs *C.float, count C.int, dim C.in
 		if metasSlice != nil && metasSlice[i] != nil {
 			mStr := C.GoString(metasSlice[i])
 			if mStr != "" {
-				_ = json.Unmarshal([]byte(mStr), &metadata)
+				_ = apexjson.Unmarshal([]byte(mStr), &metadata)
 			}
 		}
 
@@ -515,7 +532,7 @@ func ListCollections(dbID C.int) *C.char {
 	}
 
 	names := db.ListCollections()
-	bytes, err := json.Marshal(names)
+	bytes, err := apexjson.Marshal(names)
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "%v"}`, err))
 	}
@@ -618,7 +635,7 @@ func GetGlobalMemoryUsage(dbID C.int) *C.char {
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "%v"}`, err))
 	}
-	bytes, _ := json.Marshal(usage)
+	bytes, _ := apexjson.Marshal(usage)
 	return C.CString(string(bytes))
 }
 
@@ -667,7 +684,7 @@ func GetDatabaseHealth(dbID C.int) *C.char {
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "%v"}`, err))
 	}
-	bytes, _ := json.Marshal(health)
+	bytes, _ := apexjson.Marshal(health)
 	return C.CString(string(bytes))
 }
 
@@ -681,7 +698,7 @@ func GetDatabaseStats(dbID C.int) *C.char {
 		return C.CString(`{"error": "database not found"}`)
 	}
 	stats := db.Stats(context.Background())
-	bytes, _ := json.Marshal(stats)
+	bytes, _ := apexjson.Marshal(stats)
 	return C.CString(string(bytes))
 }
 
@@ -711,7 +728,7 @@ func GetVector(colID C.int, id *C.char) *C.char {
 		Metadata: record.Metadata,
 	}
 
-	bytes, _ := json.Marshal(res)
+	bytes, _ := apexjson.Marshal(res)
 	return C.CString(string(bytes))
 }
 
@@ -754,7 +771,7 @@ func UpdateVectorIfVersion(colID C.int, id *C.char, vec *C.float, dim C.int, met
 	if metadataJSON != nil {
 		goMetaJSON := C.GoString(metadataJSON)
 		if goMetaJSON != "" {
-			_ = json.Unmarshal([]byte(goMetaJSON), &metadata)
+			_ = apexjson.Unmarshal([]byte(goMetaJSON), &metadata)
 		}
 	}
 
@@ -816,7 +833,7 @@ func GetCollectionMemoryUsage(colID C.int) *C.char {
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": "%v"}`, err))
 	}
-	bytes, _ := json.Marshal(usage)
+	bytes, _ := apexjson.Marshal(usage)
 	return C.CString(string(bytes))
 }
 
@@ -932,11 +949,44 @@ func DatabaseQuery(dbID C.int, sql *C.char) *C.char {
 		return C.CString(sqlErrorJSON(err))
 	}
 
-	bytes, err := json.Marshal(results)
+	bytes, err := apexjson.Marshal(results)
 	if err != nil {
 		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal results: %w", err)))
 	}
 	return C.CString(string(bytes))
+}
+
+func queryParamsFromJSON(paramsJSON *C.char) (libravdb.QueryParams, error) {
+	params := libravdb.QueryParams{}
+	if paramsJSON == nil {
+		return params, nil
+	}
+	goParamsJSON := C.GoString(paramsJSON)
+	if goParamsJSON == "" {
+		return params, nil
+	}
+	if err := apexjson.Unmarshal([]byte(goParamsJSON), &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+	// Normalize []interface{} to []float32 for vectors.
+	for k, v := range params {
+		if slice, ok := v.([]interface{}); ok {
+			vec := make([]float32, len(slice))
+			isVec := true
+			for i, val := range slice {
+				if f, ok := val.(float64); ok {
+					vec[i] = float32(f)
+				} else {
+					isVec = false
+					break
+				}
+			}
+			if isVec {
+				params[k] = vec
+			}
+		}
+	}
+	return params, nil
 }
 
 //export DatabaseQueryWithParams
@@ -951,32 +1001,9 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 
 	goSQL := C.GoString(sql)
 
-	var params libravdb.QueryParams
-	if paramsJSON != nil {
-		goParamsJSON := C.GoString(paramsJSON)
-		if goParamsJSON != "" {
-			if err := json.Unmarshal([]byte(goParamsJSON), &params); err != nil {
-				return C.CString(sqlErrorJSON(fmt.Errorf("failed to parse params: %w", err)))
-			}
-			// Normalize []interface{} to []float32 for vectors
-			for k, v := range params {
-				if slice, ok := v.([]interface{}); ok {
-					vec := make([]float32, len(slice))
-					isVec := true
-					for i, val := range slice {
-						if f, ok := val.(float64); ok {
-							vec[i] = float32(f)
-						} else {
-							isVec = false
-							break
-						}
-					}
-					if isVec {
-						params[k] = vec
-					}
-				}
-			}
-		}
+	params, err := queryParamsFromJSON(paramsJSON)
+	if err != nil {
+		return C.CString(sqlErrorJSON(err))
 	}
 
 	results, err := db.QueryWithParams(context.Background(), goSQL, params)
@@ -984,11 +1011,80 @@ func DatabaseQueryWithParams(dbID C.int, sql *C.char, paramsJSON *C.char) *C.cha
 		return C.CString(sqlErrorJSON(err))
 	}
 
-	bytes, err := json.Marshal(results)
+	bytes, err := apexjson.Marshal(results)
 	if err != nil {
 		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal results: %w", err)))
 	}
 	return C.CString(string(bytes))
+}
+
+//export DatabaseOpenSQLSession
+func DatabaseOpenSQLSession(dbID C.int) *C.char {
+	mu.RLock()
+	db, ok := dbs[int(dbID)]
+	mu.RUnlock()
+	if !ok {
+		return C.CString(sqlErrorJSON(fmt.Errorf("database not found")))
+	}
+
+	session, err := db.NewSQLSession(context.Background())
+	if err != nil {
+		return C.CString(sqlErrorJSON(err))
+	}
+	mu.Lock()
+	id := nextSessionID
+	nextSessionID++
+	sessions[id] = sessionHandle{dbID: int(dbID), session: session}
+	mu.Unlock()
+
+	payload, marshalErr := apexjson.Marshal(map[string]interface{}{
+		"session_id": id,
+	})
+	if marshalErr != nil {
+		_ = session.Close()
+		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal epoch response: %w", marshalErr)))
+	}
+	return C.CString(string(payload))
+}
+
+//export DatabaseSessionQuery
+func DatabaseSessionQuery(sessionID C.int, sql *C.char, paramsJSON *C.char) *C.char {
+	mu.RLock()
+	handle, ok := sessions[int(sessionID)]
+	mu.RUnlock()
+	if !ok || handle.session == nil {
+		return C.CString(sqlErrorJSON(fmt.Errorf("SQL session not found")))
+	}
+	params, err := queryParamsFromJSON(paramsJSON)
+	if err != nil {
+		return C.CString(sqlErrorJSON(err))
+	}
+	results, err := handle.session.QueryWithParams(C.GoString(sql), params)
+	if err != nil {
+		return C.CString(sqlErrorJSON(err))
+	}
+	bytes, err := apexjson.Marshal(results)
+	if err != nil {
+		return C.CString(sqlErrorJSON(fmt.Errorf("failed to marshal results: %w", err)))
+	}
+	return C.CString(string(bytes))
+}
+
+//export DatabaseCloseSQLSession
+func DatabaseCloseSQLSession(sessionID C.int) *C.char {
+	mu.Lock()
+	handle, ok := sessions[int(sessionID)]
+	if ok {
+		delete(sessions, int(sessionID))
+	}
+	mu.Unlock()
+	if !ok || handle.session == nil {
+		return C.CString(sqlErrorJSON(fmt.Errorf("SQL session not found")))
+	}
+	if err := handle.session.Close(); err != nil {
+		return C.CString(sqlErrorJSON(err))
+	}
+	return nil
 }
 
 //export DatabaseLatestCommitLSN
@@ -1003,13 +1099,13 @@ func DatabaseLatestCommitLSN(dbID C.int) *C.char {
 
 	lsn, err := db.LatestCommitLSN(context.Background())
 	if err != nil {
-		errBytes, _ := json.Marshal(map[string]string{"error": err.Error()})
+		errBytes, _ := apexjson.Marshal(map[string]string{"error": err.Error()})
 		return C.CString(string(errBytes))
 	}
 	// Keep the value as a decimal string in the C ABI. JSON numbers are not
 	// exact for all uint64 values in JavaScript, while the SDK wrappers convert
 	// this one representation to Python int, Rust u64, or TypeScript bigint.
-	result, _ := json.Marshal(map[string]string{"lsn": strconv.FormatUint(lsn, 10)})
+	result, _ := apexjson.Marshal(map[string]string{"lsn": strconv.FormatUint(lsn, 10)})
 	return C.CString(string(result))
 }
 

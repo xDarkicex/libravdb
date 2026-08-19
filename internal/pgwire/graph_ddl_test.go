@@ -3,12 +3,12 @@ package pgwire
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"net"
 	"strings"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -250,7 +250,7 @@ func TestPGWireSQLCommonNeighborJoinMatch(t *testing.T) {
 		ExecutionTimeNS     int    `json:"execution_time_ns"`
 		PlanReused          bool   `json:"plan_reused"`
 	}
-	if err := json.Unmarshal(explainJSON, &explain); err != nil {
+	if err := apexjson.Unmarshal(explainJSON, &explain); err != nil {
 		t.Fatalf("decode EXPLAIN ANALYZE JSON %q: %v", explainJSON, err)
 	}
 	if explain.Strategy != "graph_join_match" || explain.ActualRows != 2 || explain.GraphExpansions == 0 || explain.ExecutionTimeNS == 0 {

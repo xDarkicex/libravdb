@@ -1,12 +1,12 @@
 package optimizer
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 )
 
@@ -189,8 +189,14 @@ func ScalarFromInterface(v interface{}) ScalarValue {
 		return VectorValue(x)
 	case time.Time:
 		return ScalarValue{Kind: ScalarTimestamp, Time: x}
-	case json.RawMessage:
+	case apexjson.RawMessage:
 		return JSONValue(x)
+	case interface {
+		String() string
+		Float64() (float64, error)
+		Int64() (int64, error)
+	}:
+		return JSONValue([]byte(x.String()))
 	case map[string]interface{}, map[string]string, []interface{}, []string, []bool,
 		[]int, []int8, []int16, []int32, []int64, []uint, []uint16,
 		[]uint32, []uint64, []float64:
@@ -198,7 +204,7 @@ func ScalarFromInterface(v interface{}) ScalarValue {
 		// arrays into []interface{}. Keep the document opaque at the optimizer
 		// boundary; JSON/JSONB casts and the collection validator decode it into
 		// LibraVDB's canonical JSON tree later.
-		if encoded, err := json.Marshal(x); err == nil {
+		if encoded, err := apexjson.Marshal(x); err == nil {
 			return JSONValue(encoded)
 		}
 	}

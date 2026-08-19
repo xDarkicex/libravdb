@@ -3,12 +3,12 @@ package pgwire
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"math"
 	"net"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -99,11 +99,11 @@ func TestPGWireParameterizedJSONBUpsert(t *testing.T) {
 	const upsert = `INSERT INTO people (id, metadata, vector)
 VALUES ($1, $2::jsonb, $3)
 ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata, vector = EXCLUDED.vector`
-	first := json.RawMessage(`{"name":"Ada","roles":["admin"]}`)
+	first := apexjson.RawMessage(`{"name":"Ada","roles":["admin"]}`)
 	if _, err := sqlDB.ExecContext(ctx, upsert, "p1", first, "[1,0,0]"); err != nil {
 		t.Fatalf("JSONB insert: %v", err)
 	}
-	second := json.RawMessage(`{"name":"Ada Lovelace","roles":["admin","owner"]}`)
+	second := apexjson.RawMessage(`{"name":"Ada Lovelace","roles":["admin","owner"]}`)
 	if _, err := sqlDB.ExecContext(ctx, upsert, "p1", second, "[0,1,0]"); err != nil {
 		t.Fatalf("JSONB update: %v", err)
 	}

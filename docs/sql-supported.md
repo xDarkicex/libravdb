@@ -910,6 +910,11 @@ by using these functions.
 JSON and JSONB values are validated at write time, canonicalized, and retained
 through transactions, WAL recovery, close/reopen, and temporal views.
 
+JSON execution uses LibraVDB's native ApexJSON tape for parsing, path
+navigation, graph-edge property predicates, and result serialization. Values
+are materialized only where the SQL/API contract requires owned Go values; the
+SQL result shape, JSONB null behavior, and pgwire encodings remain unchanged.
+
 ### Extraction and predicates
 
 ```sql

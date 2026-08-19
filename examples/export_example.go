@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -83,9 +83,6 @@ type exportRecord struct {
 }
 
 func exportJSON(out *os.File, collection string, records []libravdb.Record) error {
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-
 	for _, r := range records {
 		rec := exportRecord{
 			ID:       r.ID,
@@ -93,11 +90,16 @@ func exportJSON(out *os.File, collection string, records []libravdb.Record) erro
 			Metadata: r.Metadata,
 			Version:  r.Version,
 		}
-		if err := enc.Encode(map[string]any{
+		encoded, err := apexjson.Marshal(map[string]any{
 			"collection": collection,
 			"record":     rec,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("encode record %s: %w", r.ID, err)
+		}
+		encoded = append(encoded, '\n')
+		if _, err := out.Write(encoded); err != nil {
+			return fmt.Errorf("write record %s: %w", r.ID, err)
 		}
 	}
 	return nil

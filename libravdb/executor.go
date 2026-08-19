@@ -2,7 +2,6 @@ package libravdb
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
@@ -3502,7 +3502,7 @@ func conflictColumnValue(id string, metadata map[string]interface{}, column stri
 			case map[string]interface{}, map[string]string, []interface{}, []string, []bool,
 				[]int, []int8, []int16, []int32, []int64, []uint, []uint8, []uint16,
 				[]uint32, []uint64, []float32, []float64:
-				if encoded, err := json.Marshal(value); err == nil {
+				if encoded, err := apexjson.Marshal(value); err == nil {
 					return string(encoded), true
 				}
 			}

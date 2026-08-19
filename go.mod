@@ -7,6 +7,7 @@ require (
 	github.com/leanovate/gopter v0.2.11
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/prometheus/client_golang v1.17.0
+	github.com/xDarkicex/apexJSON/v2 v2.0.0-alpha.2
 	github.com/xDarkicex/lexer v0.1.8
 	github.com/xDarkicex/memory v1.2.9
 	go.uber.org/goleak v1.3.0
@@ -29,7 +30,6 @@ require (
 	github.com/prometheus/client_model v0.4.1-0.20230718164431-9a2bf3000d16 // indirect
 	github.com/prometheus/common v0.44.0 // indirect
 	github.com/prometheus/procfs v0.11.1 // indirect
-	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect

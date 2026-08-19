@@ -2,7 +2,6 @@ package libravdb
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 	"github.com/xDarkicex/libravdb/internal/storage"
 )
@@ -40,7 +40,7 @@ func newCollectionCostModelState(payload []byte, currentDataLSN uint64) *collect
 		return state
 	}
 	var stats CostModelStatistics
-	if err := json.Unmarshal(payload, &stats); err != nil || stats.Version != costModelStatisticsVersion {
+	if err := apexjson.Unmarshal(payload, &stats); err != nil || stats.Version != costModelStatisticsVersion {
 		return state
 	}
 	state.statistics = cloneCostModelStatistics(&stats)
@@ -112,7 +112,7 @@ func (db *Database) recordCostModelFeedback(plan *optimizer.PhysicalPlan, metric
 	if !shouldPersist {
 		return
 	}
-	payload, err := json.Marshal(updated)
+	payload, err := apexjson.Marshal(updated)
 	if err != nil {
 		return
 	}
@@ -234,7 +234,7 @@ func (db *Database) AnalyzeCollection(ctx context.Context, name string) (CostMod
 		return CostModelStatistics{}, err
 	}
 	stats.DataLSN = beforeLSN
-	payload, err := json.Marshal(stats)
+	payload, err := apexjson.Marshal(stats)
 	if err != nil {
 		return CostModelStatistics{}, fmt.Errorf("encode cost-model statistics: %w", err)
 	}

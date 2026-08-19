@@ -1,7 +1,7 @@
-from .client import LibraVDB, Collection, SQLError
+from .client import LibraVDB, Collection, SQLSession, SQLError
 from .filters import Filter, Eq, Gt, Lt, Between, ContainsAny, ContainsAll, ExactMatch, And, Or, Not
 
 __all__ = [
-    "LibraVDB", "Collection", "SQLError",
+    "LibraVDB", "Collection", "SQLSession", "SQLError",
     "Filter", "Eq", "Gt", "Lt", "Between", "ContainsAny", "ContainsAll", "ExactMatch", "And", "Or", "Not"
 ]

@@ -2,17 +2,96 @@ package libravdb
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/libravdb/internal/util"
 )
+
+// sqlLazyJSONValue keeps a validated JSON document as its original byte span.
+// Read-only SQL operators parse that span into ApexJSON's off-heap tape and
+// return scalar values or another borrowed span. Mutation and public-result
+// boundaries call decodeJSONValue/materializeSQLJSONValue and obtain the
+// existing owned Go representation.
+//
+// Keeping this wrapper private is intentional: callers must not retain a
+// query-local borrowed JSON value after the SQL result has been materialized.
+type sqlLazyJSONValue struct {
+	raw     []byte
+	decoder *apexjson.Decoder
+	value   apexjson.Value
+}
+
+func lazyJSONDocument(raw []byte) (sqlLazyJSONValue, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return sqlLazyJSONValue{}, false
+	}
+	dec, err := apexjson.NewDecoder()
+	if err != nil {
+		return sqlLazyJSONValue{}, false
+	}
+	defer dec.Free()
+	if err := dec.Parse(raw); err != nil {
+		return sqlLazyJSONValue{}, false
+	}
+	return sqlLazyJSONValue{raw: raw}, true
+}
+
+func jsonDocumentRaw(value interface{}) ([]byte, bool) {
+	switch v := value.(type) {
+	case sqlLazyJSONValue:
+		return v.raw, len(v.raw) != 0
+	case apexjson.RawMessage:
+		return []byte(v), len(v) != 0
+	default:
+		return nil, false
+	}
+}
+
+func jsonCastSourceRaw(value interface{}) ([]byte, bool) {
+	if raw, ok := jsonDocumentRaw(value); ok {
+		return raw, true
+	}
+	switch v := value.(type) {
+	case string:
+		return []byte(v), len(v) != 0
+	case []byte:
+		return v, len(v) != 0
+	default:
+		return nil, false
+	}
+}
+
+func decodeJSONReadValue(value interface{}) (interface{}, bool) {
+	// These values already are owned JSON trees. Read-only operators must not
+	// clone them merely to inspect them; mutation paths continue to use
+	// decodeJSONValue, which deliberately makes an owned canonical copy.
+	switch v := value.(type) {
+	case sqlLazyJSONValue:
+		// A retained ApexJSON tape is already parsed. Materialize directly from
+		// its root when a read-only operator needs a Go tree; reparsing raw would
+		// throw away the query-local tape and make containment pay twice.
+		if v.value.Exists() {
+			return canonicalJSONValue(v.value)
+		}
+		return decodeJSONValue(v)
+	case apexjson.RawMessage:
+		return decodeJSONValue(v)
+	case nil, util.JSONNull, bool,
+		float64, float32, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		map[string]interface{}, []interface{}:
+		return value, true
+	default:
+		return decodeJSONValue(value)
+	}
+}
 
 // JSON operators are evaluated by the query-local relation path. That keeps
 // extraction and containment semantics correct for metadata values without
@@ -70,19 +149,32 @@ func isJSONPathPredicateOperator(operator uint8) bool {
 }
 
 func decodeJSONValue(value interface{}) (interface{}, bool) {
+	if text, ok := jsonNumberText(value); ok {
+		return canonicalJSONNumber(text)
+	}
 	switch v := value.(type) {
 	case nil:
 		return nil, true
 	case util.JSONNull:
 		return v, true
-	case map[string]interface{}, []interface{}, bool, float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+	case sqlLazyJSONValue:
+		if v.value.Exists() {
+			// Mutation/output paths still receive an owned tree from
+			// canonicalJSONValue, but do not throw away a live query-local tape
+			// and parse the same document a second time.
+			return canonicalJSONValue(v.value)
+		}
+		return decodeJSONText(v.raw)
+	case apexjson.RawMessage:
+		return decodeJSONText([]byte(v))
+	case map[string]interface{}, []interface{}, bool, float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return canonicalJSONNode(v)
 	case string:
 		return decodeJSONText([]byte(v))
 	case []byte:
 		return decodeJSONText(v)
 	default:
-		encoded, err := json.Marshal(v)
+		encoded, err := apexjson.Marshal(v)
 		if err != nil {
 			return nil, false
 		}
@@ -95,21 +187,255 @@ func decodeJSONText(data []byte) (interface{}, bool) {
 	if len(data) == 0 {
 		return nil, false
 	}
-	var value interface{}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
+	decoder, err := apexjson.NewDecoder()
+	if err != nil {
 		return nil, false
 	}
-	var trailing interface{}
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	defer decoder.Free()
+	if err := decoder.Parse(data); err != nil {
 		return nil, false
 	}
-	// JSONB values use one storage-safe, recursively owned representation.
-	// In particular, json.Number never escapes this boundary because the row
-	// codec intentionally supports concrete numeric Go types rather than a
-	// parser-specific number wrapper.
-	return canonicalJSONNode(value)
+	return canonicalJSONValue(decoder.Root())
+}
+
+func parseSQLLazyJSON(raw []byte) (*apexjson.Decoder, apexjson.Value, error) {
+	decoder, err := apexjson.NewDecoder()
+	if err != nil {
+		return nil, apexjson.Value{}, err
+	}
+	if err := decoder.Parse(raw); err != nil {
+		decoder.Free()
+		return nil, apexjson.Value{}, err
+	}
+	return decoder, decoder.Root(), nil
+}
+
+func sqlLazyJSONValueFromApex(value apexjson.Value, textResult bool) (interface{}, bool, error) {
+	switch value.Type() {
+	case apexjson.TypeNull:
+		if textResult {
+			return "null", true, nil
+		}
+		return util.JSONNull{}, true, nil
+	case apexjson.TypeBool:
+		if textResult {
+			if value.Bool() {
+				return "true", true, nil
+			}
+			return "false", true, nil
+		}
+		return value.Bool(), true, nil
+	case apexjson.TypeNumber:
+		raw := value.Bytes()
+		if textResult {
+			return string(raw), true, nil
+		}
+		if bytes.IndexAny(raw, ".eE") >= 0 {
+			parsed, err := strconv.ParseFloat(string(raw), 64)
+			if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+				return nil, false, fmt.Errorf("invalid JSON number %q", raw)
+			}
+			return parsed, true, nil
+		}
+		if parsed, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+			return parsed, true, nil
+		}
+		if parsed, err := strconv.ParseUint(string(raw), 10, 64); err == nil {
+			return parsed, true, nil
+		}
+		return nil, false, fmt.Errorf("invalid JSON number %q", raw)
+	case apexjson.TypeString:
+		return value.Str(), true, nil
+	case apexjson.TypeObject, apexjson.TypeArray:
+		raw := value.Bytes()
+		if textResult {
+			return string(raw), true, nil
+		}
+		return sqlLazyJSONValue{raw: raw}, true, nil
+	default:
+		return nil, false, fmt.Errorf("invalid JSON value")
+	}
+}
+
+func sqlLazyJSONValueFromApexWithDecoder(value apexjson.Value, textResult bool, decoder *apexjson.Decoder) (interface{}, bool, error) {
+	result, ok, err := sqlLazyJSONValueFromApex(value, textResult)
+	if err != nil || !ok || decoder == nil {
+		return result, ok, err
+	}
+	if lazy, isLazy := result.(sqlLazyJSONValue); isLazy {
+		lazy.decoder = decoder
+		lazy.value = value
+		return lazy, true, nil
+	}
+	return result, true, nil
+}
+
+func sqlLazyJSONValueAtPath(root apexjson.Value, segments []string) (apexjson.Value, bool) {
+	value := root
+	for _, segment := range segments {
+		if !value.Exists() {
+			return apexjson.Value{}, false
+		}
+		switch value.Type() {
+		case apexjson.TypeObject:
+			var found bool
+			it := value.ObjectIter()
+			for it.Next() {
+				if it.Key() == segment {
+					value = it.Value()
+					found = true
+					break
+				}
+			}
+			if !found {
+				return apexjson.Value{}, false
+			}
+		case apexjson.TypeArray:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 {
+				return apexjson.Value{}, false
+			}
+			it := value.ArrayIter()
+			found := false
+			for it.Next() {
+				if it.Index() == index {
+					value = it.Value()
+					found = true
+					break
+				}
+			}
+			if !found {
+				return apexjson.Value{}, false
+			}
+		default:
+			return apexjson.Value{}, false
+		}
+	}
+	return value, value.Exists()
+}
+
+func jsonExtractRaw(document []byte, key interface{}, textResult bool) (interface{}, bool, error) {
+	keyText, ok := jsonKeyValue(key)
+	if !ok {
+		return nil, false, fmt.Errorf("JSON extraction key must be text or an integer")
+	}
+	decoder, root, err := parseSQLLazyJSON(document)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid JSON document: %w", err)
+	}
+	defer decoder.Free()
+	if root.Type() == apexjson.TypeNull {
+		return nil, true, nil
+	}
+	value := decoder.Get(keyText)
+	if !value.Exists() {
+		return nil, true, nil
+	}
+	return sqlLazyJSONValueFromApex(value, textResult)
+}
+
+func jsonPathRaw(document []byte, path interface{}, textResult bool) (interface{}, bool, error) {
+	segments, ok := jsonPathSegments(path)
+	if !ok {
+		return nil, false, fmt.Errorf("JSON path must be a text array literal such as '{a,b}'")
+	}
+	decoder, root, err := parseSQLLazyJSON(document)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid JSON document: %w", err)
+	}
+	defer decoder.Free()
+	if root.Type() == apexjson.TypeNull {
+		return nil, true, nil
+	}
+	value := decoder.GetPath(segments)
+	if !value.Exists() {
+		return nil, true, nil
+	}
+	return sqlLazyJSONValueFromApex(value, textResult)
+}
+
+// canonicalJSONValue converts apexJSON's lazy tape into the owned tree used
+// by JSONB mutation and comparison paths. Parsing and navigation stay on the
+// native off-heap tape; materialization happens only where the SQL value
+// contract requires an independently owned Go value.
+func canonicalJSONValue(value apexjson.Value) (interface{}, bool) {
+	switch value.Type() {
+	case apexjson.TypeNull:
+		return util.JSONNull{}, true
+	case apexjson.TypeBool:
+		return value.Bool(), true
+	case apexjson.TypeString:
+		return value.Str(), true
+	case apexjson.TypeNumber:
+		text := value.Bytes()
+		if bytes.IndexAny(text, ".eE") >= 0 {
+			f, err := strconv.ParseFloat(string(text), 64)
+			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+				return nil, false
+			}
+			return f, true
+		}
+		if i, err := strconv.ParseInt(string(text), 10, 64); err == nil {
+			return i, true
+		}
+		if u, err := strconv.ParseUint(string(text), 10, 64); err == nil {
+			return u, true
+		}
+		return nil, false
+	case apexjson.TypeArray:
+		out := make([]interface{}, 0, 4)
+		it := value.ArrayIter()
+		for it.Next() {
+			item, ok := canonicalJSONValue(it.Value())
+			if !ok {
+				return nil, false
+			}
+			out = append(out, item)
+		}
+		return out, true
+	case apexjson.TypeObject:
+		out := make(map[string]interface{}, 8)
+		it := value.ObjectIter()
+		for it.Next() {
+			item, ok := canonicalJSONValue(it.Value())
+			if !ok {
+				return nil, false
+			}
+			out[it.Key()] = item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func canonicalJSONNumber(text string) (interface{}, bool) {
+	if strings.ContainsAny(text, ".eE") {
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		return f, true
+	}
+	if i, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return i, true
+	}
+	if u, err := strconv.ParseUint(text, 10, 64); err == nil {
+		return u, true
+	}
+	return nil, false
+}
+
+func jsonNumberText(value interface{}) (string, bool) {
+	n, ok := value.(interface {
+		String() string
+		Float64() (float64, error)
+		Int64() (int64, error)
+	})
+	if !ok {
+		return "", false
+	}
+	return n.String(), true
 }
 
 // canonicalJSONNode converts a decoded JSON tree into the representation used
@@ -122,6 +448,18 @@ func canonicalJSONNode(value interface{}) (interface{}, bool) {
 	switch v := value.(type) {
 	case util.JSONNull:
 		return v, true
+	case sqlLazyJSONValue:
+		decoded, ok := decodeJSONValue(v)
+		if !ok {
+			return nil, false
+		}
+		return canonicalJSONNode(decoded)
+	case apexjson.RawMessage:
+		decoded, ok := decodeJSONValue(v)
+		if !ok {
+			return nil, false
+		}
+		return canonicalJSONNode(decoded)
 	case nil:
 		// A nil encountered inside a decoded JSON tree is the JSON literal
 		// null. SQL NULL is kept distinct by decodeJSONValue's top-level nil
@@ -129,22 +467,6 @@ func canonicalJSONNode(value interface{}) (interface{}, bool) {
 		return util.JSONNull{}, true
 	case bool, string:
 		return v, true
-	case json.Number:
-		text := v.String()
-		if strings.ContainsAny(text, ".eE") {
-			f, err := strconv.ParseFloat(text, 64)
-			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-				return nil, false
-			}
-			return f, true
-		}
-		if i, err := strconv.ParseInt(text, 10, 64); err == nil {
-			return i, true
-		}
-		if u, err := strconv.ParseUint(text, 10, 64); err == nil {
-			return u, true
-		}
-		return nil, false
 	case float32:
 		f := float64(v)
 		if math.IsNaN(f) || math.IsInf(f, 0) {
@@ -214,7 +536,7 @@ func canonicalJSONNode(value interface{}) (interface{}, bool) {
 }
 
 func encodeJSONValue(value interface{}) (string, error) {
-	encoded, err := json.Marshal(jsonWireValue(value))
+	encoded, err := apexjson.Marshal(jsonWireValue(value))
 	if err != nil {
 		return "", err
 	}
@@ -228,6 +550,13 @@ func jsonWireValue(value interface{}) interface{} {
 	switch v := value.(type) {
 	case util.JSONNull:
 		return nil
+	case sqlLazyJSONValue:
+		if decoded, ok := decodeJSONValue(v); ok {
+			return jsonWireValue(decoded)
+		}
+		return nil
+	case apexjson.RawMessage:
+		return v
 	case []interface{}:
 		out := make([]interface{}, len(v))
 		for i := range v {
@@ -245,14 +574,38 @@ func jsonWireValue(value interface{}) interface{} {
 	}
 }
 
+func materializeSQLJSONValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case sqlLazyJSONValue:
+		if v.value.Exists() {
+			if decoded, ok := canonicalJSONValue(v.value); ok {
+				return decoded
+			}
+		}
+		if decoded, ok := decodeJSONValue(v); ok {
+			return decoded
+		}
+		return nil
+	case apexjson.RawMessage:
+		if decoded, ok := decodeJSONValue(v); ok {
+			return decoded
+		}
+		return nil
+	case []interface{}:
+		return v
+	case map[string]interface{}:
+		return v
+	default:
+		return value
+	}
+}
+
 func jsonKeyValue(value interface{}) (string, bool) {
 	switch v := value.(type) {
 	case string:
 		return v, true
 	case []byte:
 		return string(v), true
-	case json.Number:
-		return v.String(), true
 	case float64:
 		return strconv.FormatInt(int64(v), 10), v == float64(int64(v))
 	case float32:
@@ -269,7 +622,21 @@ func jsonKeyValue(value interface{}) (string, bool) {
 }
 
 func jsonExtract(document, key interface{}, textResult bool) (interface{}, bool, error) {
-	root, ok := decodeJSONValue(document)
+	if lazy, ok := document.(sqlLazyJSONValue); ok && lazy.decoder != nil && lazy.value.Exists() {
+		keyText, keyOK := jsonKeyValue(key)
+		if !keyOK {
+			return nil, false, fmt.Errorf("JSON extraction key must be text or an integer")
+		}
+		value, found := sqlLazyJSONValueAtPath(lazy.value, []string{keyText})
+		if !found {
+			return nil, true, nil
+		}
+		return sqlLazyJSONValueFromApexWithDecoder(value, textResult, lazy.decoder)
+	}
+	if raw, rawOK := jsonDocumentRaw(document); rawOK {
+		return jsonExtractRaw(raw, key, textResult)
+	}
+	root, ok := decodeJSONReadValue(document)
 	if !ok {
 		return nil, false, fmt.Errorf("invalid JSON document")
 	}
@@ -304,7 +671,21 @@ func jsonExtract(document, key interface{}, textResult bool) (interface{}, bool,
 }
 
 func jsonPath(document, path interface{}, textResult bool) (interface{}, bool, error) {
-	root, ok := decodeJSONValue(document)
+	if lazy, ok := document.(sqlLazyJSONValue); ok && lazy.decoder != nil && lazy.value.Exists() {
+		segments, segmentsOK := jsonPathSegments(path)
+		if !segmentsOK {
+			return nil, false, fmt.Errorf("JSON path must be a text array literal such as '{a,b}'")
+		}
+		value, found := sqlLazyJSONValueAtPath(lazy.value, segments)
+		if !found {
+			return nil, true, nil
+		}
+		return sqlLazyJSONValueFromApexWithDecoder(value, textResult, lazy.decoder)
+	}
+	if raw, rawOK := jsonDocumentRaw(document); rawOK {
+		return jsonPathRaw(raw, path, textResult)
+	}
+	root, ok := decodeJSONReadValue(document)
 	if !ok {
 		return nil, false, fmt.Errorf("invalid JSON document")
 	}
@@ -372,7 +753,22 @@ func jsonPathSegments(path interface{}) ([]string, bool) {
 }
 
 func jsonExists(document, key interface{}) (bool, error) {
-	root, ok := decodeJSONValue(document)
+	if raw, rawOK := jsonDocumentRaw(document); rawOK {
+		keyText, keyOK := jsonKeyValue(key)
+		if !keyOK {
+			return false, fmt.Errorf("JSON existence key must be text")
+		}
+		decoder, root, err := parseSQLLazyJSON(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid JSON document: %w", err)
+		}
+		defer decoder.Free()
+		if root.Type() != apexjson.TypeObject {
+			return false, nil
+		}
+		return decoder.Get(keyText).Exists(), nil
+	}
+	root, ok := decodeJSONReadValue(document)
 	if !ok {
 		return false, fmt.Errorf("invalid JSON document")
 	}
@@ -460,7 +856,37 @@ func parseJSONArrayConstructor(value string) ([]interface{}, bool) {
 }
 
 func jsonAnyOrAll(document, keys interface{}, requireAll bool) (bool, error) {
-	root, ok := decodeJSONValue(document)
+	if raw, rawOK := jsonDocumentRaw(document); rawOK {
+		keyList, keyOK := jsonKeyList(keys)
+		if !keyOK || len(keyList) == 0 {
+			return false, fmt.Errorf("JSON key-set operand must be a non-empty text array")
+		}
+		decoder, root, err := parseSQLLazyJSON(raw)
+		if err != nil {
+			return false, fmt.Errorf("invalid JSON document: %w", err)
+		}
+		defer decoder.Free()
+		for _, key := range keyList {
+			exists := false
+			if root.Type() == apexjson.TypeObject {
+				exists = decoder.Get(key).Exists()
+			} else if root.Type() == apexjson.TypeArray {
+				it := root.ArrayIter()
+				for it.Next() {
+					item := it.Value()
+					if item.Type() == apexjson.TypeString && item.Str() == key {
+						exists = true
+						break
+					}
+				}
+			}
+			if exists != requireAll {
+				return !requireAll, nil
+			}
+		}
+		return requireAll, nil
+	}
+	root, ok := decodeJSONReadValue(document)
 	if !ok {
 		return false, fmt.Errorf("invalid JSON document")
 	}
@@ -739,6 +1165,8 @@ func jsonbDelete(document, path interface{}) (interface{}, error) {
 }
 
 func jsonbConcat(left, right interface{}) (interface{}, error) {
+	// Concatenation produces a new JSON value. Keep the ownership boundary
+	// used by mutation/output paths so the result cannot alias a stored tree.
 	lhs, ok := decodeJSONValue(left)
 	if !ok {
 		return nil, fmt.Errorf("invalid left JSON value")
@@ -776,6 +1204,12 @@ func jsonbConcat(left, right interface{}) (interface{}, error) {
 func jsonConstructorValue(value interface{}) (interface{}, bool) {
 	// SQL string arguments to json_build_* are JSON strings, not JSON text to
 	// parse. Explicit ::json/jsonb casts already arrive as decoded trees.
+	if lazy, ok := value.(sqlLazyJSONValue); ok {
+		return decodeJSONValue(lazy)
+	}
+	if raw, ok := value.(apexjson.RawMessage); ok {
+		return decodeJSONValue(raw)
+	}
 	if text, ok := value.(string); ok {
 		return text, true
 	}
@@ -817,7 +1251,46 @@ func jsonBuildObject(args []interface{}) (interface{}, error) {
 }
 
 func jsonbTypeof(value interface{}) (string, bool) {
-	node, ok := decodeJSONValue(value)
+	if lazy, lazyOK := value.(sqlLazyJSONValue); lazyOK && lazy.value.Exists() {
+		switch lazy.value.Type() {
+		case apexjson.TypeNull:
+			return "null", true
+		case apexjson.TypeObject:
+			return "object", true
+		case apexjson.TypeArray:
+			return "array", true
+		case apexjson.TypeString:
+			return "string", true
+		case apexjson.TypeBool:
+			return "boolean", true
+		case apexjson.TypeNumber:
+			return "number", true
+		}
+	}
+	if raw, rawOK := jsonDocumentRaw(value); rawOK {
+		decoder, root, err := parseSQLLazyJSON(raw)
+		if err != nil {
+			return "", false
+		}
+		defer decoder.Free()
+		switch root.Type() {
+		case apexjson.TypeNull:
+			return "null", true
+		case apexjson.TypeObject:
+			return "object", true
+		case apexjson.TypeArray:
+			return "array", true
+		case apexjson.TypeString:
+			return "string", true
+		case apexjson.TypeBool:
+			return "boolean", true
+		case apexjson.TypeNumber:
+			return "number", true
+		default:
+			return "", false
+		}
+	}
+	node, ok := decodeJSONReadValue(value)
 	// JSON extraction returns a native Go string for a JSON string member.
 	// It is already decoded JSON at that point, so do not require it to be
 	// re-encoded as a JSON text literal before reporting its JSONB type.
@@ -934,7 +1407,18 @@ func evaluateJSONFunction(name string, args []interface{}) (interface{}, bool, e
 		if args[0] == nil {
 			return nil, true, nil
 		}
-		node, ok := decodeJSONValue(args[0])
+		if raw, rawOK := jsonDocumentRaw(args[0]); rawOK {
+			decoder, root, err := parseSQLLazyJSON(raw)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid JSON document: %w", err)
+			}
+			defer decoder.Free()
+			if root.Type() != apexjson.TypeArray {
+				return nil, false, fmt.Errorf("jsonb_array_length requires an array")
+			}
+			return int64(countApexJSONArray(root)), true, nil
+		}
+		node, ok := decodeJSONReadValue(args[0])
 		if !ok {
 			return nil, false, fmt.Errorf("invalid JSON document")
 		}
@@ -1071,7 +1555,21 @@ func evaluateJSONArrayExpansion(name string, args []interface{}) ([]interface{},
 		}
 		return out, true, nil
 	}
-	node, ok := decodeJSONValue(args[0])
+	if lazy, lazyOK := args[0].(sqlLazyJSONValue); lazyOK && lazy.value.Exists() {
+		items, err := evaluateJSONArrayExpansionApex(name, lazy.value, textMode, objectKeys, each, lazy.decoder)
+		if err != nil {
+			return nil, true, err
+		}
+		return items, true, nil
+	}
+	if raw, rawOK := jsonDocumentRaw(args[0]); rawOK {
+		items, err := evaluateJSONArrayExpansionRaw(name, raw, textMode, objectKeys, each)
+		if err != nil {
+			return nil, true, err
+		}
+		return items, true, nil
+	}
+	node, ok := decodeJSONReadValue(args[0])
 	if !ok {
 		return nil, true, fmt.Errorf("invalid JSON document")
 	}
@@ -1126,16 +1624,222 @@ func evaluateJSONArrayExpansion(name string, args []interface{}) ([]interface{},
 	return out, true, nil
 }
 
+func evaluateJSONArrayExpansionApex(name string, root apexjson.Value, textMode, objectKeys, each bool, decoder *apexjson.Decoder) ([]interface{}, error) {
+	if objectKeys || each {
+		if root.Type() != apexjson.TypeObject {
+			return nil, fmt.Errorf("%s requires an object", name)
+		}
+		keys := make([]string, 0, 8)
+		it := root.ObjectIter()
+		for it.Next() {
+			keys = append(keys, it.Key())
+		}
+		sort.Strings(keys)
+		out := make([]interface{}, 0, len(keys))
+		for _, key := range keys {
+			value, exists := jsonApexObjectField(root, key)
+			if !exists {
+				continue
+			}
+			if objectKeys {
+				out = append(out, key)
+				continue
+			}
+			item, ok, err := sqlLazyJSONValueFromApexWithDecoder(value, strings.HasSuffix(strings.ToLower(name), "_text"), decoder)
+			if err != nil || !ok {
+				return nil, err
+			}
+			item = materializeSQLJSONValue(item)
+			out = append(out, map[string]interface{}{"key": key, "value": item})
+		}
+		return out, nil
+	}
+	if root.Type() != apexjson.TypeArray {
+		return nil, fmt.Errorf("%s requires an array", name)
+	}
+	out := make([]interface{}, 0, 8)
+	it := root.ArrayIter()
+	for it.Next() {
+		item, ok, err := sqlLazyJSONValueFromApexWithDecoder(it.Value(), textMode, decoder)
+		if err != nil || !ok {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func evaluateJSONArrayExpansionRaw(name string, raw []byte, textMode, objectKeys, each bool) ([]interface{}, error) {
+	decoder, root, err := parseSQLLazyJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON document: %w", err)
+	}
+	defer decoder.Free()
+	if objectKeys || each {
+		if root.Type() != apexjson.TypeObject {
+			return nil, fmt.Errorf("%s requires an object", name)
+		}
+		keys := make([]string, 0, 8)
+		it := root.ObjectIter()
+		for it.Next() {
+			keys = append(keys, it.Key())
+		}
+		sort.Strings(keys)
+		out := make([]interface{}, 0, len(keys))
+		for _, key := range keys {
+			value, exists := jsonApexObjectField(root, key)
+			if !exists {
+				continue
+			}
+			if objectKeys {
+				out = append(out, key)
+				continue
+			}
+			item, ok, err := sqlLazyJSONValueFromApex(value, strings.HasSuffix(strings.ToLower(name), "_text"))
+			if err != nil || !ok {
+				return nil, err
+			}
+			item = materializeSQLJSONValue(item)
+			out = append(out, map[string]interface{}{"key": key, "value": item})
+		}
+		return out, nil
+	}
+	if root.Type() != apexjson.TypeArray {
+		return nil, fmt.Errorf("%s requires an array", name)
+	}
+	out := make([]interface{}, 0, 8)
+	it := root.ArrayIter()
+	for it.Next() {
+		item, ok, err := sqlLazyJSONValueFromApex(it.Value(), textMode)
+		if err != nil || !ok {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func countApexJSONArray(value apexjson.Value) int {
+	count := 0
+	it := value.ArrayIter()
+	for it.Next() {
+		count++
+	}
+	return count
+}
+
 func jsonContains(left, right interface{}) (bool, error) {
-	lhs, ok := decodeJSONValue(left)
+	if leftLazy, leftOK := left.(sqlLazyJSONValue); leftOK && leftLazy.value.Exists() {
+		if rightLazy, rightOK := right.(sqlLazyJSONValue); rightOK && rightLazy.value.Exists() {
+			return jsonContainsApexValue(leftLazy.value, rightLazy.value), nil
+		}
+	}
+	if leftRaw, leftOK := jsonDocumentRaw(left); leftOK {
+		if rightRaw, rightOK := jsonDocumentRaw(right); rightOK {
+			return jsonContainsRaw(leftRaw, rightRaw)
+		}
+	}
+	lhs, ok := decodeJSONReadValue(left)
 	if !ok {
 		return false, fmt.Errorf("invalid left JSON value")
 	}
-	rhs, ok := decodeJSONValue(right)
+	// A stored JSON/JSONB value is already an owned tree. Do not clone it for
+	// a read-only containment predicate. Mutation paths intentionally keep the
+	// cloning behavior in decodeJSONValue.
+	if _, structured := right.(map[string]interface{}); structured {
+		return jsonContainsValue(lhs, right), nil
+	}
+	if _, structured := right.([]interface{}); structured {
+		return jsonContainsValue(lhs, right), nil
+	}
+	rhs, ok := decodeJSONReadValue(right)
 	if !ok {
 		return false, fmt.Errorf("invalid right JSON value")
 	}
 	return jsonContainsValue(lhs, rhs), nil
+}
+
+func jsonContainsRaw(leftRaw, rightRaw []byte) (bool, error) {
+	leftDecoder, left, err := parseSQLLazyJSON(leftRaw)
+	if err != nil {
+		return false, fmt.Errorf("invalid left JSON value: %w", err)
+	}
+	defer leftDecoder.Free()
+	rightDecoder, right, err := parseSQLLazyJSON(rightRaw)
+	if err != nil {
+		return false, fmt.Errorf("invalid right JSON value: %w", err)
+	}
+	defer rightDecoder.Free()
+	return jsonContainsApexValue(left, right), nil
+}
+
+func jsonApexObjectField(object apexjson.Value, key string) (apexjson.Value, bool) {
+	it := object.ObjectIter()
+	for it.Next() {
+		if it.Key() == key {
+			return it.Value(), true
+		}
+	}
+	return apexjson.Value{}, false
+}
+
+func jsonContainsApexValue(left, right apexjson.Value) bool {
+	if !left.Exists() || !right.Exists() {
+		return false
+	}
+	if right.Type() == apexjson.TypeObject {
+		if left.Type() != apexjson.TypeObject {
+			return false
+		}
+		it := right.ObjectIter()
+		for it.Next() {
+			key := it.Key()
+			wanted := it.Value()
+			candidate, exists := jsonApexObjectField(left, key)
+			if !exists || !jsonContainsApexValue(candidate, wanted) {
+				return false
+			}
+		}
+		return true
+	}
+	if right.Type() == apexjson.TypeArray {
+		if left.Type() != apexjson.TypeArray {
+			return false
+		}
+		for wantedIter := right.ArrayIter(); wantedIter.Next(); {
+			wanted := wantedIter.Value()
+			found := false
+			for candidateIter := left.ArrayIter(); candidateIter.Next(); {
+				if jsonContainsApexValue(candidateIter.Value(), wanted) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	if left.Type() != right.Type() {
+		return false
+	}
+	switch right.Type() {
+	case apexjson.TypeNull:
+		return true
+	case apexjson.TypeBool:
+		return left.Bool() == right.Bool()
+	case apexjson.TypeString:
+		return left.Str() == right.Str()
+	case apexjson.TypeNumber:
+		leftRaw, rightRaw := left.Bytes(), right.Bytes()
+		if bytes.Equal(leftRaw, rightRaw) {
+			return true
+		}
+		return left.Float() == right.Float()
+	default:
+		return false
+	}
 }
 
 func jsonContainsValue(left, right interface{}) bool {

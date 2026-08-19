@@ -126,6 +126,9 @@ extern char* LoadIndex(int colID, char* path);
 extern void FreeString(char* str);
 extern char* DatabaseQuery(int dbID, char* sql);
 extern char* DatabaseQueryWithParams(int dbID, char* sql, char* paramsJSON);
+extern char* DatabaseOpenSQLSession(int dbID);
+extern char* DatabaseSessionQuery(int sessionID, char* sql, char* paramsJSON);
+extern char* DatabaseCloseSQLSession(int sessionID);
 extern char* DatabaseLatestCommitLSN(int dbID);
 
 #ifdef __cplusplus

@@ -4,6 +4,37 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.5.9 - 2026-08-18
+
+### SQL executor performance
+
+- Replaced duplicated qualified-field maps in internal joined SQL rows with
+  immutable alias scopes and scope-aware resolution across predicates, joins,
+  aggregates, windows, graph projections, and subqueries.
+- Added conservative column pruning for simple relational, indexed, and
+  temporal scans while preserving the existing full-row path for wildcard,
+  CTE, derived, graph, and ambiguous queries.
+- Preserved the public `SearchResults` row contract while reducing the JSON
+  expansion benchmark from roughly 35,900 to roughly 19,500 allocations per
+  query.
+
+### Native JSON execution
+
+- Replaced LibraVDB's JSON parsing and serialization paths with the native
+  `github.com/xDarkicex/apexJSON/v2` engine. JSON/JSONB extraction,
+  containment, mutation, graph-edge property parsing, persisted cost-model
+  statistics, pgwire results, and CGO SDK envelopes now use the native tape
+  and encoder paths.
+- JSONB canonicalization still materializes owned Go values at the storage and
+  mutation boundary, while extraction and edge-property predicates navigate
+  lazy native values without decoding through `map[string]interface{}`.
+- Added native `apexjson.Number` compatibility in apexJSON and preserved
+  acceptance of existing number-like values so integer, fraction, exponent,
+  and large-number semantics are not silently changed.
+- Published apexJSON `v2.0.0-alpha.2`; LibraVDB now consumes that public module
+  version without a local replace directive, so downstream modules and the
+  external compatibility harness resolve the dependency normally.
+
 ### Graph SQL
 
 - Added native and pgwire support for common-neighbor graph queries using chained `JOIN MATCH` clauses that converge on the same terminal node.

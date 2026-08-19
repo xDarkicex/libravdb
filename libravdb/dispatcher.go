@@ -938,6 +938,8 @@ func recordMetaToString(v interface{}) string {
 		return fmt.Sprintf("%f", t)
 	case bool:
 		return fmt.Sprintf("%v", t)
+	case sqlLazyJSONValue:
+		return string(t.raw)
 	default:
 		return fmt.Sprintf("%v", t)
 	}

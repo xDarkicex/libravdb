@@ -10,28 +10,468 @@ package libravdb
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
-type virtualSQLRow struct {
-	ID     string
+type virtualSQLScope struct {
+	Alias  string
 	Values map[string]interface{}
+}
+
+type virtualSQLRow struct {
+	ID string
+
+	// Values is used for a single unqualified scope and for rows produced by
+	// projection/aggregation. Joined execution rows use Scopes instead so an
+	// alias does not require duplicating every field as "alias.column".
+	Values map[string]interface{}
+	Scopes []virtualSQLScope
+}
+
+type virtualColumnRequirementsContextKey struct{}
+
+type virtualColumnRequirements map[string]map[string]struct{}
+
+func withVirtualColumnRequirements(ctx context.Context, requirements virtualColumnRequirements) context.Context {
+	if len(requirements) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, virtualColumnRequirementsContextKey{}, requirements)
+}
+
+func virtualRequiredColumns(ctx context.Context, alias, table string) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	requirements, _ := ctx.Value(virtualColumnRequirementsContextKey{}).(virtualColumnRequirements)
+	if requirements == nil {
+		return nil
+	}
+	if fields := requirements[strings.ToLower(alias)]; fields != nil {
+		return fields
+	}
+	return requirements[strings.ToLower(table)]
+}
+
+func addVirtualColumnRequirement(requirements virtualColumnRequirements, aliases []string, qualifier, name string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return
+	}
+	if qualifier != "" {
+		if fields := requirements[strings.ToLower(qualifier)]; fields != nil {
+			fields[name] = struct{}{}
+		}
+		return
+	}
+	for _, alias := range aliases {
+		requirements[alias][name] = struct{}{}
+	}
+}
+
+func collectVirtualColumnRefs(src []byte, doc *parser.QueryDoc, ref parser.NodeRef, requirements virtualColumnRequirements, aliases []string, safe *bool) {
+	if !*safe || doc == nil {
+		return
+	}
+	switch ref.Kind {
+	case parser.NodeKindIdentifier:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.Identifiers) {
+			*safe = false
+			return
+		}
+		id := &doc.Identifiers[ref.ID]
+		qualifier := sourceSpan(src, id.QualStart, id.QualEnd)
+		name := sourceSpan(src, id.Start, id.End)
+		addVirtualColumnRequirement(requirements, aliases, qualifier, name)
+	case parser.NodeKindBinaryExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.BinaryExprs) {
+			*safe = false
+			return
+		}
+		be := doc.BinaryExprs[ref.ID]
+		collectVirtualColumnRefs(src, doc, be.Left, requirements, aliases, safe)
+		collectVirtualColumnRefs(src, doc, be.Right, requirements, aliases, safe)
+	case parser.NodeKindVectorFunc:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.VectorFuncs) {
+			*safe = false
+			return
+		}
+		vf := doc.VectorFuncs[ref.ID]
+		collectVirtualColumnRefs(src, doc, vf.VectorA, requirements, aliases, safe)
+		collectVirtualColumnRefs(src, doc, vf.VectorB, requirements, aliases, safe)
+	case parser.NodeKindGraphMetric:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.GraphMetrics) {
+			*safe = false
+			return
+		}
+		collectVirtualColumnRefs(src, doc, doc.GraphMetrics[ref.ID].Operand, requirements, aliases, safe)
+	case parser.NodeKindUnaryExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.UnaryExprs) {
+			*safe = false
+			return
+		}
+		collectVirtualColumnRefs(src, doc, doc.UnaryExprs[ref.ID].Expr, requirements, aliases, safe)
+	case parser.NodeKindBetweenExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.BetweenExprs) {
+			*safe = false
+			return
+		}
+		between := doc.BetweenExprs[ref.ID]
+		collectVirtualColumnRefs(src, doc, between.Expr, requirements, aliases, safe)
+		collectVirtualColumnRefs(src, doc, between.Lower, requirements, aliases, safe)
+		collectVirtualColumnRefs(src, doc, between.Upper, requirements, aliases, safe)
+	case parser.NodeKindInExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.InExprs) {
+			*safe = false
+			return
+		}
+		in := doc.InExprs[ref.ID]
+		collectVirtualColumnRefs(src, doc, in.Expr, requirements, aliases, safe)
+		for i := int32(0); i < in.ListCount; i++ {
+			index := in.ListStart + i
+			if index < 0 || int(index) >= len(doc.Nodes) {
+				*safe = false
+				return
+			}
+			collectVirtualColumnRefs(src, doc, doc.Nodes[index], requirements, aliases, safe)
+		}
+		if in.HasSubquery {
+			// Correlated subqueries can reference an outer scope through an
+			// expression that belongs to another SELECT. Keep the conservative
+			// full-row path until that dependency is analyzed separately.
+			*safe = false
+		}
+	case parser.NodeKindCaseExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.CaseExprs) {
+			*safe = false
+			return
+		}
+		ce := doc.CaseExprs[ref.ID]
+		for i := int32(0); i < ce.WhensCount; i++ {
+			index := ce.WhensStart + i
+			if index < 0 || int(index) >= len(doc.CaseWhens) {
+				*safe = false
+				return
+			}
+			when := doc.CaseWhens[index]
+			collectVirtualColumnRefs(src, doc, when.Condition, requirements, aliases, safe)
+			collectVirtualColumnRefs(src, doc, when.Value, requirements, aliases, safe)
+		}
+		if ce.HasElse {
+			collectVirtualColumnRefs(src, doc, ce.Else, requirements, aliases, safe)
+		}
+	case parser.NodeKindFunctionExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.FunctionExprs) {
+			*safe = false
+			return
+		}
+		fn := doc.FunctionExprs[ref.ID]
+		if fn.HasWindow {
+			*safe = false
+			return
+		}
+		for i := int32(0); i < fn.ArgsCount; i++ {
+			index := fn.ArgsStart + i
+			if index < 0 || int(index) >= len(doc.FunctionArgs) {
+				*safe = false
+				return
+			}
+			collectVirtualColumnRefs(src, doc, doc.FunctionArgs[index], requirements, aliases, safe)
+		}
+	case parser.NodeKindAggregateExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.AggregateExprs) {
+			*safe = false
+			return
+		}
+		aggregate := doc.AggregateExprs[ref.ID]
+		if aggregate.HasWindow {
+			*safe = false
+			return
+		}
+		collectVirtualColumnRefs(src, doc, aggregate.Expr, requirements, aliases, safe)
+		collectVirtualColumnRefs(src, doc, aggregate.OrderExpr, requirements, aliases, safe)
+	case parser.NodeKindCastExpr:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.CastExprs) {
+			*safe = false
+			return
+		}
+		collectVirtualColumnRefs(src, doc, doc.CastExprs[ref.ID].Expr, requirements, aliases, safe)
+	case parser.NodeKindSubqueryExpr:
+		*safe = false
+	}
+}
+
+func virtualColumnRequirementsForSelect(src []byte, doc *parser.QueryDoc, stmt *parser.SelectStmt) (virtualColumnRequirements, bool) {
+	if doc == nil || stmt == nil || stmt.CTEsCount > 0 {
+		return nil, false
+	}
+	requirements := make(virtualColumnRequirements)
+	aliases := make([]string, 0, 1+len(stmt.Joins))
+	addTable := func(ref parser.NodeRef, start, end, aliasStart, aliasEnd uint32) bool {
+		if ref.Kind != parser.NodeKindUnknown && ref.Kind != parser.NodeKindTableExpr {
+			return false
+		}
+		if start >= end || end > uint32(len(src)) {
+			return false
+		}
+		table := strings.ToLower(sourceSpan(src, start, end))
+		alias := table
+		if aliasEnd > aliasStart {
+			alias = strings.ToLower(sourceSpan(src, aliasStart, aliasEnd))
+		}
+		if table == "" || alias == "" {
+			return false
+		}
+		if _, exists := requirements[alias]; !exists {
+			requirements[alias] = map[string]struct{}{"id": {}}
+			aliases = append(aliases, alias)
+		}
+		return true
+	}
+	if stmt.FromTable.Kind != parser.NodeKindTableExpr || stmt.FromTable.ID < 0 || int(stmt.FromTable.ID) >= len(doc.TableExprs) {
+		return nil, false
+	}
+	from := &doc.TableExprs[stmt.FromTable.ID]
+	if from.IsDerived || from.IsFunction || !addTable(stmt.FromTable, from.Start, from.End, from.Alias, from.AliasEnd) {
+		return nil, false
+	}
+	for i := range stmt.Joins {
+		join := &stmt.Joins[i]
+		if join.Derived.Kind == parser.NodeKindTableExpr {
+			return nil, false
+		}
+		if join.IsFunction || join.MatchPath.Kind == parser.NodeKindMatchPath {
+			continue
+		}
+		if join.TableEnd <= join.TableStart || !addTable(parser.NodeRef{Kind: parser.NodeKindTableExpr}, join.TableStart, join.TableEnd, join.Alias, join.AliasEnd) {
+			return nil, false
+		}
+	}
+	safe := true
+	for i := int32(0); i < stmt.ProjectionsCount; i++ {
+		projection := doc.Projections[stmt.ProjectionsStart+i]
+		if projection.Star {
+			return nil, false
+		}
+		collectVirtualColumnRefs(src, doc, projection.Expr, requirements, aliases, &safe)
+	}
+	collectVirtualColumnRefs(src, doc, stmt.WhereExpr, requirements, aliases, &safe)
+	collectVirtualColumnRefs(src, doc, stmt.HavingExpr, requirements, aliases, &safe)
+	collectVirtualColumnRefs(src, doc, stmt.OrderBy, requirements, aliases, &safe)
+	for _, term := range stmt.OrderTerms {
+		collectVirtualColumnRefs(src, doc, term.Expr, requirements, aliases, &safe)
+	}
+	for _, ref := range stmt.GroupBy {
+		collectVirtualColumnRefs(src, doc, ref, requirements, aliases, &safe)
+	}
+	for i := range stmt.Joins {
+		join := &stmt.Joins[i]
+		collectVirtualColumnRefs(src, doc, join.OnExpr, requirements, aliases, &safe)
+		if join.IsFunction {
+			collectVirtualColumnRefs(src, doc, join.Function, requirements, aliases, &safe)
+		}
+	}
+	if !safe {
+		return nil, false
+	}
+	return requirements, true
+}
+
+func (row virtualSQLRow) lookup(qualifier, name string) (interface{}, bool) {
+	if qualifier != "" {
+		for _, scope := range row.Scopes {
+			if !strings.EqualFold(scope.Alias, qualifier) {
+				continue
+			}
+			if value, ok := lookupVirtualMapValue(scope.Values, name); ok {
+				return value, true
+			}
+		}
+		qualified := qualifier + "." + name
+		if value, ok := lookupVirtualMapValue(row.Values, qualified); ok {
+			return value, true
+		}
+	}
+	for _, scope := range row.Scopes {
+		if value, ok := lookupVirtualMapValue(scope.Values, name); ok {
+			return value, true
+		}
+	}
+	if value, ok := lookupVirtualMapValue(row.Values, name); ok {
+		return value, true
+	}
+	return nil, false
+}
+
+func lookupVirtualMapValue(values map[string]interface{}, name string) (interface{}, bool) {
+	if values == nil {
+		return nil, false
+	}
+	if value, ok := values[name]; ok {
+		return value, true
+	}
+	for key, value := range values {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+// forEachVisibleVirtualValue enumerates the same unqualified visible fields
+// that the legacy merged map exposed. Earlier scopes win on duplicate keys,
+// matching mergeVirtualRows' previous left-side precedence.
+func (row virtualSQLRow) forEachVisibleVirtualValue(fn func(string, interface{})) {
+	if len(row.Scopes) == 0 {
+		for key, value := range row.Values {
+			fn(key, value)
+		}
+		return
+	}
+	for scopeIndex, scope := range row.Scopes {
+		for key, value := range scope.Values {
+			duplicate := false
+			for priorIndex := 0; priorIndex < scopeIndex && !duplicate; priorIndex++ {
+				_, duplicate = lookupVirtualMapValue(row.Scopes[priorIndex].Values, key)
+			}
+			if !duplicate {
+				fn(key, value)
+			}
+		}
+	}
+}
+
+func (row virtualSQLRow) visibleVirtualKeys() []string {
+	keys := make([]string, 0)
+	row.forEachVisibleVirtualValue(func(key string, _ interface{}) {
+		keys = append(keys, key)
+	})
+	return keys
+}
+
+func (row virtualSQLRow) visibleVirtualValueCount() int {
+	count := 0
+	row.forEachVisibleVirtualValue(func(string, interface{}) {
+		count++
+	})
+	return count
+}
+
+func cloneVisibleVirtualValues(row virtualSQLRow) map[string]interface{} {
+	if len(row.Scopes) == 0 {
+		return cloneMetadata(row.Values)
+	}
+	values := make(map[string]interface{})
+	row.forEachVisibleVirtualValue(func(key string, value interface{}) {
+		values[key] = value
+	})
+	return cloneMetadata(values)
+}
+
+// cloneMetadataForVirtualColumns keeps the source-row contract owned while
+// avoiding work for metadata fields that cannot be observed by a provably
+// simple SELECT. A nil requirement set means that the caller must preserve
+// the existing full-row behavior.
+func cloneMetadataForVirtualColumns(metadata map[string]interface{}, required map[string]struct{}) map[string]interface{} {
+	if required == nil {
+		return cloneMetadata(metadata)
+	}
+	values := make(map[string]interface{}, len(required))
+	for key, value := range metadata {
+		if _, ok := required[strings.ToLower(key)]; !ok {
+			continue
+		}
+		values[key] = cloneMetadataValue(value)
+	}
+	return values
 }
 
 type virtualCTEEnv map[string][]virtualSQLRow
 
 type virtualCTEContextKey struct{}
+
+type sqlJSONRuntimeContextKey struct{}
+
+var sqlJSONDecoderPool = sync.Pool{
+	New: func() interface{} {
+		decoder, err := apexjson.NewDecoder()
+		if err != nil {
+			return nil
+		}
+		return decoder
+	},
+}
+
+var sqlJSONEmptyDocument = []byte("null")
+
+type sqlJSONRuntime struct {
+	decoders []*apexjson.Decoder
+}
+
+func withSQLJSONRuntime(ctx context.Context) (context.Context, *sqlJSONRuntime) {
+	runtime := &sqlJSONRuntime{}
+	return context.WithValue(ctx, sqlJSONRuntimeContextKey{}, runtime), runtime
+}
+
+func sqlJSONRuntimeFromContext(ctx context.Context) *sqlJSONRuntime {
+	if ctx == nil {
+		return nil
+	}
+	runtime, _ := ctx.Value(sqlJSONRuntimeContextKey{}).(*sqlJSONRuntime)
+	return runtime
+}
+
+func (runtime *sqlJSONRuntime) parse(raw []byte) (sqlLazyJSONValue, bool) {
+	if runtime == nil {
+		return lazyJSONDocument(raw)
+	}
+	var decoder *apexjson.Decoder
+	if pooled := sqlJSONDecoderPool.Get(); pooled != nil {
+		decoder, _ = pooled.(*apexjson.Decoder)
+	}
+	if decoder == nil {
+		var err error
+		decoder, err = apexjson.NewDecoder()
+		if err != nil {
+			return sqlLazyJSONValue{}, false
+		}
+	}
+	if err := decoder.Parse(raw); err != nil {
+		decoder.Free()
+		return sqlLazyJSONValue{}, false
+	}
+	root := decoder.Root()
+	runtime.decoders = append(runtime.decoders, decoder)
+	return sqlLazyJSONValue{raw: raw, decoder: decoder, value: root}, true
+}
+
+func (runtime *sqlJSONRuntime) Free() {
+	if runtime == nil {
+		return
+	}
+	for _, decoder := range runtime.decoders {
+		if decoder != nil {
+			if err := decoder.Parse(sqlJSONEmptyDocument); err == nil {
+				sqlJSONDecoderPool.Put(decoder)
+			} else {
+				decoder.Free()
+			}
+		}
+	}
+	runtime.decoders = nil
+}
 
 type virtualCTEState struct {
 	env    virtualCTEEnv
@@ -88,6 +528,8 @@ func selectHasDerivedRelation(doc *parser.QueryDoc, stmt *parser.SelectStmt) boo
 }
 
 func (db *Database) executeGenericCTE(ctx context.Context, src []byte, doc *parser.QueryDoc, params *optimizer.ParameterSet, legacy QueryParams, config *SessionConfig) (*SearchResults, error) {
+	ctx, jsonRuntime := withSQLJSONRuntime(ctx)
+	defer jsonRuntime.Free()
 	root := rootSelectIndex(doc)
 	if root < 0 || root >= len(doc.SelectStmts) {
 		return nil, fmt.Errorf("generic CTE has no outer SELECT")
@@ -202,23 +644,18 @@ func (db *Database) evaluateRecursiveCTE(ctx context.Context, src []byte, doc *p
 }
 
 func virtualRowKey(row virtualSQLRow) string {
-	keys := make([]string, 0, len(row.Values))
-	for key := range row.Values {
-		if strings.Contains(key, ".") {
-			continue
-		}
-		keys = append(keys, key)
-	}
+	keys := row.visibleVirtualKeys()
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, key := range keys {
-		value := fmt.Sprintf("%T:%v", row.Values[key], row.Values[key])
+		value, _ := row.lookup("", key)
+		valueText := fmt.Sprintf("%T:%v", value, value)
 		b.WriteString(strconv.Itoa(len(key)))
 		b.WriteByte(':')
 		b.WriteString(key)
-		b.WriteString(strconv.Itoa(len(value)))
+		b.WriteString(strconv.Itoa(len(valueText)))
 		b.WriteByte(':')
-		b.WriteString(value)
+		b.WriteString(valueText)
 		b.WriteByte('|')
 	}
 	return b.String()
@@ -229,6 +666,8 @@ func virtualRowKey(row virtualSQLRow) string {
 // this keeps the current outer row in scope, so correlated IN/EXISTS and
 // scalar subqueries use the same AST without rewriting SQL text.
 func (db *Database) executeSubquerySelect(ctx context.Context, src []byte, doc *parser.QueryDoc, params *optimizer.ParameterSet, legacy QueryParams) (*SearchResults, error) {
+	ctx, jsonRuntime := withSQLJSONRuntime(ctx)
+	defer jsonRuntime.Free()
 	root := rootSelectIndex(doc)
 	if root < 0 || root >= len(doc.SelectStmts) {
 		return nil, fmt.Errorf("subquery query has no outer SELECT")
@@ -246,13 +685,21 @@ func (db *Database) executeSubquerySelect(ctx context.Context, src []byte, doc *
 
 func firstVirtualValue(row virtualSQLRow, columns []string) (interface{}, bool) {
 	if len(columns) > 0 {
-		value, ok := row.Values[columns[0]]
+		value, ok := row.lookup("", columns[0])
 		if ok {
 			return value, true
 		}
 	}
-	for _, value := range row.Values {
-		return value, true
+	var first interface{}
+	found := false
+	row.forEachVisibleVirtualValue(func(_ string, value interface{}) {
+		if !found {
+			first = value
+			found = true
+		}
+	})
+	if found {
+		return first, true
 	}
 	return nil, false
 }
@@ -265,6 +712,9 @@ func firstVirtualValue(row virtualSQLRow, columns []string) (interface{}, bool) 
 func (db *Database) evaluateVirtualSelectRows(ctx context.Context, src []byte, doc *parser.QueryDoc, stmt *parser.SelectStmt, outer *virtualSQLRow, params *optimizer.ParameterSet, legacy QueryParams) ([]virtualSQLRow, []string, error) {
 	if stmt == nil {
 		return nil, nil, fmt.Errorf("nil virtual SELECT")
+	}
+	if requirements, ok := virtualColumnRequirementsForSelect(src, doc, stmt); ok {
+		ctx = withVirtualColumnRequirements(ctx, requirements)
 	}
 
 	rows, usedIndex, err := db.virtualIndexedSourceRows(ctx, src, doc, stmt, outer, params, legacy)
@@ -379,6 +829,11 @@ func (db *Database) virtualIndexedSourceRows(ctx context.Context, src []byte, do
 	if err != nil {
 		return nil, false, err
 	}
+	alias := sourceSpan(src, t.Alias, t.AliasEnd)
+	if alias == "" {
+		alias = table
+	}
+	required := virtualRequiredColumns(ctx, alias, table)
 	if column, operator, valueRef, ok := virtualJSONContainmentPredicate(src, doc, stmt.WhereExpr); ok {
 		value, valueOK, err := db.virtualExprValue(ctx, src, doc, valueRef, virtualSQLRow{}, params, legacy)
 		if err != nil {
@@ -391,13 +846,9 @@ func (db *Database) virtualIndexedSourceRows(ctx context.Context, src []byte, do
 		if err != nil || !used {
 			return nil, used, err
 		}
-		alias := sourceSpan(src, t.Alias, t.AliasEnd)
-		if alias == "" {
-			alias = table
-		}
 		rows := make([]virtualSQLRow, 0, len(records))
 		for _, record := range records {
-			values := cloneMetadata(record.Metadata)
+			values := cloneMetadataForVirtualColumns(record.Metadata, required)
 			if values == nil {
 				values = make(map[string]interface{})
 			}
@@ -429,13 +880,9 @@ func (db *Database) virtualIndexedSourceRows(ctx context.Context, src []byte, do
 	if err != nil || !used {
 		return nil, used, err
 	}
-	alias := sourceSpan(src, t.Alias, t.AliasEnd)
-	if alias == "" {
-		alias = table
-	}
 	rows := make([]virtualSQLRow, 0, len(records))
 	for _, record := range records {
-		values := cloneMetadata(record.Metadata)
+		values := cloneMetadataForVirtualColumns(record.Metadata, required)
 		if values == nil {
 			values = make(map[string]interface{})
 		}
@@ -467,7 +914,7 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 	if ref.Kind == parser.NodeKindUnknown {
 		values := make(map[string]interface{})
 		if outer != nil {
-			values = cloneMetadata(outer.Values)
+			values = cloneVisibleVirtualValues(*outer)
 		}
 		return []virtualSQLRow{{Values: values}}, nil
 	}
@@ -565,7 +1012,7 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 			}
 			rows := make([]virtualSQLRow, 0, len(cteRows))
 			for _, cteRow := range cteRows {
-				row := virtualSQLRow{ID: cteRow.ID, Values: cloneMetadata(cteRow.Values)}
+				row := virtualSQLRow{ID: cteRow.ID, Values: cloneVisibleVirtualValues(cteRow)}
 				qualifyVirtualRow(&row, alias)
 				if outer != nil {
 					row = overlayVirtualRow(*outer, row)
@@ -593,9 +1040,10 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 	if alias == "" {
 		alias = table
 	}
+	required := virtualRequiredColumns(ctx, alias, table)
 	rows := make([]virtualSQLRow, 0, len(records))
 	for _, record := range records {
-		values := cloneMetadata(record.Metadata)
+		values := cloneMetadataForVirtualColumns(record.Metadata, required)
 		if values == nil {
 			values = make(map[string]interface{})
 		}
@@ -640,9 +1088,10 @@ func (db *Database) virtualTemporalSourceRows(ctx context.Context, src []byte, t
 	if alias == "" {
 		alias = sourceSpan(src, table.Start, table.End)
 	}
+	required := virtualRequiredColumns(ctx, alias, sourceSpan(src, table.Start, table.End))
 	rows := make([]virtualSQLRow, 0)
 	err = col.ListVisibleAtLSN(ctx, snapshot.LSN, func(record *Record) bool {
-		values := cloneMetadata(record.Metadata)
+		values := cloneMetadataForVirtualColumns(record.Metadata, required)
 		if values == nil {
 			values = make(map[string]interface{})
 		}
@@ -759,7 +1208,7 @@ func (db *Database) virtualGraphJoinRows(ctx context.Context, src []byte, doc *p
 	anchorAlias := virtualMatchAnchor(src, doc, matchPath)
 	anchorRecordID := left.ID
 	if anchorAlias != "" {
-		if value, ok := left.Values[anchorAlias+".id"]; ok && value != nil {
+		if value, ok := left.lookup(anchorAlias, "id"); ok && value != nil {
 			anchorRecordID = recordMetaToString(value)
 		}
 	}
@@ -904,53 +1353,54 @@ func qualifyVirtualRow(row *virtualSQLRow, alias string) {
 	if row == nil || alias == "" {
 		return
 	}
-	for key, value := range row.Values {
-		if strings.Contains(key, ".") {
-			continue
-		}
-		row.Values[alias+"."+key] = value
+	if len(row.Scopes) > 0 {
+		values := make(map[string]interface{})
+		row.forEachVisibleVirtualValue(func(key string, value interface{}) {
+			values[key] = value
+		})
+		row.Values = values
+		row.Scopes = nil
 	}
+	row.Scopes = []virtualSQLScope{{Alias: alias, Values: row.Values}}
 }
 
 func mergeVirtualRows(left, right virtualSQLRow) virtualSQLRow {
-	values := cloneMetadata(left.Values)
-	if values == nil {
-		values = make(map[string]interface{})
-	}
-	for key, value := range right.Values {
-		if _, exists := values[key]; !exists {
-			values[key] = value
-		}
-	}
+	leftScopes := virtualRowScopes(left)
+	rightScopes := virtualRowScopes(right)
+	scopes := make([]virtualSQLScope, 0, len(leftScopes)+len(rightScopes))
+	scopes = append(scopes, leftScopes...)
+	scopes = append(scopes, rightScopes...)
 	id := left.ID
 	if id == "" {
 		id = right.ID
 	}
-	return virtualSQLRow{ID: id, Values: values}
+	return virtualSQLRow{ID: id, Scopes: scopes}
+}
+
+func virtualRowScopes(row virtualSQLRow) []virtualSQLScope {
+	if len(row.Scopes) > 0 {
+		return row.Scopes
+	}
+	if row.Values == nil {
+		return nil
+	}
+	return []virtualSQLScope{{Values: row.Values}}
 }
 
 // overlayVirtualRow adds an inner/subquery row to an outer scope. Unqualified
 // names must resolve to the innermost relation, while qualified outer names
 // remain available for correlated predicates such as d.author_id = a.id.
 func overlayVirtualRow(outer, inner virtualSQLRow) virtualSQLRow {
-	values := cloneMetadata(outer.Values)
-	if values == nil {
-		values = make(map[string]interface{})
-	}
-	for key, value := range inner.Values {
-		if !strings.Contains(key, ".") {
-			values[key] = value
-			continue
-		}
-		if _, exists := values[key]; !exists {
-			values[key] = value
-		}
-	}
+	innerScopes := virtualRowScopes(inner)
+	outerScopes := virtualRowScopes(outer)
+	scopes := make([]virtualSQLScope, 0, len(innerScopes)+len(outerScopes))
+	scopes = append(scopes, innerScopes...)
+	scopes = append(scopes, outerScopes...)
 	id := inner.ID
 	if id == "" {
 		id = outer.ID
 	}
-	return virtualSQLRow{ID: id, Values: values}
+	return virtualSQLRow{ID: id, Scopes: scopes}
 }
 
 func (db *Database) projectVirtualRows(ctx context.Context, src []byte, doc *parser.QueryDoc, stmt *parser.SelectStmt, rows []virtualSQLRow, params *optimizer.ParameterSet, legacy QueryParams) ([]virtualSQLRow, []string, error) {
@@ -984,11 +1434,9 @@ func (db *Database) projectVirtualRows(ctx context.Context, src []byte, doc *par
 		projection := &doc.Projections[stmt.ProjectionsStart+j]
 		if projection.Star {
 			if len(rows) > 0 {
-				for key := range rows[0].Values {
-					if !strings.Contains(key, ".") {
-						columns = append(columns, key)
-					}
-				}
+				rows[0].forEachVisibleVirtualValue(func(key string, _ interface{}) {
+					columns = append(columns, key)
+				})
 				sort.Strings(columns)
 			}
 			continue
@@ -1030,11 +1478,9 @@ func (db *Database) projectVirtualRows(ctx context.Context, src []byte, doc *par
 		for j := int32(0); j < stmt.ProjectionsCount; j++ {
 			projection := &doc.Projections[stmt.ProjectionsStart+j]
 			if projection.Star {
-				for key, value := range row.Values {
-					if !strings.Contains(key, ".") {
-						values[key] = value
-					}
-				}
+				row.forEachVisibleVirtualValue(func(key string, value interface{}) {
+					values[key] = value
+				})
 				continue
 			}
 			name := columns[j]
@@ -1625,7 +2071,7 @@ func (db *Database) projectVirtualGroupedAggregateRows(ctx context.Context, src 
 			continue
 		}
 		representative := group.rows[0]
-		havingRow := virtualSQLRow{ID: representative.ID, Values: cloneMetadata(representative.Values)}
+		havingRow := virtualSQLRow{ID: representative.ID, Values: cloneVisibleVirtualValues(representative)}
 		if havingRow.Values == nil {
 			havingRow.Values = make(map[string]interface{})
 		}
@@ -2412,21 +2858,31 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 		typeName = strings.ToLower(strings.TrimSpace(typeName))
 		switch typeName {
 		case "json", "jsonb":
+			if raw, rawOK := jsonCastSourceRaw(value); rawOK {
+				lazy, valid := sqlJSONRuntimeFromContext(ctx).parse(raw)
+				if !valid {
+					return nil, false, fmt.Errorf("cannot cast value to %s: invalid JSON", typeName)
+				}
+				return lazy, true, nil
+			}
 			decoded, valid := decodeJSONValue(value)
 			if !valid {
 				return nil, false, fmt.Errorf("cannot cast value to %s: invalid JSON", typeName)
 			}
 			return decoded, true, nil
 		case "text", "varchar", "character varying", "char", "string":
+			if raw, rawOK := jsonDocumentRaw(value); rawOK {
+				return string(raw), true, nil
+			}
 			if object, isObject := value.(map[string]interface{}); isObject {
-				encoded, err := json.Marshal(object)
+				encoded, err := apexjson.Marshal(object)
 				if err != nil {
 					return nil, false, err
 				}
 				return string(encoded), true, nil
 			}
 			if array, isArray := value.([]interface{}); isArray {
-				encoded, err := json.Marshal(array)
+				encoded, err := apexjson.Marshal(array)
 				if err != nil {
 					return nil, false, err
 				}
@@ -2563,11 +3019,11 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 		if ref.ID < 0 || int(ref.ID) >= len(doc.AggregateExprs) {
 			return nil, false, fmt.Errorf("invalid aggregate expression reference")
 		}
-		if value, ok := row.Values[virtualAggregateExprKey(ref.ID)]; ok {
+		if value, ok := row.lookup("", virtualAggregateExprKey(ref.ID)); ok {
 			return value, true, nil
 		}
 		name := aggregateColumnName(uint8(doc.AggregateExprs[ref.ID].Func))
-		value, ok := row.Values[name]
+		value, ok := row.lookup("", name)
 		return value, ok, nil
 	}
 	return nil, false, nil
@@ -2592,10 +3048,7 @@ func virtualScalarInterface(value optimizer.ScalarValue) interface{} {
 	case optimizer.ScalarString, optimizer.ScalarBytes:
 		return string(value.BytesData)
 	case optimizer.ScalarJSON:
-		if decoded, ok := decodeJSONValue(value.BytesData); ok {
-			return decoded
-		}
-		return string(value.BytesData)
+		return sqlLazyJSONValue{raw: value.BytesData}
 	case optimizer.ScalarInt:
 		return value.Int
 	case optimizer.ScalarFloat:
@@ -2858,7 +3311,7 @@ func executeVirtualCTEJoin(ctx context.Context, db *Database, src []byte, doc *p
 			continue
 		}
 		for _, right := range cteRows {
-			rightValue, rightOK := right.Values[rightColumn]
+			rightValue, rightOK := right.lookup("", rightColumn)
 			if !rightOK || !sqlValueEqual(leftValue, rightValue) {
 				continue
 			}
@@ -2867,13 +3320,13 @@ func executeVirtualCTEJoin(ctx context.Context, db *Database, src []byte, doc *p
 				values = make(map[string]interface{})
 			}
 			values["id"] = record.ID
-			for key, value := range right.Values {
+			right.forEachVisibleVirtualValue(func(key string, value interface{}) {
 				// Keep unqualified names usable for the common `SELECT c.id`
 				// shape. Qualified lookup remains driven by the AST offsets.
 				if _, exists := values[key]; !exists {
 					values[key] = value
 				}
-			}
+			})
 			row := virtualSQLRow{ID: record.ID, Values: values}
 			if stmt.WhereExpr.Kind != parser.NodeKindUnknown && !evalVirtualExpr(doc, src, stmt.WhereExpr, row, leftAlias, rightAlias, nil) {
 				continue
@@ -2945,9 +3398,9 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 		if projection.Star {
 			hasStar = true
 			if len(rows) > 0 {
-				for key := range rows[0].Values {
+				rows[0].forEachVisibleVirtualValue(func(key string, _ interface{}) {
 					columns = append(columns, key)
-				}
+				})
 				sort.Strings(columns)
 			}
 			continue
@@ -2969,7 +3422,10 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 	// directly avoids one map allocation and one key copy per row.
 	if hasStar && stmt.ProjectionsCount == 1 {
 		for i := range rows {
-			if rows[i].Values == nil {
+			if len(rows[i].Scopes) > 0 {
+				rows[i].Values = cloneVisibleVirtualValues(rows[i])
+				rows[i].Scopes = nil
+			} else if rows[i].Values == nil {
 				rows[i].Values = make(map[string]interface{})
 			}
 		}
@@ -2979,15 +3435,15 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 	for i := range rows {
 		valueCapacity := nonStarProjections
 		if hasStar {
-			valueCapacity += len(rows[i].Values)
+			valueCapacity += rows[i].visibleVirtualValueCount()
 		}
 		values := make(map[string]interface{}, valueCapacity)
 		for j := int32(0); j < stmt.ProjectionsCount; j++ {
 			projection := &doc.Projections[stmt.ProjectionsStart+j]
 			if projection.Star {
-				for key, value := range rows[i].Values {
+				rows[i].forEachVisibleVirtualValue(func(key string, value interface{}) {
 					values[key] = value
-				}
+				})
 				continue
 			}
 			id := &doc.Identifiers[projection.Expr.ID]
@@ -3001,28 +3457,14 @@ func projectRows(doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows
 }
 
 func virtualIdentifierValue(src []byte, id *parser.Identifier, row virtualSQLRow) (interface{}, bool) {
-	if id.QualEnd > id.QualStart {
-		qualified := sourceSpan(src, id.QualStart, id.QualEnd) + "." + sourceSpan(src, id.Start, id.End)
-		if value, ok := row.Values[qualified]; ok {
-			return value, true
-		}
-		for key, value := range row.Values {
-			if strings.EqualFold(key, qualified) {
-				return value, true
-			}
-		}
-	}
 	name := sourceSpan(src, id.Start, id.End)
-	value, ok := row.Values[name]
-	if ok {
-		return value, true
-	}
-	for key, value := range row.Values {
-		if strings.EqualFold(key, name) {
+	if id.QualEnd > id.QualStart {
+		qualifier := sourceSpan(src, id.QualStart, id.QualEnd)
+		if value, ok := row.lookup(qualifier, name); ok {
 			return value, true
 		}
 	}
-	return nil, false
+	return row.lookup("", name)
 }
 
 func virtualLikeMatch(value, pattern string, insensitive bool) bool {
@@ -3113,7 +3555,23 @@ func (db *Database) applyVirtualSelectClauses(ctx context.Context, src []byte, d
 
 func finishVirtualRows(db *Database, doc *parser.QueryDoc, src []byte, stmt *parser.SelectStmt, rows []virtualSQLRow, columns []string, params *optimizer.ParameterSet) *SearchResults {
 	out := &SearchResults{Columns: columns, ColumnTypes: virtualProjectionTypes(db, doc, src, stmt, columns), Results: make([]*SearchResult, 0, len(rows))}
-	for _, row := range rows {
+	for i := range rows {
+		row := &rows[i]
+		if len(row.Scopes) > 0 {
+			// Joined scopes may share nested values internally. Materialize an
+			// owned public map exactly once at the SQL result boundary.
+			row.Values = cloneVisibleVirtualValues(*row)
+			row.Scopes = nil
+		}
+		if row.Values == nil {
+			row.Values = make(map[string]interface{})
+		}
+		for key, value := range row.Values {
+			switch value.(type) {
+			case sqlLazyJSONValue, apexjson.RawMessage:
+				row.Values[key] = materializeSQLJSONValue(value)
+			}
+		}
 		out.Results = append(out.Results, &SearchResult{ID: row.ID, Score: 1, Metadata: row.Values})
 	}
 	if stmt.Distinct {

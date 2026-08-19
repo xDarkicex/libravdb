@@ -1,9 +1,9 @@
 package optimizer
 
 import (
-	"encoding/json"
 	"testing"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 )
 
@@ -51,7 +51,7 @@ func TestScalarFromInterfacePreservesJSONAndVectors(t *testing.T) {
 		t.Fatalf("JSON parameter kind = %v, want ScalarJSON", jsonValue.Kind)
 	}
 	var decoded map[string]interface{}
-	if err := json.Unmarshal(jsonValue.Bytes(), &decoded); err != nil {
+	if err := apexjson.Unmarshal(jsonValue.Bytes(), &decoded); err != nil {
 		t.Fatalf("JSON parameter bytes are invalid: %v", err)
 	}
 	if decoded["name"] != "Ada" {

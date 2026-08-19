@@ -9,7 +9,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/zephyr-systems/libravdbd/embed"
 )
 
@@ -170,18 +170,20 @@ func embedDocuments(ctx context.Context, engine *embed.Engine, documents []strin
 }
 
 func loadTexts(path string, vectorCount, queryCount, maxChars int) ([]string, []string, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer f.Close()
-
-	decoder := json.NewDecoder(f)
-	token, err := decoder.Token()
+	decoder, err := apexjson.NewDecoder()
 	if err != nil {
 		return nil, nil, err
 	}
-	if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+	defer decoder.Free()
+	if err := decoder.Parse(data); err != nil {
+		return nil, nil, err
+	}
+	root := decoder.Root()
+	if root.Type() != apexjson.TypeArray {
 		return nil, nil, fmt.Errorf("corpus root is not an array")
 	}
 
@@ -189,12 +191,10 @@ func loadTexts(path string, vectorCount, queryCount, maxChars int) ([]string, []
 	queries := make([]string, 0, queryCount)
 	seenDocuments := make(map[string]struct{}, vectorCount)
 	seenQueries := make(map[string]struct{}, queryCount)
-	for decoder.More() {
-		var record item
-		if err := decoder.Decode(&record); err != nil {
-			return nil, nil, err
-		}
-		query := strings.TrimSpace(record.Question)
+	items := root.ArrayIter()
+	for items.Next() {
+		record := items.Value()
+		query := strings.TrimSpace(objectText(record, "question"))
 		if query != "" && len(queries) < queryCount {
 			if _, exists := seenQueries[query]; !exists {
 				seenQueries[query] = struct{}{}
@@ -204,9 +204,14 @@ func loadTexts(path string, vectorCount, queryCount, maxChars int) ([]string, []
 		if len(documents) >= vectorCount {
 			continue
 		}
-		for _, session := range record.HaystackSessions {
-			for _, msg := range session {
-				text := strings.TrimSpace(msg.Content)
+		sessions := objectField(record, "haystack_sessions")
+		sessionIter := sessions.ArrayIter()
+		for sessionIter.Next() {
+			messages := sessionIter.Value()
+			messageIter := messages.ArrayIter()
+			for messageIter.Next() {
+				msg := messageIter.Value()
+				text := strings.TrimSpace(objectText(msg, "content"))
 				if text == "" {
 					continue
 				}
@@ -233,6 +238,24 @@ func loadTexts(path string, vectorCount, queryCount, maxChars int) ([]string, []
 		return nil, nil, fmt.Errorf("corpus yielded documents=%d/%d queries=%d/%d", len(documents), vectorCount, len(queries), queryCount)
 	}
 	return documents, queries, nil
+}
+
+func objectField(value apexjson.Value, name string) apexjson.Value {
+	it := value.ObjectIter()
+	for it.Next() {
+		if it.Key() == name {
+			return it.Value()
+		}
+	}
+	return apexjson.Value{}
+}
+
+func objectText(value apexjson.Value, name string) string {
+	field := objectField(value, name)
+	if field.Type() != apexjson.TypeString {
+		return ""
+	}
+	return field.Str()
 }
 
 func writeVector(w io.Writer, vector []float32) error {

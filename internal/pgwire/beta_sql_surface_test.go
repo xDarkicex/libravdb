@@ -3,12 +3,12 @@ package pgwire
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"net"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/libravdb"
 )
 
@@ -50,7 +50,7 @@ func TestBetaSQLSurfaceThroughPgx(t *testing.T) {
 	var completed bool
 	var priority int
 	var dueAt time.Time
-	var tags json.RawMessage
+	var tags apexjson.RawMessage
 	if err := sqlDB.QueryRowContext(ctx, "SELECT id, title, completed, priority, due_at, tags FROM todos").Scan(&id, &title, &completed, &priority, &dueAt, &tags); err != nil {
 		t.Fatalf("SELECT * scan: %v", err)
 	}
