@@ -384,8 +384,8 @@ func (e *Executor) hybridGraphSeeds(ctx context.Context, col *Collection, plan *
 
 	// A labeled first vertex is a declarative MATCH constraint, so it takes
 	// precedence over the optional vector anchor used for unlabeled patterns.
-	if plan.SeedLabel != "" {
-		return col.GetGraph().GetLabelNodes(plan.SeedLabel), nil
+	if plan.SeedLabel != "" || len(plan.SeedLabels) > 0 {
+		return graphSeedNodeIDs(col.GetGraph(), plan), nil
 	}
 
 	if plan.HasVectorAnchor {
@@ -1187,12 +1187,12 @@ func (e *Executor) hybridGraphSeedsEpoch(ctx context.Context, col *Collection, p
 		return nil, err
 	}
 	for _, rec := range records {
-		if plan.SeedLabel != "" {
+		if plan.SeedLabel != "" || len(plan.SeedLabels) > 0 {
 			g := col.GetGraph()
 			if g == nil {
 				continue
 			}
-			labelNodes := g.GetLabelNodes(plan.SeedLabel)
+			labelNodes := graphSeedNodeIDs(g, plan)
 			found := false
 			for _, ln := range labelNodes {
 				_, rid, rerr := e.resolveNodeIDInContext(ctx, ln)

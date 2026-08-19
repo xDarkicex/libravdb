@@ -102,6 +102,9 @@ func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, s
 	if results, handled, err := db.executeSQLStatsQuery(ctx, src, doc); handled {
 		return results, err
 	}
+	if len(doc.MergeStmts) > 0 {
+		return db.executeSQLMerge(ctx, src, doc, boundParams, legacyParams)
+	}
 
 	// 3. Bind OIDs (Modifies doc in place)
 	db.mu.RLock()

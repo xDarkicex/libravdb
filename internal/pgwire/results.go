@@ -764,6 +764,11 @@ func metadataValueToString(v interface{}) string {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
+	case libravdb.GraphPath:
+		if encoded, err := apexjson.Marshal(t); err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprintf("%v", t)
 	default:
 		return fmt.Sprintf("%v", t)
 	}

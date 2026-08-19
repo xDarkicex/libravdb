@@ -93,6 +93,32 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 
 	for i := 0; i < len(doc.GraphTables); i++ {
 		gt := &doc.GraphTables[i]
+		if gt.TableStart == gt.TableEnd {
+			// Native Cypher MATCH has no SQL relation name. Its vertex
+			// aliases are graph-scoped qualifiers resolved against the
+			// collection selected by the executor at runtime.
+			if gt.MatchPath.Kind == parser.NodeKindMatchPath && gt.MatchPath.ID >= 0 && int(gt.MatchPath.ID) < len(doc.MatchPaths) {
+				mp := &doc.MatchPaths[gt.MatchPath.ID]
+				for n := int32(0); n < mp.PathNodesCount; n++ {
+					ref := doc.Nodes[mp.PathNodesStart+n]
+					if ref.Kind == parser.NodeKindEdge {
+						if edge := &doc.Edges[ref.ID]; edge.AliasEnd > edge.Alias {
+							virtualQualifiers[hashIdentifier(b.src, edge.Alias, edge.AliasEnd)] = struct{}{}
+						}
+						bindMatchEdgePredicate(doc, ref)
+						continue
+					}
+					if ref.Kind == parser.NodeKindVertex {
+						vertex := &doc.Vertexes[ref.ID]
+						if vertex.AliasEnd > vertex.Alias {
+							virtualQualifiers[hashIdentifier(b.src, vertex.Alias, vertex.AliasEnd)] = struct{}{}
+						}
+						bindMatchVertexPredicate(doc, ref)
+					}
+				}
+			}
+			continue
+		}
 		hash := hashIdentifier(b.src, gt.TableStart, gt.TableEnd)
 		def, err := b.catalog.GetTable(hash)
 		if err != nil {
@@ -131,6 +157,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 		for j := range stmt.Joins {
 			jc := &stmt.Joins[j]
 			if jc.IsFunction || jc.MatchPath.Kind == parser.NodeKindMatchPath || jc.Derived.Kind == parser.NodeKindTableExpr || jc.TableEnd <= jc.TableStart {
+				if jc.MatchPath.Kind == parser.NodeKindMatchPath && jc.MatchPath.ID >= 0 && int(jc.MatchPath.ID) < len(doc.MatchPaths) {
+					path := &doc.MatchPaths[jc.MatchPath.ID]
+					if path.PathAliasEnd > path.PathAlias {
+						virtualQualifiers[hashIdentifier(b.src, path.PathAlias, path.PathAliasEnd)] = struct{}{}
+					}
+				}
 				if jc.IsFunction && jc.AliasEnd > jc.Alias {
 					virtualQualifiers[hashIdentifier(b.src, jc.Alias, jc.AliasEnd)] = struct{}{}
 				}
@@ -229,6 +261,7 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 				if vertex.AliasEnd > vertex.Alias {
 					aliasScope[hashIdentifier(b.src, vertex.Alias, vertex.AliasEnd)] = anchorDef
 				}
+				bindMatchVertexPredicate(doc, ref)
 			}
 		}
 	}
@@ -382,6 +415,12 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 	for i := range doc.SelectStmts {
 		for j := range doc.SelectStmts[i].Joins {
 			join := &doc.SelectStmts[i].Joins[j]
+			if join.MatchPath.Kind == parser.NodeKindMatchPath && join.MatchPath.ID >= 0 && int(join.MatchPath.ID) < len(doc.MatchPaths) {
+				path := &doc.MatchPaths[join.MatchPath.ID]
+				if path.PathAliasEnd > path.PathAlias {
+					aliasSet[hashIdentifier(b.src, path.PathAlias, path.PathAliasEnd)] = struct{}{}
+				}
+			}
 			if join.IsFunction && join.AliasEnd > join.Alias {
 				aliasSet[hashIdentifier(b.src, join.Alias, join.AliasEnd)] = struct{}{}
 				if join.Function.Kind == parser.NodeKindFunctionExpr && join.Function.ID >= 0 && int(join.Function.ID) < len(doc.FunctionExprs) {
@@ -392,6 +431,59 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 						aliasSet[hashIdentifier([]byte("value"), 0, 5)] = struct{}{}
 					}
 				}
+			}
+		}
+	}
+	for _, graphTable := range doc.GraphTables {
+		if graphTable.MatchPath.Kind != parser.NodeKindMatchPath || graphTable.MatchPath.ID < 0 || int(graphTable.MatchPath.ID) >= len(doc.MatchPaths) {
+			continue
+		}
+		path := &doc.MatchPaths[graphTable.MatchPath.ID]
+		if path.PathAliasEnd > path.PathAlias {
+			aliasSet[hashIdentifier(b.src, path.PathAlias, path.PathAliasEnd)] = struct{}{}
+		}
+	}
+	for _, pattern := range doc.PatternComprehensions {
+		if pattern.MatchPath.Kind != parser.NodeKindMatchPath || pattern.MatchPath.ID < 0 || int(pattern.MatchPath.ID) >= len(doc.MatchPaths) {
+			continue
+		}
+		path := &doc.MatchPaths[pattern.MatchPath.ID]
+		for n := int32(0); n < path.PathNodesCount; n++ {
+			ref := doc.Nodes[path.PathNodesStart+n]
+			if ref.Kind == parser.NodeKindEdge {
+				edge := &doc.Edges[ref.ID]
+				if edge.AliasEnd > edge.Alias {
+					virtualQualifiers[hashIdentifier(b.src, edge.Alias, edge.AliasEnd)] = struct{}{}
+				}
+				bindMatchEdgePredicate(doc, ref)
+			} else if ref.Kind == parser.NodeKindVertex {
+				vertex := &doc.Vertexes[ref.ID]
+				if vertex.AliasEnd > vertex.Alias {
+					virtualQualifiers[hashIdentifier(b.src, vertex.Alias, vertex.AliasEnd)] = struct{}{}
+				}
+				bindMatchVertexPredicate(doc, ref)
+			}
+		}
+	}
+	for _, shortest := range doc.ShortestPaths {
+		if shortest.MatchPath.Kind != parser.NodeKindMatchPath || shortest.MatchPath.ID < 0 || int(shortest.MatchPath.ID) >= len(doc.MatchPaths) {
+			continue
+		}
+		path := &doc.MatchPaths[shortest.MatchPath.ID]
+		for n := int32(0); n < path.PathNodesCount; n++ {
+			ref := doc.Nodes[path.PathNodesStart+n]
+			if ref.Kind == parser.NodeKindEdge {
+				edge := &doc.Edges[ref.ID]
+				if edge.AliasEnd > edge.Alias {
+					virtualQualifiers[hashIdentifier(b.src, edge.Alias, edge.AliasEnd)] = struct{}{}
+				}
+				bindMatchEdgePredicate(doc, ref)
+			} else if ref.Kind == parser.NodeKindVertex {
+				vertex := &doc.Vertexes[ref.ID]
+				if vertex.AliasEnd > vertex.Alias {
+					virtualQualifiers[hashIdentifier(b.src, vertex.Alias, vertex.AliasEnd)] = struct{}{}
+				}
+				bindMatchVertexPredicate(doc, ref)
 			}
 		}
 	}
@@ -628,6 +720,34 @@ func bindMatchEdgePredicate(doc *parser.QueryDoc, edgeRef parser.NodeRef) {
 		}
 	}
 	bind(edge.Predicate)
+}
+
+// bindMatchVertexPredicate reserves identifiers used by an inline vertex
+// property map such as (n:Entity {uuid: $uuid}). These properties are graph
+// predicates rather than catalog expressions, so they are not reached by the
+// ordinary SELECT/WHERE binder walk. Marking the comparison operand resolved
+// lets the graph optimizer lower it against the record represented by n.
+func bindMatchVertexPredicate(doc *parser.QueryDoc, vertexRef parser.NodeRef) {
+	if vertexRef.Kind != parser.NodeKindVertex || vertexRef.ID < 0 || int(vertexRef.ID) >= len(doc.Vertexes) {
+		return
+	}
+	vertex := &doc.Vertexes[vertexRef.ID]
+	var bind func(parser.NodeRef)
+	bind = func(ref parser.NodeRef) {
+		if ref.Kind != parser.NodeKindBinaryExpr || ref.ID < 0 || int(ref.ID) >= len(doc.BinaryExprs) {
+			return
+		}
+		be := &doc.BinaryExprs[ref.ID]
+		if be.Operator == uint8(lexer.KindAnd) || be.Operator == uint8(lexer.KindOr) {
+			bind(be.Left)
+			bind(be.Right)
+			return
+		}
+		if be.Left.Kind == parser.NodeKindIdentifier && be.Left.ID >= 0 && int(be.Left.ID) < len(doc.Identifiers) {
+			doc.Identifiers[be.Left.ID].ResolvedKind = parser.ResolvedKindColumn
+		}
+	}
+	bind(vertex.Predicate)
 }
 
 // hashIdentifier computes a case-insensitive FNV-1a hash directly from the source slice.

@@ -418,6 +418,18 @@ func describeSelect(doc *parser.QueryDoc, src []byte, cat *catalog.Catalog, stmt
 				column.Name = string(src[proj.Alias:proj.AliasEnd])
 			}
 			cols = append(cols, column)
+		case parser.NodeKindPatternComprehension:
+			name := "pattern_comprehension"
+			if proj.AliasEnd > proj.Alias {
+				name = string(src[proj.Alias:proj.AliasEnd])
+			}
+			cols = append(cols, ColumnMeta{Name: name, TypeOID: OIDJSONB})
+		case parser.NodeKindShortestPath:
+			name := "shortest_path"
+			if proj.AliasEnd > proj.Alias {
+				name = string(src[proj.Alias:proj.AliasEnd])
+			}
+			cols = append(cols, ColumnMeta{Name: name, TypeOID: OIDJSONB})
 		default:
 			// Literal / expression projections are dropped from the optimizer's
 			// projection list, so they contribute nothing to the RowDescription.

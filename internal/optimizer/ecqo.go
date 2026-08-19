@@ -171,6 +171,11 @@ type GraphJoinPlan struct {
 	JoinType           uint8                 // parser.JoinType value
 	TerminalAlias      string                // final vertex alias, if present
 	TerminalLabel      string                // final vertex label, if present
+	SeedLabels         []string              // all labels required on the anchor
+	TerminalLabels     []string              // all labels required on the terminal
+	PathAlias          string                // optional Cypher path variable (p = (...))
+	Shortest           bool                  // shortestPath wrapper requested
+	SourcePredicates   []RelationalPredicate // inline predicates on the anchor vertex
 	TerminalPredicates []RelationalPredicate // WHERE predicates bound to final vertex
 	// PredicateMatch is true when the graph path came from WHERE MATCH
 	// (existential filter). Traversal emits source anchor IDs, not
@@ -268,11 +273,29 @@ type GraphProjection struct {
 	EdgeAlias  string
 }
 
+// GraphPatternProjection is the lowered form of a graph pattern
+// comprehension. The executor evaluates it per source row and returns a
+// typed list in the containing result row.
+type GraphPatternProjection struct {
+	OutputName      string
+	AnchorAlias     string
+	TerminalAlias   string
+	SeedLabels      []string
+	TerminalLabels  []string
+	Edges           []GraphEdgePlan
+	MaxHops         int
+	Predicates      []RelationalPredicate
+	ProjectionName  string
+	ProjectionAlias string
+	Shortest        bool
+}
+
 const (
 	GraphProjectionSourceID uint8 = iota
 	GraphProjectionTargetID
 	GraphProjectionEdgeType
 	GraphProjectionEdgeWeight
+	GraphProjectionPath
 )
 
 const (
@@ -389,6 +412,7 @@ type PhysicalPlan struct {
 	HasVectorAnchor   bool
 	GraphAnchorVector []float32
 	SeedLabel         string // vertex label for label-scan seeding (e.g., "Person")
+	SeedLabels        []string
 
 	// SnapshotLSN carries a resolved temporal snapshot LSN for historical
 	// queries. When non-zero, execution must use temporal read APIs.
@@ -398,12 +422,13 @@ type PhysicalPlan struct {
 	SnapshotTimestamp time.Time
 
 	// Relational query fields — populated when Kind == QueryKindRelational
-	HasRelationalQuery    bool
-	Predicates            []RelationalPredicate
-	PredicateAlternatives PredicateAlternatives
-	Projections           []string // SELECT column list (empty = all columns)
-	ProjectionRefs        []ProjectionRef
-	GraphProjections      []GraphProjection
+	HasRelationalQuery      bool
+	Predicates              []RelationalPredicate
+	PredicateAlternatives   PredicateAlternatives
+	Projections             []string // SELECT column list (empty = all columns)
+	ProjectionRefs          []ProjectionRef
+	GraphProjections        []GraphProjection
+	GraphPatternProjections []GraphPatternProjection
 	// Scoring expression — parser AST lowered to execution hints.
 	HasScoreExpr       bool
 	ScoreArithOp       uint8 // KindAsterisk(11), KindDash(18)
@@ -727,12 +752,52 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 					if v.LabelStart != v.LabelEnd {
 						plan.SeedLabel = string(src[v.LabelStart:v.LabelEnd])
 					}
+					plan.SeedLabels = vertexPatternLabels(doc, src, v)
 				}
 			}
 			var extractErr error
 			plan.GraphEdges, plan.MaxHops, extractErr = o.extractMatchPath(doc, src, mp)
 			if extractErr != nil {
 				return nil, extractErr
+			}
+			// A top-level Cypher MATCH has no SQL FROM relation. Lower it to
+			// one graph join after preserving an empty collection name; the
+			// executor resolves that name to the first graph-backed collection
+			// at execution time and uses the normal joined-row projection path.
+			if gt.TableStart == gt.TableEnd {
+				gjp := GraphJoinPlan{GraphEdges: plan.GraphEdges, MaxHops: plan.MaxHops, JoinType: 0, Shortest: mp.Shortest}
+				if mp.PathAliasEnd > mp.PathAlias {
+					gjp.PathAlias = string(src[mp.PathAlias:mp.PathAliasEnd])
+				}
+				for n := int32(0); n < mp.PathNodesCount; n++ {
+					ref := doc.Nodes[mp.PathNodesStart+n]
+					if ref.Kind != parser.NodeKindVertex {
+						continue
+					}
+					v := &doc.Vertexes[ref.ID]
+					if v.AliasEnd > v.Alias {
+						alias := string(src[v.Alias:v.AliasEnd])
+						if gjp.LeftAlias == "" {
+							gjp.LeftAlias = alias
+						} else {
+							gjp.TerminalAlias = alias
+						}
+					}
+					labels := vertexPatternLabels(doc, src, v)
+					if n == 0 {
+						gjp.SeedLabels = labels
+						if len(labels) > 0 {
+							gjp.LeftAlias = gjp.LeftAlias
+						}
+					} else if n == mp.PathNodesCount-1 {
+						gjp.TerminalLabels = labels
+						if len(labels) > 0 {
+							gjp.TerminalLabel = labels[0]
+						}
+					}
+				}
+				plan.GraphJoins = append(plan.GraphJoins, gjp)
+				plan.Kind = QueryKindJoin
 			}
 		}
 	} else {
@@ -827,6 +892,10 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 				LeftAlias:      plan.CollectionName,
 				LeftCollection: plan.CollectionName,
 				JoinType:       uint8(jc.Type),
+				Shortest:       mp.Shortest,
+			}
+			if mp.PathAliasEnd > mp.PathAlias {
+				gjp.PathAlias = string(src[mp.PathAlias:mp.PathAliasEnd])
 			}
 			// Anchor alias = first vertex alias in the path (e.g. "s" in
 			// (s)-[:DEPENDS_ON*1..3]->(api)). The binder verified it matches a
@@ -846,11 +915,26 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 					continue
 				}
 				v := &doc.Vertexes[ref.ID]
+				labels := vertexPatternLabels(doc, src, v)
 				if v.AliasEnd > v.Alias {
 					gjp.TerminalAlias = string(src[v.Alias:v.AliasEnd])
 				}
-				if v.LabelEnd > v.LabelStart {
-					gjp.TerminalLabel = string(src[v.LabelStart:v.LabelEnd])
+				if len(labels) > 0 {
+					if i == 0 {
+						gjp.SeedLabels = labels
+					} else if i == mp.PathNodesCount-1 {
+						gjp.TerminalLabels = labels
+						gjp.TerminalLabel = labels[0]
+					}
+				}
+				if v.Predicate.Kind != parser.NodeKindUnknown {
+					inline := &PhysicalPlan{}
+					o.extractRelationalPredicates(doc, src, inline, v.Predicate)
+					if i == 0 {
+						gjp.SourcePredicates = append(gjp.SourcePredicates, inline.Predicates...)
+					} else if i == mp.PathNodesCount-1 {
+						gjp.TerminalPredicates = append(gjp.TerminalPredicates, inline.Predicates...)
+					}
 				}
 			}
 			var extractErr error
@@ -959,6 +1043,24 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 					id := &doc.Identifiers[ae.Expr.ID]
 					plan.AggregateColumn = string(src[id.Start:id.End])
 				}
+			} else if proj.Expr.Kind == parser.NodeKindPatternComprehension {
+				pattern, err := o.lowerGraphPatternProjection(doc, src, proj)
+				if err != nil {
+					return nil, err
+				}
+				plan.GraphPatternProjections = append(plan.GraphPatternProjections, pattern)
+				plan.Projections = append(plan.Projections, pattern.OutputName)
+				plan.Kind = QueryKindJoin
+				plan.HasGraphTraversal = true
+			} else if proj.Expr.Kind == parser.NodeKindShortestPath {
+				pattern, err := o.lowerShortestPathProjection(doc, src, proj)
+				if err != nil {
+					return nil, err
+				}
+				plan.GraphPatternProjections = append(plan.GraphPatternProjections, pattern)
+				plan.Projections = append(plan.Projections, pattern.OutputName)
+				plan.Kind = QueryKindJoin
+				plan.HasGraphTraversal = true
 			} else if proj.Expr.Kind == parser.NodeKindVectorFunc {
 				// SIMILARITY(col, vec) / VECTOR_DISTANCE(col, vec) in the SELECT list.
 				vf := &doc.VectorFuncs[proj.Expr.ID]
@@ -1121,6 +1223,12 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 			plan.GraphEdges = append([]GraphEdgePlan(nil), plan.GraphJoins[0].GraphEdges...)
 			plan.MaxHops = plan.GraphJoins[0].MaxHops
 		}
+	}
+	// Native `MATCH ... RETURN ...` is represented by an implicit graph
+	// table and one synthetic graph join. It must use the joined-row executor
+	// so projections can address both the source and terminal aliases.
+	if len(plan.GraphJoins) > 0 && plan.CollectionName == "" && !hasVector {
+		plan.Kind = QueryKindJoin
 	}
 
 	// GROUP BY columns
@@ -1351,6 +1459,13 @@ func lowerGraphProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifie
 	field := strings.ToLower(string(src[id.Start:id.End]))
 	kind, ok := stableGraphProjectionKind(field)
 	edgeAlias := ""
+	if !ok {
+		for _, join := range plan.GraphJoins {
+			if join.PathAlias != "" && strings.EqualFold(field, join.PathAlias) {
+				return GraphProjection{OutputName: field, Kind: GraphProjectionPath}, true
+			}
+		}
+	}
 	if !ok && id.QualEnd > id.QualStart {
 		qualifier := string(src[id.QualStart:id.QualEnd])
 		kind, ok = stableGraphEdgeProjectionKind(field)
@@ -1390,6 +1505,104 @@ func lowerGraphProjection(doc *parser.QueryDoc, src []byte, id *parser.Identifie
 	return GraphProjection{OutputName: name, Kind: kind, EdgeAlias: edgeAlias}, true
 }
 
+func (o *Optimizer) lowerGraphPatternProjection(doc *parser.QueryDoc, src []byte, proj *parser.Projection) (GraphPatternProjection, error) {
+	if proj == nil || proj.Expr.Kind != parser.NodeKindPatternComprehension || proj.Expr.ID < 0 || int(proj.Expr.ID) >= len(doc.PatternComprehensions) {
+		return GraphPatternProjection{}, fmt.Errorf("invalid graph pattern comprehension")
+	}
+	pc := &doc.PatternComprehensions[proj.Expr.ID]
+	if pc.MatchPath.Kind != parser.NodeKindMatchPath || pc.MatchPath.ID < 0 || int(pc.MatchPath.ID) >= len(doc.MatchPaths) {
+		return GraphPatternProjection{}, fmt.Errorf("pattern comprehension requires a graph path")
+	}
+	mp := &doc.MatchPaths[pc.MatchPath.ID]
+	pattern := GraphPatternProjection{OutputName: "pattern_comprehension"}
+	if proj.AliasEnd > proj.Alias {
+		pattern.OutputName = string(src[proj.Alias:proj.AliasEnd])
+	}
+	for i := int32(0); i < mp.PathNodesCount; i++ {
+		ref := doc.Nodes[mp.PathNodesStart+i]
+		if ref.Kind != parser.NodeKindVertex {
+			continue
+		}
+		v := &doc.Vertexes[ref.ID]
+		labels := vertexPatternLabels(doc, src, v)
+		if v.AliasEnd > v.Alias {
+			alias := string(src[v.Alias:v.AliasEnd])
+			if pattern.AnchorAlias == "" {
+				pattern.AnchorAlias = alias
+			} else {
+				pattern.TerminalAlias = alias
+			}
+		}
+		if i == 0 {
+			pattern.SeedLabels = labels
+		} else if i == mp.PathNodesCount-1 {
+			pattern.TerminalLabels = labels
+		}
+	}
+	var err error
+	pattern.Edges, pattern.MaxHops, err = o.extractMatchPath(doc, src, mp)
+	if err != nil {
+		return GraphPatternProjection{}, err
+	}
+	if pc.Predicate.Kind != parser.NodeKindUnknown {
+		predicatePlan := &PhysicalPlan{}
+		o.extractRelationalPredicates(doc, src, predicatePlan, pc.Predicate)
+		pattern.Predicates = append(pattern.Predicates, predicatePlan.Predicates...)
+	}
+	if pc.Projection.Kind == parser.NodeKindIdentifier {
+		id := &doc.Identifiers[pc.Projection.ID]
+		pattern.ProjectionName = string(src[id.Start:id.End])
+		if id.QualEnd > id.QualStart {
+			pattern.ProjectionAlias = string(src[id.QualStart:id.QualEnd])
+		}
+	} else if pc.Projection.Kind == parser.NodeKindMatchPath {
+		pattern.ProjectionName = pattern.TerminalAlias
+	}
+	return pattern, nil
+}
+
+func (o *Optimizer) lowerShortestPathProjection(doc *parser.QueryDoc, src []byte, proj *parser.Projection) (GraphPatternProjection, error) {
+	if proj == nil || proj.Expr.Kind != parser.NodeKindShortestPath || proj.Expr.ID < 0 || int(proj.Expr.ID) >= len(doc.ShortestPaths) {
+		return GraphPatternProjection{}, fmt.Errorf("invalid shortestPath expression")
+	}
+	sp := &doc.ShortestPaths[proj.Expr.ID]
+	if sp.MatchPath.Kind != parser.NodeKindMatchPath || sp.MatchPath.ID < 0 || int(sp.MatchPath.ID) >= len(doc.MatchPaths) {
+		return GraphPatternProjection{}, fmt.Errorf("shortestPath requires a graph path")
+	}
+	mp := &doc.MatchPaths[sp.MatchPath.ID]
+	pattern := GraphPatternProjection{OutputName: "shortest_path", Shortest: true}
+	if proj.AliasEnd > proj.Alias {
+		pattern.OutputName = string(src[proj.Alias:proj.AliasEnd])
+	}
+	for i := int32(0); i < mp.PathNodesCount; i++ {
+		ref := doc.Nodes[mp.PathNodesStart+i]
+		if ref.Kind != parser.NodeKindVertex {
+			continue
+		}
+		v := &doc.Vertexes[ref.ID]
+		labels := vertexPatternLabels(doc, src, v)
+		if v.AliasEnd > v.Alias {
+			alias := string(src[v.Alias:v.AliasEnd])
+			if pattern.AnchorAlias == "" {
+				pattern.AnchorAlias = alias
+			} else {
+				pattern.TerminalAlias = alias
+			}
+		}
+		if i == 0 {
+			pattern.SeedLabels = labels
+		} else if i == mp.PathNodesCount-1 {
+			pattern.TerminalLabels = labels
+		}
+	}
+	var err error
+	pattern.Edges, pattern.MaxHops, err = o.extractMatchPath(doc, src, mp)
+	if err != nil {
+		return GraphPatternProjection{}, err
+	}
+	return pattern, nil
+}
+
 func stableGraphProjectionKind(field string) (uint8, bool) {
 	switch strings.ToLower(field) {
 	case "source_id":
@@ -1426,6 +1639,28 @@ func (o *Optimizer) setRelationalKind(plan *PhysicalPlan) {
 
 // extractRelationalPredicates recursively walks a WHERE expression tree,
 // decomposing AND nodes and collecting leaf predicates (Identifier op Literal).
+func vertexPatternLabels(doc *parser.QueryDoc, src []byte, v *parser.Vertex) []string {
+	if v == nil {
+		return nil
+	}
+	labels := make([]string, 0, v.LabelsCount)
+	if v.LabelsCount > 0 && v.LabelsStart >= 0 {
+		end := v.LabelsStart + v.LabelsCount
+		if end > int32(len(doc.VertexLabels)) {
+			end = int32(len(doc.VertexLabels))
+		}
+		for i := v.LabelsStart; i < end; i++ {
+			label := doc.VertexLabels[i]
+			labels = append(labels, string(src[label.Start:label.End]))
+		}
+		return labels
+	}
+	if v.LabelEnd > v.LabelStart {
+		return []string{string(src[v.LabelStart:v.LabelEnd])}
+	}
+	return nil
+}
+
 // extractMatchPath converts a MatchPath AST node into GraphEdgePlans and the
 // cumulative MaxHops bound. Shared by GRAPH_TABLE FROM clauses and JOIN MATCH.
 func (o *Optimizer) extractMatchPath(doc *parser.QueryDoc, src []byte, mp *parser.MatchPath) ([]GraphEdgePlan, int, error) {

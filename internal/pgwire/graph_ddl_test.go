@@ -318,3 +318,171 @@ func TestPGWireSQLStableEndpointAndEdgeProjections(t *testing.T) {
 		t.Fatalf("stable graph projection row=(%q,%q,%q,%v), want (alice,bob,PGWIRE_STABLE_RELATES,1)", sourceID, targetID, edgeType, edgeWeight)
 	}
 }
+
+func TestPGWireGraphitiOptionalMergeAndPathProjection(t *testing.T) {
+	ctx := context.Background()
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:pgwire-graphiti"), libravdb.WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := startTestServer(t, db)
+	defer srv.Close()
+	host, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := sql.Open("pgx", "postgres://test:test@"+net.JoinHostPort(host, port)+"/test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"CREATE GRAPH TABLE graphiti_people (uuid TEXT, name TEXT)",
+		"CREATE EDGE TYPE PGWIRE_GRAPHITI_KNOWS",
+		"MERGE (a:Person {uuid: $1})-[r:PGWIRE_GRAPHITI_KNOWS {weight: $3}]->(b:Person {uuid: $2}) ON CREATE SET a.name = $4, b.name = $5",
+	} {
+		if query == "MERGE (a:Person {uuid: $1})-[r:PGWIRE_GRAPHITI_KNOWS {weight: $3}]->(b:Person {uuid: $2}) ON CREATE SET a.name = $4, b.name = $5" {
+			if _, err := sqlDB.ExecContext(ctx, query, "alice", "bob", 0.75, "Alice", "Bob"); err != nil {
+				t.Fatalf("%s: %v", query, err)
+			}
+			continue
+		}
+		if _, err := sqlDB.ExecContext(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if _, err := sqlDB.ExecContext(ctx, "MERGE (a:Person {uuid: $1})-[r:PGWIRE_GRAPHITI_KNOWS {weight: $3}]->(b:Person {uuid: $2}) ON CREATE SET a.name = $4, b.name = $5", "bob", "carol", 0.5, "Bob 2", "Carol"); err != nil {
+		t.Fatalf("second MERGE: %v", err)
+	}
+	var path []byte
+	if err := sqlDB.QueryRowContext(ctx, `
+		SELECT p
+		FROM graphiti_people AS src
+		JOIN MATCH p = (src)-[:PGWIRE_GRAPHITI_KNOWS]->(mid)-[:PGWIRE_GRAPHITI_KNOWS]->(target)
+		WHERE src.id = 'alice'`).Scan(&path); err != nil {
+		t.Fatalf("path projection over pgwire: %v", err)
+	}
+	if !strings.Contains(string(path), `"nodes":["alice","bob","carol"]`) {
+		t.Fatalf("path JSON=%q", path)
+	}
+}
+
+func TestPGWireNativeCypherShortestLabelsAndComprehension(t *testing.T) {
+	ctx := context.Background()
+	db, err := libravdb.Open(libravdb.WithStoragePath(":memory:pgwire-native-cypher"), libravdb.WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := startTestServer(t, db)
+	defer srv.Close()
+	host, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := sql.Open("pgx", "postgres://test:test@"+net.JoinHostPort(host, port)+"/test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"CREATE GRAPH TABLE cypher_people (name TEXT)",
+		"CREATE EDGE TYPE PGWIRE_CYPHER_REL",
+		"INSERT INTO cypher_people (id, name) VALUES ('alice', 'Alice')",
+		"INSERT INTO cypher_people (id, name) VALUES ('bob', 'Bob')",
+		"INSERT INTO cypher_people (id, name) VALUES ('carol', 'Carol')",
+		"INSERT INTO GRAPH_EDGES VALUES ('alice', 'PGWIRE_CYPHER_REL', 'bob')",
+		"INSERT INTO GRAPH_EDGES VALUES ('alice', 'PGWIRE_CYPHER_REL', 'carol')",
+		"INSERT INTO GRAPH_EDGES VALUES ('bob', 'PGWIRE_CYPHER_REL', 'carol')",
+	} {
+		if _, err := sqlDB.ExecContext(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	col, err := db.GetCollection("cypher_people")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		id, label string
+	}{
+		{"alice", "Person"}, {"alice", "Active"}, {"bob", "Person"}, {"carol", "Person"},
+	} {
+		node, err := db.GetNodeID(ctx, "cypher_people", item.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		col.GetGraph().RegisterVertexLabel(node, item.label)
+	}
+
+	var sourceID, targetID string
+	if native, err := db.Query(ctx, `MATCH (a:Person:Active)-{weight > 0.5}->(b:Person)
+RETURN a.id AS source_id, b.id AS target_id`); err != nil || native.Total == 0 {
+		t.Fatalf("native-before-pgwire rows=%#v err=%v", native, err)
+	}
+	if err := sqlDB.QueryRowContext(ctx, `MATCH (a:Person:Active)-{weight > 0.5}->(b:Person)
+RETURN a.id AS source_id, b.id AS target_id`).Scan(&sourceID, &targetID); err != nil {
+		t.Fatalf("native MATCH RETURN over pgwire: %v", err)
+	}
+	if sourceID != "alice" || (targetID != "bob" && targetID != "carol") {
+		t.Fatalf("native MATCH row=(%q,%q), want alice -> bob or carol", sourceID, targetID)
+	}
+
+	rows, err := sqlDB.QueryContext(ctx, `MATCH shortestPath((a)-[*1..3]->(b))
+RETURN a.id AS source_id, b.id AS target_id`)
+	if err != nil {
+		t.Fatalf("shortestPath over pgwire: %v", err)
+	}
+	shortestRows := 0
+	for rows.Next() {
+		var source, target string
+		if err := rows.Scan(&source, &target); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scan shortestPath over pgwire: %v", err)
+		}
+		shortestRows++
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if shortestRows != 3 {
+		t.Fatalf("shortestPath rows=%d, want 3", shortestRows)
+	}
+
+	rows, err = sqlDB.QueryContext(ctx, `MATCH (a)
+RETURN [(a)-[:PGWIRE_CYPHER_REL]->(b) | b.id] AS friends`)
+	if err != nil {
+		t.Fatalf("pattern comprehension over pgwire: %v", err)
+	}
+	columns, err := rows.Columns()
+	if err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if len(columns) != 1 || columns[0] != "friends" {
+		_ = rows.Close()
+		t.Fatalf("pattern comprehension columns=%v, want [friends]", columns)
+	}
+	if !rows.Next() {
+		_ = rows.Close()
+		t.Fatal("pattern comprehension returned no rows")
+	}
+	var friends []byte
+	if err := rows.Scan(&friends); err != nil {
+		_ = rows.Close()
+		t.Fatalf("scan pattern comprehension over pgwire: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(friends), "bob") || !strings.Contains(string(friends), "carol") {
+		t.Fatalf("pattern comprehension JSON=%q", friends)
+	}
+}

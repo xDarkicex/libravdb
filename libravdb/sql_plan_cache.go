@@ -165,6 +165,18 @@ func cloneCachedSQLPlan(plan *optimizer.PhysicalPlan) *optimizer.PhysicalPlan {
 		clone.GraphJoins[i] = join
 		clone.GraphJoins[i].GraphEdges = cloneCachedGraphEdges(join.GraphEdges)
 		clone.GraphJoins[i].TerminalPredicates = append([]optimizer.RelationalPredicate(nil), join.TerminalPredicates...)
+		clone.GraphJoins[i].SourcePredicates = append([]optimizer.RelationalPredicate(nil), join.SourcePredicates...)
+		clone.GraphJoins[i].SeedLabels = append([]string(nil), join.SeedLabels...)
+		clone.GraphJoins[i].TerminalLabels = append([]string(nil), join.TerminalLabels...)
+	}
+	clone.SeedLabels = append([]string(nil), plan.SeedLabels...)
+	clone.GraphPatternProjections = make([]optimizer.GraphPatternProjection, len(plan.GraphPatternProjections))
+	for i, pattern := range plan.GraphPatternProjections {
+		clone.GraphPatternProjections[i] = pattern
+		clone.GraphPatternProjections[i].Edges = cloneCachedGraphEdges(pattern.Edges)
+		clone.GraphPatternProjections[i].Predicates = append([]optimizer.RelationalPredicate(nil), pattern.Predicates...)
+		clone.GraphPatternProjections[i].SeedLabels = append([]string(nil), pattern.SeedLabels...)
+		clone.GraphPatternProjections[i].TerminalLabels = append([]string(nil), pattern.TerminalLabels...)
 	}
 	return &clone
 }

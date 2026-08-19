@@ -58,6 +58,10 @@ type EpochTx struct {
 	// Savepoint stack for agent hypothesis branching. Each savepoint records
 	// the position in the append-only mutation logs so rollback can truncate.
 	savepoints []epochSavepoint
+	// graphLabels are published after the combined record/edge WAL commit.
+	// Labels use the same record identity as the graph edges and therefore must
+	// not become visible if the epoch rolls back.
+	graphLabels []epochGraphLabel
 
 	// generation increments on every mutation, invalidating epoch-local caches.
 	generation uint64
@@ -66,12 +70,19 @@ type EpochTx struct {
 // epochSavepoint marks a position in the epoch's mutation logs.
 type epochSavepoint struct {
 	name             string
-	recordLogLen     int               // len(recordTx.ops) at savepoint
-	graphDropLen     int               // len(recordTx.graphDrops) at savepoint
-	graphOpLen       map[string]int    // collection → len(txn.OrderedStagedOps()) at savepoint
+	recordLogLen     int            // len(recordTx.ops) at savepoint
+	graphDropLen     int            // len(recordTx.graphDrops) at savepoint
+	graphOpLen       map[string]int // collection → len(txn.OrderedStagedOps()) at savepoint
+	graphLabelLen    int
 	provisionalNodes map[string]uint64 // snapshot of provisionalNodes
 	nextProvisional  uint64            // snapshot of nextProvisional
 	generation       uint64
+}
+
+type epochGraphLabel struct {
+	collection string
+	recordID   string
+	label      string
 }
 
 // SnapshotLSN returns the pinned snapshot LSN for this epoch. Zero means
@@ -148,6 +159,7 @@ func (e *EpochTx) Savepoint(name string) error {
 		recordLogLen:     recordLogLen,
 		graphDropLen:     graphDropLen,
 		graphOpLen:       make(map[string]int, len(e.graphs)),
+		graphLabelLen:    len(e.graphLabels),
 		provisionalNodes: make(map[string]uint64, len(e.provisionalNodes)),
 		nextProvisional:  e.nextProvisional,
 		generation:       e.generation,
@@ -256,6 +268,9 @@ func (e *EpochTx) RollbackTo(name string) error {
 		e.provisionalNodes[k] = v
 	}
 	e.nextProvisional = sp.nextProvisional
+	if len(e.graphLabels) > sp.graphLabelLen {
+		e.graphLabels = e.graphLabels[:sp.graphLabelLen]
+	}
 	e.generation++ // invalidates caches
 
 	// Discard younger savepoints.
@@ -358,6 +373,24 @@ func (e *EpochTx) LookupNodeID(ctx context.Context, collection, id string) (uint
 		return 0, fmt.Errorf("%w: %s", ErrRecordNotFound, id)
 	}
 	return e.db.GetNodeID(ctx, collection, id)
+}
+
+// RegisterVertexLabel stages a durable graph label assignment alongside an
+// epoch's record and edge mutations. The label WAL frame is published only
+// after the combined transaction succeeds, so rollback cannot expose a label
+// for a record that was never committed.
+func (e *EpochTx) RegisterVertexLabel(collection, recordID, label string) error {
+	if collection == "" || recordID == "" || label == "" {
+		return fmt.Errorf("graph vertex label requires collection, record ID, and label")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrEpochClosed
+	}
+	e.graphLabels = append(e.graphLabels, epochGraphLabel{collection: collection, recordID: recordID, label: label})
+	e.generation++
+	return nil
 }
 
 // ResolveNodeID maps a graph node ID back to a (collection, recordID) pair.
@@ -903,6 +936,7 @@ func (e *EpochTx) Commit(ctx context.Context) error {
 	recordTx.mu.Lock()
 	recordGraphDrops := append([]txGraphDrop(nil), recordTx.graphDrops...)
 	recordTx.mu.Unlock()
+	labels := append([]epochGraphLabel(nil), e.graphLabels...)
 	e.mu.Unlock()
 
 	reserveGraphOps := func(reservedIDs map[string]uint64) ([]storage.TxOperation, func(uint64) error) {
@@ -945,7 +979,23 @@ func (e *EpochTx) Commit(ctx context.Context) error {
 		}
 	}
 
-	return e.db.commitTxWithGraph(ctx, recordTx.ops, reserveGraphOps, nil, nil)
+	if err := e.db.commitTxWithGraph(ctx, recordTx.ops, reserveGraphOps, nil, nil); err != nil {
+		return err
+	}
+	for _, label := range labels {
+		nodeID, err := e.db.GetNodeID(ctx, label.collection, label.recordID)
+		if err != nil {
+			return fmt.Errorf("resolve graph label node %s/%s: %w", label.collection, label.recordID, err)
+		}
+		col, err := e.db.GetCollection(label.collection)
+		if err != nil {
+			return err
+		}
+		if g := col.GetGraph(); g != nil {
+			g.RegisterVertexLabel(nodeID, label.label)
+		}
+	}
+	return nil
 }
 
 // buildGraphOps converts staged graph Txns to TxOperations with collection identity.

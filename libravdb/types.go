@@ -34,6 +34,16 @@ type SearchResult struct {
 	Ordinal  uint32                 `json:"ordinal,omitempty"`
 }
 
+// GraphPath is the stable public representation of a bound graph path. Nodes
+// are record IDs in traversal order; EdgeTypes and EdgeWeights are aligned
+// with the hop between Nodes[i] and Nodes[i+1]. It is used when a MATCH path
+// variable is projected (for example `p = (...)` followed by SELECT p).
+type GraphPath struct {
+	Nodes       []string  `json:"nodes"`
+	EdgeTypes   []string  `json:"edge_types,omitempty"`
+	EdgeWeights []float32 `json:"edge_weights,omitempty"`
+}
+
 // SearchResults represents the complete search response.
 // Results are ordered by descending public relevance score.
 type SearchResults struct {
