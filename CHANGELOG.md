@@ -4,6 +4,19 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.5 - 2026-08-20
+
+### Graphiti MERGE vector writes
+
+- Fixed native Cypher `MERGE ... SET` assignments for declared SQL `VECTOR`
+  columns. Named vector columns now use the collection's physical vector
+  writer instead of being rejected as generic metadata.
+- Preserved scalar and JSONB metadata assignments in mixed MERGE statements,
+  including matched-record vector updates.
+- Added explicit type and dimension validation for MERGE vector assignments.
+- Added regression coverage for Python/Graphiti-shaped vector MERGE writes,
+  updates, mixed metadata, and invalid vector values.
+
 ## 1.6.4 - 2026-08-20
 
 ### Native Cypher and Graphiti compatibility

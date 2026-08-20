@@ -3,6 +3,7 @@ package libravdb
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/xDarkicex/libravdb/internal/graph"
@@ -455,5 +456,87 @@ RETURN a.id AS source_id, b.id AS target_id`
 	}
 	if rows.Total != 1 || rows.Results[0].Metadata["source_id"] != "alice" || rows.Results[0].Metadata["target_id"] != "bob" {
 		t.Fatalf("rows=%#v, want alice -> bob", rows)
+	}
+}
+
+func TestGraphitiMergeWritesDeclaredVectorColumn(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:graphiti_merge_vector"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Query(ctx, `CREATE GRAPH TABLE entities (
+		uuid STRING PRIMARY KEY,
+		name STRING,
+		attributes JSONB,
+		name_embedding VECTOR(4)
+	)`); err != nil {
+		t.Fatalf("CREATE GRAPH TABLE: %v", err)
+	}
+
+	vector := []float32{1, 0, 0, 0}
+	if _, err := db.QueryWithParams(ctx,
+		`MERGE (n:Entity {uuid: $uuid})
+		 SET n.name = $name,
+		     n.name_embedding = $embedding,
+		     n.attributes = $attributes`,
+		QueryParams{
+			"uuid":       "alice",
+			"name":       "Alice",
+			"embedding":  vector,
+			"attributes": map[string]interface{}{"team": "core"},
+		}); err != nil {
+		t.Fatalf("MERGE vector column: %v", err)
+	}
+
+	col, err := db.GetCollection("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := col.Get(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(record.Vector, vector) {
+		t.Fatalf("stored vector=%v, want %v", record.Vector, vector)
+	}
+	if record.Metadata["name"] != "Alice" {
+		t.Fatalf("stored scalar metadata=%#v", record.Metadata)
+	}
+
+	updatedVector := []float32{0, 1, 0, 0}
+	if _, err := db.QueryWithParams(ctx,
+		`MERGE (n:Entity {uuid: $uuid}) SET n.name_embedding = $embedding`,
+		QueryParams{"uuid": "alice", "embedding": updatedVector}); err != nil {
+		t.Fatalf("MERGE matched vector update: %v", err)
+	}
+	updated, err := col.Get(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updated.Vector, updatedVector) {
+		t.Fatalf("updated vector=%v, want %v", updated.Vector, updatedVector)
+	}
+
+	rows, err := db.Query(ctx, `MATCH (n:Entity {uuid: 'alice'})
+		WITH n RETURN n.name AS name, n.name_embedding AS embedding`)
+	if err != nil {
+		t.Fatalf("read merged vector: %v", err)
+	}
+	if rows.Total != 1 || !reflect.DeepEqual(rows.Results[0].Metadata["embedding"], updatedVector) {
+		t.Fatalf("MATCH vector metadata=%#v embedding=%T %v", rows.Results[0].Metadata, rows.Results[0].Metadata["embedding"], rows.Results[0].Metadata["embedding"])
+	}
+
+	if _, err := db.QueryWithParams(ctx,
+		`MERGE (n:Entity {uuid: $uuid}) SET n.name_embedding = $embedding`,
+		QueryParams{"uuid": "wrong-type", "embedding": "not a vector"}); err == nil || !strings.Contains(err.Error(), "column name_embedding is VECTOR(4)") {
+		t.Fatalf("vector type error=%v", err)
+	}
+	if _, err := db.QueryWithParams(ctx,
+		`MERGE (n:Entity {uuid: $uuid}) SET n.name_embedding = $embedding`,
+		QueryParams{"uuid": "wrong-dimension", "embedding": []float32{1, 2}}); err == nil || !strings.Contains(err.Error(), "received float slice of length 2") {
+		t.Fatalf("vector dimension error=%v", err)
 	}
 }

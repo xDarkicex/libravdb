@@ -21,9 +21,14 @@ type mergeVertexState struct {
 	label    string
 	id       string
 	metadata map[string]interface{}
-	created  bool
-	changed  bool
-	delta    map[string]interface{}
+	// vector is the collection's physical vector value. SQL VECTOR columns
+	// have a logical catalog name, but are persisted through the same vector
+	// argument used by INSERT/UPDATE rather than as generic metadata.
+	vector    []float32
+	vectorSet bool
+	created   bool
+	changed   bool
+	delta     map[string]interface{}
 }
 
 type mergeEdgeState struct {
@@ -186,6 +191,16 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 				return fmt.Errorf("MERGE assignment %s.%s could not be evaluated", alias, field)
 			}
 			value = materializeSQLJSONValue(value)
+			if db.mergeUsesVectorColumn(collection, field) {
+				vector, vectorErr := mergeVectorAssignment(value, collection.Dimension())
+				if vectorErr != nil {
+					return fmt.Errorf("MERGE commit: column %s is VECTOR(%d): %w", field, collection.Dimension(), vectorErr)
+				}
+				target.vector = vector
+				target.vectorSet = true
+				target.changed = true
+				continue
+			}
 			target.metadata[field] = value
 			target.delta[field] = value
 			target.changed = true
@@ -205,11 +220,18 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 	for _, state := range uniqueMergeStates(states) {
 		if state.created {
 			vector := mergeZeroVector(collection.Dimension())
+			if state.vectorSet {
+				vector = state.vector
+			}
 			if err := epoch.Insert(ctx, collection.name, state.id, vector, state.metadata); err != nil {
 				return nil, fmt.Errorf("MERGE create vertex %s: %w", state.id, err)
 			}
 		} else if state.changed {
-			if err := epoch.Update(ctx, collection.name, state.id, nil, state.delta); err != nil {
+			var vector []float32
+			if state.vectorSet {
+				vector = state.vector
+			}
+			if err := epoch.Update(ctx, collection.name, state.id, vector, state.delta); err != nil {
 				return nil, fmt.Errorf("MERGE update vertex %s: %w", state.id, err)
 			}
 		}
@@ -354,6 +376,54 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 	}
 
 	return mergeResults(states, stmt, doc, src), nil
+}
+
+// mergeUsesVectorColumn resolves the logical SQL vector column name to the
+// collection's physical vector slot. CREATE GRAPH/TABLE records the declared
+// name in the catalog; native collections retain the historical vector/vec/
+// embedding aliases.
+func (db *Database) mergeUsesVectorColumn(collection *Collection, field string) bool {
+	if db == nil || collection == nil || collection.Dimension() <= 0 {
+		return false
+	}
+	if declared := db.vectorColumnName(collection.name); declared != "" {
+		return strings.EqualFold(declared, field)
+	}
+	return strings.EqualFold(field, "vector") ||
+		strings.EqualFold(field, "vec") ||
+		strings.EqualFold(field, "embedding")
+}
+
+func mergeVectorAssignment(value interface{}, dimension int) ([]float32, error) {
+	vector := vectorValue(value)
+	if vector == nil {
+		// JSON parameters from SDKs may arrive as a materialized JSON array.
+		// Accept only numeric array members; strings and objects remain type
+		// errors instead of being silently parsed as vector text.
+		if values, ok := value.([]interface{}); ok {
+			vector = make([]float32, len(values))
+			for i, item := range values {
+				switch number := item.(type) {
+				case float32:
+					vector[i] = number
+				case float64:
+					vector[i] = float32(number)
+				case int:
+					vector[i] = float32(number)
+				case int64:
+					vector[i] = float32(number)
+				default:
+					return nil, fmt.Errorf("value is not []float")
+				}
+			}
+		} else {
+			return nil, fmt.Errorf("value is not []float")
+		}
+	}
+	if len(vector) != dimension {
+		return nil, fmt.Errorf("VECTOR(%d) column received float slice of length %d", dimension, len(vector))
+	}
+	return cloneVector(vector), nil
 }
 
 // mergeGraphCollection resolves the graph relation for a MERGE pattern. The
