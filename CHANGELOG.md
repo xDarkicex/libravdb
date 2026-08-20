@@ -4,6 +4,21 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.6 - 2026-08-20
+
+### Native Cypher list parameters
+
+- Added native support for `IN $list_param` and `NOT IN $list_param` in
+  Cypher-style `MATCH` predicates and ordinary SQL predicates.
+- List-valued parameters are expanded through typed ApexJSON values without
+  decoding JSON into generic map/slice trees. Empty lists and SQL NULL
+  membership behavior are preserved.
+- Scalar parameters used with `IN` now return an explicit
+  `IN expects list parameter` error instead of silently producing no rows.
+- Preserved literal `IN (...)` lists and subquery membership behavior.
+- Added regression coverage for native Cypher, relational SQL, `NOT IN`, empty
+  lists, and invalid scalar parameters.
+
 ## 1.6.5 - 2026-08-20
 
 ### Graphiti MERGE vector writes

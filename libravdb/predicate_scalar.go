@@ -18,12 +18,20 @@ func scalarPredicateMatches(actual interface{}, pred optimizer.RelationalPredica
 	if pred.Like || pred.ILike {
 		return sqlLikeMatch(actual, expected.BytesData, pred.ILike)
 	}
-	if len(pred.InValues) > 0 {
+	if pred.InList || len(pred.InValues) > 0 {
+		sawNull := false
 		for _, value := range pred.InValues {
+			if value.IsNull() {
+				sawNull = true
+				continue
+			}
 			cmp, actualNull, err := optimizer.CompareScalar(actual, value)
-			if err == nil && !actualNull && !value.IsNull() && cmp == 0 {
+			if err == nil && !actualNull && cmp == 0 {
 				return !pred.Not
 			}
+		}
+		if pred.Not && sawNull {
+			return false
 		}
 		return pred.Not
 	}

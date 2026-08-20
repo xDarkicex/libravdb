@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strconv"
@@ -142,6 +143,121 @@ func VectorValue(v []float32) ScalarValue {
 
 func JSONValue(v []byte) ScalarValue {
 	return ScalarValue{Kind: ScalarJSON, BytesData: append([]byte(nil), v...)}
+}
+
+// ExpandListParameter converts a bound list-valued parameter into the typed
+// membership values used by relational and graph predicates. JSON parameters
+// are walked directly through apexJSON's tape; object/array members remain
+// opaque JSON scalars instead of being decoded into map/slice trees.
+func ExpandListParameter(value ScalarValue) ([]ScalarValue, error) {
+	switch value.Kind {
+	case ScalarVector:
+		out := make([]ScalarValue, len(value.Vector))
+		for i, item := range value.Vector {
+			out[i] = FloatValue(float64(item))
+		}
+		return out, nil
+	case ScalarJSON:
+		decoder, err := apexjson.NewDecoder()
+		if err != nil {
+			return nil, fmt.Errorf("IN expects list parameter; JSON decoder: %w", err)
+		}
+		defer decoder.Free()
+		if err := decoder.Parse(value.BytesData); err != nil {
+			return nil, fmt.Errorf("IN expects list parameter; invalid JSON: %w", err)
+		}
+		root := decoder.Root()
+		if root.Type() != apexjson.TypeArray {
+			return nil, fmt.Errorf("IN expects list parameter; got JSON %s", jsonValueTypeName(root.Type()))
+		}
+		out := make([]ScalarValue, 0, 4)
+		it := root.ArrayIter()
+		for it.Next() {
+			item, err := scalarFromJSONValue(it.Value())
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, item)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("IN expects list parameter; got %s", scalarKindName(value.Kind))
+	}
+}
+
+func scalarFromJSONValue(value apexjson.Value) (ScalarValue, error) {
+	switch value.Type() {
+	case apexjson.TypeNull:
+		return NullValue(), nil
+	case apexjson.TypeBool:
+		return BoolValue(value.Bool()), nil
+	case apexjson.TypeString:
+		return StringValue(value.Str()), nil
+	case apexjson.TypeNumber:
+		raw := value.Bytes()
+		if bytes.IndexAny(raw, ".eE") >= 0 {
+			parsed, err := strconv.ParseFloat(string(raw), 64)
+			if err != nil {
+				return ScalarValue{}, fmt.Errorf("IN list contains invalid number %q: %w", raw, err)
+			}
+			return FloatValue(parsed), nil
+		}
+		if parsed, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+			return IntValue(parsed), nil
+		}
+		if parsed, err := strconv.ParseUint(string(raw), 10, 64); err == nil && parsed <= math.MaxInt64 {
+			return IntValue(int64(parsed)), nil
+		}
+		return ScalarValue{}, fmt.Errorf("IN list contains invalid number %q", raw)
+	case apexjson.TypeObject, apexjson.TypeArray:
+		return JSONValue(value.Bytes()), nil
+	default:
+		return ScalarValue{}, fmt.Errorf("IN list contains unsupported JSON %s", jsonValueTypeName(value.Type()))
+	}
+}
+
+func scalarKindName(kind ScalarKind) string {
+	switch kind {
+	case ScalarNull:
+		return "NULL"
+	case ScalarString:
+		return "string"
+	case ScalarInt:
+		return "integer"
+	case ScalarFloat:
+		return "float"
+	case ScalarBool:
+		return "boolean"
+	case ScalarVector:
+		return "vector"
+	case ScalarBytes:
+		return "bytes"
+	case ScalarTimestamp:
+		return "timestamp"
+	case ScalarJSON:
+		return "JSON"
+	default:
+		return "unknown"
+	}
+}
+
+func jsonValueTypeName(kind apexjson.Type) string {
+	switch kind {
+	case apexjson.TypeNull:
+		return "null"
+	case apexjson.TypeBool:
+		return "boolean"
+	case apexjson.TypeString:
+		return "string"
+	case apexjson.TypeNumber:
+		return "number"
+	case apexjson.TypeObject:
+		return "object"
+	case apexjson.TypeArray:
+		return "array"
+	default:
+		return "unknown"
+	}
 }
 
 // ScalarFromInterface converts a native query parameter or metadata value to

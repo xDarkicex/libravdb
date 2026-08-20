@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -2761,6 +2762,25 @@ func (db *Database) evalVirtualExpr(ctx context.Context, src []byte, doc *parser
 					break
 				}
 			}
+			if in.IsParam {
+				parameter, parameterOK, parameterErr := db.virtualExprValue(ctx, src, doc, in.ParamRef, row, params, legacy)
+				if parameterErr != nil {
+					return false, parameterErr
+				}
+				if !parameterOK {
+					return false, fmt.Errorf("IN expects list parameter; parameter is not bound")
+				}
+				candidates, listErr := virtualInParameterValues(parameter)
+				if listErr != nil {
+					return false, listErr
+				}
+				for _, candidate := range candidates {
+					if candidate != nil && sqlValueEqual(value, candidate) {
+						matched = true
+						break
+					}
+				}
+			}
 		}
 		if in.Not {
 			return !matched, nil
@@ -2796,6 +2816,25 @@ func (db *Database) evalVirtualExpr(ctx context.Context, src []byte, doc *parser
 		return true, nil
 	}
 	return false, nil
+}
+
+func virtualInParameterValues(value interface{}) ([]interface{}, error) {
+	value = materializeSQLJSONValue(value)
+	if value == nil {
+		return nil, fmt.Errorf("IN expects list parameter; got NULL")
+	}
+	rv := reflect.ValueOf(value)
+	if rv.Kind() != reflect.Array && rv.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("IN expects list parameter; got %T", value)
+	}
+	if rv.Type().Elem().Kind() == reflect.Uint8 {
+		return nil, fmt.Errorf("IN expects list parameter; got %T", value)
+	}
+	values := make([]interface{}, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		values[i] = rv.Index(i).Interface()
+	}
+	return values, nil
 }
 
 func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parser.QueryDoc, ref parser.NodeRef, row virtualSQLRow, params *optimizer.ParameterSet, legacy QueryParams) (interface{}, bool, error) {

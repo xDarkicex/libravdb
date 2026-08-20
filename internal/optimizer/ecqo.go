@@ -117,6 +117,7 @@ type RelationalPredicate struct {
 	Inclusive bool          // inclusive bound used by BETWEEN
 	Not       bool          // negated membership/range predicate
 	InValues  []ScalarValue // exact membership values for IN/NOT IN
+	InList    bool          // true even when IN's list is empty
 }
 
 // PredicateAlternatives is a disjunctive normal form representation of a
@@ -443,6 +444,7 @@ type PhysicalPlan struct {
 	FTSProjections     []FTSProjection
 	FTSPredicates      []FTSPredicate
 	FTSError           string
+	PredicateError     string
 
 	OrderBy  string // column name for ORDER BY (empty = none)
 	IsDesc   bool   // ORDER BY DESC
@@ -787,6 +789,9 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 					if v.Predicate.Kind != parser.NodeKindUnknown {
 						inline := &PhysicalPlan{}
 						o.extractRelationalPredicates(doc, src, inline, v.Predicate)
+						if inline.PredicateError != "" {
+							plan.PredicateError = inline.PredicateError
+						}
 						if n == 0 {
 							gjp.SourcePredicates = append(gjp.SourcePredicates, inline.Predicates...)
 						} else if n == mp.PathNodesCount-1 {
@@ -812,6 +817,9 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 	} else {
 		return nil, fmt.Errorf("unsupported FROM clause kind")
 	}
+	if plan.PredicateError != "" {
+		return nil, fmt.Errorf("predicate: %s", plan.PredicateError)
+	}
 
 	// 2. Map WHERE clause (Vector Search + Exact Filters)
 	if stmt.WhereExpr.Kind == parser.NodeKindUnknown {
@@ -828,6 +836,9 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 		o.extractRelationalPredicates(doc, src, plan, whereNode)
 		if plan.FTSError != "" {
 			return nil, fmt.Errorf("full-text predicate: %s", plan.FTSError)
+		}
+		if plan.PredicateError != "" {
+			return nil, fmt.Errorf("predicate: %s", plan.PredicateError)
 		}
 
 		// WHERE MATCH: walk AND chains to find the MatchPath.
@@ -939,6 +950,9 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 				if v.Predicate.Kind != parser.NodeKindUnknown {
 					inline := &PhysicalPlan{}
 					o.extractRelationalPredicates(doc, src, inline, v.Predicate)
+					if inline.PredicateError != "" {
+						plan.PredicateError = inline.PredicateError
+					}
 					if i == 0 {
 						gjp.SourcePredicates = append(gjp.SourcePredicates, inline.Predicates...)
 					} else if i == mp.PathNodesCount-1 {
@@ -1556,6 +1570,9 @@ func (o *Optimizer) lowerGraphPatternProjection(doc *parser.QueryDoc, src []byte
 	if pc.Predicate.Kind != parser.NodeKindUnknown {
 		predicatePlan := &PhysicalPlan{}
 		o.extractRelationalPredicates(doc, src, predicatePlan, pc.Predicate)
+		if predicatePlan.PredicateError != "" {
+			return GraphPatternProjection{}, fmt.Errorf("predicate: %s", predicatePlan.PredicateError)
+		}
 		pattern.Predicates = append(pattern.Predicates, predicatePlan.Predicates...)
 	}
 	if pc.Projection.Kind == parser.NodeKindIdentifier {
@@ -2587,20 +2604,31 @@ func (o *Optimizer) extractRelationalPredicates(doc *parser.QueryDoc, src []byte
 		}
 		o.setRelationalKind(plan)
 		values := make([]ScalarValue, 0, in.ListCount)
-		for i := int32(0); i < in.ListCount; i++ {
-			if value, ok := o.scalarForRef(doc, src, doc.Nodes[in.ListStart+i]); ok {
-				values = append(values, value)
+		if in.IsParam {
+			value, ok := o.scalarForRef(doc, src, in.ParamRef)
+			if !ok {
+				plan.PredicateError = "IN expects list parameter; parameter is not bound"
+				return
 			}
-		}
-		if len(values) == 0 {
-			return
+			var err error
+			values, err = ExpandListParameter(value)
+			if err != nil {
+				plan.PredicateError = err.Error()
+				return
+			}
+		} else {
+			for i := int32(0); i < in.ListCount; i++ {
+				if value, ok := o.scalarForRef(doc, src, doc.Nodes[in.ListStart+i]); ok {
+					values = append(values, value)
+				}
+			}
 		}
 		alias := ""
 		if id.QualEnd > id.QualStart {
 			alias = string(src[id.QualStart:id.QualEnd])
 		}
 		plan.Predicates = append(plan.Predicates, RelationalPredicate{
-			Alias: alias, Column: string(src[id.Start:id.End]), Operator: uint8(lexer.KindEquals), InValues: values, Not: in.Not,
+			Alias: alias, Column: string(src[id.Start:id.End]), Operator: uint8(lexer.KindEquals), InValues: values, InList: true, Not: in.Not,
 		})
 	}
 }
