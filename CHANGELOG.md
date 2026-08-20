@@ -4,6 +4,16 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.7 - 2026-08-20
+
+### Lexer dependency release
+
+- Updated the lexer dependency to the published `v0.1.11` release, which
+  contains the parser and AST support required by LibraVDB's native Cypher
+  list parameters and related Cypher clauses.
+- The repository's local `replace` workflow now resolves against the same
+  released lexer source during development.
+
 ## 1.6.6 - 2026-08-20
 
 ### Native Cypher list parameters
