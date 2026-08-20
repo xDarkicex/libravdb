@@ -414,8 +414,6 @@ var sqlJSONDecoderPool = sync.Pool{
 	},
 }
 
-var sqlJSONEmptyDocument = []byte("null")
-
 type sqlJSONRuntime struct {
 	decoders []*apexjson.Decoder
 }
@@ -433,23 +431,32 @@ func sqlJSONRuntimeFromContext(ctx context.Context) *sqlJSONRuntime {
 	return runtime
 }
 
+func getSQLJSONDecoder() (*apexjson.Decoder, error) {
+	if pooled := sqlJSONDecoderPool.Get(); pooled != nil {
+		if dec, ok := pooled.(*apexjson.Decoder); ok && dec != nil {
+			return dec, nil
+		}
+	}
+	return apexjson.NewDecoder()
+}
+
+func putSQLJSONDecoder(dec *apexjson.Decoder) {
+	if dec != nil {
+		dec.Reset()
+		sqlJSONDecoderPool.Put(dec)
+	}
+}
+
 func (runtime *sqlJSONRuntime) parse(raw []byte) (sqlLazyJSONValue, bool) {
 	if runtime == nil {
 		return lazyJSONDocument(raw)
 	}
-	var decoder *apexjson.Decoder
-	if pooled := sqlJSONDecoderPool.Get(); pooled != nil {
-		decoder, _ = pooled.(*apexjson.Decoder)
-	}
-	if decoder == nil {
-		var err error
-		decoder, err = apexjson.NewDecoder()
-		if err != nil {
-			return sqlLazyJSONValue{}, false
-		}
+	decoder, err := getSQLJSONDecoder()
+	if err != nil {
+		return sqlLazyJSONValue{}, false
 	}
 	if err := decoder.Parse(raw); err != nil {
-		decoder.Free()
+		putSQLJSONDecoder(decoder)
 		return sqlLazyJSONValue{}, false
 	}
 	root := decoder.Root()
@@ -462,13 +469,7 @@ func (runtime *sqlJSONRuntime) Free() {
 		return
 	}
 	for _, decoder := range runtime.decoders {
-		if decoder != nil {
-			if err := decoder.Parse(sqlJSONEmptyDocument); err == nil {
-				sqlJSONDecoderPool.Put(decoder)
-			} else {
-				decoder.Free()
-			}
-		}
+		putSQLJSONDecoder(decoder)
 	}
 	runtime.decoders = nil
 }

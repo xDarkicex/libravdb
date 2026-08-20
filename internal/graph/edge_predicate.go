@@ -1,5 +1,7 @@
 package graph
 
+import apexjson "github.com/xDarkicex/apexJSON/v2"
+
 // EdgePredicateOp identifies a boolean node in an edge-property predicate.
 type EdgePredicateOp uint8
 
@@ -60,10 +62,46 @@ func (p EdgePredicate) MatchesWithProperties(edge Edge, properties []byte) bool 
 	if !p.Enabled() {
 		return true
 	}
-	return p.matchesNode(p.Root, edge, properties)
+	if !p.needsArbitraryProperties() {
+		return p.matchesNode(p.Root, edge, properties, nil, false)
+	}
+	dec, err := getGraphDecoder()
+	if err != nil {
+		return false
+	}
+	defer putGraphDecoder(dec)
+	if !edgePropertyDocument(dec, properties) {
+		return false
+	}
+	return p.matchesNode(p.Root, edge, properties, dec, true)
 }
 
-func (p EdgePredicate) matchesNode(index int32, edge Edge, properties []byte) bool {
+// MatchesWithPropertiesDecoder evaluates the predicate using a decoder owned
+// by the surrounding traversal. The decoder is parsed once per edge and is
+// reused for every arbitrary-property comparison in this predicate tree.
+func (p EdgePredicate) MatchesWithPropertiesDecoder(edge Edge, properties []byte, dec *apexjson.Decoder) bool {
+	if !p.Enabled() {
+		return true
+	}
+	if !p.needsArbitraryProperties() {
+		return p.matchesNode(p.Root, edge, properties, nil, false)
+	}
+	if !edgePropertyDocument(dec, properties) {
+		return false
+	}
+	return p.matchesNode(p.Root, edge, properties, dec, true)
+}
+
+func (p EdgePredicate) needsArbitraryProperties() bool {
+	for _, node := range p.Nodes {
+		if node.Op == EdgePredicateComparison && node.Property == EdgePropertyArbitrary {
+			return true
+		}
+	}
+	return false
+}
+
+func (p EdgePredicate) matchesNode(index int32, edge Edge, properties []byte, dec *apexjson.Decoder, parsed bool) bool {
 	if index < 0 || int(index) >= len(p.Nodes) {
 		return false
 	}
@@ -76,15 +114,21 @@ func (p EdgePredicate) matchesNode(index int32, edge Edge, properties []byte) bo
 		case EdgePropertyKind:
 			return matchKind(n.Compare, edge.GetKind(), n.Kind)
 		case EdgePropertyArbitrary:
-			actual, ok := findEdgeProperty(properties, n.Name)
+			var actual EdgePropertyValue
+			var ok bool
+			if dec != nil && parsed {
+				actual, ok = edgePropertyJSONValue(dec.Get(n.Name))
+			} else {
+				actual, ok = findEdgeProperty(properties, n.Name)
+			}
 			return ok && matchPropertyValue(n.Compare, actual, n.Value)
 		default:
 			return false
 		}
 	case EdgePredicateAnd:
-		return p.matchesNode(n.Left, edge, properties) && p.matchesNode(n.Right, edge, properties)
+		return p.matchesNode(n.Left, edge, properties, dec, parsed) && p.matchesNode(n.Right, edge, properties, dec, parsed)
 	case EdgePredicateOr:
-		return p.matchesNode(n.Left, edge, properties) || p.matchesNode(n.Right, edge, properties)
+		return p.matchesNode(n.Left, edge, properties, dec, parsed) || p.matchesNode(n.Right, edge, properties, dec, parsed)
 	default:
 		return false
 	}

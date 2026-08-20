@@ -3,6 +3,8 @@ package graph
 import (
 	"sync/atomic"
 	"unsafe"
+
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 )
 
 // VisitAction is invoked for each node during traversal.
@@ -80,7 +82,7 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 
 		page := g.index.Lookup(node)
 		if page != nil {
-			gen := g.enumerateTargets(page, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, 1, false)
+			gen := g.enumerateTargets(page, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, nil, 1, false)
 
 			if atomic.LoadUint32(&page.Header.Generation) != gen {
 				if err := guard.leave(); err != nil {
@@ -108,7 +110,7 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 		}
 		reversePage := g.reverse.locator.Lookup(node)
 		if reversePage != nil {
-			reverseGen := g.enumerateTargets(reversePage, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, 1, true)
+			reverseGen := g.enumerateTargets(reversePage, 0, step, bitset, frontier, KindSet{}, WeightFilter{}, EdgePredicate{}, nil, 1, true)
 			if atomic.LoadUint32(&reversePage.Header.Generation) != reverseGen {
 				if err := reverseGuard.leave(); err != nil {
 					return err
@@ -142,6 +144,18 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 		return nil
 	}
 	lastBand := numBands - 1
+	var propertyDecoder *apexjson.Decoder
+	for _, edge := range edges {
+		if edge.Predicate.needsArbitraryProperties() {
+			var err error
+			propertyDecoder, err = getGraphDecoder()
+			if err != nil {
+				return err
+			}
+			defer putGraphDecoder(propertyDecoder)
+			break
+		}
+	}
 
 	bitset.Clear()
 	frontier.Clear()
@@ -181,7 +195,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 				oldTail := frontier.tail
 				page := g.index.Lookup(node)
 				if page != nil {
-					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands, dir < 0)
+					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, propertyDecoder, numBands, dir < 0)
 					if atomic.LoadUint32(&page.Header.Generation) != gen {
 						for i := oldTail; i < frontier.tail; i++ {
 							nd := frontier.data[i]
@@ -205,7 +219,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 				oldTail := frontier.tail
 				page := g.reverse.locator.Lookup(node)
 				if page != nil {
-					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, numBands, dir > 0)
+					gen := g.enumerateTargets(page, band, step, bitset, frontier, ks, edges[band].Weight, predicate, propertyDecoder, numBands, dir > 0)
 					if atomic.LoadUint32(&page.Header.Generation) != gen {
 						for i := oldTail; i < frontier.tail; i++ {
 							nd := frontier.data[i]
@@ -242,7 +256,7 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 // step deeper.  The caller must hold HyalineEnter on the appropriate pool.
 // Returns the generation snapshot taken at entry; the caller compares with a
 // re-read to detect concurrent writes.
-func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, bitset *Bitset, frontier *FrontierBuf, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, numBands int, onlyUndirected bool) uint32 {
+func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, bitset *Bitset, frontier *FrontierBuf, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, propertyDecoder *apexjson.Decoder, numBands int, onlyUndirected bool) uint32 {
 	gen := atomic.LoadUint32(&page.Header.Generation)
 	totalCount := page.Header.Count
 
@@ -259,7 +273,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 
 		if pageCount <= EdgePageInlineCapacity {
 			for i := uint16(0); i < pageCount; i++ {
-				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate, propertyDecoder) {
 					continue
 				}
 				target := currPage.Inline[i].Target
@@ -272,7 +286,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 			}
 		} else {
 			for i := uint16(0); i < EdgePageInlineCapacity; i++ {
-				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(currPage.Inline[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate, propertyDecoder) {
 					continue
 				}
 				target := currPage.Inline[i].Target
@@ -286,7 +300,7 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 			extra := unsafe.Slice((*Edge)(unsafe.Pointer(&currPage.Padding[0])), EdgePageOverflowCapacity)
 			extraCount := pageCount - EdgePageInlineCapacity
 			for i := uint16(0); i < extraCount; i++ {
-				if !g.matchesTraversalEdge(extra[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate) {
+				if !g.matchesTraversalEdge(extra[i], onlyUndirected, filterActive, kindFilter, weightFilter, predicate, propertyDecoder) {
 					continue
 				}
 				target := extra[i].Target
@@ -311,14 +325,14 @@ func (g *graphStore) enumerateTargets(page *EdgeTablePage, band int, step int, b
 	return gen
 }
 
-func (g *graphStore) matchesTraversalEdge(edge Edge, onlyUndirected, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate) bool {
+func (g *graphStore) matchesTraversalEdge(edge Edge, onlyUndirected, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, propertyDecoder *apexjson.Decoder) bool {
 	if onlyUndirected && !g.isUndirectedKind(edge.GetKind()) {
 		return false
 	}
-	return g.matchesEdgeFilters(edge, filterActive, kindFilter, weightFilter, predicate)
+	return g.matchesEdgeFilters(edge, filterActive, kindFilter, weightFilter, predicate, propertyDecoder)
 }
 
-func (g *graphStore) matchesEdgeFilters(edge Edge, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate) bool {
+func (g *graphStore) matchesEdgeFilters(edge Edge, filterActive bool, kindFilter KindSet, weightFilter WeightFilter, predicate EdgePredicate, propertyDecoder *apexjson.Decoder) bool {
 	if filterActive && !kindFilter.Has(edge.GetKind()) {
 		return false
 	}
@@ -329,5 +343,5 @@ func (g *graphStore) matchesEdgeFilters(edge Edge, filterActive bool, kindFilter
 	if err != nil {
 		return false
 	}
-	return predicate.MatchesWithProperties(edge, properties)
+	return predicate.MatchesWithPropertiesDecoder(edge, properties, propertyDecoder)
 }

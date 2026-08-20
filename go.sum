@@ -267,8 +267,8 @@ github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/subosito/gotenv v1.2.0/go.mod h1:N0PQaV/YGNqwC0u51sEeR/aUtSLEXKX9iv69rRypqCw=
-github.com/xDarkicex/apexJSON/v2 v2.0.0-alpha.2 h1:QEuLSeSLIweFuUOCjNUAmh1uw4bhNO/Blbq6QE8B5Nw=
-github.com/xDarkicex/apexJSON/v2 v2.0.0-alpha.2/go.mod h1:7wMCgkN4V0t3Su0XXOLrEWu2nrGNaFQF24pXEXsc1Rg=
+github.com/xDarkicex/apexJSON/v2 v2.0.3 h1:fM+y79lt95vdcyvysqwf0gN0eZlKdlvPvXVVB1ATwls=
+github.com/xDarkicex/apexJSON/v2 v2.0.3/go.mod h1:7wMCgkN4V0t3Su0XXOLrEWu2nrGNaFQF24pXEXsc1Rg=
 github.com/xDarkicex/memory v1.2.9 h1:qFCugJbwf47bA/gcua5AfscR+6950qeipefjkljDtUw=
 github.com/xDarkicex/memory v1.2.9/go.mod h1:ucTTiUZMrWXY/nDFkyLMlQ7BnO3qCmG2P2BMJKOSdGc=
 github.com/yuin/goldmark v1.1.25/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=

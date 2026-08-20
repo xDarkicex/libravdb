@@ -5,9 +5,36 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync"
 
 	apexjson "github.com/xDarkicex/apexJSON/v2"
 )
+
+var graphDecoderPool = sync.Pool{
+	New: func() interface{} {
+		decoder, err := apexjson.NewDecoder()
+		if err != nil {
+			return nil
+		}
+		return decoder
+	},
+}
+
+func getGraphDecoder() (*apexjson.Decoder, error) {
+	if pooled := graphDecoderPool.Get(); pooled != nil {
+		if dec, ok := pooled.(*apexjson.Decoder); ok && dec != nil {
+			return dec, nil
+		}
+	}
+	return apexjson.NewDecoder()
+}
+
+func putGraphDecoder(dec *apexjson.Decoder) {
+	if dec != nil {
+		dec.Reset()
+		graphDecoderPool.Put(dec)
+	}
+}
 
 // EdgePropertyEncodingVersion identifies the on-edge property envelope. The
 // envelope is intentionally small: [version byte][canonical JSON object]. A
@@ -35,19 +62,20 @@ type EdgePropertyValue struct {
 	Bool   bool
 }
 
-// NormalizeEdgeProperties validates and canonicalizes a JSON object for
-// durable edge storage. A nil or empty value means the edge has no arbitrary
+// NormalizeEdgeProperties validates edge properties, strips non-canonical
+// formatting, and packs the payload into the on-edge envelope. The input must
+// be a canonical JSON object: graph predicates bind to top-level object
 // properties. Top-level arrays/scalars are rejected so r.field is unambiguous.
 func NormalizeEdgeProperties(raw []byte) ([]byte, error) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, nil
 	}
-	dec, err := apexjson.NewDecoder()
+	dec, err := getGraphDecoder()
 	if err != nil {
 		return nil, fmt.Errorf("edge properties must be a JSON object: %w", err)
 	}
-	defer dec.Free()
+	defer putGraphDecoder(dec)
 	if err := dec.Parse(raw); err != nil {
 		return nil, fmt.Errorf("edge properties must be a JSON object: %w", err)
 	}
@@ -91,11 +119,11 @@ func decodeEdgePropertyObject(raw []byte) (map[string]interface{}, error) {
 	if raw[0] != EdgePropertyEncodingVersion {
 		return nil, fmt.Errorf("unsupported edge property encoding version %d", raw[0])
 	}
-	dec, err := apexjson.NewDecoder()
+	dec, err := getGraphDecoder()
 	if err != nil {
 		return nil, err
 	}
-	defer dec.Free()
+	defer putGraphDecoder(dec)
 	if err := dec.Parse(raw[1:]); err != nil {
 		return nil, err
 	}
@@ -154,11 +182,11 @@ func findEdgeProperty(raw []byte, name string) (EdgePropertyValue, bool) {
 	if len(raw) == 0 || raw[0] != EdgePropertyEncodingVersion {
 		return EdgePropertyValue{}, false
 	}
-	dec, err := apexjson.NewDecoder()
+	dec, err := getGraphDecoder()
 	if err != nil {
 		return EdgePropertyValue{}, false
 	}
-	defer dec.Free()
+	defer putGraphDecoder(dec)
 	if err := dec.Parse(raw[1:]); err != nil {
 		return EdgePropertyValue{}, false
 	}
@@ -166,13 +194,20 @@ func findEdgeProperty(raw []byte, name string) (EdgePropertyValue, bool) {
 	return edgePropertyJSONValue(value)
 }
 
+func edgePropertyDocument(dec *apexjson.Decoder, raw []byte) bool {
+	if dec == nil || len(raw) == 0 || raw[0] != EdgePropertyEncodingVersion {
+		return false
+	}
+	return dec.Parse(raw[1:]) == nil
+}
+
 func edgePropertyJSONValue(value apexjson.Value) (EdgePropertyValue, bool) {
 	switch value.Type() {
 	case apexjson.TypeNull:
 		return EdgePropertyValue{Kind: EdgePropertyNull}, true
 	case apexjson.TypeNumber:
-		f, err := strconv.ParseFloat(string(value.Bytes()), 64)
-		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		f := value.Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return EdgePropertyValue{}, false
 		}
 		return EdgePropertyValue{Kind: EdgePropertyNumber, Number: f}, true

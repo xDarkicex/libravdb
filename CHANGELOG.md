@@ -4,6 +4,28 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.1 - 2026-08-19
+
+### Native ApexJSON JSONB execution
+
+- Switched `jsonb_set` and `jsonb_insert` mutation execution to ApexJSON's
+  native path-aware, copy-on-write primitives. Mutations no longer build
+  temporary `map[string]interface{}`/`[]interface{}` JSON trees.
+- Reused pooled JSON decoders and retained their off-heap mutation capacity
+  across calls, while preserving atomic replacement validation, stale-value
+  invalidation, reset, and reopen semantics.
+- Reused a traversal-scoped JSON decoder for arbitrary graph-edge property
+  predicates and removed per-edge number/string conversion allocations.
+- Added permanent native-vs-tree JSONB mutation benchmarks and retained the
+  existing native SQL, epoch, pgwire, and JSON regression coverage.
+
+The native JSONB mutation benchmarks on the release candidate measured roughly
+`1.0 us/op, 272 B/op, 5 allocs/op` for `jsonb_set` and `1.0 us/op, 288 B/op,
+5 allocs/op` for `jsonb_insert`, compared with roughly `2.2 us/op, 1.9 KB/op,
+18 allocs/op` and `2.0 us/op, 1.7 KB/op, 16 allocs/op` for the former tree
+baselines respectively on an Apple M2. Exact numbers depend on hardware and
+Go version.
+
 ## 1.5.9 - 2026-08-18
 
 ### SQL executor performance

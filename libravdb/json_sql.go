@@ -32,11 +32,11 @@ func lazyJSONDocument(raw []byte) (sqlLazyJSONValue, bool) {
 	if len(raw) == 0 {
 		return sqlLazyJSONValue{}, false
 	}
-	dec, err := apexjson.NewDecoder()
+	dec, err := getSQLJSONDecoder()
 	if err != nil {
 		return sqlLazyJSONValue{}, false
 	}
-	defer dec.Free()
+	defer putSQLJSONDecoder(dec)
 	if err := dec.Parse(raw); err != nil {
 		return sqlLazyJSONValue{}, false
 	}
@@ -187,11 +187,11 @@ func decodeJSONText(data []byte) (interface{}, bool) {
 	if len(data) == 0 {
 		return nil, false
 	}
-	decoder, err := apexjson.NewDecoder()
+	decoder, err := getSQLJSONDecoder()
 	if err != nil {
 		return nil, false
 	}
-	defer decoder.Free()
+	defer putSQLJSONDecoder(decoder)
 	if err := decoder.Parse(data); err != nil {
 		return nil, false
 	}
@@ -199,12 +199,12 @@ func decodeJSONText(data []byte) (interface{}, bool) {
 }
 
 func parseSQLLazyJSON(raw []byte) (*apexjson.Decoder, apexjson.Value, error) {
-	decoder, err := apexjson.NewDecoder()
+	decoder, err := getSQLJSONDecoder()
 	if err != nil {
 		return nil, apexjson.Value{}, err
 	}
 	if err := decoder.Parse(raw); err != nil {
-		decoder.Free()
+		putSQLJSONDecoder(decoder)
 		return nil, apexjson.Value{}, err
 	}
 	return decoder, decoder.Root(), nil
@@ -323,7 +323,7 @@ func jsonExtractRaw(document []byte, key interface{}, textResult bool) (interfac
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid JSON document: %w", err)
 	}
-	defer decoder.Free()
+	defer putSQLJSONDecoder(decoder)
 	if root.Type() == apexjson.TypeNull {
 		return nil, true, nil
 	}
@@ -343,7 +343,7 @@ func jsonPathRaw(document []byte, path interface{}, textResult bool) (interface{
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid JSON document: %w", err)
 	}
-	defer decoder.Free()
+	defer putSQLJSONDecoder(decoder)
 	if root.Type() == apexjson.TypeNull {
 		return nil, true, nil
 	}
@@ -762,7 +762,7 @@ func jsonExists(document, key interface{}) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("invalid JSON document: %w", err)
 		}
-		defer decoder.Free()
+		defer putSQLJSONDecoder(decoder)
 		if root.Type() != apexjson.TypeObject {
 			return false, nil
 		}
@@ -865,7 +865,7 @@ func jsonAnyOrAll(document, keys interface{}, requireAll bool) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("invalid JSON document: %w", err)
 		}
-		defer decoder.Free()
+		defer putSQLJSONDecoder(decoder)
 		for _, key := range keyList {
 			exists := false
 			if root.Type() == apexjson.TypeObject {
@@ -914,179 +914,85 @@ func jsonAnyOrAll(document, keys interface{}, requireAll bool) (bool, error) {
 	return requireAll, nil
 }
 
-func jsonbSet(document, path, replacement interface{}, createMissing bool) (interface{}, error) {
-	root, ok := decodeJSONValue(document)
-	if !ok {
-		return nil, fmt.Errorf("invalid JSON document")
+// jsonMutationRaw converts the SQL JSON value contract into one complete raw
+// JSON value without building a Go JSON tree. Strings and byte slices retain
+// the existing SQL behavior: they are JSON text and must therefore contain a
+// valid JSON value. Structured values are encoded directly by ApexJSON.
+func jsonMutationRaw(value interface{}) ([]byte, error) {
+	if raw, ok := jsonDocumentRaw(value); ok {
+		raw = bytes.TrimSpace(raw)
+		if len(raw) != 0 {
+			return raw, nil
+		}
+	}
+	switch v := value.(type) {
+	case string:
+		raw := bytes.TrimSpace([]byte(v))
+		if len(raw) != 0 {
+			return raw, nil
+		}
+	case []byte:
+		raw := bytes.TrimSpace(v)
+		if len(raw) != 0 {
+			return raw, nil
+		}
+	case util.JSONNull:
+		return []byte("null"), nil
+	}
+	encoded, err := apexjson.Marshal(jsonWireValue(value))
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+// nativeJSONMutation applies a variable-size JSON mutation through
+// ApexJSON's off-heap candidate/commit path. The returned RawMessage owns a
+// copy of the committed span because the pooled decoder is reset before this
+// function returns.
+func nativeJSONMutation(document, path, replacement interface{}, mutate func(*apexjson.Decoder, []string, []byte) (bool, error)) (interface{}, error) {
+	documentRaw, err := jsonMutationRaw(document)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON document: %w", err)
 	}
 	segments, ok := jsonPathSegments(path)
 	if !ok || len(segments) == 0 {
-		return nil, fmt.Errorf("jsonb_set path must be a non-empty text array")
+		return nil, fmt.Errorf("JSON mutation path must be a non-empty text array")
 	}
-	value, ok := decodeJSONValue(replacement)
-	if !ok {
-		return nil, fmt.Errorf("invalid JSON replacement value")
+	replacementRaw, err := jsonMutationRaw(replacement)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JSON replacement value: %w", err)
 	}
-	updated, changed := setJSONPath(root, segments, value, createMissing)
-	if !changed {
-		return root, nil
+	decoder, err := getSQLJSONDecoder()
+	if err != nil {
+		return nil, err
 	}
-	return updated, nil
+	defer putSQLJSONDecoder(decoder)
+	if err := decoder.Parse(documentRaw); err != nil {
+		return nil, fmt.Errorf("invalid JSON document: %w", err)
+	}
+	if _, err := mutate(decoder, segments, replacementRaw); err != nil {
+		return nil, err
+	}
+	committed := decoder.Root().RawJSON()
+	if len(committed) == 0 {
+		return nil, fmt.Errorf("invalid JSON mutation result")
+	}
+	owned := make(apexjson.RawMessage, len(committed))
+	copy(owned, committed)
+	return owned, nil
 }
 
-func setJSONPath(node interface{}, segments []string, replacement interface{}, createMissing bool) (interface{}, bool) {
-	if len(segments) == 0 {
-		return replacement, true
-	}
-	switch current := node.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(current))
-		for key, value := range current {
-			out[key] = value
-		}
-		key := segments[0]
-		child, exists := current[key]
-		if len(segments) == 1 {
-			if !exists && !createMissing {
-				return node, false
-			}
-			out[key] = replacement
-			return out, true
-		}
-		if !exists {
-			if !createMissing {
-				return node, false
-			}
-			child = make(map[string]interface{})
-		}
-		updated, changed := setJSONPath(child, segments[1:], replacement, createMissing)
-		if !changed {
-			return node, false
-		}
-		out[key] = updated
-		return out, true
-	case []interface{}:
-		index, err := strconv.Atoi(segments[0])
-		if err != nil || index < 0 {
-			return node, false
-		}
-		out := append([]interface{}(nil), current...)
-		if index >= len(out) {
-			if !createMissing || index != len(out) {
-				return node, false
-			}
-			if len(segments) == 1 {
-				return append(out, replacement), true
-			}
-			out = append(out, make(map[string]interface{}))
-		}
-		if len(segments) == 1 {
-			out[index] = replacement
-			return out, true
-		}
-		updated, changed := setJSONPath(out[index], segments[1:], replacement, createMissing)
-		if !changed {
-			return node, false
-		}
-		out[index] = updated
-		return out, true
-	default:
-		return node, false
-	}
-}
-
-// insertJSONPath implements the immutable tree update used by jsonb_insert.
-// Object keys are inserted only when absent; array indexes accept PostgreSQL's
-// negative-index form and insert before/after the selected element.
-func insertJSONPath(node interface{}, segments []string, replacement interface{}, insertAfter bool) (interface{}, bool) {
-	if len(segments) == 0 {
-		return node, false
-	}
-	switch current := node.(type) {
-	case map[string]interface{}:
-		key := segments[0]
-		if len(segments) == 1 {
-			if _, exists := current[key]; exists {
-				return node, false
-			}
-			out := make(map[string]interface{}, len(current)+1)
-			for k, value := range current {
-				out[k] = value
-			}
-			out[key] = replacement
-			return out, true
-		}
-		child, exists := current[key]
-		if !exists {
-			return node, false
-		}
-		updated, changed := insertJSONPath(child, segments[1:], replacement, insertAfter)
-		if !changed {
-			return node, false
-		}
-		out := make(map[string]interface{}, len(current))
-		for k, value := range current {
-			out[k] = value
-		}
-		out[key] = updated
-		return out, true
-	case []interface{}:
-		index, err := strconv.Atoi(segments[0])
-		if err != nil {
-			return node, false
-		}
-		if len(segments) == 1 {
-			if index < 0 {
-				index = len(current) + index
-			}
-			if index < 0 {
-				index = 0
-			}
-			if index > len(current) {
-				index = len(current)
-			}
-			if insertAfter && index < len(current) {
-				index++
-			}
-			out := make([]interface{}, 0, len(current)+1)
-			out = append(out, current[:index]...)
-			out = append(out, replacement)
-			out = append(out, current[index:]...)
-			return out, true
-		}
-		if index < 0 {
-			index = len(current) + index
-		}
-		if index < 0 || index >= len(current) {
-			return node, false
-		}
-		updated, changed := insertJSONPath(current[index], segments[1:], replacement, insertAfter)
-		if !changed {
-			return node, false
-		}
-		out := append([]interface{}(nil), current...)
-		out[index] = updated
-		return out, true
-	default:
-		return node, false
-	}
+func jsonbSet(document, path, replacement interface{}, createMissing bool) (interface{}, error) {
+	return nativeJSONMutation(document, path, replacement, func(decoder *apexjson.Decoder, segments []string, raw []byte) (bool, error) {
+		return decoder.SetPathRaw(segments, raw, createMissing)
+	})
 }
 
 func jsonbInsert(document, path, replacement interface{}, insertAfter bool) (interface{}, error) {
-	root, ok := decodeJSONValue(document)
-	if !ok {
-		return nil, fmt.Errorf("invalid JSON document")
-	}
-	segments, ok := jsonPathSegments(path)
-	if !ok || len(segments) == 0 {
-		return nil, fmt.Errorf("jsonb_insert path must be a non-empty text array")
-	}
-	value, ok := decodeJSONValue(replacement)
-	if !ok {
-		return nil, fmt.Errorf("invalid JSON replacement value")
-	}
-	updated, _ := insertJSONPath(root, segments, value, insertAfter)
-	return updated, nil
+	return nativeJSONMutation(document, path, replacement, func(decoder *apexjson.Decoder, segments []string, raw []byte) (bool, error) {
+		return decoder.InsertPathRaw(segments, raw, insertAfter)
+	})
 }
 
 func deleteJSONPath(node interface{}, segments []string) (interface{}, bool) {
@@ -1272,7 +1178,7 @@ func jsonbTypeof(value interface{}) (string, bool) {
 		if err != nil {
 			return "", false
 		}
-		defer decoder.Free()
+		defer putSQLJSONDecoder(decoder)
 		switch root.Type() {
 		case apexjson.TypeNull:
 			return "null", true
@@ -1412,7 +1318,7 @@ func evaluateJSONFunction(name string, args []interface{}) (interface{}, bool, e
 			if err != nil {
 				return nil, false, fmt.Errorf("invalid JSON document: %w", err)
 			}
-			defer decoder.Free()
+			defer putSQLJSONDecoder(decoder)
 			if root.Type() != apexjson.TypeArray {
 				return nil, false, fmt.Errorf("jsonb_array_length requires an array")
 			}
@@ -1674,7 +1580,7 @@ func evaluateJSONArrayExpansionRaw(name string, raw []byte, textMode, objectKeys
 	if err != nil {
 		return nil, fmt.Errorf("invalid JSON document: %w", err)
 	}
-	defer decoder.Free()
+	defer putSQLJSONDecoder(decoder)
 	if objectKeys || each {
 		if root.Type() != apexjson.TypeObject {
 			return nil, fmt.Errorf("%s requires an object", name)
@@ -1764,12 +1670,12 @@ func jsonContainsRaw(leftRaw, rightRaw []byte) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("invalid left JSON value: %w", err)
 	}
-	defer leftDecoder.Free()
+	defer putSQLJSONDecoder(leftDecoder)
 	rightDecoder, right, err := parseSQLLazyJSON(rightRaw)
 	if err != nil {
 		return false, fmt.Errorf("invalid right JSON value: %w", err)
 	}
-	defer rightDecoder.Free()
+	defer putSQLJSONDecoder(rightDecoder)
 	return jsonContainsApexValue(left, right), nil
 }
 

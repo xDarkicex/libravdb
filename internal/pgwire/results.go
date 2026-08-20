@@ -755,16 +755,31 @@ func metadataValueToString(v interface{}) string {
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLQueryStats:
+		if encoded, err := apexjson.Marshal(&t); err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprintf("%v", t)
+	case *libravdb.SQLQueryStats:
 		if encoded, err := apexjson.Marshal(t); err == nil {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLExplainPlan:
+		if encoded, err := apexjson.Marshal(&t); err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprintf("%v", t)
+	case *libravdb.SQLExplainPlan:
 		if encoded, err := apexjson.Marshal(t); err == nil {
 			return string(encoded)
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.GraphPath:
+		if encoded, err := apexjson.Marshal(&t); err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprintf("%v", t)
+	case *libravdb.GraphPath:
 		if encoded, err := apexjson.Marshal(t); err == nil {
 			return string(encoded)
 		}

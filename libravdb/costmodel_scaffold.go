@@ -1,9 +1,12 @@
 package libravdb
 
 import (
+	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
+	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
@@ -52,6 +55,61 @@ type CostModelGraphStats struct {
 	EdgeKindCounts   map[uint16]uint64
 	AverageBranching float64
 	PatternSamples   map[string]CostModelGraphPatternSample
+}
+
+// CostModelGraphStats keeps EdgeKindCounts numeric in the Go API, but JSON
+// object keys are strings. The standard library transparently converts
+// integer map keys during JSON encoding; ApexJSON intentionally requires
+// string-keyed maps on its native path. Keep the conversion at this wire
+// boundary so persisted statistics retain the existing shape and ApexJSON
+// remains the only JSON implementation used by LibraVDB.
+type costModelGraphStatsJSON struct {
+	VertexCount      uint64                                 `json:"VertexCount"`
+	EdgeCount        uint64                                 `json:"EdgeCount"`
+	LabelCounts      map[string]uint64                      `json:"LabelCounts"`
+	EdgeKindCounts   map[string]uint64                      `json:"EdgeKindCounts"`
+	AverageBranching float64                                `json:"AverageBranching"`
+	PatternSamples   map[string]CostModelGraphPatternSample `json:"PatternSamples"`
+}
+
+func (s CostModelGraphStats) MarshalJSON() ([]byte, error) {
+	counts := make(map[string]uint64, len(s.EdgeKindCounts))
+	for kind, count := range s.EdgeKindCounts {
+		counts[strconv.FormatUint(uint64(kind), 10)] = count
+	}
+	return apexjson.Marshal(costModelGraphStatsJSON{
+		VertexCount:      s.VertexCount,
+		EdgeCount:        s.EdgeCount,
+		LabelCounts:      s.LabelCounts,
+		EdgeKindCounts:   counts,
+		AverageBranching: s.AverageBranching,
+		PatternSamples:   s.PatternSamples,
+	})
+}
+
+func (s *CostModelGraphStats) UnmarshalJSON(data []byte) error {
+	if s == nil {
+		return fmt.Errorf("cannot unmarshal cost-model graph statistics into nil receiver")
+	}
+	var wire costModelGraphStatsJSON
+	if err := apexjson.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	counts := make(map[uint16]uint64, len(wire.EdgeKindCounts))
+	for rawKind, count := range wire.EdgeKindCounts {
+		kind, err := strconv.ParseUint(rawKind, 10, 16)
+		if err != nil {
+			return fmt.Errorf("invalid graph edge kind %q: %w", rawKind, err)
+		}
+		counts[uint16(kind)] = count
+	}
+	s.VertexCount = wire.VertexCount
+	s.EdgeCount = wire.EdgeCount
+	s.LabelCounts = wire.LabelCounts
+	s.EdgeKindCounts = counts
+	s.AverageBranching = wire.AverageBranching
+	s.PatternSamples = wire.PatternSamples
+	return nil
 }
 
 type CostModelGraphPatternSample struct {
