@@ -61,6 +61,83 @@ func TestSQLGraphDDLBootstrapsAndReopensUnifiedGraph(t *testing.T) {
 	}
 }
 
+func TestSQLGraphVectorMergeSurvivesCatalogUpdatesAndReopen(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/graph-vector-catalog.libravdb"
+
+	db, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"CREATE GRAPH TABLE Entity (uuid STRING PRIMARY KEY, name STRING, name_embedding VECTOR(4))",
+		"CREATE GRAPH TABLE Episodic (uuid STRING PRIMARY KEY, name STRING, content STRING)",
+		"CREATE GRAPH TABLE Community (uuid STRING PRIMARY KEY, name STRING, summary STRING)",
+		"CREATE GRAPH TABLE Saga (uuid STRING PRIMARY KEY, name STRING, group_id STRING)",
+		"CREATE GRAPH TABLE RelatesToNode_ (uuid STRING PRIMARY KEY, name STRING, fact STRING)",
+		"CREATE EDGE TYPE SQL_GRAPH_VECTOR_MENTIONS",
+		"CREATE EDGE TYPE SQL_GRAPH_VECTOR_RELATES_TO",
+	} {
+		if _, err := db.Query(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+
+	vector := []float32{0.01, 0.02, 0.03, 0.04}
+	if _, err := db.QueryWithParams(ctx,
+		"MERGE (n:Entity {uuid: $uuid}) SET n.name = $name, n.name_embedding = $embedding",
+		QueryParams{"uuid": "alice", "name": "Alice", "embedding": vector}); err != nil {
+		t.Fatalf("MERGE after graph-table bootstrap: %v", err)
+	}
+	entity, err := db.GetCollection("Entity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := entity.Get(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Vector) != len(vector) {
+		t.Fatalf("stored vector length=%d, want %d", len(record.Vector), len(vector))
+	}
+	for i := range vector {
+		if record.Vector[i] != vector[i] {
+			t.Fatalf("stored vector=%v, want %v", record.Vector, vector)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	entity, err = db.GetCollection("Entity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vector = []float32{0.04, 0.03, 0.02, 0.01}
+	if _, err := db.QueryWithParams(ctx,
+		"MERGE (n:Entity {uuid: $uuid}) SET n.name_embedding = $embedding",
+		QueryParams{"uuid": "bob", "embedding": vector}); err != nil {
+		t.Fatalf("MERGE after reopen: %v", err)
+	}
+	record, err = entity.Get(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Vector) != len(vector) {
+		t.Fatalf("reopened stored vector length=%d, want %d", len(record.Vector), len(vector))
+	}
+	for i := range vector {
+		if record.Vector[i] != vector[i] {
+			t.Fatalf("reopened stored vector=%v, want %v", record.Vector, vector)
+		}
+	}
+}
+
 func TestSQLUndirectedEdgeTypeTraversesBothEndpointsAndSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/undirected-graph-ddl.libravdb"

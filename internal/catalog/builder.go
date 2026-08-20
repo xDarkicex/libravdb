@@ -143,6 +143,7 @@ func NewBuilderFrom(cat *Catalog) *Builder {
 			}
 			col := (*ColumnDef)(unsafe.Pointer(&cat.data[offset]))
 			te.columns = append(te.columns, ColumnInfo{
+				Name:     cat.ColumnName(t, col),
 				Type:     col.Type,
 				Flags:    col.Flags,
 				nameHash: col.NameHash,

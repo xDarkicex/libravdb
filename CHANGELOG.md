@@ -4,6 +4,17 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.9 - 2026-08-20
+
+### Graphiti vector MERGE catalog regression
+
+- Fixed catalog rebuilds after multiple `CREATE GRAPH TABLE` statements to
+  preserve existing column names and declared vector-column bindings.
+- Restored Graphiti-shaped `MERGE ... SET n.name_embedding = $vector` routing
+  through the physical vector writer after graph-table bootstrap and reopen.
+- Added regression coverage for multi-table bootstrap, edge-kind registration,
+  vector round trips, and post-reopen vector MERGE writes.
+
 ## 1.6.8 - 2026-08-20
 
 ### Unified SQL graph namespace
