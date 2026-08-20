@@ -72,6 +72,12 @@ func TestSQL_JoinMatchGraphJoin(t *testing.T) {
 	if g == nil {
 		t.Fatalf("no graph on collection")
 	}
+	// The MATCH pattern declares endpoint labels. Register them on the test
+	// vertices so this fixture exercises label filtering explicitly.
+	g.RegisterVertexLabel(api1, "Endpoint")
+	g.RegisterVertexLabel(api2, "Endpoint")
+	g.RegisterVertexLabel(doc1, "Manual")
+	g.RegisterVertexLabel(doc2, "Manual")
 	txn := g.BeginTxn()
 	// svc1 -DEPENDS_ON-> api1 -DOCUMENTED_BY-> doc1
 	if err := g.AddEdge(txn, svc1, api1, 1.0, 71); err != nil {

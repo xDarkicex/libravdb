@@ -4,6 +4,18 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.2 - 2026-08-19
+
+### SQL parser and graph join correctness
+
+- Updated the lexer dependency to the published `v0.1.10` release and
+  restored support for `optional` as an unquoted SQL column identifier while
+  retaining `OPTIONAL MATCH` syntax.
+- Fixed chained `JOIN MATCH` execution so terminal vertex labels are applied
+  to final-hop rows without incorrectly filtering intermediate path rows.
+- Added labeled graph vertices to the chained-join regression fixture and
+  retained coverage for both inner and left graph joins.
+
 ## 1.6.1 - 2026-08-19
 
 ### Native ApexJSON JSONB execution

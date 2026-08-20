@@ -6340,7 +6340,10 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 			}
 
 			seedID := nodeID
-			seen := make(map[uint64]bool) // nodeID → reached via traversal
+			type seenGraphNode struct {
+				final bool
+			}
+			seen := make(map[uint64]seenGraphNode) // nodeID → path reach state
 
 			if err := g.BFSPattern(nodeID, edges, gjp.MaxHops, func(vid uint64, band int, step int) bool {
 				trackSQLGraphExpansion(ctx, 1)
@@ -6357,12 +6360,15 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 				// matches (Min == 0 for ->*).  Otherwise exclude the seed
 				// initialization visit — it must be reached via expansion
 				// or band transition to count.
+				isFinal := band == len(edges)-1
 				if vid == seedID && band == 0 && step == 0 {
 					if edges[0].Min == 0 {
-						seen[vid] = true
+						seen[vid] = seenGraphNode{final: isFinal}
 					}
 				} else {
-					seen[vid] = true
+					state := seen[vid]
+					state.final = state.final || isFinal
+					seen[vid] = state
 				}
 				return plan.Limit <= 0 || len(results) < plan.Limit
 			}, bitset, frontier); err != nil {
@@ -6374,7 +6380,7 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 
 			// Emit joined rows: leftKey|vertexRecID, filtering by min depth.
 			emitted := false
-			for vid := range seen {
+			for vid, reach := range seen {
 				_, recID, err := e.db.ResolveNodeID(ctx, vid)
 				if err != nil {
 					continue
@@ -6386,7 +6392,11 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 				if len(gjp.TerminalPredicates) > 0 && !recordMatchesPredicatesTracked(ctx, terminal, gjp.TerminalPredicates) {
 					continue
 				}
-				if len(gjp.TerminalLabels) > 0 && !graphLabelsMatch(g, vid, gjp.TerminalLabels) {
+				// Terminal labels apply to rows reached at the final path
+				// band. Intermediate rows are still part of the JOIN MATCH
+				// result contract and must not be tested against the final
+				// vertex label.
+				if reach.final && len(gjp.TerminalLabels) > 0 && !graphLabelsMatch(g, vid, gjp.TerminalLabels) {
 					continue
 				}
 				if len(plan.PredicateAlternatives) > 0 && !graphJoinMatchesAlternativesTracked(ctx, plan, map[string]Record{
