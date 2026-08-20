@@ -66,6 +66,16 @@ func describeStatement(db *libravdb.Database, query string, paramCount int) ([]u
 	if err := parser.Parse(src, doc); err != nil {
 		return nil, nil, fmt.Errorf("parse error: %w", err)
 	}
+	// Native Cypher pipelines are executed by LibraVDB's graph pipeline
+	// executor, not by the relational catalog binder.  In particular, aliases
+	// introduced by WITH (for example `WITH n.uuid AS u`) are deliberately not
+	// catalog columns.  Describe must therefore derive the final RETURN shape
+	// directly from the parsed projection list and leave binding to execution.
+	// Without this branch pgwire rejects a valid prepared statement before the
+	// executor gets a chance to evaluate the pipeline.
+	if paramOIDs, columns, ok := describeNativeCypherPipeline(doc, src, paramCount); ok {
+		return paramOIDs, columns, nil
+	}
 
 	cat := db.Catalog()
 	if cat == nil {
@@ -147,6 +157,67 @@ func describeStatement(db *libravdb.Database, query string, paramCount int) ([]u
 
 	paramOIDs := inferParamOIDs(doc, src, cat, byOID, paramCount)
 	return paramOIDs, columns, nil
+}
+
+// describeNativeCypherPipeline returns the wire shape for a native MATCH
+// query containing one or more mid-query WITH clauses.  WITH aliases are
+// query-local values, so a catalog binder cannot resolve them.  The executor
+// still supplies the authoritative result values and columns; this function
+// only provides the pre-execution protocol metadata required by Parse,
+// Describe, and clients using the extended query protocol.
+func describeNativeCypherPipeline(doc *parser.QueryDoc, src []byte, paramCount int) ([]uint32, []ColumnMeta, bool) {
+	if doc == nil {
+		return nil, nil, false
+	}
+	var stmt *parser.SelectStmt
+	for i := len(doc.Nodes) - 1; i >= 0; i-- {
+		node := doc.Nodes[i]
+		if node.Kind != parser.NodeKindSelectStmt || node.ID < 0 || int(node.ID) >= len(doc.SelectStmts) {
+			continue
+		}
+		candidate := &doc.SelectStmts[node.ID]
+		if candidate.PipeWithCount > 0 && candidate.FromTable.Kind == parser.NodeKindGraphTable {
+			stmt = candidate
+			break
+		}
+	}
+	if stmt == nil {
+		return nil, nil, false
+	}
+
+	paramOIDs := inferParamOIDs(doc, src, nil, nil, paramCount)
+	columns := make([]ColumnMeta, 0, stmt.ProjectionsCount)
+	for i := int32(0); i < stmt.ProjectionsCount; i++ {
+		projection := doc.Projections[stmt.ProjectionsStart+i]
+		if projection.Star {
+			// A star can carry the complete scope, whose exact shape is only
+			// known after the graph relation is selected.  Returning no static
+			// columns lets Execute provide the authoritative description.
+			return paramOIDs, nil, true
+		}
+		name := "expr"
+		if projection.AliasEnd > projection.Alias && projection.AliasEnd <= uint32(len(src)) {
+			name = string(src[projection.Alias:projection.AliasEnd])
+		} else if projection.Expr.Kind == parser.NodeKindIdentifier && projection.Expr.ID >= 0 && int(projection.Expr.ID) < len(doc.Identifiers) {
+			id := doc.Identifiers[projection.Expr.ID]
+			if id.End <= uint32(len(src)) && id.Start < id.End {
+				name = string(src[id.Start:id.End])
+			}
+		}
+		oid := uint32(OIDText)
+		switch projection.Expr.Kind {
+		case parser.NodeKindAggregateExpr, parser.NodeKindNumber:
+			oid = OIDInt8
+		case parser.NodeKindVectorFunc:
+			oid = OIDFloat8
+		case parser.NodeKindFunctionExpr:
+			// Graph/JSON values are serialized by the result layer. Text is
+			// the safe fallback for a dynamically typed pipeline expression.
+			oid = OIDText
+		}
+		columns = append(columns, ColumnMeta{Name: name, TypeOID: oid})
+	}
+	return paramOIDs, columns, true
 }
 
 // describeCollectionStar expands a bare SELECT * against the same collection

@@ -4,6 +4,24 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.3 - 2026-08-19
+
+### Native Cypher graph queries
+
+- Documented LibraVDB's native Cypher-style graph surface in
+  `docs/cypher-supported.md`, including `MATCH ... RETURN`, graph patterns,
+  labels, variable-length traversal, shortest paths, path values, pattern
+  comprehensions, `WITH` pipelines, vector similarity, `MERGE`, and graph
+  deletion semantics.
+- Documented native graph access through the unified SQL engine and its
+  PostgreSQL-compatible clients, including pgx, `database/sql`, GORM,
+  psycopg, asyncpg, SQLAlchemy, and Django.
+- Added reference coverage for graph semijoins, evidence projections,
+  temporal `AS OF LSN` reads, and graph `EXPLAIN ANALYZE` output.
+- Clarified graph label registration, directed and undirected relationship
+  behavior, stable endpoint/edge projections, and the supported Cypher
+  compatibility boundaries.
+
 ## 1.6.2 - 2026-08-19
 
 ### SQL parser and graph join correctness

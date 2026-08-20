@@ -103,7 +103,7 @@ data, and time-aware reads.
 | --- | --- |
 | Relational | Tables, joins, constraints, aggregates, JSON/JSONB, indexes, and ORM-friendly DDL/DML |
 | Vector | `VECTOR(n)` columns, `VECTOR_DISTANCE`, `SIMILARITY`, `VECTOR_AVG`, and nearest-neighbor ordering |
-| Graph | `MATCH`, `JOIN MATCH`, typed directed edges, bounded traversal, centrality, and Leiden computation |
+| Graph | Native Cypher-style `MATCH ... RETURN`, SQL/PGQ `JOIN MATCH` and `GRAPH_TABLE`, typed edges, bounded traversal, and graph analytics |
 | Temporal | `AS OF TIMESTAMP`, retained historical snapshots, version ranges, and temporal graph state |
 
 The important part is the composition. This is one query over one durable
@@ -127,6 +127,32 @@ queries use `Database.Query` or `Database.QueryWithParams`; PostgreSQL clients
 use the normal driver connection and parameter binding. See the
 [supported SQL reference](docs/sql-supported.md) for the compatibility scope,
 supported types, graph syntax, temporal behavior, and client matrix.
+
+### Native Cypher-style graph queries
+
+LibraVDB also accepts a focused Cypher-style graph surface directly inside the
+unified SQL engine. Native graph statements use the same durable records,
+vectors, graph edges, transactions, snapshots, and result contract as SQL;
+they are not routed to a separate graph subsystem:
+
+```sql
+MATCH (source:Person)-[:FOLLOWS*1..2]->(target:Person)
+RETURN source.id AS source_id, target.id AS target_id
+ORDER BY source_id, target_id
+LIMIT $limit;
+```
+
+The surface includes multi-hop and bounded paths, labels and inline property
+filters, edge predicates, `WITH` pipelines, vector similarity expressions,
+`MERGE`, relationship updates, `DETACH DELETE`, shortest paths, path values,
+and pattern comprehensions. The same graph queries can be sent through
+`Database.Query`, `Database.QueryWithParams`, `EpochTx`, or the PostgreSQL wire
+server. Consequently, `pgx`, Go `database/sql`, GORM's PostgreSQL dialector
+(`Raw`/`Scan`), psycopg, asyncpg, SQLAlchemy, Django, and other PostgreSQL
+clients can use the documented graph surface without a separate graph driver.
+
+See [Cypher and Graph Query Support](docs/cypher-supported.md) for the exact
+grammar, execution semantics, result shapes, and supported boundaries.
 
 ### Why a single file matters
 

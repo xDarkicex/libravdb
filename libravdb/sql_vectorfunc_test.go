@@ -112,6 +112,87 @@ func TestSQL_VectorDistanceProjection(t *testing.T) {
 	if math.Abs(float64(sim)-1.0) > 1e-5 {
 		t.Errorf("sim of exact match: %f, want 1.0", sim)
 	}
+
+	// ARRAY_COSINE_SIMILARITY is a Kuzu/Graphiti-compatible spelling of the
+	// existing max-similarity vector projection and must produce the same
+	// values and ordering as SIMILARITY.
+	resArray, err := db.Query(ctx, "SELECT id, array_cosine_similarity(vector, '[1,0,0,0]') AS sim FROM docs ORDER BY sim DESC")
+	if err != nil {
+		t.Fatalf("Query array_cosine_similarity failed: %v", err)
+	}
+	if len(resArray.Results) != len(resSim.Results) {
+		t.Fatalf("array cosine row count: got %d, want %d", len(resArray.Results), len(resSim.Results))
+	}
+	for i := range resSim.Results {
+		if resArray.Results[i].ID != resSim.Results[i].ID {
+			t.Fatalf("array cosine order at %d: got %s, want %s", i, resArray.Results[i].ID, resSim.Results[i].ID)
+		}
+		want, ok := resSim.Results[i].Metadata["sim"].(float32)
+		if !ok {
+			t.Fatalf("similarity row %s not float32: %T", resSim.Results[i].ID, resSim.Results[i].Metadata["sim"])
+		}
+		got, ok := resArray.Results[i].Metadata["sim"].(float32)
+		if !ok {
+			t.Fatalf("array cosine row %s not float32: %T", resArray.Results[i].ID, resArray.Results[i].Metadata["sim"])
+		}
+		if math.Abs(float64(got-want)) > 1e-5 {
+			t.Errorf("array cosine row %s: got %f, want %f", resArray.Results[i].ID, got, want)
+		}
+	}
+}
+
+func TestSQL_ArrayCosineSimilarityInCypherWith(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:array_cosine_cypher"), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	g, err := NewGraph(GraphConfig{})
+	if err != nil {
+		t.Fatalf("NewGraph: %v", err)
+	}
+	defer g.Close()
+	col, err := db.CreateCollection(ctx, "people", WithDimension(4), WithMetric(CosineDistance), WithGraph(g), WithMetadataSchema(MetadataSchema{
+		"group_id": StringField,
+	}))
+	if err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	for _, row := range []struct {
+		id string
+		v  []float32
+	}{
+		{id: "alice", v: []float32{1, 0, 0, 0}},
+		{id: "bob", v: []float32{0.9, 0.1, 0, 0}},
+		{id: "carol", v: []float32{0, 1, 0, 0}},
+	} {
+		if err := col.Insert(ctx, row.id, normalize(row.v), map[string]interface{}{"group_id": "g"}); err != nil {
+			t.Fatalf("Insert %s: %v", row.id, err)
+		}
+	}
+
+	rows, err := db.QueryWithParams(ctx, `
+		MATCH (n)
+		WITH n, array_cosine_similarity(n.vector, $v) AS score
+		WHERE score > $min
+		RETURN n.id AS uuid, score
+		ORDER BY score DESC
+		LIMIT $limit`, QueryParams{
+		"v":     []float32{1, 0, 0, 0},
+		"min":   float32(0.5),
+		"limit": int64(2),
+	})
+	if err != nil {
+		t.Fatalf("Graphiti-shaped ARRAY_COSINE_SIMILARITY query: %v", err)
+	}
+	if rows.Total != 2 {
+		t.Fatalf("rows=%d, want 2: %#v", rows.Total, rows.Results)
+	}
+	if rows.Results[0].Metadata["uuid"] != "alice" || rows.Results[1].Metadata["uuid"] != "bob" {
+		t.Fatalf("ordered rows=%#v", rows.Results)
+	}
 }
 
 func cosineSim(a, b []float32) float32 {

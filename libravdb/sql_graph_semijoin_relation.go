@@ -131,9 +131,14 @@ func (db *Database) virtualGraphSemijoinRelationRows(ctx context.Context, args [
 			if resolveErr != nil {
 				continue
 			}
-			name := graphpkg.EdgeKindName(view.Edge.GetKind())
+			// A process can legitimately have multiple SQL edge names mapped
+			// to the same numeric kind (the graph store persists the kind, while
+			// SQL preserves the requested name).  When the relation was filtered
+			// by an explicit edge type, return that logical name instead of the
+			// registry's first canonical alias.
+			name := edgeType
 			if name == "" {
-				name = edgeType
+				name = graphpkg.EdgeKindName(view.Edge.GetKind())
 			}
 			candidateShared := sharedByCandidate[record.ID]
 			if candidateShared == nil {

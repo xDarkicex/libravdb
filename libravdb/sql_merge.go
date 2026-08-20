@@ -8,6 +8,7 @@ import (
 	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
 	"github.com/xDarkicex/lexer/parser"
+	"github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
 )
 
@@ -23,6 +24,22 @@ type mergeVertexState struct {
 	created  bool
 	changed  bool
 	delta    map[string]interface{}
+}
+
+type mergeEdgeState struct {
+	alias      string
+	from       uint64
+	target     uint64
+	kind       uint8
+	weight     float32
+	properties map[string]interface{}
+	existed    bool
+	changed    bool
+}
+
+type pendingMergeEdgeAssignment struct {
+	assignment parser.MergeAssignment
+	created    bool
 }
 
 func (db *Database) executeSQLMerge(ctx context.Context, src []byte, doc *parser.QueryDoc, params *optimizer.ParameterSet, legacy QueryParams) (*SearchResults, error) {
@@ -129,44 +146,60 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		byAlias[strings.ToLower(alias)] = state
 	}
 
-	assignments := stmt.OnMatchStart
-	count := stmt.OnMatchCount
-	for _, state := range states {
-		if state.created {
-			assignments = stmt.OnCreateStart
-			count = stmt.OnCreateCount
+	edgeAliases := make(map[string]struct{}, len(edges))
+	for _, edgeRef := range edges {
+		alias := sourceSpan(src, doc.Edges[edgeRef.ID].Alias, doc.Edges[edgeRef.ID].AliasEnd)
+		if alias != "" {
+			edgeAliases[strings.ToLower(alias)] = struct{}{}
 		}
+	}
+	pendingEdges := make([]pendingMergeEdgeAssignment, 0)
+	applyVertexAssignments := func(start, count int32, createdOnly, matchedOnly bool) error {
 		for i := int32(0); i < count; i++ {
-			assignment := doc.MergeAssignments[assignments+i]
+			assignment := doc.MergeAssignments[start+i]
 			if assignment.Column.Kind != parser.NodeKindIdentifier || assignment.Column.ID < 0 || int(assignment.Column.ID) >= len(doc.Identifiers) {
-				return nil, fmt.Errorf("MERGE assignment target is not an identifier")
+				return fmt.Errorf("MERGE assignment target is not an identifier")
 			}
 			column := &doc.Identifiers[assignment.Column.ID]
 			field := sourceSpan(src, column.Start, column.End)
 			alias := sourceSpan(src, column.QualStart, column.QualEnd)
-			target := state
-			if alias != "" {
-				target = byAlias[strings.ToLower(alias)]
+			if _, isEdge := edgeAliases[strings.ToLower(alias)]; isEdge {
+				pendingEdges = append(pendingEdges, pendingMergeEdgeAssignment{assignment: assignment, created: createdOnly})
+				continue
 			}
+			target := byAlias[strings.ToLower(alias)]
 			if target == nil {
-				return nil, fmt.Errorf("MERGE assignment references unknown vertex alias %q", alias)
+				return fmt.Errorf("MERGE assignment references unknown vertex alias %q", alias)
+			}
+			if (createdOnly && !target.created) || (matchedOnly && target.created) {
+				continue
 			}
 			if strings.EqualFold(field, "id") {
-				return nil, fmt.Errorf("MERGE cannot update the graph record id")
+				return fmt.Errorf("MERGE cannot update the graph record id")
 			}
 			row := mergeStateRow(target)
 			value, ok, err := db.virtualExprValue(ctx, src, doc, assignment.Value, row, params, legacy)
 			if err != nil {
-				return nil, fmt.Errorf("MERGE assignment %s.%s: %w", alias, field, err)
+				return fmt.Errorf("MERGE assignment %s.%s: %w", alias, field, err)
 			}
 			if !ok {
-				return nil, fmt.Errorf("MERGE assignment %s.%s could not be evaluated", alias, field)
+				return fmt.Errorf("MERGE assignment %s.%s could not be evaluated", alias, field)
 			}
 			value = materializeSQLJSONValue(value)
 			target.metadata[field] = value
 			target.delta[field] = value
 			target.changed = true
 		}
+		return nil
+	}
+	if err := applyVertexAssignments(stmt.UniversalSetStart, stmt.UniversalSetCount, false, false); err != nil {
+		return nil, err
+	}
+	if err := applyVertexAssignments(stmt.OnCreateStart, stmt.OnCreateCount, true, false); err != nil {
+		return nil, err
+	}
+	if err := applyVertexAssignments(stmt.OnMatchStart, stmt.OnMatchCount, false, true); err != nil {
+		return nil, err
 	}
 
 	for _, state := range uniqueMergeStates(states) {
@@ -187,6 +220,7 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		}
 	}
 
+	edgeStates := make([]*mergeEdgeState, 0, len(edges))
 	for i, edgeRef := range edges {
 		edge := &doc.Edges[edgeRef.ID]
 		kind := uint8(0)
@@ -212,33 +246,110 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		if err != nil {
 			return nil, fmt.Errorf("MERGE edge: %w", err)
 		}
-		encoded := []byte(nil)
-		if len(properties) > 0 {
-			encoded, err = apexjson.Marshal(properties)
-			if err != nil {
-				return nil, fmt.Errorf("MERGE edge properties: %w", err)
-			}
-		}
 		gtx, err := epoch.GraphTxn(collection.name)
 		if err != nil {
 			return nil, fmt.Errorf("MERGE graph transaction: %w", err)
 		}
-		existing, err := gtx.NeighborsOverlay(from)
+		existing, err := gtx.NeighborsOverlayWithProperties(from)
 		if err != nil {
 			return nil, fmt.Errorf("MERGE inspect edge: %w", err)
 		}
-		alreadyExists := false
+		state := &mergeEdgeState{
+			alias: sourceSpan(src, edge.Alias, edge.AliasEnd), from: from, target: to,
+			kind: kind, weight: weight, properties: properties,
+		}
 		for _, candidate := range existing {
-			if candidate.Target == to && candidate.GetKind() == kind {
-				alreadyExists = true
+			if candidate.Edge.Target == to && candidate.Edge.GetKind() == kind {
+				state.existed = true
+				state.weight = candidate.Edge.Weight
+				if raw, jsonErr := graph.EdgePropertyJSON(candidate.Properties); jsonErr == nil && len(raw) > 0 {
+					var current map[string]interface{}
+					if decodeErr := apexjson.Unmarshal(raw, &current); decodeErr == nil && current != nil {
+						state.properties = current
+					}
+				}
 				break
 			}
 		}
-		if alreadyExists {
-			continue
+		edgeStates = append(edgeStates, state)
+	}
+	edgesByAlias := make(map[string]*mergeEdgeState, len(edgeStates))
+	for _, state := range edgeStates {
+		if state.alias != "" {
+			edgesByAlias[strings.ToLower(state.alias)] = state
 		}
-		if err := epoch.AddGraphEdgeWithPropertiesJSON(collection.name, from, to, weight, kind, encoded); err != nil {
-			return nil, fmt.Errorf("MERGE edge %s: %w", sourceSpan(src, edge.TypeStart, edge.TypeEnd), err)
+	}
+	applyEdgeAssignments := func(start, count int32, createdOnly, matchedOnly bool) error {
+		for i := int32(0); i < count; i++ {
+			assignment := doc.MergeAssignments[start+i]
+			if assignment.Column.Kind != parser.NodeKindIdentifier || assignment.Column.ID < 0 || int(assignment.Column.ID) >= len(doc.Identifiers) {
+				return fmt.Errorf("MERGE edge assignment target is not an identifier")
+			}
+			column := &doc.Identifiers[assignment.Column.ID]
+			alias := sourceSpan(src, column.QualStart, column.QualEnd)
+			state := edgesByAlias[strings.ToLower(alias)]
+			if state == nil {
+				continue
+			}
+			if (createdOnly && state.existed) || (matchedOnly && !state.existed) {
+				continue
+			}
+			field := sourceSpan(src, column.Start, column.End)
+			row := mergeEdgeStateRow(state)
+			value, ok, err := db.virtualExprValue(ctx, src, doc, assignment.Value, row, params, legacy)
+			if err != nil || !ok {
+				if err != nil {
+					return fmt.Errorf("MERGE edge assignment %s.%s: %w", alias, field, err)
+				}
+				return fmt.Errorf("MERGE edge assignment %s.%s could not be evaluated", alias, field)
+			}
+			value = materializeSQLJSONValue(value)
+			if strings.EqualFold(field, "weight") {
+				switch number := value.(type) {
+				case float64:
+					state.weight = float32(number)
+				case float32:
+					state.weight = number
+				case int:
+					state.weight = float32(number)
+				case int64:
+					state.weight = float32(number)
+				default:
+					return fmt.Errorf("MERGE edge weight must be numeric")
+				}
+			}
+			state.properties[field] = value
+			state.changed = true
+		}
+		return nil
+	}
+	if err := applyEdgeAssignments(stmt.UniversalSetStart, stmt.UniversalSetCount, false, false); err != nil {
+		return nil, err
+	}
+	if err := applyEdgeAssignments(stmt.OnCreateStart, stmt.OnCreateCount, true, false); err != nil {
+		return nil, err
+	}
+	if err := applyEdgeAssignments(stmt.OnMatchStart, stmt.OnMatchCount, false, true); err != nil {
+		return nil, err
+	}
+	for _, state := range edgeStates {
+		encoded := []byte(nil)
+		if len(state.properties) > 0 {
+			encoded, err = apexjson.Marshal(state.properties)
+			if err != nil {
+				return nil, fmt.Errorf("MERGE edge properties: %w", err)
+			}
+		}
+		if state.existed {
+			if !state.changed {
+				continue
+			}
+			if err := epoch.RemoveGraphEdge(collection.name, state.from, state.target, state.kind); err != nil {
+				return nil, err
+			}
+		}
+		if err := epoch.AddGraphEdgeWithPropertiesJSON(collection.name, state.from, state.target, state.weight, state.kind, encoded); err != nil {
+			return nil, fmt.Errorf("MERGE edge: %w", err)
 		}
 	}
 
@@ -342,6 +453,10 @@ func mergePathElements(doc *parser.QueryDoc, path *parser.MatchPath) ([]parser.N
 }
 
 func (db *Database) mergePropertyMap(ctx context.Context, src []byte, doc *parser.QueryDoc, ref parser.NodeRef, params *optimizer.ParameterSet, legacy QueryParams) (map[string]interface{}, error) {
+	return db.mergePropertyMapInRow(ctx, src, doc, ref, virtualSQLRow{}, params, legacy)
+}
+
+func (db *Database) mergePropertyMapInRow(ctx context.Context, src []byte, doc *parser.QueryDoc, ref parser.NodeRef, row virtualSQLRow, params *optimizer.ParameterSet, legacy QueryParams) (map[string]interface{}, error) {
 	properties := make(map[string]interface{})
 	var walk func(parser.NodeRef) error
 	walk = func(node parser.NodeRef) error {
@@ -360,7 +475,7 @@ func (db *Database) mergePropertyMap(ctx context.Context, src []byte, doc *parse
 		}
 		id := &doc.Identifiers[be.Left.ID]
 		field := sourceSpan(src, id.Start, id.End)
-		value, ok, err := db.virtualExprValue(ctx, src, doc, be.Right, virtualSQLRow{}, params, legacy)
+		value, ok, err := db.virtualExprValue(ctx, src, doc, be.Right, row, params, legacy)
 		if err != nil {
 			return err
 		}
@@ -441,6 +556,18 @@ func mergeStateRow(state *mergeVertexState) virtualSQLRow {
 	return virtualSQLRow{ID: state.id, Values: values, Scopes: []virtualSQLScope{{Alias: state.alias, Values: values}}}
 }
 
+func mergeEdgeStateRow(state *mergeEdgeState) virtualSQLRow {
+	values := cloneMetadata(state.properties)
+	if values == nil {
+		values = make(map[string]interface{})
+	}
+	values["weight"] = state.weight
+	values["source_id"] = state.from
+	values["target_id"] = state.target
+	values["edge_type"] = graph.EdgeKindName(state.kind)
+	return virtualSQLRow{Values: values, Scopes: []virtualSQLScope{{Alias: state.alias, Values: values}}}
+}
+
 func uniqueMergeStates(states []*mergeVertexState) []*mergeVertexState {
 	seen := make(map[*mergeVertexState]struct{}, len(states))
 	result := make([]*mergeVertexState, 0, len(states))
@@ -467,16 +594,51 @@ func mergeZeroVector(dimension int) []float32 {
 func mergeResults(states []*mergeVertexState, stmt *parser.MergeStmt, doc *parser.QueryDoc, src []byte) *SearchResults {
 	unique := uniqueMergeStates(states)
 	result := &SearchResults{Results: make([]*SearchResult, 0, len(unique))}
-	if stmt.ReturningStar || len(stmt.Returning) == 0 {
+	if len(stmt.ReturningProjections) > 0 {
+		result.Columns = make([]string, 0, len(stmt.ReturningProjections))
+		for _, projection := range stmt.ReturningProjections {
+			name := "expr"
+			if projection.Expr.Kind == parser.NodeKindIdentifier && projection.Expr.ID >= 0 && int(projection.Expr.ID) < len(doc.Identifiers) {
+				identifier := &doc.Identifiers[projection.Expr.ID]
+				name = sourceSpan(src, identifier.Start, identifier.End)
+			}
+			if projection.AliasEnd > projection.Alias {
+				name = sourceSpan(src, projection.Alias, projection.AliasEnd)
+			}
+			result.Columns = append(result.Columns, name)
+		}
+	} else if stmt.ReturningStar || len(stmt.Returning) == 0 {
 		result.Columns = []string{"id"}
-	}
-	if len(stmt.Returning) > 0 && !stmt.ReturningStar {
+	} else {
 		result.Columns = make([]string, 0, len(stmt.Returning))
+		for _, ref := range stmt.Returning {
+			if ref.Kind != parser.NodeKindIdentifier || ref.ID < 0 || int(ref.ID) >= len(doc.Identifiers) {
+				continue
+			}
+			identifier := &doc.Identifiers[ref.ID]
+			result.Columns = append(result.Columns, sourceSpan(src, identifier.Start, identifier.End))
+		}
 	}
 	for _, state := range unique {
 		metadata := make(map[string]interface{})
 		if stmt.ReturningStar || len(stmt.Returning) == 0 {
 			metadata["id"] = state.id
+		} else if len(stmt.ReturningProjections) > 0 {
+			row := mergeStateRow(state)
+			for i, projection := range stmt.ReturningProjections {
+				name := result.Columns[i]
+				if projection.Expr.Kind == parser.NodeKindIdentifier && projection.Expr.ID >= 0 && int(projection.Expr.ID) < len(doc.Identifiers) {
+					id := &doc.Identifiers[projection.Expr.ID]
+					name = sourceSpan(src, id.Start, id.End)
+					if projection.AliasEnd > projection.Alias {
+						name = sourceSpan(src, projection.Alias, projection.AliasEnd)
+					}
+					value, ok := virtualIdentifierValue(src, id, row)
+					if ok {
+						metadata[name] = value
+					}
+				}
+			}
 		} else {
 			for _, ref := range stmt.Returning {
 				if ref.Kind != parser.NodeKindIdentifier || ref.ID < 0 || int(ref.ID) >= len(doc.Identifiers) {
@@ -487,7 +649,6 @@ func mergeResults(states []*mergeVertexState, stmt *parser.MergeStmt, doc *parse
 				if field == "" {
 					continue
 				}
-				result.Columns = append(result.Columns, field)
 				if strings.EqualFold(field, "id") {
 					metadata[field] = state.id
 				} else {

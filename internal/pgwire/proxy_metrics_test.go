@@ -133,7 +133,7 @@ func TestPROXYv1ActualTLSStartup(t *testing.T) {
 	if err := sendStartupPacket(secure, "proxy-user", "test"); err != nil {
 		t.Fatal(err)
 	}
-	assertStartupMessages(t, secure, 6)
+	assertStartupMessages(t, secure, 8)
 	cancel()
 	server.Close()
 	select {

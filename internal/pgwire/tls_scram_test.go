@@ -56,7 +56,7 @@ func TestStartupTLSNegotiationAndReady(t *testing.T) {
 	if err := sendStartupPacket(secure, "tls-user", "test"); err != nil {
 		t.Fatalf("send TLS startup: %v", err)
 	}
-	assertStartupMessages(t, secure, 7)
+	assertStartupMessages(t, secure, 8)
 	if err := <-serverResult; err != nil {
 		t.Fatalf("server startup: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestStartupSCRAMSHA256(t *testing.T) {
 	if err != nil || msgType != msgAuth || len(payload) < 4 || binary.BigEndian.Uint32(payload[:4]) != 0 {
 		t.Fatalf("expected AuthenticationOk, type=%q err=%v payload=%x", msgType, err, payload)
 	}
-	assertStartupMessages(t, client, 6)
+	assertStartupMessages(t, client, 7)
 	if err := <-serverResult; err != nil {
 		t.Fatalf("SCRAM server startup: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestServerIdleTimeoutClosesQuietSession(t *testing.T) {
 	if err := sendStartupPacket(clientConn, "idle-user", "test"); err != nil {
 		t.Fatalf("send startup: %v", err)
 	}
-	assertStartupMessages(t, clientConn, 7)
+	assertStartupMessages(t, clientConn, 8)
 	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set client deadline: %v", err)
 	}
@@ -758,7 +758,7 @@ func TestServerRequireTLSActualListener(t *testing.T) {
 	if err := sendStartupPacket(secure, "tls-user", "test"); err != nil {
 		t.Fatal(err)
 	}
-	assertStartupMessages(t, secure, 7)
+	assertStartupMessages(t, secure, 8)
 	cancel()
 	server.Close()
 	select {

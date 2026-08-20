@@ -23,11 +23,13 @@ import (
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/catalog"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 type virtualSQLScope struct {
 	Alias  string
 	Values map[string]interface{}
+	Vector []float32
 }
 
 type virtualSQLRow struct {
@@ -3014,6 +3016,48 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 		default:
 			return evaluateJSONFunction(name, args)
 		}
+	case parser.NodeKindVectorFunc:
+		if ref.ID < 0 || int(ref.ID) >= len(doc.VectorFuncs) {
+			return nil, false, fmt.Errorf("invalid vector function reference")
+		}
+		vf := doc.VectorFuncs[ref.ID]
+		var stored []float32
+		if vf.VectorA.Kind == parser.NodeKindIdentifier && vf.VectorA.ID >= 0 && int(vf.VectorA.ID) < len(doc.Identifiers) {
+			id := &doc.Identifiers[vf.VectorA.ID]
+			name := sourceSpan(src, id.Start, id.End)
+			qualifier := sourceSpan(src, id.QualStart, id.QualEnd)
+			for _, scope := range virtualRowScopes(row) {
+				if qualifier != "" && !strings.EqualFold(scope.Alias, qualifier) {
+					continue
+				}
+				if strings.EqualFold(name, "vector") || strings.EqualFold(name, "embedding") || strings.EqualFold(name, "vec") {
+					stored = scope.Vector
+					if stored != nil {
+						break
+					}
+				}
+			}
+		}
+		if len(stored) == 0 {
+			value, ok, err := db.virtualExprValue(ctx, src, doc, vf.VectorA, row, params, legacy)
+			if err != nil || !ok {
+				return value, ok, err
+			}
+			stored = vectorValue(value)
+		}
+		queryValue, ok, err := db.virtualExprValue(ctx, src, doc, vf.VectorB, row, params, legacy)
+		if err != nil || !ok || queryValue == nil {
+			return nil, false, err
+		}
+		query := vectorValue(queryValue)
+		if len(stored) == 0 || len(query) == 0 || len(stored) != len(query) {
+			return nil, false, fmt.Errorf("vector dimension mismatch")
+		}
+		distance := util.CosineDistance_func(query, stored)
+		if vf.IsMaxSim {
+			return float32(1 - distance), true, nil
+		}
+		return distance, true, nil
 	case parser.NodeKindSubqueryExpr:
 		return db.virtualSubqueryValue(ctx, src, doc, ref, row, params, legacy)
 	case parser.NodeKindAggregateExpr:
@@ -3028,6 +3072,21 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 		return value, ok, nil
 	}
 	return nil, false, nil
+}
+
+func vectorValue(value interface{}) []float32 {
+	switch vector := value.(type) {
+	case []float32:
+		return vector
+	case []float64:
+		out := make([]float32, len(vector))
+		for i, item := range vector {
+			out[i] = float32(item)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (db *Database) virtualSubqueryRows(ctx context.Context, src []byte, doc *parser.QueryDoc, ref parser.NodeRef, outer virtualSQLRow, params *optimizer.ParameterSet, legacy QueryParams) ([]virtualSQLRow, bool, error) {

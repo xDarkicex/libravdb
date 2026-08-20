@@ -105,6 +105,17 @@ func (db *Database) queryWithBoundParamsAndConfigInternal(ctx context.Context, s
 	if len(doc.MergeStmts) > 0 {
 		return db.executeSQLMerge(ctx, src, doc, boundParams, legacyParams)
 	}
+	for i := range doc.DeleteStmts {
+		if doc.DeleteStmts[i].Cypher {
+			if i != 0 || len(doc.DeleteStmts) != 1 {
+				return nil, fmt.Errorf("Cypher DELETE currently requires exactly one graph pattern")
+			}
+			return db.executeSQLCypherDelete(ctx, src, doc, boundParams, legacyParams)
+		}
+	}
+	if root := rootSelectIndex(doc); root >= 0 && root < len(doc.SelectStmts) && doc.SelectStmts[root].PipeWithCount > 0 {
+		return db.executeCypherPipe(ctx, src, doc, &doc.SelectStmts[root], boundParams, legacyParams)
+	}
 
 	// 3. Bind OIDs (Modifies doc in place)
 	db.mu.RLock()

@@ -1090,8 +1090,9 @@ ORDER BY id;
 ```
 
 The bounded path's lower and upper hop limits are enforced during traversal.
-The executor does not expose a path object or shortest-path result expression;
-use a bounded traversal and project the terminal nodes when that is sufficient.
+Native Cypher-style `shortestPath`, path variables, pattern comprehensions,
+and graph mutation statements are documented in
+[Cypher and Graph Query Support](cypher-supported.md).
 
 ### Stable graph row projections
 
