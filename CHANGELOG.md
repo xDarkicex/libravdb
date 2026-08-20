@@ -4,6 +4,26 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.4 - 2026-08-20
+
+### Native Cypher and Graphiti compatibility
+
+- Fixed implicit top-level `MATCH` collection resolution when multiple graph
+  collections are present. Collections with matching explicitly registered
+  vertex labels now take precedence over unlabeled graph-table fallbacks.
+- Preserved declared logical vector column names in graph-table catalog and
+  Cypher `WITH` evaluation, including vector projections such as
+  `array_cosine_similarity(n.name_embedding, [...])`.
+- Fixed logical `uuid` key matching and projection for graph-table records
+  whose physical record ID stores the declared primary key.
+- Added support for bracketed numeric vector literals in native Cypher
+  virtual expression evaluation.
+- Added regression coverage for graph-table SQL inserts, implicit labeled
+  `MATCH`, named-vector projections, multiple graph collections, and reopen
+  behavior.
+- Verified the complete external pgwire/pgx, Python, SQLAlchemy, Django,
+  GORM, vector, temporal, relational, and native Cypher e2e harness.
+
 ## 1.6.3 - 2026-08-19
 
 ### Native Cypher graph queries

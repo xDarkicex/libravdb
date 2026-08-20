@@ -196,7 +196,7 @@ func materializeReturning(plan *optimizer.PhysicalPlan, rows []*SearchResult) *S
 			if strings.EqualFold(column, "id") {
 				continue
 			}
-			if strings.EqualFold(column, "embedding") && len(row.Vector) > 0 {
+			if (strings.EqualFold(column, "embedding") || strings.EqualFold(column, "vector") || strings.EqualFold(column, "vec")) && len(row.Vector) > 0 {
 				projected.Metadata[column] = formatConflictVector(row.Vector)
 				continue
 			}
@@ -1688,9 +1688,6 @@ func compareColumn(colVal, lit string, op uint8) bool {
 // Each neighbor expansion uses NeighborsOverlay/InboundNeighborsOverlay so
 // staged edges are visible and concurrent commits at higher LSNs are invisible.
 func (e *Executor) executeGraphEpoch(ctx context.Context, plan *optimizer.PhysicalPlan, gtx *graph.Txn, col *Collection) (*SearchResults, error) {
-	if len(plan.GraphEdges) == 0 {
-		return &SearchResults{}, nil
-	}
 	// Build edge plans from the optimizer's graph edge descriptors.
 	type bfsEdge struct {
 		dir       int8
@@ -1719,10 +1716,6 @@ func (e *Executor) executeGraphEpoch(ctx context.Context, plan *optimizer.Physic
 			predicate: gep.Predicate,
 		})
 	}
-	if len(edges) == 0 {
-		return &SearchResults{}, nil
-	}
-
 	// Collect seeds (same priority cascade as executeGraph).
 	var seeds []uint64
 	if plan.HasExplicitSeed {
@@ -1755,6 +1748,14 @@ func (e *Executor) executeGraphEpoch(ctx context.Context, plan *optimizer.Physic
 	seedMatched := make(map[uint64]bool)
 
 	for _, seed := range seeds {
+		if len(edges) == 0 {
+			if returnsSource {
+				seedMatched[seed] = true
+			} else {
+				seen[seed] = true
+			}
+			continue
+		}
 		type bfsNode struct {
 			nodeID uint64
 			band   int
@@ -2156,6 +2157,14 @@ func (e *Executor) executeGraph(ctx context.Context, plan *optimizer.PhysicalPla
 
 	for _, seed := range seeds {
 		matched := false
+		if len(edges) == 0 {
+			if returnsSource {
+				seedMatched[seed] = true
+			} else {
+				seen[seed] = true
+			}
+			continue
+		}
 		if err := g.BFSPattern(seed, edges, plan.MaxHops, func(nodeID uint64, band int, step int) bool {
 			trackSQLGraphExpansion(ctx, 1)
 			if returnsSource {
@@ -2855,7 +2864,7 @@ func (e *Executor) attachMetadata(ctx context.Context, col *Collection, sr *Sear
 		// in metadata, which silently emitted SQL NULL for a valid stored vector.
 		// Keep the physical vector in the established wire representation used by
 		// INSERT ... RETURNING and ordinary vector projections.
-		if (strings.EqualFold(sourceName, "embedding") || strings.EqualFold(sourceName, "vector") || strings.EqualFold(sourceName, "vec")) && len(rec.Vector) > 0 {
+		if e.isVectorColumn(plan.CollectionName, sourceName) && len(rec.Vector) > 0 {
 			proj[colName] = formatConflictVector(rec.Vector)
 			continue
 		}
@@ -3043,6 +3052,27 @@ func encodeCompositePrimaryKey(columns []string, values map[string]string) (stri
 	return b.String(), nil
 }
 
+func (e *Executor) isVectorColumn(collectionName, columnName string) bool {
+	if strings.EqualFold(columnName, "vector") || strings.EqualFold(columnName, "vec") || strings.EqualFold(columnName, "embedding") {
+		return true
+	}
+	if e == nil || e.db == nil || strings.TrimSpace(collectionName) == "" || strings.TrimSpace(columnName) == "" {
+		return false
+	}
+	e.db.mu.RLock()
+	cat := e.db.catalog
+	e.db.mu.RUnlock()
+	if cat == nil {
+		return false
+	}
+	table, err := cat.GetTable(catalog.HashIdentifier(collectionName))
+	if err != nil {
+		return false
+	}
+	column, err := cat.GetColumn(table, catalog.HashIdentifier(columnName))
+	return err == nil && column.Type == catalog.TypeVector
+}
+
 // executeInsert handles INSERT INTO via col.InsertBatch.
 func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
 	if catalog.IsSystemTableOID(plan.CollectionOID) || isSystemTableName(plan.CollectionName) {
@@ -3057,7 +3087,7 @@ func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPl
 	// Guardrail: metadata-only collections reject vector columns
 	if col.Dimension() == 0 {
 		for _, c := range plan.InsertColumns {
-			if c == "vector" || c == "vec" || c == "embedding" {
+			if e.isVectorColumn(plan.CollectionName, c) {
 				return nil, fmt.Errorf("collection %q is metadata-only; vector columns not accepted", plan.CollectionName)
 			}
 		}
@@ -3080,7 +3110,7 @@ func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPl
 		if err != nil {
 			return nil, fmt.Errorf("INSERT ... SELECT source: %w", err)
 		}
-		entries, err := entriesFromSelectResults(selected, plan)
+		entries, err := e.entriesFromSelectResults(selected, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -3124,7 +3154,7 @@ func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPl
 						}
 						return nil, fmt.Errorf("INSERT column %q is NOT NULL", colName)
 					}
-					if strings.EqualFold(colName, "vector") || strings.EqualFold(colName, "vec") || strings.EqualFold(colName, "embedding") {
+					if e.isVectorColumn(plan.CollectionName, colName) {
 						return nil, fmt.Errorf("INSERT column %q is NOT NULL", colName)
 					}
 					meta[colName] = nil
@@ -3133,7 +3163,7 @@ func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPl
 				rowValues[strings.ToLower(colName)] = val
 				if strings.EqualFold(colName, "id") {
 					id = val
-				} else if strings.EqualFold(colName, "vector") || strings.EqualFold(colName, "vec") || strings.EqualFold(colName, "embedding") {
+				} else if e.isVectorColumn(plan.CollectionName, colName) {
 					vec = parseVectorLiteral(val)
 					if vec == nil && val != "" {
 						return nil, fmt.Errorf("invalid vector literal for column %q: %q", colName, val)
@@ -3201,7 +3231,7 @@ func (e *Executor) executeInsert(ctx context.Context, plan *optimizer.PhysicalPl
 	return materializeReturning(plan, searchRowsFromEntries(entries)), nil
 }
 
-func entriesFromSelectResults(results *SearchResults, plan *optimizer.PhysicalPlan) ([]VectorEntry, error) {
+func (e *Executor) entriesFromSelectResults(results *SearchResults, plan *optimizer.PhysicalPlan) ([]VectorEntry, error) {
 	if results == nil || len(results.Results) == 0 {
 		return nil, nil
 	}
@@ -3245,7 +3275,7 @@ func entriesFromSelectResults(results *SearchResults, plan *optimizer.PhysicalPl
 				}
 				continue
 			}
-			if strings.EqualFold(target, "vector") || strings.EqualFold(target, "vec") || strings.EqualFold(target, "embedding") {
+			if e.isVectorColumn(plan.CollectionName, target) {
 				if value != nil {
 					vector = parseVectorLiteral(recordMetaToString(value))
 				}
@@ -3343,7 +3373,7 @@ func (e *Executor) executeInsertOnConflict(ctx context.Context, plan *optimizer.
 				continue
 			}
 		}
-		vector, metadata, err := applyConflictAssignments(current, proposed, plan)
+		vector, metadata, err := e.applyConflictAssignments(current, proposed, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -3526,7 +3556,7 @@ func namedUniqueKey(id string, metadata map[string]interface{}, columns []string
 	return b.String(), true
 }
 
-func applyConflictAssignments(current Record, proposed VectorEntry, plan *optimizer.PhysicalPlan) ([]float32, map[string]interface{}, error) {
+func (e *Executor) applyConflictAssignments(current Record, proposed VectorEntry, plan *optimizer.PhysicalPlan) ([]float32, map[string]interface{}, error) {
 	metadata := make(map[string]interface{})
 	for key, value := range current.Metadata {
 		metadata[key] = value
@@ -3536,7 +3566,7 @@ func applyConflictAssignments(current Record, proposed VectorEntry, plan *optimi
 		if strings.EqualFold(column, "id") {
 			return nil, nil, fmt.Errorf("ON CONFLICT DO UPDATE cannot modify primary key column %q", column)
 		}
-		isVector := strings.EqualFold(column, "vector") || strings.EqualFold(column, "vec") || strings.EqualFold(column, "embedding")
+		isVector := e.isVectorColumn(plan.CollectionName, column)
 		if i < len(plan.InsertConflictExprRoots) {
 			value, isNull, err := evalConflictExpr(plan, plan.InsertConflictExprRoots[i], current, proposed)
 			if err != nil {
@@ -4592,6 +4622,7 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 		}
 		var schema MetadataSchema
 		var vectorCount int
+		var vectorColumnName string
 		primaryKeyColumns := append([]string(nil), plan.DDLPrimaryKeyColumns...)
 		columnConstraints := map[string]uint16{
 			"id": catalog.ColFlagPrimaryKey | catalog.ColFlagNotNull,
@@ -4610,6 +4641,7 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 						"multiple VECTOR columns in table %q; only one vector column per collection is supported",
 						plan.DDLTableName)
 				}
+				vectorColumnName = col.Name
 				opts = []CollectionOption{WithDimension(int(col.VectorDimension))}
 				continue
 			}
@@ -4811,12 +4843,20 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 			opts = append(opts, WithGraph(graphLayer))
 		}
 
-		_, err := e.db.CreateCollection(ctx, plan.DDLTableName, opts...)
+		created, err := e.db.CreateCollection(ctx, plan.DDLTableName, opts...)
 		if err != nil {
 			if graphLayer != nil {
 				_ = graphLayer.Close()
 			}
 			return nil, err
+		}
+		if vectorColumnName != "" && created != nil {
+			e.db.registerVectorColumnInCatalog(
+				plan.DDLTableName,
+				vectorColumnName,
+				created.Dimension(),
+				created.config.Metric,
+			)
 		}
 		return &SearchResults{}, nil
 
@@ -6138,20 +6178,20 @@ func (e *Executor) implicitGraphCollection(plan *optimizer.PhysicalPlan) *Collec
 			continue
 		}
 		g := col.GetGraph()
-		if len(plan.SeedLabels) > 0 && len(graphLabelNodeSetForLabels(g, plan.SeedLabels)) == 0 {
+		if len(plan.SeedLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, plan.SeedLabels)) == 0 {
 			continue
 		}
 		if len(plan.GraphJoins) > 0 && len(plan.GraphJoins[0].TerminalLabels) > 0 &&
-			len(graphLabelNodeSetForLabels(g, plan.GraphJoins[0].TerminalLabels)) == 0 {
+			graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, plan.GraphJoins[0].TerminalLabels)) == 0 {
 			continue
 		}
 		patternMatched := true
 		for _, pattern := range plan.GraphPatternProjections {
-			if len(pattern.SeedLabels) > 0 && len(graphLabelNodeSetForLabels(g, pattern.SeedLabels)) == 0 {
+			if len(pattern.SeedLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, pattern.SeedLabels)) == 0 {
 				patternMatched = false
 				break
 			}
-			if len(pattern.TerminalLabels) > 0 && len(graphLabelNodeSetForLabels(g, pattern.TerminalLabels)) == 0 {
+			if len(pattern.TerminalLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, pattern.TerminalLabels)) == 0 {
 				patternMatched = false
 				break
 			}
@@ -6211,9 +6251,41 @@ func (e *Executor) implicitGraphCollection(plan *optimizer.PhysicalPlan) *Collec
 		}
 	}
 	if len(candidates) > 0 {
+		// An unlabeled CREATE GRAPH TABLE can accept a Cypher label as a
+		// schema hint, but it must not outrank a graph that explicitly
+		// registered the requested labels when several graph collections are
+		// present. This matters for native top-level MATCH, which has no FROM
+		// relation to disambiguate the source table.
+		if graphPlanHasLabelConstraints(plan) {
+			for _, candidate := range candidates {
+				if graphHasVertexLabels(candidate.GetGraph()) {
+					return candidate
+				}
+			}
+		}
 		return candidates[0]
 	}
 	return e.db.firstGraphCollection()
+}
+
+func graphPlanHasLabelConstraints(plan *optimizer.PhysicalPlan) bool {
+	if plan == nil {
+		return false
+	}
+	if len(plan.SeedLabels) > 0 {
+		return true
+	}
+	for _, join := range plan.GraphJoins {
+		if len(join.SeedLabels) > 0 || len(join.TerminalLabels) > 0 {
+			return true
+		}
+	}
+	for _, pattern := range plan.GraphPatternProjections {
+		if len(pattern.SeedLabels) > 0 || len(pattern.TerminalLabels) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // executeGraphJoin implements JOIN MATCH: for each row of the left (FROM)
@@ -6345,7 +6417,9 @@ func (e *Executor) executeGraphJoin(ctx context.Context, plan *optimizer.Physica
 			}
 			seen := make(map[uint64]seenGraphNode) // nodeID → path reach state
 
-			if err := g.BFSPattern(nodeID, edges, gjp.MaxHops, func(vid uint64, band int, step int) bool {
+			if len(edges) == 0 {
+				seen[nodeID] = seenGraphNode{final: true}
+			} else if err := g.BFSPattern(nodeID, edges, gjp.MaxHops, func(vid uint64, band int, step int) bool {
 				trackSQLGraphExpansion(ctx, 1)
 				// BFSPattern visits intermediate states as well as final
 				// matches. Keep valid intermediate-band rows (the existing
@@ -6896,6 +6970,33 @@ func graphLabelNodeSetForLabels(g Graph, labels []string) map[uint64]struct{} {
 		}
 	}
 	return set
+}
+
+// graphHasVertexLabels reports whether a graph has any explicit vertex-label
+// registrations. CREATE GRAPH TABLE gives the relation graph semantics, but
+// does not require a separate label declaration. In that unlabeled state a
+// native Cypher label is a schema-side hint (for example, Graphiti's
+// (n:Entity) over its entities table) and must not make every row disappear.
+// Once explicit labels exist, normal label filtering remains strict.
+func graphHasVertexLabels(g Graph) bool {
+	if g == nil {
+		return false
+	}
+	labels, ok := g.(interface {
+		ForEachVertexLabel(func(uint64, string) bool)
+	})
+	if !ok {
+		return false
+	}
+	found := false
+	labels.ForEachVertexLabel(func(_ uint64, label string) bool {
+		if strings.TrimSpace(label) != "" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func graphJoinTerminalLabelSet(g Graph, join optimizer.GraphJoinPlan) map[uint64]struct{} {
@@ -7779,10 +7880,8 @@ func chainedGraphJoinProjectionMetadata(aliases map[string]Record, resultID stri
 			metadata[ref.OutputName] = nil
 			continue
 		}
-		if strings.EqualFold(ref.SourceName, "id") {
-			metadata[ref.OutputName] = record.ID
-		} else if record.Metadata != nil {
-			metadata[ref.OutputName] = record.Metadata[ref.SourceName]
+		if value, ok := logicalRecordColumnValue(&record, ref.SourceName); ok {
+			metadata[ref.OutputName] = value
 		} else {
 			metadata[ref.OutputName] = nil
 		}
@@ -7827,10 +7926,8 @@ func graphJoinProjectionMetadata(left Record, terminal *Record, resultID string,
 			metadata[ref.OutputName] = nil
 			continue
 		}
-		if strings.EqualFold(ref.SourceName, "id") {
-			metadata[ref.OutputName] = record.ID
-		} else if record.Metadata != nil {
-			metadata[ref.OutputName] = record.Metadata[ref.SourceName]
+		if value, ok := logicalRecordColumnValue(record, ref.SourceName); ok {
+			metadata[ref.OutputName] = value
 		} else {
 			metadata[ref.OutputName] = nil
 		}
@@ -8411,6 +8508,9 @@ func hasGraphLabel(labels map[uint64]struct{}, nodeID uint64) bool {
 }
 
 func graphLabelsMatch(g Graph, nodeID uint64, labels []string) bool {
+	if len(labels) == 0 || !graphHasVertexLabels(g) {
+		return true
+	}
 	for _, label := range labels {
 		found := false
 		for _, candidate := range g.GetLabelNodes(label) {

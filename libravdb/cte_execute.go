@@ -890,6 +890,9 @@ func (db *Database) virtualIndexedSourceRows(ctx context.Context, src []byte, do
 			values = make(map[string]interface{})
 		}
 		values["id"] = record.ID
+		if vectorColumn := db.vectorColumnName(table); vectorColumn != "" && len(record.Vector) > 0 {
+			values[vectorColumn] = cloneVector(record.Vector)
+		}
 		row := virtualSQLRow{ID: record.ID, Values: values}
 		qualifyVirtualRow(&row, alias)
 		rows = append(rows, row)
@@ -1051,6 +1054,9 @@ func (db *Database) virtualSourceRows(ctx context.Context, src []byte, doc *pars
 			values = make(map[string]interface{})
 		}
 		values["id"] = record.ID
+		if vectorColumn := db.vectorColumnName(table); vectorColumn != "" && len(record.Vector) > 0 {
+			values[vectorColumn] = cloneVector(record.Vector)
+		}
 		row := virtualSQLRow{ID: record.ID, Values: values}
 		qualifyVirtualRow(&row, alias)
 		if outer != nil {
@@ -2813,6 +2819,14 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 			array, ok := parseJSONArrayConstructor(identifierText)
 			return array, ok, nil
 		}
+		// The parser keeps bracketed numeric vectors source-backed to avoid a
+		// second array AST. Decode that representation here for virtual Cypher
+		// expressions such as array_cosine_similarity(n.embedding, [1, 0]).
+		if strings.HasPrefix(strings.TrimSpace(identifierText), "[") {
+			if vector := parseVectorLiteral(strings.TrimSpace(identifierText)); len(vector) > 0 {
+				return vector, true, nil
+			}
+		}
 		if id.Start < uint32(len(src)) && (src[id.Start] == '$' || src[id.Start] == '@') && params != nil {
 			if value, found := params.Lookup(src, id.Start, id.End); found {
 				return virtualScalarInterface(value), true, nil
@@ -3030,7 +3044,18 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 				if qualifier != "" && !strings.EqualFold(scope.Alias, qualifier) {
 					continue
 				}
-				if strings.EqualFold(name, "vector") || strings.EqualFold(name, "embedding") || strings.EqualFold(name, "vec") {
+				// Native Cypher WITH is evaluated before catalog binding. A
+				// declared vector column therefore may not yet carry
+				// ResolvedKindVector, but the row scope still contains its
+				// physical []float32 value. Prefer that typed value so named
+				// vector columns work through the same path as `n.vector`.
+				if value, ok := lookupVirtualMapValue(scope.Values, name); ok {
+					if candidate := vectorValue(value); len(candidate) > 0 {
+						stored = candidate
+						break
+					}
+				}
+				if id.ResolvedKind == parser.ResolvedKindVector || strings.EqualFold(name, "vector") || strings.EqualFold(name, "embedding") || strings.EqualFold(name, "vec") {
 					stored = scope.Vector
 					if stored != nil {
 						break

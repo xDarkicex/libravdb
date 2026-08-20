@@ -590,6 +590,84 @@ func (db *Database) registerCollectionInCatalog(name string, config *CollectionC
 	}
 }
 
+// registerVectorColumnInCatalog adds the logical name of a SQL VECTOR column
+// to the durable table definition. Vectors live in the collection's physical
+// vector slot rather than in metadata, but SQL still needs the declared name
+// (for example name_embedding) to bind INSERT and vector expressions.
+//
+// CREATE GRAPH/TABLE is the only path that can introduce a non-canonical
+// vector name today, so this is kept as a narrow catalog publication step
+// instead of changing the native collection configuration contract.
+func (db *Database) registerVectorColumnInCatalog(name, vectorName string, dimension int, metric DistanceMetric) {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(vectorName) == "" || dimension <= 0 {
+		return
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.catalog == nil {
+		return
+	}
+
+	table, err := db.catalog.GetTable(catalog.HashIdentifier(name))
+	if err != nil {
+		return
+	}
+	columns := make([]catalog.ColumnInfo, 0, table.ColumnsCount+1)
+	found := false
+	for _, column := range db.catalog.AllColumns(table) {
+		columns = append(columns, catalog.ColumnInfo{
+			Name:  column.Name,
+			Type:  column.Type,
+			Flags: column.Flags,
+		})
+		if strings.EqualFold(column.Name, vectorName) {
+			found = true
+		}
+	}
+	if !found {
+		columns = append(columns, catalog.ColumnInfo{Name: vectorName, Type: catalog.TypeVector})
+	}
+
+	builder := catalog.NewBuilderFrom(db.catalog)
+	builder.AddTable(name, columns)
+	if !found {
+		builder.AddVectorIndex(vectorName, uint32(dimension), uint8(metric))
+	}
+	data := builder.Build()
+	cat, err := catalog.Load(data, db.quantRegistry)
+	if err != nil {
+		return
+	}
+	db.catalog = cat
+	db.catalogGeneration.Add(1)
+	if e, ok := db.storage.(interface{ SetCatalogData([]byte) }); ok {
+		e.SetCatalogData(data)
+	}
+}
+
+func (db *Database) vectorColumnName(name string) string {
+	if db == nil || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	db.mu.RLock()
+	cat := db.catalog
+	db.mu.RUnlock()
+	if cat == nil {
+		return ""
+	}
+	table, err := cat.GetTable(catalog.HashIdentifier(name))
+	if err != nil {
+		return ""
+	}
+	for _, column := range cat.AllColumns(table) {
+		if column.Type == catalog.TypeVector {
+			return column.Name
+		}
+	}
+	return ""
+}
+
 // metadataFieldToCatalogType maps a metadata FieldType to a catalog column type.
 func metadataFieldToCatalogType(ft FieldType) uint16 {
 	switch ft {

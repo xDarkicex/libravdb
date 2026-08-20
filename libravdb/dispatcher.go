@@ -879,7 +879,7 @@ func recordMatchesPredicates(rec Record, predicates []optimizer.RelationalPredic
 			continue
 		}
 
-		colVal, ok := rec.Metadata[pred.Column]
+		colVal, ok := logicalRecordColumnValue(&rec, pred.Column)
 		isNull := !ok || colVal == nil
 		if pred.NullTest == optimizer.NullTestIsNull {
 			if !isNull {

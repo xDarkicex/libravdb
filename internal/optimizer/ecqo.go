@@ -784,6 +784,15 @@ func (o *Optimizer) optimize(doc *parser.QueryDoc, src []byte, legacyParams map[
 						}
 					}
 					labels := vertexPatternLabels(doc, src, v)
+					if v.Predicate.Kind != parser.NodeKindUnknown {
+						inline := &PhysicalPlan{}
+						o.extractRelationalPredicates(doc, src, inline, v.Predicate)
+						if n == 0 {
+							gjp.SourcePredicates = append(gjp.SourcePredicates, inline.Predicates...)
+						} else if n == mp.PathNodesCount-1 {
+							gjp.TerminalPredicates = append(gjp.TerminalPredicates, inline.Predicates...)
+						}
+					}
 					if n == 0 {
 						gjp.SeedLabels = labels
 						if len(labels) > 0 {

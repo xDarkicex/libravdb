@@ -571,7 +571,11 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 			} else {
 				id.TableOID = tDef.OID
 				id.ColumnOID = col.OID
-				id.ResolvedKind = parser.ResolvedKindColumn
+				if col.Type == TypeVector {
+					id.ResolvedKind = parser.ResolvedKindVector
+				} else {
+					id.ResolvedKind = parser.ResolvedKindColumn
+				}
 				resolved = true
 			}
 		} else {
@@ -588,7 +592,11 @@ func (b *Binder) Bind(doc *parser.QueryDoc) error {
 				if colErr == nil {
 					id.TableOID = tDef.OID
 					id.ColumnOID = col.OID
-					id.ResolvedKind = parser.ResolvedKindColumn
+					if col.Type == TypeVector {
+						id.ResolvedKind = parser.ResolvedKindVector
+					} else {
+						id.ResolvedKind = parser.ResolvedKindColumn
+					}
 					resolved = true
 					break
 				}

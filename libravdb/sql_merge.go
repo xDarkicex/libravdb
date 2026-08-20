@@ -534,17 +534,36 @@ func mergeRecordMatches(record *Record, properties map[string]interface{}) bool 
 		return false
 	}
 	for key, expected := range properties {
-		actual := interface{}(nil)
-		if key == "id" {
-			actual = record.ID
-		} else if record.Metadata != nil {
-			actual = record.Metadata[key]
-		}
+		actual, _ := logicalRecordColumnValue(record, key)
 		if !sqlValueEqual(actual, expected) {
 			return false
 		}
 	}
 	return true
+}
+
+// logicalRecordColumnValue exposes the record identity through the logical
+// key names used by graph/Cypher schemas. A graph table commonly declares
+// uuid as its PRIMARY KEY while the storage layer keeps that value in the
+// physical record ID rather than duplicating it in metadata.
+func logicalRecordColumnValue(record *Record, column string) (interface{}, bool) {
+	if record == nil {
+		return nil, false
+	}
+	if strings.EqualFold(column, "id") {
+		return record.ID, true
+	}
+	if record.Metadata != nil {
+		for name, value := range record.Metadata {
+			if strings.EqualFold(name, column) {
+				return value, true
+			}
+		}
+	}
+	if strings.EqualFold(column, "uuid") {
+		return record.ID, true
+	}
+	return nil, false
 }
 
 func mergeStateRow(state *mergeVertexState) virtualSQLRow {

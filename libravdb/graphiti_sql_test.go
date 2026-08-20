@@ -338,3 +338,122 @@ RETURN shortestPath((a)-[*1..3]->(b)) AS path`)
 		t.Fatalf("alice friends=%#v", rows.Results[0].Metadata["friends"])
 	}
 }
+
+func TestGraphitiSQLGraphTableInsertAndImplicitCypherVectorProjection(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/graphiti-graph-table.libravdb"
+
+	db, err := Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Query(ctx, "CREATE GRAPH TABLE entities (uuid STRING PRIMARY KEY, name STRING, name_embedding VECTOR(4))"); err != nil {
+		t.Fatalf("CREATE GRAPH TABLE: %v", err)
+	}
+	insert := func(id, name string, vector []float32) {
+		t.Helper()
+		if _, err := db.QueryWithParams(ctx,
+			"INSERT INTO entities (uuid, name, name_embedding) VALUES ($1, $2, $3)",
+			QueryParams{"1": id, "2": name, "3": vector}); err != nil {
+			t.Fatalf("INSERT %s: %v", id, err)
+		}
+	}
+	insert("alice", "Alice", []float32{1, 0, 0, 0})
+	insert("bob", "Bob", []float32{0, 1, 0, 0})
+
+	match, err := db.Query(ctx, "MATCH (n:Entity {uuid: 'alice'}) RETURN n.uuid AS uuid, n.name AS name")
+	if err != nil {
+		t.Fatalf("implicit MATCH after INSERT: %v", err)
+	}
+	if match.Total != 1 || match.Results[0].Metadata["uuid"] != "alice" || match.Results[0].Metadata["name"] != "Alice" {
+		t.Fatalf("implicit MATCH after INSERT = %#v, want alice/Alice", match.Results)
+	}
+
+	scored, err := db.Query(ctx, "MATCH (n:Entity {uuid: 'alice'}) WITH n, array_cosine_similarity(n.name_embedding, [1.0, 0.0, 0.0, 0.0]) AS score RETURN n.uuid AS uuid, score")
+	if err != nil {
+		t.Fatalf("array_cosine_similarity after INSERT: %v", err)
+	}
+	if scored.Total != 1 || scored.Results[0].Metadata["uuid"] != "alice" {
+		t.Fatalf("scored MATCH = %#v, want one alice row", scored.Results)
+	}
+	score, ok := toFloat(scored.Results[0].Metadata["score"])
+	if !ok || score < 0.99 {
+		t.Fatalf("score=%#v, want cosine similarity near 1", scored.Results[0].Metadata["score"])
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(WithStoragePath(path), WithMetrics(false))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	reopened, err := db.Query(ctx, "MATCH (n:Entity {uuid: 'alice'}) WITH n, array_cosine_similarity(n.name_embedding, [1.0, 0.0, 0.0, 0.0]) AS score RETURN n.uuid AS uuid, score")
+	if err != nil {
+		t.Fatalf("MATCH after reopen: %v", err)
+	}
+	if reopened.Total != 1 {
+		t.Fatalf("MATCH after reopen rows=%d, want 1: %#v", reopened.Total, reopened.Results)
+	}
+	if score, ok := toFloat(reopened.Results[0].Metadata["score"]); !ok || score < 0.99 {
+		t.Fatalf("reopened score=%#v, want cosine similarity near 1", reopened.Results[0].Metadata["score"])
+	}
+}
+
+func TestGraphitiSQLGraphTableNativeCypherLabelsAndAnonymousWeight(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:graphiti_graph_table_labels"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Query(ctx, "CREATE GRAPH TABLE entities (id TEXT PRIMARY KEY, uuid TEXT, name TEXT)"); err != nil {
+		t.Fatalf("CREATE GRAPH TABLE: %v", err)
+	}
+	edgeType := "GRAPHITI_GRAPH_TABLE_LABELS"
+	if !graph.RegisterEdgeKind(edgeType, 230) {
+		t.Fatal("edge kind registration failed")
+	}
+	merge := "MERGE (a:Person {uuid: $1})-[r:" + edgeType + " {weight: $3}]->(b:Person {uuid: $2}) ON CREATE SET a.name = $4, b.name = $5 ON MATCH SET a.name = $4"
+	for _, values := range []QueryParams{
+		{"1": "alice", "2": "bob", "3": 0.75, "4": "Alice", "5": "Bob"},
+		{"1": "bob", "2": "carol", "3": 0.5, "4": "Bob 2", "5": "Carol"},
+	} {
+		if _, err := db.QueryWithParams(ctx, merge, values); err != nil {
+			t.Fatalf("MERGE: %v", err)
+		}
+	}
+	if _, err := db.QueryWithParams(ctx, `MERGE (d:Person {uuid: $1}) ON CREATE SET d.name = $2`, QueryParams{"1": "dave", "2": "Dave"}); err != nil {
+		t.Fatalf("node MERGE: %v", err)
+	}
+	if _, err := db.Query(ctx, "CREATE GRAPH TABLE fallback_entities (id TEXT PRIMARY KEY, uuid TEXT, name TEXT)"); err != nil {
+		t.Fatalf("CREATE fallback GRAPH TABLE: %v", err)
+	}
+	col, err := db.GetCollection("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"alice", "bob", "carol", "dave"} {
+		node, nodeErr := db.GetNodeID(ctx, "entities", id)
+		if nodeErr != nil {
+			t.Fatal(nodeErr)
+		}
+		col.GetGraph().RegisterVertexLabel(node, "Person")
+		if id == "alice" {
+			col.GetGraph().RegisterVertexLabel(node, "Active")
+		}
+	}
+	query := `MATCH (a:Person:Active)-{weight > 0.5}->(b:Person)
+RETURN a.id AS source_id, b.id AS target_id`
+	rows, err := db.Query(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Total != 1 || rows.Results[0].Metadata["source_id"] != "alice" || rows.Results[0].Metadata["target_id"] != "bob" {
+		t.Fatalf("rows=%#v, want alice -> bob", rows)
+	}
+}

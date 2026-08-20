@@ -47,7 +47,7 @@ func (db *Database) executeCypherPipe(ctx context.Context, src []byte, doc *pars
 	}
 	rows := make([]virtualSQLRow, 0, len(bindings))
 	for _, binding := range bindings {
-		rows = append(rows, cypherBindingRow(binding))
+		rows = append(rows, db.cypherBindingRow(binding, db.vectorColumnName(collection.name)))
 	}
 	for i := int32(0); i < stmt.PipeWithCount; i++ {
 		clause := &doc.WithClauses[stmt.PipeWithStart+i]
@@ -70,7 +70,7 @@ func (db *Database) executeCypherPipe(ctx context.Context, src []byte, doc *pars
 			}
 			rows = make([]virtualSQLRow, 0, len(rowsBindings))
 			for _, binding := range rowsBindings {
-				rows = append(rows, cypherBindingRow(binding))
+				rows = append(rows, db.cypherBindingRow(binding, db.vectorColumnName(nextCollection.name)))
 			}
 		}
 	}
@@ -81,7 +81,7 @@ func (db *Database) executeCypherPipe(ctx context.Context, src []byte, doc *pars
 	return finishVirtualRows(db, doc, src, stmt, rows, columns, params), nil
 }
 
-func cypherBindingRow(binding cypherMatchBinding) virtualSQLRow {
+func (db *Database) cypherBindingRow(binding cypherMatchBinding, vectorColumn string) virtualSQLRow {
 	aliases := make([]string, 0, len(binding.vertices)+len(binding.edges))
 	for alias := range binding.vertices {
 		aliases = append(aliases, alias)
@@ -102,6 +102,9 @@ func cypherBindingRow(binding cypherMatchBinding) virtualSQLRow {
 				values = make(map[string]interface{})
 			}
 			values["id"] = record.ID
+			if vectorColumn != "" && len(record.Vector) > 0 {
+				values[vectorColumn] = cloneVector(record.Vector)
+			}
 			row.Scopes = append(row.Scopes, virtualSQLScope{Alias: alias, Values: values, Vector: record.Vector})
 			if row.ID == "" {
 				row.ID = record.ID
