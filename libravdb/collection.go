@@ -90,27 +90,130 @@ type CollectionConfig struct {
 		HNSWThreshold  int `json:"hnsw_threshold,omitempty"`
 		IVFPQThreshold int `json:"ivfpq_threshold,omitempty"`
 	} `json:"auto_index_thresholds,omitempty"`
-	MemoryLimit        int64          `json:"memory_limit,omitempty"`
-	EfSearch           int            `json:"ef_search"`
-	ML                 float64        `json:"ml"`
-	RawStoreCap        int            `json:"raw_store_cap,omitempty"`
-	IDMapCapacity      int            `json:"id_map_capacity,omitempty"`
-	Metric             DistanceMetric `json:"metric"`
-	SaveInterval       time.Duration  `json:"save_interval"`
-	Graph              Graph          `json:"-"`
-	NProbes            int            `json:"n_probes,omitempty"`
-	NClusters          int            `json:"n_clusters,omitempty"`
-	IndexType          IndexType      `json:"index_type"`
-	Version            int            `json:"version"`
-	Dimension          int            `json:"dimension"`
-	CachePolicy        CachePolicy    `json:"cache_policy,omitempty"`
-	M                  int            `json:"m"`
-	EfConstruction     int            `json:"ef_construction"`
-	Sharded            bool           `json:"sharded,omitempty"`
-	EnableMMapping     bool           `json:"enable_mmapping,omitempty"`
-	AutoIndexSelection bool           `json:"auto_index_selection,omitempty"`
-	AutoSave           bool           `json:"auto_save"`
+	MemoryLimit   int64          `json:"memory_limit,omitempty"`
+	EfSearch      int            `json:"ef_search"`
+	ML            float64        `json:"ml"`
+	RawStoreCap   int            `json:"raw_store_cap,omitempty"`
+	IDMapCapacity int            `json:"id_map_capacity,omitempty"`
+	Metric        DistanceMetric `json:"metric"`
+	SaveInterval  time.Duration  `json:"save_interval"`
+	Graph         Graph          `json:"-"`
+	// GraphNamespace is persisted graph ownership metadata. SQL-created graph
+	// tables use the database-wide default namespace; an empty value retains
+	// the explicit/native isolated-graph behavior.
+	GraphNamespace     string      `json:"graph_namespace,omitempty"`
+	NProbes            int         `json:"n_probes,omitempty"`
+	NClusters          int         `json:"n_clusters,omitempty"`
+	IndexType          IndexType   `json:"index_type"`
+	Version            int         `json:"version"`
+	Dimension          int         `json:"dimension"`
+	CachePolicy        CachePolicy `json:"cache_policy,omitempty"`
+	M                  int         `json:"m"`
+	EfConstruction     int         `json:"ef_construction"`
+	Sharded            bool        `json:"sharded,omitempty"`
+	EnableMMapping     bool        `json:"enable_mmapping,omitempty"`
+	AutoIndexSelection bool        `json:"auto_index_selection,omitempty"`
+	AutoSave           bool        `json:"auto_save"`
 }
+
+const defaultGraphNamespace = "default"
+
+// withGraphNamespace is intentionally internal. SQL DDL opts graph tables
+// into the database-owned namespace without expanding the native collection
+// API, where WithGraph continues to mean an explicitly isolated graph.
+func withGraphNamespace(namespace string) CollectionOption {
+	return func(c *CollectionConfig) error {
+		c.GraphNamespace = namespace
+		return nil
+	}
+}
+
+// collectionGraph binds graph transactions to one collection while sharing
+// the underlying graph store. A graph transaction carries its collection in
+// WAL records, so shared topology remains recoverable without mutating a
+// graph-global collection name on every query.
+type collectionGraph struct {
+	Graph
+	collection string
+}
+
+func (g *collectionGraph) BeginTxn() *graph.Txn {
+	if g == nil || g.Graph == nil {
+		return nil
+	}
+	if binder, ok := g.Graph.(interface {
+		BeginTxnFor(string) *graph.Txn
+	}); ok {
+		return binder.BeginTxnFor(g.collection)
+	}
+	txn := g.Graph.BeginTxn()
+	if txn != nil {
+		txn.SetCollection(g.collection)
+	}
+	return txn
+}
+
+func (g *collectionGraph) SetWALWriter(w storage.GraphWALWriter) {
+	if setter, ok := g.Graph.(interface {
+		SetWALWriter(storage.GraphWALWriter)
+	}); ok {
+		setter.SetWALWriter(w)
+	}
+}
+
+// SetCollectionName is deliberately a no-op. The wrapper binds each
+// transaction independently; changing the shared store's global name would
+// race concurrent SQL sessions and misroute WAL frames.
+func (g *collectionGraph) SetCollectionName(string) {}
+
+// ForEachVertexLabel keeps the optional label-inspection seam visible through
+// a collection-bound shared-graph view. Query planning uses it to distinguish
+// an actually labeled namespace from a graph that only has schema-side label
+// hints.
+func (g *collectionGraph) ForEachVertexLabel(fn func(uint64, string) bool) {
+	if labels, ok := g.Graph.(interface {
+		ForEachVertexLabel(func(uint64, string) bool)
+	}); ok {
+		labels.ForEachVertexLabel(fn)
+	}
+}
+
+func (g *collectionGraph) ReplayEdgeAdd(src, tgt uint64, weight float32, kind uint8, properties []byte, commitLSN uint64) error {
+	target, ok := g.Graph.(storage.GraphRecoveryTarget)
+	if !ok {
+		return fmt.Errorf("graph does not support WAL recovery")
+	}
+	return target.ReplayEdgeAdd(src, tgt, weight, kind, properties, commitLSN)
+}
+
+func (g *collectionGraph) ReplayEdgeRemove(src, tgt uint64, kind uint8, commitLSN uint64) error {
+	target, ok := g.Graph.(storage.GraphRecoveryTarget)
+	if !ok {
+		return fmt.Errorf("graph does not support WAL recovery")
+	}
+	return target.ReplayEdgeRemove(src, tgt, kind, commitLSN)
+}
+
+func (g *collectionGraph) ReplayNodeEdgeDrop(nodeID uint64, commitLSN uint64) error {
+	target, ok := g.Graph.(storage.GraphRecoveryTarget)
+	if !ok {
+		return fmt.Errorf("graph does not support WAL recovery")
+	}
+	return target.ReplayNodeEdgeDrop(nodeID, commitLSN)
+}
+
+func (g *collectionGraph) ReplayVertexLabel(nodeID uint64, label string, commitLSN uint64) error {
+	target, ok := g.Graph.(storage.GraphRecoveryTarget)
+	if !ok {
+		return fmt.Errorf("graph does not support WAL recovery")
+	}
+	return target.ReplayVertexLabel(nodeID, label, commitLSN)
+}
+
+// Shared graph namespaces are owned by Database, not by an individual
+// collection. Collection.Close therefore must not close this wrapper's
+// underlying graph; Database.Close closes the namespace exactly once.
+func (g *collectionGraph) Close() error { return nil }
 
 // SQLIndexDefinition describes a named ordinary SQL index declared with
 // CREATE INDEX. It is persisted as a logical declaration; posting lists are
@@ -662,6 +765,7 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 		SQLIndexes:       sqlIndexesToStorage(config.SQLIndexes),
 		SQLIndexedFields: append([]string(nil), config.SQLIndexedFields...),
 		GraphEnabled:     config.Graph != nil,
+		GraphNamespace:   config.GraphNamespace,
 	}
 
 	// Initialize memory manager if memory management is configured
@@ -737,9 +841,9 @@ func newCollection(ctx context.Context, name string, storageEngine storage.Engin
 }
 
 // newCollectionFromStorage creates a collection instance from existing storage
-func newCollectionFromStorage(ctx context.Context, name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index) (*Collection, error) {
-	var graphLayer Graph
-	if engineConfig.GraphEnabled {
+func newCollectionFromStorage(ctx context.Context, name string, storageCollection storage.Collection, metrics *obs.Metrics, engineConfig *storage.CollectionConfig, writes *writeController, cachedIndex index.Index, graphOverride Graph) (*Collection, error) {
+	graphLayer := graphOverride
+	if engineConfig.GraphEnabled && graphLayer == nil {
 		var err error
 		graphLayer, err = NewGraph(GraphConfig{})
 		if err != nil {
@@ -766,6 +870,7 @@ func newCollectionFromStorage(ctx context.Context, name string, storageCollectio
 		SQLIndexes:       sqlIndexesFromStorage(engineConfig.SQLIndexes),
 		SQLIndexedFields: append([]string(nil), engineConfig.SQLIndexedFields...),
 		Graph:            graphLayer,
+		GraphNamespace:   engineConfig.GraphNamespace,
 	}
 	if config.NClusters <= 0 {
 		config.NClusters = 100
@@ -908,9 +1013,9 @@ func (p storageEntryProvider) IterateEntries(fn func(id string, ordinal uint32, 
 }
 
 // newShardedCollectionFromStorage creates a sharded collection from existing shard storages
-func newShardedCollectionFromStorage(ctx context.Context, name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController) (*Collection, error) {
-	var graphLayer Graph
-	if engineConfig.GraphEnabled {
+func newShardedCollectionFromStorage(ctx context.Context, name string, shardStorages []storage.Collection, engineConfig *storage.CollectionConfig, metrics *obs.Metrics, writes *writeController, graphOverride Graph) (*Collection, error) {
+	graphLayer := graphOverride
+	if engineConfig.GraphEnabled && graphLayer == nil {
 		var err error
 		graphLayer, err = NewGraph(GraphConfig{})
 		if err != nil {
@@ -937,6 +1042,7 @@ func newShardedCollectionFromStorage(ctx context.Context, name string, shardStor
 		SQLIndexes:       sqlIndexesFromStorage(engineConfig.SQLIndexes),
 		SQLIndexedFields: append([]string(nil), engineConfig.SQLIndexedFields...),
 		Graph:            graphLayer,
+		GraphNamespace:   engineConfig.GraphNamespace,
 		Sharded:          true, // Mark as sharded so lifecycle methods work correctly
 	}
 	if config.NClusters <= 0 {

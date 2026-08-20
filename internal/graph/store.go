@@ -1319,11 +1319,19 @@ retry:
 
 // BeginTxn starts a new graph transaction.
 func (g *graphStore) BeginTxn() *Txn {
+	return g.BeginTxnFor(g.collectionName)
+}
+
+// BeginTxnFor starts a transaction bound to one collection without mutating
+// the graph-wide collection name. This is required by database-wide graph
+// namespaces, where concurrent collections share topology but WAL frames must
+// retain their owning collection for record/recovery routing.
+func (g *graphStore) BeginTxnFor(collection string) *Txn {
 	return &Txn{
 		ID:         g.nextTxnID.Add(1),
 		walWriter:  g.walWriter,
 		store:      g,
-		collection: g.collectionName,
+		collection: collection,
 	}
 }
 

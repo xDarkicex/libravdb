@@ -435,6 +435,29 @@ func mergeVectorAssignment(value interface{}, dimension int) ([]float32, error) 
 func (db *Database) mergeGraphCollection(doc *parser.QueryDoc, src []byte, path *parser.MatchPath) (*Collection, error) {
 	keys := mergePathPropertyKeys(doc, src, path)
 	names := db.graphCollectionNames("")
+	// SQL graph tables use their table name as the canonical Cypher label.
+	// Resolve that exact label before schema-key fallback; otherwise a
+	// database with Entity, Episodic, Community, Saga, and RelatesToNode_
+	// tables has five equally valid candidates for `MERGE (n:Entity ...)`.
+	labels := mergePathLabels(doc, src, path)
+	if len(labels) > 0 {
+		labeled := make([]*Collection, 0, len(labels))
+		for _, name := range names {
+			for _, label := range labels {
+				if !strings.EqualFold(name, label) {
+					continue
+				}
+				collection, err := db.GetCollection(name)
+				if err == nil && collection.GetGraph() != nil {
+					labeled = append(labeled, collection)
+				}
+				break
+			}
+		}
+		if len(labeled) == 1 {
+			return labeled[0], nil
+		}
+	}
 	candidates := make([]*Collection, 0, len(names))
 	for _, name := range names {
 		collection, err := db.GetCollection(name)
@@ -455,6 +478,31 @@ func (db *Database) mergeGraphCollection(doc *parser.QueryDoc, src []byte, path 
 		return nil, fmt.Errorf("MERGE graph pattern is ambiguous: no graph collection declares its vertex properties")
 	}
 	return nil, fmt.Errorf("MERGE graph pattern is ambiguous across %d graph collections", len(candidates))
+}
+
+func mergePathLabels(doc *parser.QueryDoc, src []byte, path *parser.MatchPath) []string {
+	if path == nil {
+		return nil
+	}
+	labels := make([]string, 0, path.PathNodesCount)
+	seen := make(map[string]struct{})
+	for i := int32(0); i < path.PathNodesCount; i++ {
+		ref := doc.Nodes[path.PathNodesStart+i]
+		if ref.Kind != parser.NodeKindVertex || ref.ID < 0 || int(ref.ID) >= len(doc.Vertexes) {
+			continue
+		}
+		label := sourceSpan(src, doc.Vertexes[ref.ID].LabelStart, doc.Vertexes[ref.ID].LabelEnd)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		labels = append(labels, label)
+	}
+	return labels
 }
 
 func mergePathPropertyKeys(doc *parser.QueryDoc, src []byte, path *parser.MatchPath) map[string]struct{} {

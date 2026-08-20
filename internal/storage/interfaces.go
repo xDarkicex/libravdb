@@ -48,7 +48,12 @@ type CollectionConfig struct {
 	// GraphEnabled persists that the collection owns a graph layer. The graph
 	// object itself is runtime state and is recreated by libravdb on reopen.
 	GraphEnabled bool
-	DataLSN      uint64
+	// GraphNamespace identifies the runtime graph namespace to reconstruct on
+	// reopen. An empty value preserves the historical isolated-graph behavior;
+	// the SQL layer uses the reserved "default" namespace for graph tables that
+	// participate in the database-wide graph.
+	GraphNamespace string
+	DataLSN        uint64
 }
 
 // SQLIndexDefinition is the storage-neutral form of a named SQL index.

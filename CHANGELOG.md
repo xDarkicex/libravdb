@@ -4,6 +4,21 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.8 - 2026-08-20
+
+### Unified SQL graph namespace
+
+- Added one database-wide graph namespace for SQL-created `GRAPH TABLE`
+  collections, allowing graph nodes and relationships to span collections
+  such as `Entity`, `Episodic`, `Community`, `Saga`, and `RelatesToNode_`.
+- Persisted graph namespace metadata and restored the shared graph runtime
+  across database reopen while preserving explicit Go-side graph isolation.
+- Fixed implicit native Cypher `MATCH`, `WITH`, `MERGE`, `DELETE`, shortest-path,
+  and pattern-comprehension source resolution when multiple graph tables are
+  present.
+- Added regression coverage for cross-table traversal, shared graph lifetime,
+  reopen behavior, and graph-table owner selection.
+
 ## 1.6.7 - 2026-08-20
 
 ### Lexer dependency release

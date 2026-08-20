@@ -51,6 +51,8 @@ type Database struct {
 	catalogGeneration atomic.Uint64
 	autoIncrementMu   sync.Mutex
 	autoIncrementNext map[string]uint64
+	defaultGraphMu    sync.Mutex
+	defaultGraph      Graph
 	mu                sync.RWMutex
 	closed            bool
 }
@@ -276,6 +278,7 @@ func Open(opts ...Option) (*Database, error) {
 	// that were deserialized or rebuilt during recovery.
 	if err := db.loadExistingCollections(context.Background(), bridge); err != nil {
 		db.healthMonitor.Stop()
+		db.closeDefaultGraph()
 		_ = storageEngine.Close()
 		bridge.closeCachedIndexes()
 		return nil, fmt.Errorf("failed to load existing collections: %w", err)
@@ -313,6 +316,40 @@ func Open(opts ...Option) (*Database, error) {
 	}
 
 	return db, nil
+}
+
+// defaultGraphForCollection returns a collection-bound view of the one graph
+// namespace used by SQL-created graph tables. The graph object is runtime
+// state and is reconstructed from persisted collection namespace metadata on
+// reopen; transactions retain the collection name for WAL routing.
+func (db *Database) defaultGraphForCollection(collection string) (Graph, error) {
+	db.defaultGraphMu.Lock()
+	defer db.defaultGraphMu.Unlock()
+	if db.defaultGraph == nil {
+		g, err := NewGraph(GraphConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("create default graph namespace: %w", err)
+		}
+		db.defaultGraph = g
+	}
+	return &collectionGraph{Graph: db.defaultGraph, collection: collection}, nil
+}
+
+func (db *Database) graphOverrideForCollection(name string, config *storage.CollectionConfig) (Graph, error) {
+	if config == nil || !config.GraphEnabled || config.GraphNamespace != defaultGraphNamespace {
+		return nil, nil
+	}
+	return db.defaultGraphForCollection(name)
+}
+
+func (db *Database) closeDefaultGraph() {
+	db.defaultGraphMu.Lock()
+	g := db.defaultGraph
+	db.defaultGraph = nil
+	db.defaultGraphMu.Unlock()
+	if g != nil {
+		_ = g.Close()
+	}
 }
 
 // createSQLEdgeKind allocates, registers, and durably records a named graph
@@ -1356,7 +1393,14 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 			}
 		}
 
-		collection, err := newShardedCollectionFromStorage(ctx, name, shardStorages, config, db.metrics, db.newWriteController())
+		graphOverride, overrideErr := db.graphOverrideForCollection(name, config)
+		if overrideErr != nil {
+			for j := 0; j < shardCount; j++ {
+				shardStorages[j].Close()
+			}
+			return nil, overrideErr
+		}
+		collection, err := newShardedCollectionFromStorage(ctx, name, shardStorages, config, db.metrics, db.newWriteController(), graphOverride)
 		if err != nil {
 			for j := 0; j < shardCount; j++ {
 				shardStorages[j].Close()
@@ -1387,7 +1431,12 @@ func (db *Database) loadCollectionFromStorage(ctx context.Context, name string, 
 		cachedIndex = bridge.takeCachedIndex(name)
 	}
 
-	collection, err := newCollectionFromStorage(ctx, name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex)
+	graphOverride, overrideErr := db.graphOverrideForCollection(name, config)
+	if overrideErr != nil {
+		storageCollection.Close()
+		return nil, overrideErr
+	}
+	collection, err := newCollectionFromStorage(ctx, name, storageCollection, db.metrics, config, db.newWriteController(), cachedIndex, graphOverride)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create collection from storage: %w", err)
 	}
@@ -1455,6 +1504,9 @@ func (db *Database) Close() error {
 			errors = append(errors, err)
 		}
 	}
+	// SQL graph tables share one namespace. Collection.Close intentionally
+	// leaves that runtime alive; the database owns the single final close.
+	db.closeDefaultGraph()
 
 	// Close temporal ANN cache before storage.
 	if db.temporalCache != nil {
@@ -1534,6 +1586,7 @@ func (db *Database) Drop(ctx context.Context) error {
 		collection.Close()
 	}
 	db.collections = make(map[string]*Collection)
+	db.closeDefaultGraph()
 
 	// Stop health monitor
 	if db.healthMonitor != nil {

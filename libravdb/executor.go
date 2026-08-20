@@ -4615,7 +4615,7 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 		var graphLayer Graph
 		if plan.DDLGraph {
 			var err error
-			graphLayer, err = NewGraph(GraphConfig{})
+			graphLayer, err = e.db.defaultGraphForCollection(plan.DDLTableName)
 			if err != nil {
 				return nil, fmt.Errorf("create graph table %q: %w", plan.DDLTableName, err)
 			}
@@ -4841,6 +4841,7 @@ func (e *Executor) executeDDL(ctx context.Context, plan *optimizer.PhysicalPlan)
 		}
 		if graphLayer != nil {
 			opts = append(opts, WithGraph(graphLayer))
+			opts = append(opts, withGraphNamespace(defaultGraphNamespace))
 		}
 
 		created, err := e.db.CreateCollection(ctx, plan.DDLTableName, opts...)
@@ -6178,20 +6179,37 @@ func (e *Executor) implicitGraphCollection(plan *optimizer.PhysicalPlan) *Collec
 			continue
 		}
 		g := col.GetGraph()
-		if len(plan.SeedLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, plan.SeedLabels)) == 0 {
+		// Graph tables in the SQL default namespace share one physical graph.
+		// A graph kind is therefore not enough to identify the source relation:
+		// every collection can observe that kind in the shared store. For a
+		// native top-level MATCH, bind the implicit source to the collection
+		// that owns at least one source endpoint for the first path edge.
+		// Without this check, adding another graph table earlier in catalog order
+		// can make an otherwise valid shortestPath/path query scan the wrong
+		// relation and return zero rows.
+		if len(plan.GraphJoins) > 0 && len(plan.GraphJoins[0].GraphEdges) > 0 &&
+			!e.graphCollectionHasEdgeOrigin(col, plan.GraphJoins[0].GraphEdges[0]) {
+			continue
+		}
+		if (len(plan.GraphJoins) == 0 || len(plan.GraphJoins[0].GraphEdges) == 0) && len(plan.GraphPatternProjections) > 0 &&
+			len(plan.GraphPatternProjections[0].Edges) > 0 &&
+			!graphCollectionHasEdgeOriginForDatabase(e.db, col, plan.GraphPatternProjections[0].Edges[0].EdgeKind) {
+			continue
+		}
+		if len(plan.SeedLabels) > 0 && graphHasVertexLabels(g) && !e.graphCollectionMatchesLabels(col, plan.SeedLabels) {
 			continue
 		}
 		if len(plan.GraphJoins) > 0 && len(plan.GraphJoins[0].TerminalLabels) > 0 &&
-			graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, plan.GraphJoins[0].TerminalLabels)) == 0 {
+			graphHasVertexLabels(g) && !e.graphCollectionMatchesLabels(col, plan.GraphJoins[0].TerminalLabels) {
 			continue
 		}
 		patternMatched := true
 		for _, pattern := range plan.GraphPatternProjections {
-			if len(pattern.SeedLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, pattern.SeedLabels)) == 0 {
+			if len(pattern.SeedLabels) > 0 && graphHasVertexLabels(g) && !e.graphCollectionMatchesLabels(col, pattern.SeedLabels) {
 				patternMatched = false
 				break
 			}
-			if len(pattern.TerminalLabels) > 0 && graphHasVertexLabels(g) && len(graphLabelNodeSetForLabels(g, pattern.TerminalLabels)) == 0 {
+			if len(pattern.TerminalLabels) > 0 && graphHasVertexLabels(g) && !e.graphCollectionMatchesLabels(col, pattern.TerminalLabels) {
 				patternMatched = false
 				break
 			}
@@ -6266,6 +6284,64 @@ func (e *Executor) implicitGraphCollection(plan *optimizer.PhysicalPlan) *Collec
 		return candidates[0]
 	}
 	return e.db.firstGraphCollection()
+}
+
+func (e *Executor) graphCollectionHasEdgeOrigin(col *Collection, edgePlan optimizer.GraphEdgePlan) bool {
+	return graphCollectionHasEdgeOriginForDatabase(e.db, col, edgePlan.EdgeKind)
+}
+
+func graphCollectionHasEdgeOriginForDatabase(db *Database, col *Collection, kind uint8) bool {
+	if db == nil || col == nil || col.GetGraph() == nil || kind == 0 {
+		return true
+	}
+	found := false
+	col.GetGraph().ForEachEdge(func(src, _ uint64, edge graph.Edge) bool {
+		if edge.GetKind() != kind {
+			return true
+		}
+		owner, _, err := db.ResolveNodeID(context.Background(), src)
+		if err == nil && strings.EqualFold(owner, col.name) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// graphCollectionMatchesLabels resolves labels against the collection that
+// owns their durable graph node IDs. The graph label registry is intentionally
+// namespace-wide, so checking only GetLabelNodes would make every shared SQL
+// table look like a candidate for every label.
+func (e *Executor) graphCollectionMatchesLabels(col *Collection, labels []string) bool {
+	return graphCollectionMatchesLabelsForDatabase(e.db, col, labels)
+}
+
+func graphCollectionMatchesLabelsForDatabase(db *Database, col *Collection, labels []string) bool {
+	if col == nil || len(labels) == 0 {
+		return true
+	}
+	g := col.GetGraph()
+	if g == nil {
+		return false
+	}
+	for _, label := range labels {
+		if strings.EqualFold(col.name, label) {
+			continue
+		}
+		owned := false
+		for _, nodeID := range g.GetLabelNodes(label) {
+			owner, _, err := db.ResolveNodeID(context.Background(), nodeID)
+			if err == nil && strings.EqualFold(owner, col.name) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			return false
+		}
+	}
+	return true
 }
 
 func graphPlanHasLabelConstraints(plan *optimizer.PhysicalPlan) bool {

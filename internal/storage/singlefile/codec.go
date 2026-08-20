@@ -634,7 +634,7 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 		if config.GraphEnabled {
 			// A trailing length-prefixed optional field keeps older readers able
 			// to skip this declaration using the existing optSize boundary.
-			optSize += 5 // uint32 length + one boolean byte
+			optSize += uint32(4 + len(graphConfigField(config.GraphNamespace)))
 		}
 		enc.WriteUint32(optSize)
 	}
@@ -647,7 +647,7 @@ func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionCon
 			enc.WriteBytes(declarations)
 		}
 		if config.GraphEnabled {
-			enc.WriteBytes(graphConfigFieldMagic)
+			enc.WriteBytes(graphConfigField(config.GraphNamespace))
 		}
 	}
 	return nil
@@ -907,7 +907,7 @@ func estimateCollectionConfigSize(config storage.CollectionConfig) int {
 			size += 4 + len(declarations)
 		}
 		if config.GraphEnabled {
-			size += 5
+			size += 4 + len(graphConfigField(config.GraphNamespace))
 		}
 	}
 	return size
@@ -972,6 +972,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 	var sqlIndexes []storage.SQLIndexDefinition
 	var sqlIndexedFields []string
 	var graphEnabled bool
+	var graphNamespace string
 
 	if version >= 2 {
 		if dec.Off+4 <= len(dec.Data) {
@@ -1024,7 +1025,10 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 				if readErr != nil {
 					return storage.CollectionConfig{}, readErr
 				}
-				graphEnabled = bytes.Equal(graphBytes, graphConfigFieldMagic)
+				graphEnabled = bytes.HasPrefix(graphBytes, graphConfigFieldMagic)
+				if graphEnabled && len(graphBytes) > len(graphConfigFieldMagic) {
+					graphNamespace = string(graphBytes[len(graphConfigFieldMagic):])
+				}
 				consumed += 4 + len(graphBytes)
 			}
 			if int(optSize) > consumed {
@@ -1067,6 +1071,7 @@ func readCollectionConfig(dec *util.BinaryDecoder) (storage.CollectionConfig, er
 		SQLIndexes:       sqlIndexes,
 		SQLIndexedFields: sqlIndexedFields,
 		GraphEnabled:     graphEnabled,
+		GraphNamespace:   graphNamespace,
 	}, nil
 }
 
@@ -1075,10 +1080,20 @@ func hasGraphConfigField(dec *util.BinaryDecoder, optSize uint32, consumed int) 
 		return false
 	}
 	length := binary.LittleEndian.Uint32(dec.Data[dec.Off : dec.Off+4])
-	if length != uint32(len(graphConfigFieldMagic)) || dec.Off+4+int(length) > len(dec.Data) {
+	if length < uint32(len(graphConfigFieldMagic)) || dec.Off+4+int(length) > len(dec.Data) {
 		return false
 	}
-	return bytes.Equal(dec.Data[dec.Off+4:dec.Off+4+int(length)], graphConfigFieldMagic)
+	return bytes.HasPrefix(dec.Data[dec.Off+4:dec.Off+4+int(length)], graphConfigFieldMagic)
+}
+
+func graphConfigField(namespace string) []byte {
+	if namespace == "" {
+		return graphConfigFieldMagic
+	}
+	field := make([]byte, 0, len(graphConfigFieldMagic)+len(namespace))
+	field = append(field, graphConfigFieldMagic...)
+	field = append(field, namespace...)
+	return field
 }
 
 func readCollection(dec *util.BinaryDecoder, snapshotVersion byte) (*persistedCollection, error) {

@@ -177,7 +177,7 @@ func (db *Database) cypherMatchGraphCollection(doc *parser.QueryDoc, src []byte,
 					labels = append(labels, sourceSpan(src, label.Start, label.End))
 				}
 			}
-			if len(labels) > 0 && len(graphLabelNodeSetForLabels(g, labels)) == 0 {
+			if len(labels) > 0 && graphHasVertexLabels(g) && !graphCollectionMatchesLabelsForDatabase(db, collection, labels) {
 				matched = false
 				break
 			}
@@ -197,15 +197,7 @@ func (db *Database) cypherMatchGraphCollection(doc *parser.QueryDoc, src []byte,
 			if kind == 0 {
 				continue
 			}
-			found := false
-			g.ForEachEdge(func(_, _ uint64, candidate graph.Edge) bool {
-				if candidate.GetKind() == kind {
-					found = true
-					return false
-				}
-				return true
-			})
-			if !found {
+			if !graphCollectionHasEdgeOriginForDatabase(db, collection, kind) {
 				matched = false
 				break
 			}
@@ -215,6 +207,15 @@ func (db *Database) cypherMatchGraphCollection(doc *parser.QueryDoc, src []byte,
 		}
 	}
 	if len(candidates) > 0 {
+		// A graph without explicit vertex labels can still satisfy a label as
+		// a schema-side hint. Prefer a candidate with durable labels when one
+		// exists; otherwise an earlier unlabeled relation (for example a
+		// bootstrap documents table) can shadow the actual labeled graph table.
+		for _, candidate := range candidates {
+			if graphHasVertexLabels(candidate.GetGraph()) {
+				return candidate, nil
+			}
+		}
 		return candidates[0], nil
 	}
 	// Preserve the established implicit MATCH behavior for an empty graph or
