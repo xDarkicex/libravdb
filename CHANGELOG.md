@@ -4,6 +4,21 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.12 - 2026-08-21
+
+### WAL replay and catalog relocation recovery
+
+- Fixed repeated legacy chunk-tail relocation when catalog metadata is updated
+  more than once, preventing stale page duplication and invalid WAL checksums.
+- Published catalog pages before checkpoint metapages so recovery never adopts a
+  new snapshot with an older catalog page.
+- Added conservative recovery for affected files that validates the authoritative
+  snapshot and active WAL before skipping only the duplicated stale prefix.
+- Added complete-write checks for chunk, checkpoint, vacuum, backup, and
+  compaction file writes.
+- Added regression coverage for repeated catalog updates and legacy-page
+  clearing.
+
 ## 1.6.11 - 2026-08-21
 
 ### Resilient incremental index recovery

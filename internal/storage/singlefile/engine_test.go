@@ -2323,6 +2323,59 @@ func TestReplayWALSkipsCorruptNonWALHeader(t *testing.T) {
 	}
 }
 
+func TestCatalogRelocationIsIdempotentAndClearsLegacyPage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog-relocation.libravdb")
+
+	engIface, err := New(path)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	eng := engIface.(*Engine)
+	if err := eng.Close(); err != nil {
+		t.Fatalf("initial close: %v", err)
+	}
+
+	engIface, err = New(path)
+	if err != nil {
+		t.Fatalf("reopen legacy layout: %v", err)
+	}
+	eng = engIface.(*Engine)
+
+	// Two catalog updates in one open exercise the historical bug: the first
+	// update moves a legacy tail, and the second update must not move it again.
+	eng.SetCatalogData([]byte("catalog-v1"))
+	eng.SetCatalogData([]byte("catalog-v2"))
+	if err := eng.Close(); err != nil {
+		t.Fatalf("close after catalog updates: %v", err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open bytes: %v", err)
+	}
+	defer f.Close()
+	page := make([]byte, pageSize)
+	if n, err := f.ReadAt(page, int64(3*pageSize)); err != nil {
+		t.Fatalf("read catalog page: %v", err)
+	} else if n != len(page) {
+		t.Fatalf("short catalog page: %d/%d", n, len(page))
+	}
+	if string(page[:len("catalog-v2")]) != "catalog-v2" {
+		t.Fatalf("catalog page was not written atomically: %q", page[:len("catalog-v2")])
+	}
+	if binary.LittleEndian.Uint32(page[:4]) == chunkMagic {
+		t.Fatal("catalog page still begins with a legacy chunk header")
+	}
+
+	engIface, err = New(path)
+	if err != nil {
+		t.Fatalf("reopen after idempotent relocation: %v", err)
+	}
+	if err := engIface.(*Engine).Close(); err != nil {
+		t.Fatalf("final close: %v", err)
+	}
+}
+
 // TestOrdinalPreReservation_CrashRecovery verifies that ordinals reserved via the
 // atomic counter but never committed do not leak into NextOrdinal after restart.
 func TestOrdinalPreReservation_CrashRecovery(t *testing.T) {

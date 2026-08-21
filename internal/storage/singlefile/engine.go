@@ -1,6 +1,7 @@
 package singlefile
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -377,11 +378,15 @@ type Engine struct {
 	replayedIndexDeletes uint64
 	lastLSN              atomic.Uint64
 	activeMetaPage       uint64
-	nextGraphNodeID      atomic.Uint64
-	reverseDir           *reverseDirectory
-	mu                   sync.RWMutex
-	status               atomic.Int32
-	closed               atomic.Bool
+	// walReplayStart is normally page 3. Recovery sets it to the end of the
+	// selected snapshot when it safely skips a stale legacy relocation prefix;
+	// compaction uses the same boundary so it never reparses that prefix.
+	walReplayStart  int64
+	nextGraphNodeID atomic.Uint64
+	reverseDir      *reverseDirectory
+	mu              sync.RWMutex
+	status          atomic.Int32
+	closed          atomic.Bool
 	// writesDisabled is set when a post-WAL-write durability failure
 	// (sync or short write) makes the committed/uncommitted boundary
 	// ambiguous. All mutation paths must reject writes until the
@@ -887,8 +892,26 @@ func (e *Engine) openExisting() error {
 	e.commitCatalog = append([]commitEntry(nil), e.state.CommitCatalog...)
 	e.oldestRetainedLSN = e.state.OldestRetainedLSN
 
-	// Load catalog data from page 3 if present
-	e.catalogData = e.readCatalogPageLocked()
+	// A pre-catalog writer could relocate the legacy chunk tail more than
+	// once. In that failure mode page 3 contains a repeated stale prefix and
+	// the first WAL chunk straddles a page boundary, so replay must begin at
+	// the authoritative snapshot instead of treating the stale prefix as live
+	// WAL. This is read-only recovery; the file is repaired by the next normal
+	// checkpoint after the database has opened successfully.
+	replayStart := int64(3 * pageSize)
+	staleRelocation, err := e.detectStaleRelocationPrefix(chosen.meta)
+	if err != nil {
+		e.fail(fmt.Errorf("inspect legacy catalog relocation: %w", err))
+		return err
+	}
+	if staleRelocation {
+		e.catalogData = nil
+		replayStart = int64(chosen.meta.SnapshotOffset) + 16 + int64(chosen.meta.SnapshotLength)
+	} else {
+		// Load catalog data from page 3 if present.
+		e.catalogData = e.readCatalogPageLocked()
+	}
+	e.walReplayStart = replayStart
 
 	e.collectionsByID = make(map[uint64]string, len(e.state.Collections))
 	for name, col := range e.state.Collections {
@@ -919,7 +942,7 @@ func (e *Engine) openExisting() error {
 
 	// Phase 3: replay WAL
 	e.status.Store(int32(storage.StatusReplayingWAL))
-	if err := e.replayWAL(chosen.meta.LastAppliedLSN); err != nil {
+	if err := e.replayWALFrom(chosen.meta.LastAppliedLSN, replayStart); err != nil {
 		e.fail(fmt.Errorf("replay WAL: %w", err))
 		return err
 	}
@@ -1363,8 +1386,32 @@ func writeFixedPage(file *os.File, page uint64, data []byte) error {
 	if len(data) > pageSize {
 		return fmt.Errorf("page payload too large: %d", len(data))
 	}
-	_, err := file.WriteAt(data, int64(page)*pageSize)
-	return err
+	return writeFullAt(file, data, int64(page)*pageSize)
+}
+
+func writeFullAt(file *os.File, data []byte, offset int64) error {
+	n, err := file.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func writeFull(file *os.File, data []byte) error {
+	for len(data) > 0 {
+		n, err := file.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 func encodeHeader(header *fileHeader, buf []byte) []byte {
@@ -1634,12 +1681,114 @@ func decodeChunkHeader(buf []byte) chunkHeader {
 	}
 }
 
+// detectStaleRelocationPrefix identifies the specific interrupted legacy
+// catalog migration that duplicated the first chunk page at page 3. The
+// detector is deliberately conservative: it requires a page-aligned
+// post-page-3 snapshot, repeated page contents, a valid WAL prefix, and a
+// WAL chunk whose payload crosses the repeated page boundary with a failed
+// chunk CRC. A normal catalog page, a truncated final WAL chunk, and any
+// prefix containing graph or edge-kind frames are not classified as this
+// case, because silently skipping those bytes could lose topology.
+func (e *Engine) detectStaleRelocationPrefix(meta *metaPage) (bool, error) {
+	if meta == nil || meta.SnapshotLength == 0 || meta.SnapshotOffset < uint64(4*pageSize) || meta.SnapshotOffset%uint64(pageSize) != 0 {
+		return false, nil
+	}
+	stat, err := e.file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if meta.SnapshotOffset > uint64(stat.Size()) {
+		return false, nil
+	}
+
+	first := make([]byte, pageSize)
+	if n, err := e.file.ReadAt(first, int64(3*pageSize)); err != nil {
+		if errors.Is(err, io.EOF) && n == 0 {
+			return false, nil
+		}
+		return false, err
+	} else if n != len(first) {
+		return false, io.ErrUnexpectedEOF
+	}
+	if binary.LittleEndian.Uint32(first[:4]) != chunkMagic {
+		return false, nil
+	}
+
+	// Every page from the stale prefix through the page before the selected
+	// snapshot must be identical. This is the signature of the old
+	// read-tail/write-at+page relocation being applied repeatedly.
+	for offset := uint64(4 * pageSize); offset < meta.SnapshotOffset; offset += uint64(pageSize) {
+		page := make([]byte, pageSize)
+		if n, err := e.file.ReadAt(page, int64(offset)); err != nil {
+			return false, err
+		} else if n != len(page) {
+			return false, io.ErrUnexpectedEOF
+		}
+		if !bytes.Equal(first, page) {
+			return false, nil
+		}
+	}
+
+	// The first copied page must contain a valid chunk prefix followed by a
+	// WAL header whose payload extends into the next copied page and whose
+	// checksum does not match the bytes available in the stale page. Validate
+	// every complete WAL frame before that boundary and reject graph frames,
+	// which cannot safely be skipped because graph topology is external to the
+	// record snapshot.
+	var foundWAL, foundBoundary bool
+	for relative := 0; relative+16 <= len(first); {
+		header := decodeChunkHeader(first[relative : relative+16])
+		if header.Magic != chunkMagic || header.Version == 0 || header.Version > formatVersion || header.PayloadLen > maxChunkSize {
+			return false, nil
+		}
+		end := relative + 16 + int(header.PayloadLen)
+		if end > len(first) {
+			if header.Kind != chunkTypeWAL {
+				return false, nil
+			}
+			available := first[relative+16:]
+			if crc32.Checksum(available, castagnoli) == header.Checksum {
+				return false, nil
+			}
+			foundBoundary = true
+			break
+		}
+		payload := first[relative+16 : end]
+		if header.Kind == chunkTypeWAL {
+			foundWAL = true
+			if crc32.Checksum(payload, castagnoli) != header.Checksum {
+				return false, nil
+			}
+			record, err := decodeWALRecord(payload)
+			if err != nil || record.Header.LSN > meta.LastAppliedLSN {
+				return false, nil
+			}
+			switch record.Header.RecordType {
+			case recordTypeGraphEdgeAdd, recordTypeGraphEdgeRemove,
+				recordTypeGraphNodeDrop, recordTypeGraphVertexLabel,
+				recordTypeEdgeKindCreate:
+				return false, nil
+			}
+		}
+		relative = end
+	}
+	return foundWAL && foundBoundary, nil
+}
+
 func (e *Engine) replayWAL(lastApplied uint64) error {
+	return e.replayWALFrom(lastApplied, int64(3*pageSize))
+}
+
+// replayWALFrom replays complete chunks beginning at startOffset. The
+// ordinary format starts scanning at page 3. Recovery of a known interrupted
+// legacy catalog relocation may start at the end of the selected snapshot,
+// after validating that the bytes before it are stale and not live WAL.
+func (e *Engine) replayWALFrom(lastApplied uint64, startOffset int64) error {
 	stat, err := e.file.Stat()
 	if err != nil {
 		return err
 	}
-	offset := int64(3 * pageSize)
+	offset := startOffset
 	started := false
 	fileSize := stat.Size()
 	pending := make(map[uint64][]walRecord)
@@ -1702,8 +1851,12 @@ func (e *Engine) replayWAL(lastApplied uint64) error {
 		if _, err := e.file.ReadAt(payload, offset+16); err != nil {
 			return err
 		}
-		if crc32.Checksum(payload, castagnoli) != chunk.Checksum {
-			return fmt.Errorf("invalid chunk checksum during replay")
+		calculated := crc32.Checksum(payload, castagnoli)
+		if calculated != chunk.Checksum {
+			return fmt.Errorf(
+				"invalid chunk checksum during replay at offset %d (kind=%d version=%d payload=%d stored=%08x calculated=%08x)",
+				offset, chunk.Kind, chunk.Version, chunk.PayloadLen, chunk.Checksum, calculated,
+			)
 		}
 
 		record, err := decodeWALRecord(payload)
@@ -3236,7 +3389,7 @@ func (e *Engine) ensureFileExtendsPastReservedLocked() error {
 	if stat.Size() < minSize {
 		// Extend the file with zeros so that SeekEnd returns >= minSize.
 		zero := make([]byte, pageSize)
-		if _, err := e.file.WriteAt(zero, minSize-pageSize); err != nil {
+		if err := writeFullAt(e.file, zero, minSize-pageSize); err != nil {
 			return err
 		}
 	}
@@ -3264,12 +3417,30 @@ func (e *Engine) relocateLegacyChunksPastCatalogLocked() error {
 	if binary.LittleEndian.Uint32(magicBuf[:]) != chunkMagic {
 		return e.ensureFileExtendsPastReservedLocked()
 	}
+	// A previous relocation may have completed the tail move and persisted the
+	// adjusted recovery offsets before a process stopped. Do not move the same
+	// tail again. The catalog page is cleared below during a successful move;
+	// this guard covers the crash window before that clear becomes durable.
+	for page := uint64(1); page <= 2; page++ {
+		meta, metaErr := e.readMetaPage(page)
+		if metaErr == nil && meta.SnapshotOffset >= uint64(4*pageSize) {
+			return nil
+		}
+	}
 	tailLen := stat.Size() - legacyOffset
 	tail := make([]byte, tailLen)
-	if _, err := e.file.ReadAt(tail, legacyOffset); err != nil {
+	if n, err := e.file.ReadAt(tail, legacyOffset); err != nil {
+		return err
+	} else if n != len(tail) {
+		return io.ErrUnexpectedEOF
+	}
+	if err := writeFullAt(e.file, tail, legacyOffset+pageSize); err != nil {
 		return err
 	}
-	if _, err := e.file.WriteAt(tail, legacyOffset+pageSize); err != nil {
+	// Make page 3 unambiguously reserved before publishing the adjusted
+	// metapage/header offsets. This makes the relocation idempotent on the next
+	// catalog update and prevents replay from seeing the stale first page.
+	if err := writeFullAt(e.file, make([]byte, pageSize), legacyOffset); err != nil {
 		return err
 	}
 	if err := e.file.Truncate(stat.Size() + pageSize); err != nil {
@@ -3425,22 +3596,24 @@ func (e *Engine) checkpointLocked() error {
 	for i := range buf {
 		buf[i] = 0
 	}
-	// STEP 4: fsync (durable: snapshot + index + metapage)
-	if err := e.checkpointWriteAtLocked(int64(nextMetaPage)*pageSize, encodeMeta(meta, buf)); err != nil {
-		return err
-	}
-	if err := e.checkpointSyncLocked(); err != nil {
-		return err
-	}
-
-	// STEP 4b: write catalog page (page 3, reserved by RootCatalog in the meta page)
+	// STEP 3b: write the catalog before publishing a metapage that points at
+	// this snapshot. A crash after publishing the metapage but before writing
+	// page 3 otherwise leaves a valid checkpoint paired with a stale catalog
+	// page, which is exactly the ordering that exposed the relocation bug.
 	if len(e.catalogData) > 0 {
 		catalogPage := make([]byte, pageSize)
 		copy(catalogPage, e.catalogData)
 		if err := e.checkpointWriteAtLocked(3*pageSize, catalogPage); err != nil {
 			return fmt.Errorf("write catalog page: %w", err)
 		}
-		e.catalogDirty = false
+	}
+
+	// STEP 4: fsync (durable: snapshot + index + catalog + metapage)
+	if err := e.checkpointWriteAtLocked(int64(nextMetaPage)*pageSize, encodeMeta(meta, buf)); err != nil {
+		return err
+	}
+	if err := e.checkpointSyncLocked(); err != nil {
+		return err
 	}
 
 	// STEP 5: write header (publishes the new metapage as authoritative)
@@ -3460,6 +3633,9 @@ func (e *Engine) checkpointLocked() error {
 	}
 	if err := e.checkpointSyncLocked(); err != nil {
 		return err
+	}
+	if len(e.catalogData) > 0 {
+		e.catalogDirty = false
 	}
 
 	e.activeMetaPage = nextMetaPage
@@ -3690,10 +3866,10 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
 	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
 	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
-	if _, err := tmpFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+	if err := writeFullAt(tmpFile, chunkHdr[:], int64(snapshotOffset)); err != nil {
 		return fmt.Errorf("vacuum write chunk header: %w", err)
 	}
-	if _, err := tmpFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+	if err := writeFullAt(tmpFile, snapshotBytes, int64(snapshotOffset)+16); err != nil {
 		return fmt.Errorf("vacuum write snapshot payload: %w", err)
 	}
 
@@ -3704,10 +3880,10 @@ func (e *Engine) Vacuum(ctx context.Context) error {
 		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
 		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
 		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
-		if _, err := tmpFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+		if err := writeFullAt(tmpFile, idxHdr[:], int64(indexOffset)); err != nil {
 			return fmt.Errorf("vacuum write index chunk header: %w", err)
 		}
-		if _, err := tmpFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+		if err := writeFullAt(tmpFile, indexBlock, int64(indexOffset)+16); err != nil {
 			return fmt.Errorf("vacuum write index payload: %w", err)
 		}
 	}
@@ -3942,10 +4118,10 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
 	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
 	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
-	if _, err := destFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+	if err := writeFullAt(destFile, chunkHdr[:], int64(snapshotOffset)); err != nil {
 		return fmt.Errorf("backup write chunk header: %w", err)
 	}
-	if _, err := destFile.WriteAt(snapshotBytes, int64(snapshotOffset)+16); err != nil {
+	if err := writeFullAt(destFile, snapshotBytes, int64(snapshotOffset)+16); err != nil {
 		return fmt.Errorf("backup write snapshot payload: %w", err)
 	}
 
@@ -3956,10 +4132,10 @@ func (e *Engine) Backup(ctx context.Context, destPath string) error {
 		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
 		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
 		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
-		if _, err := destFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+		if err := writeFullAt(destFile, idxHdr[:], int64(indexOffset)); err != nil {
 			return fmt.Errorf("backup write index chunk header: %w", err)
 		}
-		if _, err := destFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+		if err := writeFullAt(destFile, indexBlock, int64(indexOffset)+16); err != nil {
 			return fmt.Errorf("backup write index payload: %w", err)
 		}
 	}
@@ -4056,7 +4232,10 @@ func (e *Engine) collectCommittedGraphWALLocked() ([]byte, error) {
 	var chunks []graphWALChunk
 	graphTx := make(map[uint64]bool)
 	committedTx := make(map[uint64]bool)
-	offset := int64(3 * pageSize)
+	offset := e.walReplayStart
+	if offset < int64(3*pageSize) {
+		offset = int64(3 * pageSize)
+	}
 	started := false
 	for offset <= stat.Size()-16 {
 		var headerBuf [16]byte
@@ -4265,10 +4444,10 @@ func (e *Engine) compactFileLocked() error {
 	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
 	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshot)))
 	binary.LittleEndian.PutUint32(chunkHdr[12:16], checksum)
-	if _, err := tmpFile.WriteAt(chunkHdr[:], int64(snapshotOffset)); err != nil {
+	if err := writeFullAt(tmpFile, chunkHdr[:], int64(snapshotOffset)); err != nil {
 		return fmt.Errorf("compact: write chunk header: %w", err)
 	}
-	if _, err := tmpFile.WriteAt(snapshot, int64(snapshotOffset)+16); err != nil {
+	if err := writeFullAt(tmpFile, snapshot, int64(snapshotOffset)+16); err != nil {
 		return fmt.Errorf("compact: write snapshot payload: %w", err)
 	}
 	if len(e.catalogData) > 0 {
@@ -4288,15 +4467,15 @@ func (e *Engine) compactFileLocked() error {
 		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
 		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
 		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
-		if _, err := tmpFile.WriteAt(idxHdr[:], int64(indexOffset)); err != nil {
+		if err := writeFullAt(tmpFile, idxHdr[:], int64(indexOffset)); err != nil {
 			return fmt.Errorf("compact: write index chunk header: %w", err)
 		}
-		if _, err := tmpFile.WriteAt(indexBlock, int64(indexOffset)+16); err != nil {
+		if err := writeFullAt(tmpFile, indexBlock, int64(indexOffset)+16); err != nil {
 			return fmt.Errorf("compact: write index block payload: %w", err)
 		}
 	}
 	if len(graphWAL) > 0 {
-		if _, err := tmpFile.WriteAt(graphWAL, int64(graphWALOffset)); err != nil {
+		if err := writeFullAt(tmpFile, graphWAL, int64(graphWALOffset)); err != nil {
 			return fmt.Errorf("compact: write graph WAL: %w", err)
 		}
 	}
@@ -4341,6 +4520,7 @@ func (e *Engine) compactFileLocked() error {
 	// ── Reset bookkeeping to match the compacted file ─────────────────────
 	e.activeMetaPage = 1
 	e.metaEpoch = 1
+	e.walReplayStart = int64(3 * pageSize)
 	e.dirty = false
 	e.dirtyBytes = 0
 	e.dirtyOps = 0
@@ -4402,16 +4582,16 @@ func (e *Engine) appendChunkHeaderPayloadLocked(kind uint16, headerPart, payload
 	binary.LittleEndian.PutUint16(header[6:8], formatVersion)
 	binary.LittleEndian.PutUint32(header[8:12], payloadLen)
 	binary.LittleEndian.PutUint32(header[12:16], checksum)
-	if _, err := e.file.Write(header[:]); err != nil {
+	if err := writeFull(e.file, header[:]); err != nil {
 		return 0, err
 	}
 	if len(headerPart) > 0 {
-		if _, err := e.file.Write(headerPart); err != nil {
+		if err := writeFull(e.file, headerPart); err != nil {
 			return 0, err
 		}
 	}
 	if len(payloadPart) > 0 {
-		if _, err := e.file.Write(payloadPart); err != nil {
+		if err := writeFull(e.file, payloadPart); err != nil {
 			return 0, err
 		}
 	}
