@@ -4,6 +4,18 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.11 - 2026-08-21
+
+### Resilient incremental index recovery
+
+- If an incremental WAL delta cannot be applied to a derived vector index,
+  LibraVDB now discards that index and rebuilds it from the authoritative
+  records instead of failing database reopen.
+- Subsequent deltas for the affected collection are skipped until the rebuild,
+  preventing a partially applied or stale index from becoming visible.
+- Added recovery regression coverage for index-delta replay and fallback
+  behavior.
+
 ## 1.6.10 - 2026-08-20
 
 ### Native Graphiti Kuzu edge-save MERGE

@@ -314,8 +314,8 @@ type IndexRestorePolicy interface {
 
 // IncrementalIndexRecoveryProvider applies committed WAL mutations to an index
 // that already represents the selected snapshot. Recovery invokes these methods
-// in transaction and LSN order; returning an error aborts open before the index
-// can become visible.
+// in transaction and LSN order. A delta failure invalidates the derived index
+// for that collection; the caller falls back to rebuilding it from records.
 type IncrementalIndexRecoveryProvider interface {
 	CanApplyIndexDeltas(collectionName string, config *storage.CollectionConfig) bool
 	ApplyIndexPut(collectionName string, entry *index.VectorEntry, replace bool, previousOrdinal uint32, config *storage.CollectionConfig) error
@@ -1937,6 +1937,14 @@ func (e *Engine) applyCommittedFrames(
 				touchedCollections[payload.Collection] = struct{}{}
 				continue
 			}
+			// Once a delta fails, stop applying further deltas to this
+			// collection. The durable record state is authoritative and the
+			// complete derived index is rebuilt after WAL replay. This keeps a
+			// stale/corrupt index snapshot from making the whole database fail
+			// to open.
+			if _, rebuilding := touchedCollections[payload.Collection]; rebuilding {
+				continue
+			}
 			current := collection.Records[payload.ID]
 			entry := &index.VectorEntry{
 				ID:       payload.ID,
@@ -1946,7 +1954,9 @@ func (e *Engine) applyCommittedFrames(
 				Ordinal:  current.Ordinal,
 			}
 			if err := deltaProvider.ApplyIndexPut(payload.Collection, entry, replace, previousOrdinal, &collection.Config); err != nil {
-				return fmt.Errorf("replay index put %s/%s at LSN %d: %w", payload.Collection, payload.ID, record.Header.LSN, err)
+				touchedCollections[payload.Collection] = struct{}{}
+				deltaProvider.DiscardIndex(payload.Collection)
+				continue
 			}
 			e.replayedIndexPuts++
 		case recordTypeRecordDelete:
@@ -1974,8 +1984,13 @@ func (e *Engine) applyCommittedFrames(
 				touchedCollections[payload.Collection] = struct{}{}
 				continue
 			}
+			if _, rebuilding := touchedCollections[payload.Collection]; rebuilding {
+				continue
+			}
 			if err := deltaProvider.ApplyIndexDelete(payload.Collection, payload.ID, ordinal, &collection.Config); err != nil {
-				return fmt.Errorf("replay index delete %s/%s at LSN %d: %w", payload.Collection, payload.ID, record.Header.LSN, err)
+				touchedCollections[payload.Collection] = struct{}{}
+				deltaProvider.DiscardIndex(payload.Collection)
+				continue
 			}
 			e.replayedIndexDeletes++
 		case recordTypeGraphEdgeAdd:
