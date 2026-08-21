@@ -4,6 +4,27 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.10 - 2026-08-20
+
+### Native Graphiti Kuzu edge-save MERGE
+
+- Added native parsing for disconnected Cypher `MATCH` bindings followed by
+  `MERGE`, including Graphiti's Kuzu edge-save query shape.
+- Resolved MERGE vertices against their owning graph-table collections so
+  `Entity`, `RelatesToNode_`, `Episodic`, and other labels can participate in
+  one shared graph namespace.
+- Enforced endpoint existence for preceding `MATCH` clauses; missing endpoints
+  now produce an empty result without creating intermediate records.
+- Preserved atomic record and graph mutations, idempotent edge creation, and
+  cross-table relationship updates.
+- Fixed projected MERGE results such as `RETURN e.uuid` to return the single
+  matched binding rather than one row per path vertex.
+- Added exact-query regression coverage and verified the Python Graphiti suite
+  and external pgwire/pgx, SQLAlchemy, Django, GORM, vector, temporal, and
+  native Cypher e2e harness.
+
+The lexer dependency is `github.com/xDarkicex/lexer v0.1.12`.
+
 ## 1.6.9 - 2026-08-20
 
 ### Graphiti vector MERGE catalog regression

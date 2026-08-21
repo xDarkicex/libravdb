@@ -540,3 +540,117 @@ func TestGraphitiMergeWritesDeclaredVectorColumn(t *testing.T) {
 		t.Fatalf("vector dimension error=%v", err)
 	}
 }
+
+func TestGraphitiNativeKuzuEdgeSaveAcrossGraphTables(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(WithStoragePath(":memory:graphiti_kuzu_edge_save"), WithMetrics(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, query := range []string{
+		"CREATE GRAPH TABLE Entity (uuid STRING PRIMARY KEY, name STRING)",
+		"CREATE GRAPH TABLE Episodic (uuid STRING PRIMARY KEY, name STRING)",
+		"CREATE GRAPH TABLE Community (uuid STRING PRIMARY KEY, name STRING)",
+		"CREATE GRAPH TABLE Saga (uuid STRING PRIMARY KEY, name STRING)",
+		"CREATE GRAPH TABLE RelatesToNode_ (uuid STRING PRIMARY KEY, fact STRING)",
+		"CREATE EDGE TYPE RELATES_TO",
+	} {
+		if _, err := db.Query(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+
+	for _, id := range []string{"source", "target"} {
+		if _, err := db.QueryWithParams(ctx,
+			"MERGE (n:Entity {uuid: $uuid}) SET n.name = $name",
+			QueryParams{"uuid": id, "name": id}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	const edgeSave = `MATCH (source:Entity {uuid: $source_uuid})
+MATCH (target:Entity {uuid: $target_uuid})
+MERGE (source)-[:RELATES_TO]->(e:RelatesToNode_ {uuid: $uuid})-[:RELATES_TO]->(target)
+SET e.fact = $fact
+RETURN e.uuid AS uuid`
+	params := QueryParams{
+		"source_uuid": "source",
+		"target_uuid": "target",
+		"uuid":        "edge-1",
+		"fact":        "first fact",
+	}
+	rows, err := db.QueryWithParams(ctx, edgeSave, params)
+	if err != nil {
+		t.Fatalf("native Kuzu edge save: %v", err)
+	}
+	if rows.Total == 0 {
+		t.Fatalf("native Kuzu edge save returned no rows: %#v", rows)
+	}
+
+	node, err := db.GetCollection("RelatesToNode_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := node.Get(ctx, "edge-1")
+	if err != nil {
+		t.Fatalf("created RelatesToNode_: %v", err)
+	}
+	if record.Metadata["fact"] != "first fact" {
+		t.Fatalf("edge node metadata=%#v, want first fact", record.Metadata)
+	}
+
+	params["fact"] = "updated fact"
+	if _, err := db.QueryWithParams(ctx, edgeSave, params); err != nil {
+		t.Fatalf("idempotent Kuzu edge save: %v", err)
+	}
+	record, err = node.Get(ctx, "edge-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Metadata["fact"] != "updated fact" {
+		t.Fatalf("matched edge node metadata=%#v, want updated fact", record.Metadata)
+	}
+
+	entity, err := db.GetCollection("Entity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceNode, err := entity.LookupNodeID(ctx, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetNode, err := entity.LookupNodeID(ctx, "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeNode, err := node.LookupNodeID(ctx, "edge-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighbors, err := entity.GetGraph().Neighbors(sourceNode)
+	if err != nil || len(neighbors) != 1 || neighbors[0].Target != edgeNode || neighbors[0].GetKind() != ResolveEdgeKind("RELATES_TO") {
+		t.Fatalf("source edges=%#v err=%v, want one RELATES_TO edge node", neighbors, err)
+	}
+	neighbors, err = entity.GetGraph().Neighbors(edgeNode)
+	if err != nil || len(neighbors) != 1 || neighbors[0].Target != targetNode || neighbors[0].GetKind() != ResolveEdgeKind("RELATES_TO") {
+		t.Fatalf("edge-node edges=%#v err=%v, want one RELATES_TO target edge", neighbors, err)
+	}
+
+	// A missing prefix MATCH is a non-match, never an implicit endpoint create.
+	missing := params
+	missing["source_uuid"] = "missing-source"
+	missing["uuid"] = "must-not-be-created"
+	missingRows, err := db.QueryWithParams(ctx, edgeSave, missing)
+	if err != nil {
+		t.Fatalf("missing endpoint edge save: %v", err)
+	}
+	if missingRows.Total != 0 {
+		t.Fatalf("missing endpoint returned %#v, want no rows", missingRows.Results)
+	}
+	if _, err := node.Get(ctx, "must-not-be-created"); err == nil {
+		t.Fatal("missing MATCH endpoint caused RelatesToNode_ creation")
+	}
+
+}

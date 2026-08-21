@@ -17,22 +17,30 @@ import (
 // graph endpoints are resolved through EpochTx so new vertices and edges share
 // one atomic record/graph commit.
 type mergeVertexState struct {
-	alias    string
-	label    string
-	id       string
-	metadata map[string]interface{}
+	alias      string
+	label      string
+	collection string
+	id         string
+	metadata   map[string]interface{}
 	// vector is the collection's physical vector value. SQL VECTOR columns
 	// have a logical catalog name, but are persisted through the same vector
 	// argument used by INSERT/UPDATE rather than as generic metadata.
 	vector    []float32
 	vectorSet bool
+	mustExist bool
 	created   bool
 	changed   bool
 	delta     map[string]interface{}
 }
 
+type mergePrefixBinding struct {
+	collection *Collection
+	record     Record
+}
+
 type mergeEdgeState struct {
 	alias      string
+	collection string
 	from       uint64
 	target     uint64
 	kind       uint8
@@ -73,23 +81,85 @@ func (db *Database) executeSQLMerge(ctx context.Context, src []byte, doc *parser
 	return result, nil
 }
 
+// resolveMergePrefixBindings resolves disconnected MATCH clauses that
+// precede a MERGE. These bindings are intentionally read-only: a missing
+// endpoint produces an empty result and never causes MERGE to create it.
+func (db *Database) resolveMergePrefixBindings(ctx context.Context, src []byte, doc *parser.QueryDoc, paths []parser.NodeRef, epoch *EpochTx, params *optimizer.ParameterSet, legacy QueryParams) (map[string]mergePrefixBinding, bool, error) {
+	bindings := make(map[string]mergePrefixBinding, len(paths))
+	for _, pathRef := range paths {
+		if pathRef.Kind != parser.NodeKindMatchPath || pathRef.ID < 0 || int(pathRef.ID) >= len(doc.MatchPaths) {
+			return nil, false, fmt.Errorf("MATCH before MERGE requires a valid graph pattern")
+		}
+		path := &doc.MatchPaths[pathRef.ID]
+		vertices, edges := mergePathElements(doc, path)
+		if len(vertices) != 1 || len(edges) != 0 {
+			return nil, false, fmt.Errorf("MATCH before MERGE currently supports one vertex per disconnected pattern")
+		}
+		vertex := &doc.Vertexes[vertices[0].ID]
+		alias := sourceSpan(src, vertex.Alias, vertex.AliasEnd)
+		if alias == "" {
+			return nil, false, fmt.Errorf("MATCH before MERGE vertices must have aliases")
+		}
+		properties, err := db.mergePropertyMap(ctx, src, doc, vertex.Predicate, params, legacy)
+		if err != nil {
+			return nil, false, fmt.Errorf("MATCH before MERGE vertex %s: %w", alias, err)
+		}
+		label := sourceSpan(src, vertex.LabelStart, vertex.LabelEnd)
+		collection, err := db.mergeCollectionForVertex(label, mergePropertyKeys(properties))
+		if err != nil {
+			return nil, false, err
+		}
+		records, err := epoch.ListRecords(ctx, collection.name)
+		if err != nil {
+			return nil, false, fmt.Errorf("MATCH before MERGE read %s: %w", collection.name, err)
+		}
+		var found *Record
+		for i := range records {
+			if mergeRecordMatches(&records[i], properties) {
+				found = &records[i]
+				break
+			}
+		}
+		if found == nil {
+			return nil, false, nil
+		}
+		key := strings.ToLower(alias)
+		if existing, ok := bindings[key]; ok && (existing.collection.name != collection.name || existing.record.ID != found.ID) {
+			return nil, false, fmt.Errorf("MATCH before MERGE alias %q has conflicting bindings", alias)
+		}
+		bindings[key] = mergePrefixBinding{collection: collection, record: *found}
+	}
+	return bindings, true, nil
+}
+
 func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *parser.QueryDoc, stmt *parser.MergeStmt, epoch *EpochTx, params *optimizer.ParameterSet, legacy QueryParams) (*SearchResults, error) {
 	if stmt == nil || stmt.MatchPath.Kind != parser.NodeKindMatchPath || stmt.MatchPath.ID < 0 || int(stmt.MatchPath.ID) >= len(doc.MatchPaths) {
 		return nil, fmt.Errorf("MERGE requires a valid graph pattern")
 	}
 	path := &doc.MatchPaths[stmt.MatchPath.ID]
-	collection, err := db.mergeGraphCollection(doc, src, path)
-	if collection == nil {
-		return nil, fmt.Errorf("MERGE requires a graph-backed collection")
-	}
 	vertices, edges := mergePathElements(doc, path)
 	if len(vertices) == 0 || len(edges) != len(vertices)-1 {
 		return nil, fmt.Errorf("MERGE requires a connected graph pattern")
 	}
 
-	records, err := epoch.ListRecords(ctx, collection.name)
+	prefixBindings, matched, err := db.resolveMergePrefixBindings(ctx, src, doc, stmt.PrefixMatchPaths, epoch, params, legacy)
 	if err != nil {
-		return nil, fmt.Errorf("MERGE read %s: %w", collection.name, err)
+		return nil, err
+	}
+	if !matched {
+		return &SearchResults{}, nil
+	}
+	recordsByCollection := make(map[string][]Record)
+	loadRecords := func(collection *Collection) ([]Record, error) {
+		if records, ok := recordsByCollection[collection.name]; ok {
+			return records, nil
+		}
+		records, loadErr := epoch.ListRecords(ctx, collection.name)
+		if loadErr != nil {
+			return nil, fmt.Errorf("MERGE read %s: %w", collection.name, loadErr)
+		}
+		recordsByCollection[collection.name] = records
+		return records, nil
 	}
 	states := make([]*mergeVertexState, len(vertices))
 	byID := make(map[string]*mergeVertexState, len(vertices))
@@ -104,32 +174,64 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		if err != nil {
 			return nil, fmt.Errorf("MERGE vertex %s: %w", alias, err)
 		}
-		identity, ok := mergeIdentity(properties)
-		if !ok {
-			return nil, fmt.Errorf("MERGE vertex %s requires an id or uuid property", alias)
+		aliasKey := strings.ToLower(alias)
+		prefix, prefixBound := prefixBindings[aliasKey]
+		var collection *Collection
+		var found *Record
+		mustExist := false
+		identity, hasIdentity := mergeIdentity(properties)
+		if prefixBound {
+			collection = prefix.collection
+			foundRecord := prefix.record
+			found = &foundRecord
+			identity = found.ID
+			hasIdentity = true
+			mustExist = true
+			if len(properties) > 0 && !mergeRecordMatches(found, properties) {
+				return nil, fmt.Errorf("MERGE vertex %s does not match its preceding MATCH binding", alias)
+			}
+		} else {
+			label := sourceSpan(src, vertex.LabelStart, vertex.LabelEnd)
+			collection, err = db.mergeCollectionForVertex(label, mergePropertyKeys(properties))
+			if err != nil {
+				return nil, fmt.Errorf("MERGE vertex %s: %w", alias, err)
+			}
 		}
-		if existing := byID[identity]; existing != nil {
+		if !hasIdentity {
+			return nil, fmt.Errorf("MERGE vertex %s requires an id or uuid property, or a preceding MATCH binding", alias)
+		}
+		stateKey := strings.ToLower(collection.name) + "\x00" + identity
+
+		if existing := byID[stateKey]; existing != nil {
 			states[i] = existing
-			byAlias[strings.ToLower(alias)] = existing
+			byAlias[aliasKey] = existing
 			continue
 		}
-		var found *Record
-		for j := range records {
-			if mergeRecordMatches(&records[j], properties) {
-				found = &records[j]
-				break
+		if found == nil {
+			records, loadErr := loadRecords(collection)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			for j := range records {
+				if mergeRecordMatches(&records[j], properties) {
+					found = &records[j]
+					break
+				}
 			}
 		}
 		state := &mergeVertexState{
-			alias:    alias,
-			label:    sourceSpan(src, vertex.LabelStart, vertex.LabelEnd),
-			id:       identity,
-			metadata: make(map[string]interface{}, len(properties)),
-			delta:    make(map[string]interface{}),
+			alias:      alias,
+			label:      sourceSpan(src, vertex.LabelStart, vertex.LabelEnd),
+			collection: collection.name,
+			id:         identity,
+			metadata:   make(map[string]interface{}, len(properties)),
+			mustExist:  mustExist,
+			delta:      make(map[string]interface{}),
 		}
 		if found != nil {
 			state.id = found.ID
 			state.metadata = cloneMetadata(found.Metadata)
+			state.vector = cloneVector(found.Vector)
 			if state.metadata == nil {
 				state.metadata = make(map[string]interface{})
 			}
@@ -147,8 +249,8 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 			}
 		}
 		states[i] = state
-		byID[identity] = state
-		byAlias[strings.ToLower(alias)] = state
+		byID[stateKey] = state
+		byAlias[aliasKey] = state
 	}
 
 	edgeAliases := make(map[string]struct{}, len(edges))
@@ -191,10 +293,14 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 				return fmt.Errorf("MERGE assignment %s.%s could not be evaluated", alias, field)
 			}
 			value = materializeSQLJSONValue(value)
-			if db.mergeUsesVectorColumn(collection, field) {
-				vector, vectorErr := mergeVectorAssignment(value, collection.Dimension())
+			targetCollection, collectionErr := db.GetCollection(target.collection)
+			if collectionErr != nil {
+				return fmt.Errorf("MERGE assignment %s.%s: %w", alias, field, collectionErr)
+			}
+			if db.mergeUsesVectorColumn(targetCollection, field) {
+				vector, vectorErr := mergeVectorAssignment(value, targetCollection.Dimension())
 				if vectorErr != nil {
-					return fmt.Errorf("MERGE commit: column %s is VECTOR(%d): %w", field, collection.Dimension(), vectorErr)
+					return fmt.Errorf("MERGE commit: column %s is VECTOR(%d): %w", field, targetCollection.Dimension(), vectorErr)
 				}
 				target.vector = vector
 				target.vectorSet = true
@@ -218,12 +324,16 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 	}
 
 	for _, state := range uniqueMergeStates(states) {
+		stateCollection, collectionErr := db.GetCollection(state.collection)
+		if collectionErr != nil {
+			return nil, fmt.Errorf("MERGE resolve collection %s: %w", state.collection, collectionErr)
+		}
 		if state.created {
-			vector := mergeZeroVector(collection.Dimension())
+			vector := mergeZeroVector(stateCollection.Dimension())
 			if state.vectorSet {
 				vector = state.vector
 			}
-			if err := epoch.Insert(ctx, collection.name, state.id, vector, state.metadata); err != nil {
+			if err := epoch.Insert(ctx, state.collection, state.id, vector, state.metadata); err != nil {
 				return nil, fmt.Errorf("MERGE create vertex %s: %w", state.id, err)
 			}
 		} else if state.changed {
@@ -231,12 +341,12 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 			if state.vectorSet {
 				vector = state.vector
 			}
-			if err := epoch.Update(ctx, collection.name, state.id, vector, state.delta); err != nil {
+			if err := epoch.Update(ctx, state.collection, state.id, vector, state.delta); err != nil {
 				return nil, fmt.Errorf("MERGE update vertex %s: %w", state.id, err)
 			}
 		}
 		if state.label != "" {
-			if err := epoch.RegisterVertexLabel(collection.name, state.id, state.label); err != nil {
+			if err := epoch.RegisterVertexLabel(state.collection, state.id, state.label); err != nil {
 				return nil, err
 			}
 		}
@@ -256,11 +366,11 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		if edge.Direction < 0 {
 			sourceState, targetState = targetState, sourceState
 		}
-		from, err := epoch.LookupNodeID(ctx, collection.name, sourceState.id)
+		from, err := epoch.LookupNodeID(ctx, sourceState.collection, sourceState.id)
 		if err != nil {
 			return nil, err
 		}
-		to, err := epoch.LookupNodeID(ctx, collection.name, targetState.id)
+		to, err := epoch.LookupNodeID(ctx, targetState.collection, targetState.id)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +378,7 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		if err != nil {
 			return nil, fmt.Errorf("MERGE edge: %w", err)
 		}
-		gtx, err := epoch.GraphTxn(collection.name)
+		gtx, err := epoch.GraphTxn(sourceState.collection)
 		if err != nil {
 			return nil, fmt.Errorf("MERGE graph transaction: %w", err)
 		}
@@ -277,8 +387,8 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 			return nil, fmt.Errorf("MERGE inspect edge: %w", err)
 		}
 		state := &mergeEdgeState{
-			alias: sourceSpan(src, edge.Alias, edge.AliasEnd), from: from, target: to,
-			kind: kind, weight: weight, properties: properties,
+			alias: sourceSpan(src, edge.Alias, edge.AliasEnd), collection: sourceState.collection,
+			from: from, target: to, kind: kind, weight: weight, properties: properties,
 		}
 		for _, candidate := range existing {
 			if candidate.Edge.Target == to && candidate.Edge.GetKind() == kind {
@@ -366,11 +476,11 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 			if !state.changed {
 				continue
 			}
-			if err := epoch.RemoveGraphEdge(collection.name, state.from, state.target, state.kind); err != nil {
+			if err := epoch.RemoveGraphEdge(state.collection, state.from, state.target, state.kind); err != nil {
 				return nil, err
 			}
 		}
-		if err := epoch.AddGraphEdgeWithPropertiesJSON(collection.name, state.from, state.target, state.weight, state.kind, encoded); err != nil {
+		if err := epoch.AddGraphEdgeWithPropertiesJSON(state.collection, state.from, state.target, state.weight, state.kind, encoded); err != nil {
 			return nil, fmt.Errorf("MERGE edge: %w", err)
 		}
 	}
@@ -424,6 +534,64 @@ func mergeVectorAssignment(value interface{}, dimension int) ([]float32, error) 
 		return nil, fmt.Errorf("VECTOR(%d) column received float slice of length %d", dimension, len(vector))
 	}
 	return cloneVector(vector), nil
+}
+
+// mergePropertyKeys returns the case-insensitive field names from a Cypher
+// vertex property map. It is used only for collection disambiguation; values
+// are evaluated separately by mergePropertyMap.
+func mergePropertyKeys(properties map[string]interface{}) map[string]struct{} {
+	keys := make(map[string]struct{}, len(properties))
+	for key := range properties {
+		keys[strings.ToLower(key)] = struct{}{}
+	}
+	return keys
+}
+
+// mergeCollectionForVertex resolves the owner of one Cypher vertex. A label
+// that names a SQL GRAPH TABLE is authoritative, which is what allows a
+// single MERGE path to span Entity, RelatesToNode_, Episodic, and other graph
+// tables sharing the database graph namespace. The schema fallback preserves
+// older native Go graphs whose Cypher labels are registered independently of
+// the collection name.
+func (db *Database) mergeCollectionForVertex(label string, keys map[string]struct{}) (*Collection, error) {
+	if db == nil {
+		return nil, fmt.Errorf("MERGE requires a graph-backed collection")
+	}
+	names := db.graphCollectionNames("")
+	for _, name := range names {
+		if !strings.EqualFold(name, label) {
+			continue
+		}
+		collection, err := db.GetCollection(name)
+		if err != nil {
+			return nil, err
+		}
+		return collection, nil
+	}
+
+	candidates := make([]*Collection, 0, len(names))
+	for _, name := range names {
+		collection, err := db.GetCollection(name)
+		if err != nil || collection.GetGraph() == nil {
+			continue
+		}
+		if len(keys) == 0 || mergeSchemaContainsKeys(collection.Config().MetadataSchema, keys) {
+			candidates = append(candidates, collection)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	if len(candidates) == 0 && len(names) == 1 {
+		return db.GetCollection(names[0])
+	}
+	if len(candidates) == 0 {
+		if label == "" {
+			return nil, fmt.Errorf("MERGE requires a graph-backed collection")
+		}
+		return nil, fmt.Errorf("MERGE vertex label %q does not identify a graph-backed collection", label)
+	}
+	return nil, fmt.Errorf("MERGE vertex label %q is ambiguous across %d graph collections", label, len(candidates))
 }
 
 // mergeGraphCollection resolves the graph relation for a MERGE pattern. The
@@ -693,6 +861,46 @@ func mergeStateRow(state *mergeVertexState) virtualSQLRow {
 	return virtualSQLRow{ID: state.id, Values: values, Scopes: []virtualSQLScope{{Alias: state.alias, Values: values}}}
 }
 
+func mergeCombinedStateRow(states []*mergeVertexState) virtualSQLRow {
+	row := virtualSQLRow{}
+	if len(states) > 0 && states[0] != nil {
+		row.ID = states[0].id
+	}
+	row.Scopes = make([]virtualSQLScope, 0, len(states))
+	for _, state := range states {
+		if state == nil {
+			continue
+		}
+		values := cloneMetadata(state.metadata)
+		if values == nil {
+			values = make(map[string]interface{})
+		}
+		values["id"] = state.id
+		row.Scopes = append(row.Scopes, virtualSQLScope{Alias: state.alias, Values: values})
+	}
+	return row
+}
+
+func mergeProjectionState(states []*mergeVertexState, projection parser.Projection, doc *parser.QueryDoc, src []byte) *mergeVertexState {
+	if projection.Expr.Kind == parser.NodeKindIdentifier && projection.Expr.ID >= 0 && int(projection.Expr.ID) < len(doc.Identifiers) {
+		identifier := &doc.Identifiers[projection.Expr.ID]
+		alias := sourceSpan(src, identifier.QualStart, identifier.QualEnd)
+		if alias != "" {
+			for _, state := range states {
+				if state != nil && strings.EqualFold(state.alias, alias) {
+					return state
+				}
+			}
+		}
+	}
+	for _, state := range states {
+		if state != nil {
+			return state
+		}
+	}
+	return nil
+}
+
 func mergeEdgeStateRow(state *mergeEdgeState) virtualSQLRow {
 	values := cloneMetadata(state.properties)
 	if values == nil {
@@ -730,6 +938,13 @@ func mergeZeroVector(dimension int) []float32 {
 
 func mergeResults(states []*mergeVertexState, stmt *parser.MergeStmt, doc *parser.QueryDoc, src []byte) *SearchResults {
 	unique := uniqueMergeStates(states)
+	resultStates := unique
+	projectionRow := mergeCombinedStateRow(unique)
+	if len(stmt.ReturningProjections) > 0 {
+		if state := mergeProjectionState(unique, stmt.ReturningProjections[0], doc, src); state != nil {
+			resultStates = []*mergeVertexState{state}
+		}
+	}
 	result := &SearchResults{Results: make([]*SearchResult, 0, len(unique))}
 	if len(stmt.ReturningProjections) > 0 {
 		result.Columns = make([]string, 0, len(stmt.ReturningProjections))
@@ -756,12 +971,12 @@ func mergeResults(states []*mergeVertexState, stmt *parser.MergeStmt, doc *parse
 			result.Columns = append(result.Columns, sourceSpan(src, identifier.Start, identifier.End))
 		}
 	}
-	for _, state := range unique {
+	for _, state := range resultStates {
 		metadata := make(map[string]interface{})
 		if stmt.ReturningStar || len(stmt.Returning) == 0 {
 			metadata["id"] = state.id
 		} else if len(stmt.ReturningProjections) > 0 {
-			row := mergeStateRow(state)
+			row := projectionRow
 			for i, projection := range stmt.ReturningProjections {
 				name := result.Columns[i]
 				if projection.Expr.Kind == parser.NodeKindIdentifier && projection.Expr.ID >= 0 && int(projection.Expr.ID) < len(doc.Identifiers) {
