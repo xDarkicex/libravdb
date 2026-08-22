@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/leanovate/gopter"
@@ -25,6 +26,31 @@ func TestGraphCloseReleasesEdgeTableIndexes(t *testing.T) {
 	}
 	if reverse.m != nil {
 		t.Fatal("reverse edge table index retained its off-heap hash map after close")
+	}
+}
+
+func TestClosedGraphTraversalIsSafe(t *testing.T) {
+	store, err := NewGraph(DefaultGraphConfig())
+	if err != nil {
+		t.Fatalf("NewGraph: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	called := false
+	store.ForEachEdge(func(uint64, uint64, Edge) bool {
+		called = true
+		return true
+	})
+	if called {
+		t.Fatal("closed graph invoked ForEachEdge callback")
+	}
+	if _, err := store.Neighbors(1); !errors.Is(err, ErrGraphClosed) {
+		t.Fatalf("Neighbors error = %v, want ErrGraphClosed", err)
+	}
+	if store.(*graphStore).GraphAvailable() {
+		t.Fatal("closed graph reported live traversal resources")
 	}
 }
 

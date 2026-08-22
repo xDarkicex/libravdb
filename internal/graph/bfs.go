@@ -49,6 +49,14 @@ func (p EdgePlan) MatchesWithProperties(edge Edge, properties []byte) bool {
 // zero heap allocations on the hot path.  Single-band (no pattern), so
 // band is always 0 and step equals depth.
 func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error {
+	if g == nil {
+		return ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return ErrGraphClosed
+	}
 	if maxDepth <= 0 {
 		maxDepth = 1 << 20
 	}
@@ -63,8 +71,18 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 	for !frontier.Empty() {
 		node, band, step := frontier.Pop()
 
+		// Do not hold the lifecycle read lock while invoking user code. A visit
+		// callback may perform another graph read or trigger shutdown; either
+		// operation must be able to make progress without an RWMutex upgrade
+		// deadlock.
+		g.lifecycleMu.RUnlock()
 		if !visit(node, band, step) {
+			g.lifecycleMu.RLock()
 			return nil
+		}
+		g.lifecycleMu.RLock()
+		if !g.graphAvailableUnlocked() {
+			return ErrGraphClosed
 		}
 		g.metrics.bfsNodesVisited.Add(1)
 
@@ -139,6 +157,14 @@ func (g *graphStore) BFS(start uint64, maxDepth int, visit VisitAction, bitset *
 // Visited dedup uses per-(node, band) keying via VisitedKey so a node
 // reached in band 0 can be expanded as a transition into band 1.
 func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, visit VisitAction, bitset *Bitset, frontier *FrontierBuf) error {
+	if g == nil {
+		return ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return ErrGraphClosed
+	}
 	numBands := len(edges)
 	if numBands == 0 {
 		return nil
@@ -170,8 +196,16 @@ func (g *graphStore) BFSPattern(start uint64, edges []EdgePlan, maxDepth int, vi
 	for !frontier.Empty() {
 		node, band, step := frontier.Pop()
 
+		// See BFS: callbacks run without the lifecycle lock so nested reads and
+		// an attaching/closing owner cannot deadlock each other.
+		g.lifecycleMu.RUnlock()
 		if !visit(node, band, step) {
+			g.lifecycleMu.RLock()
 			return nil
+		}
+		g.lifecycleMu.RLock()
+		if !g.graphAvailableUnlocked() {
+			return ErrGraphClosed
 		}
 		g.metrics.bfsNodesVisited.Add(1)
 

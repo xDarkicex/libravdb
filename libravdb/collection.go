@@ -215,6 +215,19 @@ func (g *collectionGraph) ReplayVertexLabel(nodeID uint64, label string, commitL
 // underlying graph; Database.Close closes the namespace exactly once.
 func (g *collectionGraph) Close() error { return nil }
 
+// GraphAvailable exposes the lifecycle state of the wrapped graph without
+// adding lifecycle methods to the public Graph interface. Shared namespace
+// wrappers otherwise hide the concrete graph's closed-state check.
+func (g *collectionGraph) GraphAvailable() bool {
+	if g == nil || g.Graph == nil {
+		return false
+	}
+	if checker, ok := g.Graph.(interface{ GraphAvailable() bool }); ok {
+		return checker.GraphAvailable()
+	}
+	return true
+}
+
 // SQLIndexDefinition describes a named ordinary SQL index declared with
 // CREATE INDEX. It is persisted as a logical declaration; posting lists are
 // still derived from the collection records.
@@ -375,20 +388,36 @@ func (c *Collection) Config() CollectionConfig {
 // SetGraph attaches a Graph interface to an existing collection. If the
 // database's storage engine supports graph edge durability, the WAL writer
 // is wired automatically so Txn.Commit() writes durable edge records.
+//
+// SetGraph preserves the historical no-error API. Call SetGraphWithError when
+// a replacement graph must report that the previous graph was already closed
+// or that topology could not be copied.
 func (c *Collection) SetGraph(g Graph) {
+	_ = c.SetGraphWithError(g)
+}
+
+// SetGraphWithError attaches g and copies topology from the previous graph
+// only while that graph is known to be live. A closed source is not treated as
+// an empty graph: the new graph is attached and wired, but the unavailable
+// topology is reported to the caller and the old graph is not closed again.
+func (c *Collection) SetGraphWithError(g Graph) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	previous := c.graph
 	c.graph = g
-	c.mu.Unlock()
 
+	var attachErr error
 	// Graph-enabled collections are now recreated automatically on reopen.
 	// Preserve the historical public reattach workflow as well: callers that
 	// provide a replacement graph receive the live topology already recovered
 	// into the previous runtime graph. The copy is in-memory only and therefore
 	// does not emit duplicate WAL frames.
 	if previous != nil && previous != g && g != nil {
-		copyGraphTopology(previous, g)
-		_ = previous.Close()
+		if err := copyGraphTopology(previous, g); err != nil {
+			attachErr = err
+		} else if err := previous.Close(); err != nil {
+			attachErr = fmt.Errorf("close replaced graph: %w", err)
+		}
 	}
 
 	if c.db != nil && g != nil {
@@ -420,20 +449,41 @@ func (c *Collection) SetGraph(g Graph) {
 			}
 		}
 	}
+	return attachErr
 }
 
-func copyGraphTopology(source, target Graph) {
+func graphAvailable(g Graph) bool {
+	if g == nil {
+		return false
+	}
+	if checker, ok := g.(interface{ GraphAvailable() bool }); ok {
+		return checker.GraphAvailable()
+	}
+	return true
+}
+
+func copyGraphTopology(source, target Graph) error {
+	if !graphAvailable(source) || !graphAvailable(target) {
+		return graph.ErrGraphClosed
+	}
 	txn := target.BeginTxn()
 	if txn == nil {
-		return
+		return graph.ErrGraphClosed
 	}
+	var copyErr error
 	source.ForEachEdge(func(src, tgt uint64, edge Edge) bool {
 		if err := target.AddEdge(txn, src, tgt, edge.Weight, edge.GetKind()); err != nil {
+			copyErr = err
 			return false
 		}
 		return true
 	})
-	_ = txn.ApplyInMemory()
+	if copyErr != nil {
+		return fmt.Errorf("copy graph topology: %w", copyErr)
+	}
+	if err := txn.ApplyInMemory(); err != nil {
+		return fmt.Errorf("copy graph topology: %w", err)
+	}
 	if labels, ok := source.(interface {
 		ForEachVertexLabel(func(uint64, string) bool)
 	}); ok {
@@ -442,6 +492,7 @@ func copyGraphTopology(source, target Graph) {
 			return true
 		})
 	}
+	return nil
 }
 
 // GetIndex returns the collection's index, or nil if none is configured.

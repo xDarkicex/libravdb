@@ -587,6 +587,14 @@ func (g *graphStore) InboundNeighborsAtLSN(nodeID uint64, snapshotLSN uint64) ([
 }
 
 func (g *graphStore) InboundNeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	liveEdges, err := g.liveOrientedNeighbors(nodeID, true)
 	if err != nil {
 		return nil, err
@@ -754,6 +762,7 @@ type Graph interface {
 
 type graphStore struct {
 	cfg             GraphConfig
+	lifecycleMu     sync.RWMutex
 	directionMu     sync.RWMutex
 	undirectedKinds KindSet
 	edgePool        *memory.ShardedFreeList
@@ -764,6 +773,7 @@ type graphStore struct {
 	pageOwners      map[*EdgeTablePage]*memory.ShardedFreeList
 	propertyOwners  map[*EdgePropertyPage]*memory.ShardedFreeList
 	ownersMu        sync.RWMutex
+	labelMu         sync.RWMutex
 	bitsetPool      *memory.ShardedFreeList
 	frontierPool    *memory.ShardedFreeList
 	pageReg         *PageRegistry
@@ -1327,6 +1337,15 @@ func (g *graphStore) BeginTxn() *Txn {
 // namespaces, where concurrent collections share topology but WAL frames must
 // retain their owning collection for record/recovery routing.
 func (g *graphStore) BeginTxnFor(collection string) *Txn {
+	if g == nil {
+		return nil
+	}
+	g.lifecycleMu.RLock()
+	available := g.graphAvailableUnlocked()
+	g.lifecycleMu.RUnlock()
+	if !available {
+		return nil
+	}
 	return &Txn{
 		ID:         g.nextTxnID.Add(1),
 		walWriter:  g.walWriter,
@@ -1559,6 +1578,14 @@ func visibleEdgeVersion(state *edgeTemporalState, snapshotLSN uint64) (edgeTempo
 }
 
 func (g *graphStore) NeighborsAtLSNWithProperties(nodeID uint64, snapshotLSN uint64) ([]EdgeView, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	liveEdges, err := g.liveOrientedNeighbors(nodeID, false)
 	g.temporalMu.Lock()
 	defer g.temporalMu.Unlock()
@@ -1751,6 +1778,14 @@ func (g *graphStore) AddEdgeWithStamp(txn *Txn, src, tgt uint64, weight float32,
 }
 
 func (g *graphStore) AddEdgeWithStampAndProperties(txn *Txn, src, tgt uint64, weight float32, kind uint8, stamp uint32, properties []byte) error {
+	if g == nil {
+		return ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return ErrGraphClosed
+	}
 	fEdge := Edge{Target: tgt, Weight: weight}
 	fEdge.SetStamp(stamp)
 	fEdge.SetKind(kind)
@@ -1889,7 +1924,15 @@ func (g *graphStore) physicalEdge(src, tgt uint64, kind uint8) bool {
 }
 
 func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
-	edges, _ := g.Neighbors(src)
+	if g == nil {
+		return ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return ErrGraphClosed
+	}
+	edges, _ := g.neighborsUnlocked(src)
 	var weight float32
 	var stamp uint32
 	var properties []byte
@@ -1933,6 +1976,14 @@ func (g *graphStore) RemoveEdge(txn *Txn, src, tgt uint64, kind uint8) error {
 }
 
 func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
+	if g == nil {
+		return ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return ErrGraphClosed
+	}
 	var firstErr error
 	inboundEdges, err := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 	if err != nil {
@@ -1947,7 +1998,7 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 		}
 	}
 
-	outboundEdges, err := g.NeighborsWithProperties(nodeID)
+	outboundEdges, err := g.neighborsWithPropertiesUnlocked(nodeID)
 	if err != nil {
 		return err
 	}
@@ -1972,6 +2023,18 @@ func (g *graphStore) DropNodeEdges(txn *Txn, nodeID uint64) error {
 }
 
 func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	return g.neighborsUnlocked(nodeID)
+}
+
+func (g *graphStore) neighborsUnlocked(nodeID uint64) ([]Edge, error) {
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	outbound, err := g.neighborsFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
 	if err != nil {
 		return nil, err
@@ -1992,6 +2055,18 @@ func (g *graphStore) Neighbors(nodeID uint64) ([]Edge, error) {
 }
 
 func (g *graphStore) NeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	return g.neighborsWithPropertiesUnlocked(nodeID)
+}
+
+func (g *graphStore) neighborsWithPropertiesUnlocked(nodeID uint64) ([]EdgeView, error) {
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	outbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.index, g.pagePools[0], g.cfg.PageShards)
 	if err != nil {
 		return nil, err
@@ -2012,6 +2087,14 @@ func (g *graphStore) NeighborsWithProperties(nodeID uint64) ([]EdgeView, error) 
 }
 
 func (g *graphStore) InboundNeighbors(nodeID uint64) ([]Edge, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	inbound, err := g.neighborsFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 	if err != nil {
 		return nil, err
@@ -2032,6 +2115,14 @@ func (g *graphStore) InboundNeighbors(nodeID uint64) ([]Edge, error) {
 }
 
 func (g *graphStore) InboundNeighborsWithProperties(nodeID uint64) ([]EdgeView, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	inbound, err := g.neighborsWithPropertiesFromTable(nodeID, g.reverse.locator, g.reverse.pool, g.cfg.PageShards)
 	if err != nil {
 		return nil, err
@@ -2128,22 +2219,55 @@ func (g *graphStore) CentralityAtLSN(nodeID uint64, snapshotLSN uint64) float64 
 }
 
 func (g *graphStore) ForEachEdge(fn func(src, tgt uint64, edge Edge) bool) {
-	stop := false
+	if g == nil || fn == nil {
+		return
+	}
+	g.lifecycleMu.RLock()
+	if !g.graphAvailableUnlocked() {
+		g.lifecycleMu.RUnlock()
+		return
+	}
+	type edgeRecord struct {
+		src, tgt uint64
+		edge     Edge
+	}
+	records := make([]edgeRecord, 0)
 	g.index.Iterate(func(nodeID uint64) {
-		if stop {
-			return
-		}
-		edges, err := g.Neighbors(nodeID)
+		edges, err := g.neighborsUnlocked(nodeID)
 		if err != nil {
 			return
 		}
 		for _, e := range edges {
-			if !fn(nodeID, e.Target, e) {
-				stop = true
-				return
-			}
+			records = append(records, edgeRecord{src: nodeID, tgt: e.Target, edge: e})
 		}
 	})
+	g.lifecycleMu.RUnlock()
+	for _, record := range records {
+		if !fn(record.src, record.tgt, record.edge) {
+			return
+		}
+	}
+}
+
+// GraphAvailable reports whether the graph still owns live traversal
+// resources. It is intentionally an optional lifecycle seam so callers that
+// replace a graph can distinguish an empty graph from one already closed.
+func (g *graphStore) GraphAvailable() bool {
+	if g == nil {
+		return false
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	return g.graphAvailableUnlocked()
+}
+
+func (g *graphStore) graphAvailableUnlocked() bool {
+	if g == nil {
+		return false
+	}
+	g.pagePoolsMu.RLock()
+	defer g.pagePoolsMu.RUnlock()
+	return g.index != nil && g.reverse != nil && g.reverse.locator != nil && len(g.pagePools) > 0 && g.pagePools[0] != nil
 }
 
 func (g *graphStore) degreeFromTable(nodeID uint64, index *EdgeTableIndex, pool *memory.ShardedFreeList, shards int) (int, error) {
@@ -2190,7 +2314,15 @@ func (g *graphStore) NeighborsAny(nodeID uint64, kindSet KindSet) ([]Edge, error
 }
 
 func (g *graphStore) Stats() GraphStats {
+	if g == nil {
+		return GraphStats{}
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
 	stats := g.metrics.get()
+	if !g.graphAvailableUnlocked() {
+		return stats
+	}
 	g.pagePoolsMu.RLock()
 	var pageAllocated uint64
 	for _, pool := range g.pagePools {
@@ -2207,6 +2339,14 @@ func (g *graphStore) Stats() GraphStats {
 }
 
 func (g *graphStore) GetBitset() (*Bitset, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	slot, err := g.bitsetPool.Allocate()
 	if err != nil {
 		return nil, fmt.Errorf("Bitset Allocate failed: %w", err)
@@ -2221,6 +2361,16 @@ func (g *graphStore) PutBitset(b *Bitset) {
 	if b == nil || b.slot == nil {
 		return
 	}
+	if g == nil {
+		b.slot = nil
+		return
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() || g.bitsetPool == nil {
+		b.slot = nil
+		return
+	}
 	// These buffers are caller-owned scratch space. No shared reader can retain
 	// a pointer after the BFS call returns, so ordinary Deallocate is the
 	// correct lifecycle and avoids putting short-lived buffers through Hyaline.
@@ -2229,6 +2379,14 @@ func (g *graphStore) PutBitset(b *Bitset) {
 }
 
 func (g *graphStore) GetFrontierBuf() (*FrontierBuf, error) {
+	if g == nil {
+		return nil, ErrGraphClosed
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() {
+		return nil, ErrGraphClosed
+	}
 	slot, err := g.frontierPool.Allocate()
 	if err != nil {
 		return nil, fmt.Errorf("FrontierBuf Allocate failed: %w", err)
@@ -2243,11 +2401,26 @@ func (g *graphStore) PutFrontierBuf(f *FrontierBuf) {
 	if f == nil || f.slot == nil {
 		return
 	}
+	if g == nil {
+		f.slot = nil
+		return
+	}
+	g.lifecycleMu.RLock()
+	defer g.lifecycleMu.RUnlock()
+	if !g.graphAvailableUnlocked() || g.frontierPool == nil {
+		f.slot = nil
+		return
+	}
 	_ = g.frontierPool.Deallocate(f.slot)
 	f.slot = nil
 }
 
 func (g *graphStore) Close() error {
+	if g == nil {
+		return nil
+	}
+	g.lifecycleMu.Lock()
+	defer g.lifecycleMu.Unlock()
 	// Stop new graph writers, then wait for every reader's Hyaline interval
 	// before unmapping the indexes or freeing any page pool. Readers hold
 	// pagePoolsMu.RLock for their complete raw-pointer traversal, including
@@ -2260,12 +2433,11 @@ func (g *graphStore) Close() error {
 	var indexErr, err1, err2, err3, err4 error
 	if g.index != nil {
 		indexErr = g.index.Close()
-		if indexErr == nil {
-			g.index = nil
-		}
+		g.index = nil
 	}
 	if g.edgePool != nil {
 		err1 = g.edgePool.Free()
+		g.edgePool = nil
 	}
 	pagePools := g.pagePools
 	g.pagePools = nil
@@ -2274,14 +2446,16 @@ func (g *graphStore) Close() error {
 	}
 	if g.bitsetPool != nil {
 		err3 = g.bitsetPool.Free()
+		g.bitsetPool = nil
 	}
 	if g.frontierPool != nil {
 		err4 = g.frontierPool.Free()
+		g.frontierPool = nil
 	}
 	if g.reverse != nil {
 		if err := g.reverse.Close(); err != nil && err4 == nil {
 			err4 = err
-		} else if err == nil {
+		} else {
 			g.reverse = nil
 		}
 	}
@@ -2317,6 +2491,15 @@ func (g *graphStore) rebuildReverseIndex() {
 // in-memory only and is not persisted. It is an MVP feature for label-scan
 // seeding in graph queries.
 func (g *graphStore) RegisterVertexLabel(nodeID uint64, label string) {
+	if g == nil {
+		return
+	}
+	g.lifecycleMu.RLock()
+	available := g.graphAvailableUnlocked()
+	g.lifecycleMu.RUnlock()
+	if !available {
+		return
+	}
 	g.registerVertexLabel(nodeID, label)
 	if writer, ok := g.walWriter.(storage.GraphLabelWALWriter); ok {
 		_ = writer.AppendGraphLabel(context.Background(), nodeID, label, nil)
@@ -2324,6 +2507,8 @@ func (g *graphStore) RegisterVertexLabel(nodeID uint64, label string) {
 }
 
 func (g *graphStore) registerVertexLabel(nodeID uint64, label string) {
+	g.labelMu.Lock()
+	defer g.labelMu.Unlock()
 	if g.labelToNodes == nil {
 		g.labelToNodes = make(map[string][]uint64)
 	}
@@ -2335,18 +2520,39 @@ func (g *graphStore) registerVertexLabel(nodeID uint64, label string) {
 // GetLabelNodes returns all node IDs registered under the given label.
 // Returns nil if no nodes have the label.
 func (g *graphStore) GetLabelNodes(label string) []uint64 {
-	return g.labelToNodes[label]
+	if g == nil {
+		return nil
+	}
+	g.labelMu.RLock()
+	nodes := append([]uint64(nil), g.labelToNodes[label]...)
+	g.labelMu.RUnlock()
+	return nodes
 }
 
 // ForEachVertexLabel exposes the in-memory label registry to the owning
 // libravdb package for runtime graph replacement. It is intentionally an
 // optional method rather than part of the public Graph interface.
 func (g *graphStore) ForEachVertexLabel(fn func(nodeID uint64, label string) bool) {
+	if g == nil || fn == nil {
+		return
+	}
+	g.labelMu.RLock()
+	labels := make([]struct {
+		nodeID uint64
+		label  string
+	}, 0)
 	for label, nodes := range g.labelToNodes {
 		for _, nodeID := range nodes {
-			if !fn(nodeID, label) {
-				return
-			}
+			labels = append(labels, struct {
+				nodeID uint64
+				label  string
+			}{nodeID: nodeID, label: label})
+		}
+	}
+	g.labelMu.RUnlock()
+	for _, item := range labels {
+		if !fn(item.nodeID, item.label) {
+			return
 		}
 	}
 }

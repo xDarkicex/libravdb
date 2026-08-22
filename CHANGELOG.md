@@ -4,6 +4,19 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.13 - 2026-08-21
+
+### Safe graph reattachment and shutdown
+
+- Prevented graph reattachment from panicking when the previous graph runtime
+  has already been closed or its edge indexes are unavailable.
+- Added lifecycle-safe graph traversal, mutation, BFS, label snapshots, and
+  scratch-buffer cleanup during concurrent shutdown and replacement.
+- Added controlled `SetGraphWithError` reporting while preserving the legacy
+  `SetGraph` API and live graph topology during replacement.
+- Added regression and race coverage for closed, empty, reopened, persisted,
+  and concurrently reattached graph runtimes.
+
 ## 1.6.12 - 2026-08-21
 
 ### WAL replay and catalog relocation recovery

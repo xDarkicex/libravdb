@@ -21,4 +21,8 @@ var (
 	// ErrConcurrentModification indicates that a lock-free operation failed due to concurrent writes and should be retried.
 	// Callers should implement exponential backoff when encountering this error.
 	ErrConcurrentModification = errors.New("concurrent modification")
+
+	// ErrGraphClosed indicates that the graph runtime is no longer available
+	// for traversal or mutation.
+	ErrGraphClosed = errors.New("graph is closed")
 )

@@ -59,6 +59,9 @@ func (idx *EdgeTableIndex) Lookup(nodeID uint64) *EdgeTablePage {
 
 // Iterate visits every non-empty node in the table.
 func (idx *EdgeTableIndex) Iterate(fn func(nodeID uint64)) {
+	if idx == nil || idx.m == nil || fn == nil {
+		return
+	}
 	idx.m.Range(func(k uint64, v unsafe.Pointer) bool {
 		fn(k)
 		return true
