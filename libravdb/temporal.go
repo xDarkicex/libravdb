@@ -11,6 +11,14 @@ import (
 	"github.com/xDarkicex/libravdb/internal/storage/singlefile"
 )
 
+// ErrRetentionExpired indicates a requested snapshot timestamp or LSN has
+// been pruned by temporal history compaction.
+var ErrRetentionExpired = singlefile.ErrRetentionExpired
+
+type retentionBoundaryProvider interface {
+	OldestRetainedLSN() uint64
+}
+
 // TemporalStats is a defensive, point-in-time observability value. It never
 // owns or changes a snapshot lease and never triggers compaction.
 type TemporalStats struct {
@@ -63,6 +71,14 @@ type TemporalConfig struct {
 
 // activeSnapshots tracks LSNs pinned by in-flight temporal queries.
 // Compaction cannot advance past the minimum pinned LSN.
+//
+// Lock Ordering Constraint:
+// activeSnapshots.mu MUST always be acquired BEFORE the engine mutex (e.mu).
+// - Pinning (SnapshotAt/SnapshotAtLSN) acquires activeSnapshots.mu and then queries
+//   the engine's OldestRetainedLSN (taking and releasing e.mu.RLock).
+// - Compaction (CompactHistory) acquires activeSnapshots.mu across computing the
+//   retention boundary and calling CompactTemporalHistory (taking e.mu.Lock).
+// - No path in the codebase may ever acquire activeSnapshots.mu while holding e.mu.
 type activeSnapshots struct {
 	mu     sync.Mutex
 	pins   map[uint64]snapshotPin
@@ -74,8 +90,16 @@ type snapshotPin struct {
 	firstPinnedAt time.Time
 }
 
-func (a *activeSnapshots) pin(lsn uint64) {
+func (a *activeSnapshots) pin(lsn uint64, provider retentionBoundaryProvider) error {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if provider != nil {
+		if oldest := provider.OldestRetainedLSN(); oldest > 0 && lsn < oldest {
+			return fmt.Errorf("%w: LSN %d < oldest retained %d", ErrRetentionExpired, lsn, oldest)
+		}
+	}
+
 	if a.pins == nil {
 		a.pins = make(map[uint64]snapshotPin)
 	}
@@ -88,7 +112,7 @@ func (a *activeSnapshots) pin(lsn uint64) {
 	if a.minLSN == 0 || lsn < a.minLSN {
 		a.minLSN = lsn
 	}
-	a.mu.Unlock()
+	return nil
 }
 
 func (a *activeSnapshots) unpin(lsn uint64) {
@@ -164,8 +188,11 @@ func (db *Database) SnapshotAt(ctx context.Context, t time.Time) (*TemporalSnaps
 	if err != nil {
 		return nil, err
 	}
+	provider, _ := db.storage.(retentionBoundaryProvider)
+	if err := db.activeSnaps.pin(lsn, provider); err != nil {
+		return nil, err
+	}
 	snap := &TemporalSnapshot{LSN: lsn, Timestamp: ts, db: db}
-	db.activeSnaps.pin(lsn)
 	return snap, nil
 }
 
@@ -183,8 +210,11 @@ func (db *Database) SnapshotAtLSN(ctx context.Context, lsn uint64) (*TemporalSna
 	if err != nil {
 		return nil, err
 	}
+	provider, _ := db.storage.(retentionBoundaryProvider)
+	if err := db.activeSnaps.pin(lsn, provider); err != nil {
+		return nil, err
+	}
 	snap := &TemporalSnapshot{LSN: lsn, Timestamp: ts, db: db}
-	db.activeSnaps.pin(lsn)
 	return snap, nil
 }
 
@@ -291,6 +321,12 @@ func WithTemporalRetention(d time.Duration) Option {
 // compaction never removes data needed by in-flight queries. Callers should
 // ensure no long-running snapshots are pinned unnecessarily.
 //
+// Lock Ordering Constraint:
+// CompactHistory holds activeSnapshots.mu across reading the minimum pin,
+// computing the retention boundary, and executing the prune in the storage engine.
+// This prevents concurrent SnapshotAt calls from registering pins at LSNs about
+// to be compacted.
+//
 // Returns the new oldestRetainedLSN after compaction, or 0 if nothing was
 // pruned.
 func (db *Database) CompactHistory(ctx context.Context) (uint64, error) {
@@ -302,14 +338,18 @@ func (db *Database) CompactHistory(ctx context.Context) (uint64, error) {
 		return 0, fmt.Errorf("storage engine does not support temporal compaction")
 	}
 
-	// Compute safe boundary: max(config boundary, oldest pinned snapshot).
+	// Lock active snapshots across: read min-pin -> compute boundary -> engine prune.
+	// Lock order constraint: activeSnapshots.mu MUST be acquired before the engine mutex.
+	db.activeSnaps.mu.Lock()
+	defer db.activeSnaps.mu.Unlock()
+
 	boundary := db.computeRetentionBoundary()
-	pinned := db.activeSnaps.safeRetentionBoundary()
-	if pinned > 0 && pinned < boundary {
-		boundary = pinned
-	}
 	if boundary == 0 {
 		return 0, nil // nothing to compact
+	}
+	pinned := db.activeSnaps.minLSN
+	if pinned > 0 && pinned < boundary {
+		boundary = pinned
 	}
 
 	newBoundary, err := eng.CompactTemporalHistory(boundary)
@@ -324,12 +364,17 @@ func (db *Database) computeRetentionBoundary() uint64 {
 		return 0 // no pruning configured
 	}
 	cutoff := time.Now().UTC().Add(-db.config.Temporal.RetainDuration)
-	snap, err := db.SnapshotAt(context.Background(), cutoff)
+	type temporalEngine interface {
+		ResolveTimestamp(t time.Time) (uint64, time.Time, error)
+	}
+	eng, ok := db.storage.(temporalEngine)
+	if !ok {
+		return 0
+	}
+	lsn, _, err := eng.ResolveTimestamp(cutoff)
 	if err != nil {
 		return 0
 	}
-	lsn := snap.LSN
-	snap.Close()
 	return lsn
 }
 

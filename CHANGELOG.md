@@ -4,6 +4,23 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.14 - 2026-10-22
+
+### Concurrent history compaction and snapshot pin safety (Issue #11)
+
+- Fixed a race condition where `CompactHistory` could prune history out from under a
+  concurrently-registered snapshot pin (`SnapshotAt` / `SnapshotAtLSN`).
+- Ensured `CompactHistory` holds `activeSnapshots.mu` across reading the active pin set,
+  computing the retention boundary, and executing the prune in the storage engine.
+- Added atomic pin validation against the engine's `OldestRetainedLSN()` under `activeSnapshots.mu`,
+  preventing stale pins from registering and permanently disabling future compaction.
+- Eliminated self-deadlock in `computeRetentionBoundary` by resolving cutoff timestamps directly
+  against the storage engine instead of acquiring a dummy snapshot.
+- Fixed a nested `sync.RWMutex.RLock` re-entrancy deadlock in `executeGraphAtLSN` during concurrent
+  graph pattern matching and compaction.
+- Exported `ErrRetentionExpired` in package `libravdb` and added comprehensive concurrent stress tests
+  covering raw temporal snapshots as well as SQL and Cypher queries.
+
 ## 1.6.13 - 2026-08-21
 
 ### Safe graph reattachment and shutdown

@@ -535,6 +535,13 @@ func (e *Engine) OldestRetained() (time.Time, uint64, error) {
 	return time.Unix(0, entry.Timestamp).UTC(), entry.LSN, nil
 }
 
+// OldestRetainedLSN returns the boundary below which historical versions have been pruned.
+func (e *Engine) OldestRetainedLSN() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.oldestRetainedLSN
+}
+
 // RetainedHistoryStats returns the number and deterministic payload size of
 // archived record versions still available to temporal reads. Live Records
 // are intentionally excluded: this is history-retention telemetry, not a

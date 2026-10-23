@@ -268,17 +268,21 @@ func (e *Executor) executeGraphAtLSN(ctx context.Context, plan *optimizer.Physic
 		// alias, not by an explicit ID or label. In that shape the complete
 		// visible collection is the seed relation; the bounded BFS below then
 		// retains only source rows with a qualifying historical endpoint.
+		var candidateIDs []string
 		if err := col.ListVisibleAtLSN(ctx, plan.SnapshotLSN, func(rec *Record) bool {
 			if len(seedPredicates) > 0 && !recordMatchesPredicatesSnapshot(rec, seedPredicates) {
 				return true
 			}
-			nodeID, nodeErr := e.db.GetNodeID(ctx, plan.CollectionName, rec.ID)
-			if nodeErr == nil {
-				seeds = append(seeds, nodeID)
-			}
+			candidateIDs = append(candidateIDs, rec.ID)
 			return true
 		}); err != nil {
 			return nil, err
+		}
+		for _, id := range candidateIDs {
+			nodeID, nodeErr := e.db.GetNodeID(ctx, plan.CollectionName, id)
+			if nodeErr == nil {
+				seeds = append(seeds, nodeID)
+			}
 		}
 	}
 	if len(plan.GraphEdges) == 0 {
