@@ -176,7 +176,7 @@ func TestTemporalSQL_CypherAndSQLConcurrentWithCompact(t *testing.T) {
 	gr.RegisterVertexLabel(u2Node, "User")
 
 	txn := gr.BeginTxn()
-	txn.AddEdge(u1Node, u2Node, 1.0, 1) // kind 1 = FOLLOWS
+	txn.AddEdge(u1Node, u2Node, 1.0, 1) // kind 1 = TEMPORAL_FOLLOWS
 	txn.Commit(ctx)
 	time.Sleep(30 * time.Millisecond)
 
