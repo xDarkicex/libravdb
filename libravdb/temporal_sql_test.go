@@ -153,8 +153,8 @@ func TestTemporalSQL_CypherAndSQLConcurrentWithCompact(t *testing.T) {
 	}
 	defer gr.Close()
 
-	if !RegisterEdgeKind("FOLLOWS", 1) && ResolveEdgeKind("FOLLOWS") != 1 {
-		t.Fatal("failed to register edge kind FOLLOWS")
+	if !RegisterEdgeKind("TEMPORAL_FOLLOWS", 1) && ResolveEdgeKind("TEMPORAL_FOLLOWS") != 1 {
+		t.Fatal("failed to register edge kind TEMPORAL_FOLLOWS")
 	}
 
 	col, err := db.CreateCollection(ctx, "people",
@@ -231,7 +231,7 @@ func TestTemporalSQL_CypherAndSQLConcurrentWithCompact(t *testing.T) {
 					target = t1
 				}
 				sql := fmt.Sprintf("SELECT u.name FROM people u AS OF TIMESTAMP '%s' "+
-					"WHERE MATCH (u)-[r:FOLLOWS]->(v:User) AND v.name = 'Bob' LIMIT 5",
+					"WHERE MATCH (u)-[r:TEMPORAL_FOLLOWS]->(v:User) AND v.name = 'Bob' LIMIT 5",
 					target.Format(time.RFC3339Nano))
 
 				res, qErr := db.Query(runCtx, sql)

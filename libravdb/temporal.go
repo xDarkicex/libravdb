@@ -163,14 +163,6 @@ func (a *activeSnapshots) stats(now time.Time) (leases, distinct, minLSN uint64,
 	return leases, distinct, minLSN, oldestAge
 }
 
-// safeRetentionBoundary returns the highest LSN that is safe to compact
-// (i.e., the minimum pinned LSN, or if no pins, 0 meaning no restriction).
-func (a *activeSnapshots) safeRetentionBoundary() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.minLSN
-}
-
 // SnapshotAt returns the latest committed state at or before t (UTC). If t
 // is newer than the latest commit, the latest commit is returned. If t is
 // older than the earliest retained commit, ErrRetentionExpired is returned.
