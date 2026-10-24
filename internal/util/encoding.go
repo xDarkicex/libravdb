@@ -93,6 +93,61 @@ func pooledEncoderCapacity(estimated int) int {
 	return capacity
 }
 
+type JSONEncoder struct {
+	Buf []byte
+}
+
+var JSONEncoderPool = sync.Pool{
+	New: func() interface{} {
+		return &JSONEncoder{}
+	},
+}
+
+func AcquireJSONEncoder(estimated int) *JSONEncoder {
+	enc := JSONEncoderPool.Get().(*JSONEncoder)
+	enc.Buf = enc.Buf[:0]
+	targetCap := pooledEncoderCapacity(estimated)
+	if targetCap > cap(enc.Buf) {
+		enc.Buf = make([]byte, 0, targetCap)
+	}
+	return enc
+}
+
+func ReleaseJSONEncoder(enc *JSONEncoder) {
+	if enc == nil {
+		return
+	}
+	if cap(enc.Buf) > maxPooledEncoderCapacity {
+		enc.Buf = nil
+	} else {
+		enc.Buf = enc.Buf[:0]
+	}
+	JSONEncoderPool.Put(enc)
+}
+
+// EstimateJSONCapacity returns a conservative capacity estimate for v,
+// matching the heuristics used by apexJSON.
+func EstimateJSONCapacity(v interface{}) int {
+	switch value := v.(type) {
+	case nil:
+		return 4
+	case string:
+		return len(value)*2 + 2
+	case []byte:
+		return len(value)*2 + 2
+	case map[string]interface{}:
+		return len(value)*48 + 2
+	case map[string]string:
+		return len(value)*48 + 2
+	case []interface{}:
+		return len(value)*30 + 2
+	case []string:
+		return len(value)*30 + 2
+	default:
+		return 64
+	}
+}
+
 func (enc *BinaryEncoder) DetachBytes() []byte {
 	out := enc.Buf
 	enc.Buf = nil

@@ -109,3 +109,31 @@ func BenchmarkSQLJSONMembership(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkSQLJSONCastTextRows(b *testing.B) {
+	db := newSQLAggregateBenchmarkDB(b)
+	defer db.Close()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, err := db.Query(ctx, "SELECT payload::text AS payload FROM aggregate_bench")
+		if err != nil || result.Total != 512 {
+			b.Fatalf("JSON cast rows result rows=%d err=%v", result.Total, err)
+		}
+	}
+}
+
+func BenchmarkSQLJSONTextElements(b *testing.B) {
+	db := newSQLAggregateBenchmarkDB(b)
+	defer db.Close()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, err := db.Query(ctx, "SELECT elem FROM aggregate_bench b CROSS JOIN jsonb_array_elements_text(b.payload) AS elem")
+		if err != nil || result.Total != 1536 {
+			b.Fatalf("JSON text expansion result rows=%d err=%v", result.Total, err)
+		}
+	}
+}

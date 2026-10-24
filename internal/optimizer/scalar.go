@@ -9,6 +9,7 @@ import (
 
 	apexjson "github.com/xDarkicex/apexJSON/v2"
 	"github.com/xDarkicex/lexer"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 // ScalarKind is the semantic type carried by a SQL predicate value. The
@@ -320,9 +321,15 @@ func ScalarFromInterface(v interface{}) ScalarValue {
 		// arrays into []interface{}. Keep the document opaque at the optimizer
 		// boundary; JSON/JSONB casts and the collection validator decode it into
 		// LibraVDB's canonical JSON tree later.
-		if encoded, err := apexjson.Marshal(x); err == nil {
-			return JSONValue(encoded)
+		enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(x))
+		var err error
+		enc.Buf, err = apexjson.AppendMarshal(enc.Buf, x)
+		if err == nil {
+			v := JSONValue(enc.Buf)
+			util.ReleaseJSONEncoder(enc)
+			return v
 		}
+		util.ReleaseJSONEncoder(enc)
 	}
 	return ScalarValue{}
 }

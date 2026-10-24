@@ -10,6 +10,7 @@ import (
 	"github.com/xDarkicex/lexer/parser"
 	"github.com/xDarkicex/libravdb/internal/graph"
 	"github.com/xDarkicex/libravdb/internal/optimizer"
+	"github.com/xDarkicex/libravdb/internal/util"
 )
 
 // mergeVertexState is the query-local identity and mutation image for one
@@ -465,22 +466,30 @@ func (db *Database) executeMergeInEpoch(ctx context.Context, src []byte, doc *pa
 		return nil, err
 	}
 	for _, state := range edgeStates {
-		encoded := []byte(nil)
+		var encoded []byte
+		var enc *util.JSONEncoder
 		if len(state.properties) > 0 {
-			encoded, err = apexjson.Marshal(state.properties)
+			enc = util.AcquireJSONEncoder(util.EstimateJSONCapacity(state.properties))
+			enc.Buf, err = apexjson.AppendMarshal(enc.Buf, state.properties)
 			if err != nil {
+				util.ReleaseJSONEncoder(enc)
 				return nil, fmt.Errorf("MERGE edge properties: %w", err)
 			}
+			encoded = enc.Buf
 		}
 		if state.existed {
 			if !state.changed {
+				util.ReleaseJSONEncoder(enc)
 				continue
 			}
 			if err := epoch.RemoveGraphEdge(state.collection, state.from, state.target, state.kind); err != nil {
+				util.ReleaseJSONEncoder(enc)
 				return nil, err
 			}
 		}
-		if err := epoch.AddGraphEdgeWithPropertiesJSON(state.collection, state.from, state.target, state.weight, state.kind, encoded); err != nil {
+		err = epoch.AddGraphEdgeWithPropertiesJSON(state.collection, state.from, state.target, state.weight, state.kind, encoded)
+		util.ReleaseJSONEncoder(enc)
+		if err != nil {
 			return nil, fmt.Errorf("MERGE edge: %w", err)
 		}
 	}

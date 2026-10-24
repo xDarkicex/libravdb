@@ -2931,18 +2931,28 @@ func (db *Database) virtualExprValue(ctx context.Context, src []byte, doc *parse
 				return string(raw), true, nil
 			}
 			if object, isObject := value.(map[string]interface{}); isObject {
-				encoded, err := apexjson.Marshal(object)
+				enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(object))
+				var err error
+				enc.Buf, err = apexjson.AppendMarshal(enc.Buf, object)
 				if err != nil {
+					util.ReleaseJSONEncoder(enc)
 					return nil, false, err
 				}
-				return string(encoded), true, nil
+				s := string(enc.Buf)
+				util.ReleaseJSONEncoder(enc)
+				return s, true, nil
 			}
 			if array, isArray := value.([]interface{}); isArray {
-				encoded, err := apexjson.Marshal(array)
+				enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(array))
+				var err error
+				enc.Buf, err = apexjson.AppendMarshal(enc.Buf, array)
 				if err != nil {
+					util.ReleaseJSONEncoder(enc)
 					return nil, false, err
 				}
-				return string(encoded), true, nil
+				s := string(enc.Buf)
+				util.ReleaseJSONEncoder(enc)
+				return s, true, nil
 			}
 			return recordMetaToString(value), true, nil
 		case "uuid":

@@ -174,6 +174,10 @@ func decodeJSONValue(value interface{}) (interface{}, bool) {
 	case []byte:
 		return decodeJSONText(v)
 	default:
+		// The decoded value's strings point into the bytes they were decoded
+		// from, so those bytes must outlive the value. A pooled buffer does
+		// not: the next user of the pool overwrites a string the caller
+		// still holds. This branch owns its bytes.
 		encoded, err := apexjson.Marshal(v)
 		if err != nil {
 			return nil, false
@@ -536,11 +540,15 @@ func canonicalJSONNode(value interface{}) (interface{}, bool) {
 }
 
 func encodeJSONValue(value interface{}) (string, error) {
-	encoded, err := apexjson.Marshal(jsonWireValue(value))
+	wire := jsonWireValue(value)
+	enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(wire))
+	defer util.ReleaseJSONEncoder(enc)
+	var err error
+	enc.Buf, err = apexjson.AppendMarshal(enc.Buf, wire)
 	if err != nil {
 		return "", err
 	}
-	return string(encoded), nil
+	return string(enc.Buf), nil
 }
 
 // jsonWireValue converts the internal JSON-null sentinel back to the JSON

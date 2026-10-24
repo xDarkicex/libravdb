@@ -3525,9 +3525,15 @@ func conflictColumnValue(id string, metadata map[string]interface{}, column stri
 			case map[string]interface{}, map[string]string, []interface{}, []string, []bool,
 				[]int, []int8, []int16, []int32, []int64, []uint, []uint8, []uint16,
 				[]uint32, []uint64, []float32, []float64:
-				if encoded, err := apexjson.Marshal(value); err == nil {
-					return string(encoded), true
+				enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(value))
+				var err error
+				enc.Buf, err = apexjson.AppendMarshal(enc.Buf, value)
+				if err == nil {
+					s := string(enc.Buf)
+					util.ReleaseJSONEncoder(enc)
+					return s, true
 				}
+				util.ReleaseJSONEncoder(enc)
 			}
 			return recordMetaToString(value), true
 		}

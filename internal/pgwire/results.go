@@ -750,43 +750,54 @@ func metadataValueToString(v interface{}) string {
 	case bool:
 		return strconv.FormatBool(t)
 	case map[string]interface{}, []interface{}, map[string]string:
-		if encoded, err := apexjson.Marshal(jsonWireValue(t)); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(jsonWireValue(t)); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLQueryStats:
-		if encoded, err := apexjson.Marshal(&t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(&t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case *libravdb.SQLQueryStats:
-		if encoded, err := apexjson.Marshal(t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.SQLExplainPlan:
-		if encoded, err := apexjson.Marshal(&t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(&t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case *libravdb.SQLExplainPlan:
-		if encoded, err := apexjson.Marshal(t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case libravdb.GraphPath:
-		if encoded, err := apexjson.Marshal(&t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(&t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	case *libravdb.GraphPath:
-		if encoded, err := apexjson.Marshal(t); err == nil {
-			return string(encoded)
+		if s, ok := encodeJSONToString(t); ok {
+			return s
 		}
 		return fmt.Sprintf("%v", t)
 	default:
 		return fmt.Sprintf("%v", t)
 	}
+}
+
+func encodeJSONToString(v interface{}) (string, bool) {
+	enc := util.AcquireJSONEncoder(util.EstimateJSONCapacity(v))
+	defer util.ReleaseJSONEncoder(enc)
+	var err error
+	enc.Buf, err = apexjson.AppendMarshal(enc.Buf, v)
+	if err != nil {
+		return "", false
+	}
+	return string(enc.Buf), true
 }
 
 func metadataValueToText(v interface{}, oid uint32) string {
