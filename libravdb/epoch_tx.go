@@ -447,6 +447,27 @@ func (e *EpochTx) Update(ctx context.Context, collection, id string, vector []fl
 	return nil
 }
 
+// UpdateIfVersion stages a vector record update in the epoch, conditional on
+// the record's current version.
+//
+// The version is validated when the epoch commits, against the transaction's
+// base snapshot, so an update that was computed from a stale read fails
+// instead of overwriting a concurrent write.
+func (e *EpochTx) UpdateIfVersion(ctx context.Context, collection, id string, vector []float32, metadata map[string]interface{}, expectedVersion uint64) error {
+	tx, err := e.RecordTx()
+	if err != nil {
+		return err
+	}
+	epochCtx := e.Context(ctx)
+	if err := tx.UpdateIfVersion(epochCtx, collection, id, vector, metadata, expectedVersion); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.generation++
+	e.mu.Unlock()
+	return nil
+}
+
 // Upsert stages an insert-or-replace mutation in the epoch overlay. SQL
 // ON CONFLICT execution uses this only after it has resolved a non-conflicting
 // proposed row; conflicting DO UPDATE paths use Update so unspecified columns
@@ -918,6 +939,15 @@ func (e *EpochTx) Commit(ctx context.Context) error {
 		return ErrEpochClosed
 	}
 	e.closed = true
+	// The epoch owns a TemporalSnapshot pin from begin until the transaction
+	// ends. Take the handle here so every exit path below releases it: a
+	// committed epoch that keeps its pin would block compaction for the life
+	// of the process.
+	snap := e.snapshot
+	e.snapshot = nil
+	if snap != nil {
+		defer snap.Close()
+	}
 	graphs := make([]*graph.Txn, 0, len(e.graphs))
 	for _, tx := range e.graphs {
 		graphs = append(graphs, tx)

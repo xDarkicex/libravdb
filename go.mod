@@ -7,7 +7,7 @@ require (
 	github.com/leanovate/gopter v0.2.11
 	github.com/mmcloughlin/avo v0.6.0
 	github.com/prometheus/client_golang v1.17.0
-	github.com/xDarkicex/apexJSON/v2 v2.0.3
+	github.com/xDarkicex/apexJSON/v2 v2.0.4
 	github.com/xDarkicex/lexer v0.1.12
 	github.com/xDarkicex/memory v1.2.9
 	go.uber.org/goleak v1.3.0
@@ -37,3 +37,9 @@ require (
 	golang.org/x/tools v0.47.0 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 )
+
+// The module proxy resolves github.com/xDarkicex/apexJSON/v2 from the root
+// tag, with the module taken from the v2/ subdirectory. The require below
+// pins the release that fixes the Go 1.27 map encoder; this replace keeps the
+// sibling tree building against the working copy until the proxy catches up.
+replace github.com/xDarkicex/apexJSON/v2 => ../apexJSON/v2
