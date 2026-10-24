@@ -750,7 +750,9 @@ func metadataValueToString(v interface{}) string {
 	case bool:
 		return strconv.FormatBool(t)
 	case map[string]interface{}, []interface{}, map[string]string:
-		if s, ok := encodeJSONToString(jsonWireValue(t)); ok {
+		// The JSON-null sentinel encodes as null where it sits, so the
+		// document is encoded as it stands rather than copied first.
+		if s, ok := encodeJSONToString(t); ok {
 			return s
 		}
 		return fmt.Sprintf("%v", t)
@@ -870,25 +872,4 @@ func encodeTextArray(value interface{}) string {
 	}
 	out.WriteByte('}')
 	return out.String()
-}
-
-func jsonWireValue(value interface{}) interface{} {
-	switch v := value.(type) {
-	case util.JSONNull:
-		return nil
-	case []interface{}:
-		out := make([]interface{}, len(v))
-		for i := range v {
-			out[i] = jsonWireValue(v[i])
-		}
-		return out
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(v))
-		for key, item := range v {
-			out[key] = jsonWireValue(item)
-		}
-		return out
-	default:
-		return value
-	}
 }

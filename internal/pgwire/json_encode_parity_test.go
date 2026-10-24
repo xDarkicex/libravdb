@@ -88,7 +88,9 @@ func TestPGWire_MetadataValueToString_MapWireParity(t *testing.T) {
 		"nested": map[string]interface{}{"null": util.JSONNull{}},
 		"list":   []interface{}{util.JSONNull{}, 1},
 	}
-	expected, err := apexjson.Marshal(jsonWireValue(in))
+	// The sentinel encodes as the JSON null literal where it sits, so the
+	// document is expected to encode as it stands.
+	expected, err := apexjson.Marshal(in)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}

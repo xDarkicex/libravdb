@@ -551,13 +551,48 @@ func encodeJSONValue(value interface{}) (string, error) {
 	return string(enc.Buf), nil
 }
 
-// jsonWireValue converts the internal JSON-null sentinel back to the JSON
-// encoder's nil representation, recursively. It deliberately leaves SQL nil
-// untouched; callers use this only when serializing a JSON document.
+// jsonWireValue materialises any lazily decoded JSON inside a document, so
+// that the document can be encoded.
+//
+// It deliberately leaves the JSON-null sentinel alone. The sentinel encodes as
+// the JSON null literal where it sits, so a document that carries one needs
+// no rewriting at all. It also leaves SQL nil untouched; callers use this only
+// when serializing a JSON document.
+//
+// A document only needs a copy when it carries a lazily decoded value, and
+// that is rare, so the copy is made only when one is found.
 func jsonWireValue(value interface{}) interface{} {
+	if !jsonNeedsWire(value) {
+		return value
+	}
+	return jsonWireCopy(value)
+}
+
+// jsonNeedsWire reports whether a document carries a lazily decoded value.
+func jsonNeedsWire(value interface{}) bool {
 	switch v := value.(type) {
-	case util.JSONNull:
-		return nil
+	case sqlLazyJSONValue:
+		return true
+	case []interface{}:
+		for _, item := range v {
+			if jsonNeedsWire(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range v {
+			if jsonNeedsWire(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// jsonWireCopy rebuilds a document with its lazily decoded values
+// materialised.
+func jsonWireCopy(value interface{}) interface{} {
+	switch v := value.(type) {
 	case sqlLazyJSONValue:
 		if decoded, ok := decodeJSONValue(v); ok {
 			return jsonWireValue(decoded)
@@ -567,14 +602,14 @@ func jsonWireValue(value interface{}) interface{} {
 		return v
 	case []interface{}:
 		out := make([]interface{}, len(v))
-		for i := range v {
-			out[i] = jsonWireValue(v[i])
+		for i, item := range v {
+			out[i] = jsonWireCopy(item)
 		}
 		return out
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(v))
 		for key, item := range v {
-			out[key] = jsonWireValue(item)
+			out[key] = jsonWireCopy(item)
 		}
 		return out
 	default:

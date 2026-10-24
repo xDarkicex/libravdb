@@ -42,6 +42,21 @@ const (
 // the JSON literal null stored inside a JSON/JSONB document.
 type JSONNull struct{}
 
+// MarshalJSON renders the sentinel as the JSON null literal.
+//
+// The sentinel is the JSON literal null, so that is what it has to encode to.
+// Rendering it here means a document that carries it can be encoded as it
+// stands: the encoder puts a null where the sentinel sits, instead of the
+// tree being copied first to replace every sentinel with a nil. The copy was
+// one allocation per level of every document that contained a null, on a path
+// that runs once per column per row.
+//
+// The binary encoder does not use this: it writes the sentinel as its own
+// type tag, so a decoded document keeps the distinction.
+func (JSONNull) MarshalJSON() ([]byte, error) {
+	return []byte("null"), nil
+}
+
 type BinaryEncoder struct {
 	Buf []byte
 }
