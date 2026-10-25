@@ -5,8 +5,8 @@ import (
 )
 
 const (
-	OffsetMask = uint64(0x0000FFFFFFFFFFFF) // 48 bits
-	DegreeMask = uint64(0xFFFF000000000000) // 16 bits
+	OffsetMask  = uint64(0x0000FFFFFFFFFFFF) // 48 bits
+	DegreeMask  = uint64(0xFFFF000000000000) // 16 bits
 	DegreeShift = 48
 )
 
@@ -33,11 +33,11 @@ func (r RoutingPointer) Degree() uint16 {
 }
 
 // SlabHeader defines the cache-line-aligned prefix of a CoW Slab.
-// Implementing the Bridge Protocol: 
-// The tombstone is represented by setting Xmax to the active transaction. 
-// Tombstoned nodes remain fully routable during HNSW traversal but are filtered out 
+// Implementing the Bridge Protocol:
+// The tombstone is represented by setting Xmax to the active transaction.
+// Tombstoned nodes remain fully routable during HNSW traversal but are filtered out
 // of the final result set via visibility checks.
-// 
+//
 // Size: 32 bytes
 type SlabHeader struct {
 	Xmin         uint64 // Transaction ID that created this slab
@@ -60,7 +60,7 @@ func NewSlabHeader(xmin uint64, vectorOffset uint64, layerCount uint32) SlabHead
 
 // IsTombstoned checks if the node was logically deleted prior to the snapshot xid.
 func (s *SlabHeader) IsTombstoned(snapshotXid uint64) bool {
-	// If Xmax is less than the current snapshot, it means the deletion committed 
+	// If Xmax is less than the current snapshot, it means the deletion committed
 	// before the reader started.
 	return s.Xmax < snapshotXid
 }

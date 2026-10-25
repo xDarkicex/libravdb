@@ -59,10 +59,15 @@ const (
 	recordTypeCommitTimestamp  = uint16(25) // commit LSN → UTC timestamp mapping
 	recordTypeGraphVertexLabel = uint16(26)
 	recordTypeEdgeKindCreate   = uint16(27)
+	recordTypeOrdinalReserve   = uint16(28)
+	recordTypeGraphIDReserve   = uint16(29)
 )
 
 // ReserveGraphNodeIDs reserves n sequential graph node IDs atomically.
 func (e *Engine) ReserveGraphNodeIDs(ctx context.Context, n int) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if n <= 0 {
 		return 0, nil
 	}
@@ -71,9 +76,42 @@ func (e *Engine) ReserveGraphNodeIDs(ctx context.Context, n int) (uint64, error)
 	if e.closed.Load() {
 		return 0, fmt.Errorf("database is closed")
 	}
+	if err := e.writesAvailable(); err != nil {
+		return 0, err
+	}
+	if err := e.beginCommit(); err != nil {
+		return 0, err
+	}
+	defer e.endCommit()
 	first := e.state.NextGraphNodeID
-	e.state.NextGraphNodeID += uint64(n)
-	e.nextGraphNodeID.Store(e.state.NextGraphNodeID)
+	if uint64(n) > math.MaxUint64-first {
+		return 0, fmt.Errorf("GraphNodeID overflow")
+	}
+	next := first + uint64(n)
+	payload := make([]byte, 8)
+	binary.LittleEndian.PutUint64(payload, next)
+	txID := e.nextTxID()
+	begin, op, commit := e.nextLSN(), e.nextLSN(), e.nextLSN()
+	frames := []walRecord{
+		newFrame(recordTypeTxBegin, begin, txID, 0, emptyPayload()),
+		newFrame(recordTypeGraphIDReserve, op, txID, begin, encodedPayload{bytes: payload}),
+		e.makeTxCommitFrame(commit, txID, op),
+	}
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return 0, err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return 0, err
+	}
+	e.state.NextGraphNodeID = next
+	e.nextGraphNodeID.Store(next)
+	e.recordPendingCommitLocked()
+	e.markDirtyLocked(written, 1)
 	return first, nil
 }
 
@@ -386,9 +424,11 @@ type Engine struct {
 	// chunk this instance has applied. Another process may have appended
 	// since; the refresh scans from here.
 	walAppliedOffset int64
+	refreshPending   map[uint64][]walRecord
 	// commitDepth counts nested commit sections, so an inner one does not
-	// release the lock the outer one holds.
+	// release the lock the outer one holds. All access is protected by e.mu.
 	commitDepth int
+	commitFile  *os.File
 	// usersFile is the sidecar lock that records which processes have the
 	// store open. The compaction replaces the file, so it may only do that
 	// when nobody else has it open.
@@ -739,6 +779,38 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		return nil, err
 	}
 
+	engine := &Engine{path: resolved}
+	if err := engine.holdUsersFile(); err != nil {
+		return nil, err
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			engine.releaseUsersFile()
+		}
+	}()
+	if err := engine.openCommitFile(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !opened {
+			engine.commitFile.Close()
+		}
+	}()
+	if err := engine.lockFile(); err != nil {
+		return nil, err
+	}
+	// The engine is not published yet. Index recovery callbacks may take mu.
+	engine.commitDepth = 1
+	openingLocked := true
+	defer func() {
+		if openingLocked {
+			engine.commitDepth = 0
+			engine.unlockFile()
+		}
+	}()
+	finishOpen := func() { engine.commitDepth = 0; engine.unlockFile(); openingLocked = false }
+
 	// Not O_APPEND: the engine writes its fixed pages with WriteAt, which the
 	// runtime refuses on an append-mode file. The append stream is serialised
 	// by the commit lock instead, which also allocates the LSNs.
@@ -768,21 +840,11 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 
 	// Record that this process has the store open, so that a compaction in
 	// another process waits rather than replacing the file underneath us.
-	engine := &Engine{
-		path:        resolved,
-		file:        file,
-		state:       &persistedState{NextCollectionID: 1, NextGraphNodeID: 1, Collections: make(map[string]*persistedCollection), EdgeKinds: make(map[string]uint8), UndirectedEdgeKinds: make(map[string]bool)},
-		collections: make(map[string]*Collection),
-		walSync:     true,
-	}
+	engine.file = file
+	engine.state = &persistedState{NextCollectionID: 1, NextGraphNodeID: 1, Collections: make(map[string]*persistedCollection), EdgeKinds: make(map[string]uint8), UndirectedEdgeKinds: make(map[string]bool)}
+	engine.collections = make(map[string]*Collection)
+	engine.walSync = true
 	engine.ctx, engine.cancel = context.WithCancel(context.Background())
-
-	// Record that this process has the store open, so that a compaction in
-	// another process waits rather than replacing the file underneath us.
-	if err := engine.holdUsersFile(); err != nil {
-		file.Close()
-		return nil, err
-	}
 
 	// Apply options before recovery so provider is available to loadIndexes.
 	for _, opt := range opts {
@@ -830,9 +892,11 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 			return nil, fmt.Errorf("sync new database directory entry: %w", err)
 		}
 		// Start background flusher only after successful initialization
+		finishOpen()
 		startBatchFlusher(engine)
 		engine.status.Store(int32(storage.StatusReady))
 		engine.initReservedOrdinals()
+		opened = true
 		return engine, nil
 	}
 
@@ -843,8 +907,10 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	}
 
 	// Start background flusher only after successful open
+	finishOpen()
 	startBatchFlusher(engine)
 	engine.initReservedOrdinals()
+	opened = true
 	return engine, nil
 }
 
@@ -980,6 +1046,14 @@ func (e *Engine) openExisting() error {
 	// here, so it only ever looks at what another process appended.
 	if stat, statErr := e.file.Stat(); statErr == nil {
 		e.walAppliedOffset = stat.Size()
+	}
+
+	if traceEnabled() {
+		total := 0
+		for _, c := range e.state.Collections {
+			total += len(c.Records)
+		}
+		log.Printf("singlefile: after recovery the state has %d records (lastLSN=%d)", total, e.lastLSN.Load())
 	}
 
 	// Phase 4: legacy V2 migration — assign GraphNodeIDs to any live records
@@ -1607,13 +1681,33 @@ func (e *Engine) selectRecoveryCandidate() (*recoveryCandidate, error) {
 		ordered[count] = meta2
 		count++
 	}
-	if count == 2 && ordered[1].MetaEpoch > ordered[0].MetaEpoch {
+	// Order the candidates by what the file says, not by the epoch. The
+	// epoch is a per-process counter, so two processes' epochs are not
+	// comparable: one process's second checkpoint can look newer than
+	// another's tenth, and the recovery would then pick the older snapshot
+	// and lose everything the newer one holds.
+	//
+	// The snapshot's last applied LSN is global, because the LSNs are
+	// allocated under the commit lock. Its offset says where the snapshot
+	// sits in the file, which breaks a tie.
+	if count == 2 && metaHoldsNewerSnapshot(ordered[1], ordered[0]) {
 		ordered[0], ordered[1] = ordered[1], ordered[0]
 	}
 
 	var candidateErrors [2]error
 	for i := 0; i < count; i++ {
 		candidate, err := e.decodeRecoveryCandidate(ordered[i])
+		if traceEnabled() {
+			total := 0
+			if candidate != nil {
+				for _, c := range candidate.state.Collections {
+					total += len(c.Records)
+				}
+			}
+			log.Printf("singlefile: recovery candidate page=%d epoch=%d snapshotLen=%d lastApplied=%d records=%d err=%v",
+				ordered[i].PageNumber, ordered[i].MetaEpoch, ordered[i].SnapshotLength,
+				ordered[i].LastAppliedLSN, total, err)
+		}
 		if err == nil {
 			return candidate, nil
 		}
@@ -1629,6 +1723,15 @@ func (e *Engine) selectRecoveryCandidate() (*recoveryCandidate, error) {
 		ordered[1].PageNumber,
 		candidateErrors[1],
 	)
+}
+
+// metaHoldsNewerSnapshot reports whether one meta page holds a newer
+// snapshot than another.
+func metaHoldsNewerSnapshot(a, b *metaPage) bool {
+	if a.LastAppliedLSN != b.LastAppliedLSN {
+		return a.LastAppliedLSN > b.LastAppliedLSN
+	}
+	return a.SnapshotOffset > b.SnapshotOffset
 }
 
 func (e *Engine) decodeRecoveryCandidate(meta *metaPage) (*recoveryCandidate, error) {
@@ -2045,6 +2148,27 @@ func (e *Engine) applyCommittedFrames(
 	commitLSN := frames[len(frames)-1].Header.LSN
 	for _, record := range frames {
 		switch record.Header.RecordType {
+		case recordTypeGraphIDReserve:
+			if len(record.Payload) != 8 {
+				return fmt.Errorf("invalid graph ID reservation")
+			}
+			next := binary.LittleEndian.Uint64(record.Payload)
+			if next > e.state.NextGraphNodeID {
+				e.state.NextGraphNodeID = next
+				e.nextGraphNodeID.Store(next)
+			}
+		case recordTypeOrdinalReserve:
+			if len(record.Payload) < 4 {
+				return fmt.Errorf("invalid ordinal reservation")
+			}
+			next := binary.LittleEndian.Uint32(record.Payload[:4])
+			name := string(record.Payload[4:])
+			if col := e.state.Collections[name]; col != nil && next > col.NextOrdinal {
+				col.NextOrdinal = next
+				if next > 0 {
+					advanceReservedOrdinal(col, next-1)
+				}
+			}
 		case recordTypeCollectionCreate:
 			payload, err := decodeCollectionCreatePayloadBinary(record.Payload)
 			if err != nil {
@@ -2576,6 +2700,9 @@ func reserveOrdinal(collection *persistedCollection) (uint32, error) {
 			return 0, fmt.Errorf("ordinal space exhausted")
 		}
 		if collection.reservedNextOrdinal.CompareAndSwap(current, current+1) {
+			if traceEnabled() {
+				log.Printf("singlefile: reserved ordinal %d (frontier was %d)", current, current)
+			}
 			return current, nil
 		}
 	}
@@ -3197,6 +3324,9 @@ func (e *Engine) SetGraphRecoveryTarget(collection string, target storage.GraphR
 // source-compatible while being restart-safe.
 func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label string, onCommit func(uint64)) error { // The commit lock covers the LSN allocation and the append that go
 	// with it, and brings this instance up to date with the file first.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.beginCommit(); err != nil {
 		return err
 	}
@@ -3205,8 +3335,6 @@ func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label stri
 	if label == "" {
 		return fmt.Errorf("graph label must not be empty")
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := e.writesAvailable(); err != nil {
 		return err
 	}
@@ -3268,6 +3396,9 @@ func (e *Engine) CreateEdgeKind(name string, kind uint8) error {
 // database metadata.
 func (e *Engine) CreateEdgeKindDefinition(name string, kind uint8, undirected bool) error { // The commit lock covers the LSN allocation and the append that go
 	// with it, and brings this instance up to date with the file first.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.beginCommit(); err != nil {
 		return err
 	}
@@ -3279,8 +3410,6 @@ func (e *Engine) CreateEdgeKindDefinition(name string, kind uint8, undirected bo
 	if kind == 0 {
 		return fmt.Errorf("edge type kind 0 is reserved")
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := e.writesAvailable(); err != nil {
 		return err
 	}
@@ -3561,6 +3690,14 @@ func (e *Engine) checkpointLocked() error {
 	}
 
 	// STEP 1: write snapshot chunk
+	if traceEnabled() {
+		total := 0
+		for _, c := range e.state.Collections {
+			total += len(c.Records)
+		}
+		log.Printf("singlefile: checkpoint snapshot has %d records, lastLSN=%d, lastTxID=%d, appliedOffset=%d",
+			total, e.lastLSN.Load(), e.lastTxID.Load(), e.walAppliedOffset)
+	}
 	snapshot, err := encodeStateBinary(e.state)
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
@@ -3705,6 +3842,8 @@ func (e *Engine) checkpointLocked() error {
 		e.catalogDirty = false
 	}
 
+	e.walAppliedOffset = stat.Size()
+
 	e.activeMetaPage = nextMetaPage
 	e.dirty = false
 	e.dirtyBytes = 0
@@ -3715,7 +3854,7 @@ func (e *Engine) checkpointLocked() error {
 	// The compaction replaces the file, so it waits for anyone else who
 	// has the store open to go away first.
 	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot)) + 16 + int64(len(indexBlock))
-	if stat.Size() > compactSize*2 && e.compactionAllowed() {
+	if stat.Size() > compactSize*2 {
 		if err := e.compactFile(); err != nil {
 			log.Printf("singlefile: auto-compact failed: %v", err)
 		}
@@ -4278,6 +4417,14 @@ func (e *Engine) Drop(ctx context.Context) error {
 // current snapshot, then atomically renames it over the original. Caller must
 // hold e.mu. The checkpoint that precedes this call must already be fsynced.
 func (e *Engine) compactFile() error {
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+	if !e.compactionAllowed() {
+		return nil
+	}
+	defer e.finishCompaction()
 	err := e.compactFileLocked()
 	if err != nil {
 		e.compactionErrors++
@@ -4590,6 +4737,12 @@ func (e *Engine) compactFileLocked() error {
 	e.activeMetaPage = 1
 	e.metaEpoch = 1
 	e.walReplayStart = int64(3 * pageSize)
+	stat, err := newFile.Stat()
+	if err != nil {
+		return err
+	}
+	e.walAppliedOffset = stat.Size()
+	e.refreshPending = nil
 	e.dirty = false
 	e.dirtyBytes = 0
 	e.dirtyOps = 0
@@ -4993,13 +5146,13 @@ var (
 
 func (e *Engine) createCollection(name string, config storage.CollectionConfig) error { // The commit lock covers the LSN allocation and the append that go
 	// with it, and brings this instance up to date with the file first.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.beginCommit(); err != nil {
 		return err
 	}
 	defer e.endCommit()
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if err := e.writesAvailable(); err != nil {
 		return err
@@ -5379,6 +5532,27 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 		collection = e.state.Collections[batches[0].collection]
 	}
 
+	// Private storage writes reserve speculatively so group commit remains cheap.
+	// A remote writer may have consumed those slots before the batch flushes.
+	// Public reservations are already durable and must retain their hook/index ID.
+	for i := range batches {
+		for j := 0; j < batches[i].count(); j++ {
+			entry := batches[i].entryAt(j)
+			if entry == nil {
+				continue
+			}
+			if current := collection.Records[entry.ID]; current != nil {
+				entry.Ordinal = current.Ordinal
+			} else if !entry.OrdinalReserved && entry.Ordinal < collection.NextOrdinal {
+				ordinal, err := reserveOrdinal(collection)
+				if err != nil {
+					return 0, 0, 0, err
+				}
+				entry.Ordinal = ordinal
+			}
+		}
+	}
+
 	entryCount := 0
 	maxOrdinal := -1
 	for i := range batches {
@@ -5659,6 +5833,11 @@ func (e *Engine) deleteRecord(name, id string) error {
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
@@ -5707,14 +5886,27 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 		return nil, err
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed.Load() {
+		return nil, fmt.Errorf("database is closed")
+	}
+	if err := e.writesAvailable(); err != nil {
+		return nil, err
+	}
+
+	if err := e.beginCommit(); err != nil {
+		return nil, err
+	}
+	defer e.endCommit()
 
 	if e.closed.Load() {
 		return nil, fmt.Errorf("database is closed")
 	}
 
 	prepared := make([]storage.TxOperation, len(ops))
+	frontiers := make(map[string]uint32)
 	for i, op := range ops {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -5755,8 +5947,12 @@ func (e *Engine) PrepareTx(ctx context.Context, ops []storage.TxOperation) ([]st
 			return nil, fmt.Errorf("reserve ordinal for %s/%s: %w", op.Collection, op.ID, err)
 		}
 		prepared[i].Ordinal = ordinal
+		frontiers[op.Collection] = ordinal + 1
 	}
 
+	if err := e.persistOrdinalReservationsLocked(frontiers); err != nil {
+		return nil, err
+	}
 	return prepared, nil
 }
 
@@ -6061,6 +6257,11 @@ func (e *Engine) UpdateCollectionConfig(ctx context.Context, name string, config
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	if collection := e.state.Collections[name]; collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
 	}
@@ -6113,6 +6314,11 @@ func (e *Engine) setCollectionCostModelStats(ctx context.Context, name string, s
 	if e.closed.Load() {
 		return false, fmt.Errorf("database is closed")
 	}
+	if err := e.beginCommit(); err != nil {
+		return false, err
+	}
+	defer e.endCommit()
+
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return false, fmt.Errorf("collection %s not found", name)
@@ -6249,6 +6455,11 @@ func (e *Engine) DeleteCollection(name string) error {
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	collection := e.state.Collections[name]
 	if collection == nil || collection.Deleted {
 		return fmt.Errorf("collection %s not found", name)
@@ -6317,7 +6528,8 @@ func (e *Engine) Close() error {
 	// unnecessary: Free() releases all mmap'd slabs at once.
 	// Give the users lock back: nobody else has the store open because of
 	// this process any more, so a compaction may now replace the file.
-	e.releaseUsersFile()
+	defer e.releaseUsersFile()
+	defer e.commitFile.Close()
 
 	for _, collection := range e.state.Collections {
 		collection.freeVectorSFLs()
@@ -6454,6 +6666,9 @@ func (c *Collection) persisted() (*persistedCollection, error) {
 	return persisted, nil
 }
 
+// AssignOrdinals durably reserves ordinals before indexes or hooks use them.
+// Reservations survive restart; failed inserts may leave gaps. Private storage
+// writes use speculative reservations reconciled by the WAL batch writer.
 func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.VectorEntry) error {
 	_ = ctx
 	c.engine.mu.Lock()
@@ -6461,10 +6676,24 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 	if c.closed.Load() || c.engine.closed.Load() {
 		return fmt.Errorf("collection %s is closed", c.name)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.engine.writesAvailable(); err != nil {
+		return err
+	}
+
+	if err := c.engine.beginCommit(); err != nil {
+		return err
+	}
+	defer c.engine.endCommit()
+
 	persisted := c.engine.state.Collections[c.name]
 	if persisted == nil || persisted.Deleted {
 		return fmt.Errorf("collection %s not found", c.name)
 	}
+	frontier := uint32(0)
+	var newlyReserved []*index.VectorEntry
 	for _, entry := range entries {
 		if entry == nil {
 			continue
@@ -6479,7 +6708,17 @@ func (c *Collection) AssignOrdinals(ctx context.Context, entries []*index.Vector
 			return err
 		}
 		entry.Ordinal = ordinal
-		entry.OrdinalReserved = true
+		frontier = ordinal + 1
+		entry.OrdinalReserved = false
+		newlyReserved = append(newlyReserved, entry)
+	}
+	if frontier > 0 {
+		if err := c.engine.persistOrdinalReservationsLocked(map[string]uint32{c.name: frontier}); err != nil {
+			return err
+		}
+		for _, entry := range newlyReserved {
+			entry.OrdinalReserved = true
+		}
 	}
 	return nil
 }
@@ -6527,9 +6766,8 @@ func (c *Collection) assignOrdinal(entry *index.VectorEntry) error {
 		return nil
 	}
 	if entry.OrdinalReserved {
-		// Collection.AssignOrdinals already reserved this ordinal from the same
-		// collection frontier. Consume the handoff instead of reserving again.
-		entry.OrdinalReserved = false
+		// AssignOrdinals durably reserved this slot. Keep the handoff tagged
+		// so the WAL batch writer does not treat it as speculative.
 		return nil
 	}
 	ordinal, err := reserveOrdinal(persisted)
@@ -6866,6 +7104,9 @@ func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 			entry.Ordinal = current.Ordinal
 			continue
 		}
+		if entry.OrdinalReserved {
+			continue
+		}
 		ordinal, err := reserveOrdinal(persisted)
 		if err != nil {
 			return err
@@ -6873,4 +7114,13 @@ func (c *Collection) assignOrdinals(entries []*index.VectorEntry) error {
 		entry.Ordinal = ordinal
 	}
 	return nil
+}
+
+// traceEnabled reports whether the engine should log what it is doing.
+//
+// The trace is off unless it is asked for, because the engine traces paths
+// that run on every write, and a store that logs by default is a store
+// nobody can run.
+func traceEnabled() bool {
+	return os.Getenv("LIBRAVDB_TRACE") != ""
 }

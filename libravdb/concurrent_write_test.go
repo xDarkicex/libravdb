@@ -6,7 +6,6 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"testing"
 )
@@ -53,12 +52,14 @@ func TestConcurrentProcessesKeepEveryRecord(t *testing.T) {
 		wg.Add(1)
 		go func(who string) {
 			defer wg.Done()
-			cmd := osexec.Command(os.Args[0], "-test.run=^TestConcurrentProcessesKeepEveryRecord$")
+			cmd := osexec.Command(os.Args[0], "-test.run=^TestConcurrentProcessesKeepEveryRecord$", "-test.timeout=30s")
 			cmd.Env = append(os.Environ(),
 				concurrentHelperEnv+"=write",
 				"LIBRAVDB_CONCURRENT_PATH="+dir,
 				"LIBRAVDB_CONCURRENT_WHO="+who)
-			if out, err := cmd.CombinedOutput(); err != nil {
+			out, err := cmd.CombinedOutput()
+			t.Logf("writer %s: err=%v out=%q", who, err, string(out))
+			if err != nil {
 				t.Errorf("writer %s: %v\n%s", who, err, out)
 			}
 		}(who)
@@ -104,7 +105,7 @@ func concurrentHelper(t *testing.T) {
 	who := os.Getenv("LIBRAVDB_CONCURRENT_WHO")
 	for i := range concurrentRecords {
 		id := fmt.Sprintf("%s-%06d", who, i)
-		if err := col.Insert(ctx, id, nil, map[string]interface{}{"who": who, "n": strconv.Itoa(i)}); err != nil {
+		if err := col.Insert(ctx, id, nil, map[string]interface{}{"k": "v"}); err != nil {
 			t.Fatalf("insert %s: %v", id, err)
 		}
 	}

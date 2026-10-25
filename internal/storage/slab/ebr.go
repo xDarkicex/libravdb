@@ -45,11 +45,11 @@ func (r *EpochRegistry) Acquire(snapshotXid uint64) uint32 {
 			time.Sleep(1 * time.Microsecond)
 			continue
 		}
-		
+
 		// Find the lowest 0-bit
 		slot := uint32(bits.TrailingZeros64(^free))
 		mask := uint64(1) << slot
-		
+
 		if atomic.CompareAndSwapUint64(&r.freelist, free, free|mask) {
 			atomic.StoreUint64(&r.cells[slot].Epoch, snapshotXid)
 			return slot
@@ -60,7 +60,7 @@ func (r *EpochRegistry) Acquire(snapshotXid uint64) uint32 {
 // Release unregisters a reader when its transaction completes and frees the slot.
 func (r *EpochRegistry) Release(slot uint32) {
 	atomic.StoreUint64(&r.cells[slot].Epoch, math.MaxUint64) // math.MaxUint64 = Inactive
-	
+
 	// Free the slot in the bitmask
 	mask := ^(uint64(1) << slot)
 	for {
@@ -93,9 +93,9 @@ type LimboEntry struct {
 
 // LimboManager manages the lock-free reclamation lifecycle.
 type LimboManager struct {
-	registry   *EpochRegistry
-	budget     uint64 // Max allowed bytes in limbo before stalling writers
-	
+	registry *EpochRegistry
+	budget   uint64 // Max allowed bytes in limbo before stalling writers
+
 	mu         sync.Mutex
 	entries    []LimboEntry
 	totalBytes uint64
@@ -110,7 +110,7 @@ func NewLimboManager(registry *EpochRegistry, maxBudgetBytes uint64) *LimboManag
 }
 
 // Retire marks a slab for deferred reclamation.
-// This is the writer's safety valve. If the limbo budget is exhausted, 
+// This is the writer's safety valve. If the limbo budget is exhausted,
 // the writer will gently spin/yield until the background reclaimer catches up,
 // preventing unbounded memory growth.
 func (m *LimboManager) Retire(deletionXid uint64, offset uint64, size uint64) {
@@ -129,7 +129,7 @@ func (m *LimboManager) Retire(deletionXid uint64, offset uint64, size uint64) {
 			return
 		}
 		m.mu.Unlock()
-		
+
 		// Gently yield back to the Go scheduler.
 		// The CAS-retry loop already makes writers resilient to delays.
 		time.Sleep(1 * time.Millisecond)
@@ -139,13 +139,13 @@ func (m *LimboManager) Retire(deletionXid uint64, offset uint64, size uint64) {
 // Reclaim is called periodically by a background worker to drain the limbo list.
 func (m *LimboManager) Reclaim(currentXid uint64) []LimboEntry {
 	watermark := m.registry.MinimumActiveEpoch(currentXid)
-	
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	var reclaimed []LimboEntry
 	var remaining []LimboEntry
-	
+
 	for _, entry := range m.entries {
 		if entry.DeletionXid < watermark {
 			// The slab was deleted before the oldest active reader started.
@@ -156,7 +156,7 @@ func (m *LimboManager) Reclaim(currentXid uint64) []LimboEntry {
 			remaining = append(remaining, entry)
 		}
 	}
-	
+
 	m.entries = remaining
 	return reclaimed
 }

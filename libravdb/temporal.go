@@ -74,11 +74,11 @@ type TemporalConfig struct {
 //
 // Lock Ordering Constraint:
 // activeSnapshots.mu MUST always be acquired BEFORE the engine mutex (e.mu).
-// - Pinning (SnapshotAt/SnapshotAtLSN) acquires activeSnapshots.mu and then queries
-//   the engine's OldestRetainedLSN (taking and releasing e.mu.RLock).
-// - Compaction (CompactHistory) acquires activeSnapshots.mu across computing the
-//   retention boundary and calling CompactTemporalHistory (taking e.mu.Lock).
-// - No path in the codebase may ever acquire activeSnapshots.mu while holding e.mu.
+//   - Pinning (SnapshotAt/SnapshotAtLSN) acquires activeSnapshots.mu and then queries
+//     the engine's OldestRetainedLSN (taking and releasing e.mu.RLock).
+//   - Compaction (CompactHistory) acquires activeSnapshots.mu across computing the
+//     retention boundary and calling CompactTemporalHistory (taking e.mu.Lock).
+//   - No path in the codebase may ever acquire activeSnapshots.mu while holding e.mu.
 type activeSnapshots struct {
 	mu     sync.Mutex
 	pins   map[uint64]snapshotPin

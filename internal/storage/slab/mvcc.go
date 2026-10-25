@@ -25,7 +25,7 @@ func NewArena(size uint64) *Arena {
 func (a *Arena) WriteSlab(payload []byte) uint64 {
 	length := uint64(len(payload))
 	offset := atomic.AddUint64(&a.tail, length) - length
-	
+
 	// Fast zero-copy write directly into the pre-allocated slice.
 	copy(a.data[offset:], payload)
 	return offset

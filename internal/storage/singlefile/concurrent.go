@@ -1,10 +1,12 @@
 package singlefile
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"syscall"
 )
@@ -81,21 +83,20 @@ func (e *Engine) compactionAllowed() bool {
 		return true
 	}
 	if err := syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// Somebody else has the store open.
+		// A failed flock upgrade can release the previous shared lock.
+		_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_SH)
 		return false
 	}
-	// Put the shared lock back for the rest of this instance's life.
-	_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_SH)
 	return true
 }
 
 // lockFile takes the store's exclusive commit lock.
 //
-// The lock is on the file itself, so it coordinates with other processes. It
+// The lock is on a stable sidecar, so it survives database replacement. It
 // is advisory: a reader never takes it, so a read keeps progressing while a
 // write is in flight.
 func (e *Engine) lockFile() error {
-	if err := syscall.Flock(int(e.file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(e.commitFile.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock store file: %w", err)
 	}
 	return nil
@@ -103,7 +104,7 @@ func (e *Engine) lockFile() error {
 
 // unlockFile releases the store's commit lock.
 func (e *Engine) unlockFile() {
-	_ = syscall.Flock(int(e.file.Fd()), syscall.LOCK_UN)
+	_ = syscall.Flock(int(e.commitFile.Fd()), syscall.LOCK_UN)
 }
 
 // beginCommit takes the commit lock and brings this instance's view of the
@@ -111,16 +112,21 @@ func (e *Engine) unlockFile() {
 //
 // It must be paired with endCommit. The caller holds e.mu.
 func (e *Engine) beginCommit() error {
-	if e.commitDepth == 0 {
-		if err := e.lockFile(); err != nil {
-			return err
-		}
-		if err := e.refreshFromDiskLocked(); err != nil {
-			e.unlockFile()
-			return err
-		}
-	}
 	e.commitDepth++
+	if e.commitDepth != 1 {
+		// An outer section already holds the lock, and it already refreshed:
+		// no other process can have written while it holds it.
+		return nil
+	}
+	if err := e.lockFile(); err != nil {
+		e.commitDepth--
+		return err
+	}
+	if err := e.refreshFromDiskLocked(); err != nil {
+		e.unlockFile()
+		e.commitDepth--
+		return err
+	}
 	return nil
 }
 
@@ -140,21 +146,26 @@ func (e *Engine) endCommit() {
 // written to the file.
 //
 // It is the read path's entry point. The check is a stat, which is cheap;
-// the refresh only runs when the file has actually grown.
+// the refresh runs when the size differs. Live remote compaction is prevented
+// by the lifetime users lock; an unexpected truncation is reported as an error.
 func (e *Engine) refreshIfBehind() error {
+	e.mu.RLock()
 	stat, err := e.file.Stat()
+	behind := err == nil && stat.Size() != e.walAppliedOffset
+	e.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("stat store file: %w", err)
 	}
-	e.mu.RLock()
-	behind := stat.Size() > e.walAppliedOffset
-	e.mu.RUnlock()
 	if !behind {
 		return nil
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.refreshFromDiskLocked()
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	e.endCommit()
+	return nil
 }
 
 // refreshFromDiskLocked applies the commits another process made.
@@ -173,11 +184,33 @@ func (e *Engine) refreshFromDiskLocked() error {
 	}
 	fileSize := stat.Size()
 	offset := e.walAppliedOffset
-	if fileSize <= offset {
+	if fileSize < offset {
+		return fmt.Errorf("store file shrank while open: size %d, applied offset %d", fileSize, offset)
+	}
+	if fileSize == 0 {
 		return nil
 	}
-	pending := make(map[uint64][]walRecord)
+	header, err := e.readHeader()
+	if err != nil {
+		return err
+	}
+	meta, err := e.readMetaPage(header.ActiveMetaPage)
+	if err != nil {
+		return err
+	}
+	e.activeMetaPage = header.ActiveMetaPage
+	if meta.MetaEpoch > e.metaEpoch {
+		e.metaEpoch = meta.MetaEpoch
+	}
+	if fileSize == offset {
+		return nil
+	}
+	if e.refreshPending == nil {
+		e.refreshPending = make(map[uint64][]walRecord)
+	}
+	pending := e.refreshPending
 	touched := make(map[string]struct{})
+	refreshedFrames := 0
 	deltaProvider, _ := e.indexProvider.(IncrementalIndexRecoveryProvider)
 
 	for fileSize >= 16 && offset >= 0 && offset <= fileSize-16 {
@@ -214,35 +247,104 @@ func (e *Engine) refreshFromDiskLocked() error {
 		if err != nil {
 			return err
 		}
-		if record.Header.LSN <= e.lastLSN.Load() {
-			// Already applied.
-			offset = chunkEnd
-			continue
-		}
 		switch record.Header.RecordType {
 		case recordTypeTxBegin:
 			pending[record.Header.TxID] = []walRecord{record}
+		case recordTypeTxAbort:
+			delete(pending, record.Header.TxID)
 		case recordTypeTxCommit:
+			if record.Header.LSN <= e.lastLSN.Load() {
+				delete(pending, record.Header.TxID)
+				break
+			}
+			if len(pending[record.Header.TxID]) == 0 || pending[record.Header.TxID][0].Header.RecordType != recordTypeTxBegin {
+				return fmt.Errorf("commit for transaction %d has no begin frame", record.Header.TxID)
+			}
 			frames := append(pending[record.Header.TxID], record)
 			if err := e.applyCommittedFrames(frames, touched, deltaProvider); err != nil {
 				return err
 			}
+			refreshedFrames += len(frames)
 			delete(pending, record.Header.TxID)
+			// The counters follow the file, but only as far as a
+			// *committed* transaction. Advancing them on a frame whose
+			// transaction has not been seen whole would put the next
+			// transaction's LSN below the counter, and the frames of a
+			// half-read transaction would then be skipped as though they
+			// had already been applied.
+			if record.Header.LSN > e.lastLSN.Load() {
+				e.lastLSN.Store(record.Header.LSN)
+			}
+			if record.Header.TxID > e.lastTxID.Load() {
+				e.lastTxID.Store(record.Header.TxID)
+			}
 		default:
 			pending[record.Header.TxID] = append(pending[record.Header.TxID], record)
-		}
-		// The counters have to follow the file. A stale one hands out an LSN
-		// another process has already taken, and two commits at the same LSN
-		// leave the catalog ambiguous and the recovery unable to say which
-		// of them a snapshot contains.
-		if record.Header.LSN > e.lastLSN.Load() {
-			e.lastLSN.Store(record.Header.LSN)
-		}
-		if record.Header.TxID > e.lastTxID.Load() {
-			e.lastTxID.Store(record.Header.TxID)
 		}
 		offset = chunkEnd
 	}
 	e.walAppliedOffset = offset
+	if refreshedFrames > 0 && traceEnabled() {
+		log.Printf("singlefile: refresh applied %d frames (tx %d)", refreshedFrames, e.lastLSN.Load())
+	}
+	return nil
+}
+
+// openCommitFile uses a stable inode: replacing the database must never replace
+// the object on which writers coordinate. This sidecar is never unlinked.
+func (e *Engine) openCommitFile() error {
+	f, err := os.OpenFile(e.path+".lock", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	e.commitFile = f
+	return nil
+}
+
+func (e *Engine) finishCompaction() {
+	if e.usersFile != nil {
+		_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_SH)
+	}
+}
+
+// persistOrdinalReservationsLocked publishes reservation frontiers as one WAL
+// transaction, amortizing durability across a batch. Caller holds e.mu and the
+// commit lock. Aborted writes may leave reserved gaps.
+func (e *Engine) persistOrdinalReservationsLocked(frontiers map[string]uint32) error {
+	if len(frontiers) == 0 {
+		return nil
+	}
+	txID := e.nextTxID()
+	begin := e.nextLSN()
+	frames := []walRecord{newFrame(recordTypeTxBegin, begin, txID, 0, emptyPayload())}
+	prev := begin
+	for name, next := range frontiers {
+		payload := make([]byte, 4+len(name))
+		binary.LittleEndian.PutUint32(payload, next)
+		copy(payload[4:], name)
+		lsn := e.nextLSN()
+		frames = append(frames, newFrame(recordTypeOrdinalReserve, lsn, txID, prev, encodedPayload{bytes: payload}))
+		prev = lsn
+	}
+	commit := e.nextLSN()
+	frames = append(frames, e.makeTxCommitFrame(commit, txID, prev))
+	written, err := e.appendTransactionLocked(frames)
+	if err != nil {
+		if isAmbiguousWriteError(err) {
+			e.disableWrites()
+		}
+		return err
+	}
+	if err := e.syncWALLocked(); err != nil {
+		e.disableWrites()
+		return err
+	}
+	for name, next := range frontiers {
+		if col := e.state.Collections[name]; next > col.NextOrdinal {
+			col.NextOrdinal = next
+		}
+	}
+	e.recordPendingCommitLocked()
+	e.markDirtyLocked(written, 1)
 	return nil
 }
