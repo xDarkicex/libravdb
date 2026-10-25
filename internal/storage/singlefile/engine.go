@@ -381,7 +381,18 @@ type Engine struct {
 	// walReplayStart is normally page 3. Recovery sets it to the end of the
 	// selected snapshot when it safely skips a stale legacy relocation prefix;
 	// compaction uses the same boundary so it never reparses that prefix.
-	walReplayStart  int64
+	walReplayStart int64
+	// walAppliedOffset is the file offset just past the last write-ahead-log
+	// chunk this instance has applied. Another process may have appended
+	// since; the refresh scans from here.
+	walAppliedOffset int64
+	// commitDepth counts nested commit sections, so an inner one does not
+	// release the lock the outer one holds.
+	commitDepth int
+	// usersFile is the sidecar lock that records which processes have the
+	// store open. The compaction replaces the file, so it may only do that
+	// when nobody else has it open.
+	usersFile       *os.File
 	nextGraphNodeID atomic.Uint64
 	reverseDir      *reverseDirectory
 	mu              sync.RWMutex
@@ -728,6 +739,9 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		return nil, err
 	}
 
+	// Not O_APPEND: the engine writes its fixed pages with WriteAt, which the
+	// runtime refuses on an append-mode file. The append stream is serialised
+	// by the commit lock instead, which also allocates the LSNs.
 	file, err := os.OpenFile(resolved, os.O_RDWR|os.O_CREATE|oNoFollow, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open database file: %w", err)
@@ -752,6 +766,8 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		}
 	}
 
+	// Record that this process has the store open, so that a compaction in
+	// another process waits rather than replacing the file underneath us.
 	engine := &Engine{
 		path:        resolved,
 		file:        file,
@@ -760,6 +776,13 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 		walSync:     true,
 	}
 	engine.ctx, engine.cancel = context.WithCancel(context.Background())
+
+	// Record that this process has the store open, so that a compaction in
+	// another process waits rather than replacing the file underneath us.
+	if err := engine.holdUsersFile(); err != nil {
+		file.Close()
+		return nil, err
+	}
 
 	// Apply options before recovery so provider is available to loadIndexes.
 	for _, opt := range opts {
@@ -952,6 +975,11 @@ func (e *Engine) openExisting() error {
 	if err := e.replayWALFrom(chosen.meta.LastAppliedLSN, replayStart); err != nil {
 		e.fail(fmt.Errorf("replay WAL: %w", err))
 		return err
+	}
+	// Everything in the file has been applied. A later refresh scans from
+	// here, so it only ever looks at what another process appended.
+	if stat, statErr := e.file.Stat(); statErr == nil {
+		e.walAppliedOffset = stat.Size()
 	}
 
 	// Phase 4: legacy V2 migration — assign GraphNodeIDs to any live records
@@ -3167,7 +3195,13 @@ func (e *Engine) SetGraphRecoveryTarget(collection string, target storage.GraphR
 // AppendGraphLabel writes one committed label assignment. Labels are rare and
 // use a dedicated synchronous WAL transaction so RegisterVertexLabel remains
 // source-compatible while being restart-safe.
-func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label string, onCommit func(uint64)) error {
+func (e *Engine) AppendGraphLabel(ctx context.Context, nodeID uint64, label string, onCommit func(uint64)) error { // The commit lock covers the LSN allocation and the append that go
+	// with it, and brings this instance up to date with the file first.
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	if label == "" {
 		return fmt.Errorf("graph label must not be empty")
 	}
@@ -3232,7 +3266,13 @@ func (e *Engine) CreateEdgeKind(name string, kind uint8) error {
 // CreateEdgeKindDefinition durably registers a named SQL edge type and its
 // direction through the same transaction/WAL/checkpoint machinery as other
 // database metadata.
-func (e *Engine) CreateEdgeKindDefinition(name string, kind uint8, undirected bool) error {
+func (e *Engine) CreateEdgeKindDefinition(name string, kind uint8, undirected bool) error { // The commit lock covers the LSN allocation and the append that go
+	// with it, and brings this instance up to date with the file first.
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	if name == "" {
 		return fmt.Errorf("edge type name must not be empty")
 	}
@@ -3321,6 +3361,12 @@ func (e *Engine) AppendGraphEdges(ctx context.Context, adds, removes []storage.G
 // one WAL transaction for all queued ops. Returns the commit LSN. Caller must
 // hold e.mu.
 func (e *Engine) flushPendingGraphEdgesLocked() (uint64, error) {
+	// The commit lock covers the LSN allocation and the append that go with
+	// it, and brings this instance up to date with the file first.
+	if err := e.beginCommit(); err != nil {
+		return 0, err
+	}
+	defer e.endCommit()
 	e.graphEdgeMu.Lock()
 	adds := e.pendingAdds
 	removes := e.pendingRemoves
@@ -3490,6 +3536,15 @@ func (e *Engine) checkpointLocked() error {
 	if !e.dirty && !e.catalogDirty {
 		return nil
 	}
+	// The commit lock covers the checkpoint too. It writes the file header,
+	// the metapage and the snapshot, and the header says where the write-
+	// ahead log ends. Two processes writing the header would leave one
+	// process's log frames past the recorded head, and the recovery would
+	// skip them.
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
 	// Commit timestamps/LSNs are part of the temporal snapshot contract. Keep
 	// the persisted state copy synchronized before encoding so compaction and
 	// reopen can resolve historical timestamps even after old WAL is removed.
@@ -3565,9 +3620,18 @@ func (e *Engine) checkpointLocked() error {
 
 	// STEP 3: write metapage (now authoritative: snapshot + index)
 	e.metaEpoch++
+	// The metapage must be the one the file is not using. Another process may
+	// have checkpointed since this engine last looked, and two writers
+	// choosing the same page overwrite each other's snapshot -- and a snapshot
+	// that names an LSN past the records it holds makes the recovery skip
+	// them.
+	header, err := e.readHeader()
+	if err != nil {
+		return err
+	}
 	nextMetaPage := uint64(1)
 	rootFreelist := uint64(0)
-	if e.activeMetaPage == 1 {
+	if header.ActiveMetaPage == 1 {
 		nextMetaPage = 2
 		rootFreelist = math.MaxUint64
 	}
@@ -3624,10 +3688,6 @@ func (e *Engine) checkpointLocked() error {
 	}
 
 	// STEP 5: write header (publishes the new metapage as authoritative)
-	header, err := e.readHeader()
-	if err != nil {
-		return err
-	}
 	header.LastCheckpointLSN = e.lastLSN.Load()
 	header.ActiveMetaPage = nextMetaPage
 	header.WALHeadPage = pageCount
@@ -3652,8 +3712,10 @@ func (e *Engine) checkpointLocked() error {
 	e.checkpoints++
 
 	// Auto-compact when WAL bloat exceeds 2× the minimum file size.
+	// The compaction replaces the file, so it waits for anyone else who
+	// has the store open to go away first.
 	compactSize := int64(3*pageSize) + 16 + int64(len(snapshot)) + 16 + int64(len(indexBlock))
-	if stat.Size() > compactSize*2 {
+	if stat.Size() > compactSize*2 && e.compactionAllowed() {
 		if err := e.compactFile(); err != nil {
 			log.Printf("singlefile: auto-compact failed: %v", err)
 		}
@@ -4677,7 +4739,9 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	}
 	e.walTransactions++
 	e.walBytes += written
-	_ = offset
+	// The append lock is held, so the bytes just written are ours and the
+	// file now ends where this instance has applied up to.
+	e.walAppliedOffset = offset + int64(written)
 	return written, nil
 }
 
@@ -4906,6 +4970,12 @@ func (e *Engine) ResolveLSN(lsn uint64) (time.Time, error) {
 // LatestCommitLSN returns the latest committed TxCommit LSN from the durable
 // commit catalog. It never reports an allocated-but-uncommitted sequence.
 func (e *Engine) LatestCommitLSN() (uint64, error) {
+	// Another process may have committed since this instance last looked.
+	// Catch up before answering, so the commit LSN is the file's, not this
+	// instance's memory of it.
+	if err := e.refreshIfBehind(); err != nil {
+		return 0, err
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -4921,7 +4991,13 @@ var (
 	ErrUnknownLSN       = fmt.Errorf("unknown LSN")
 )
 
-func (e *Engine) createCollection(name string, config storage.CollectionConfig) error {
+func (e *Engine) createCollection(name string, config storage.CollectionConfig) error { // The commit lock covers the LSN allocation and the append that go
+	// with it, and brings this instance up to date with the file first.
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -5279,6 +5355,12 @@ func (e *Engine) appendBatchRunWALLocked(batches []batchEntry) (uint64, uint64, 
 	if len(batches) == 0 {
 		return 0, 0, 0, nil
 	}
+	// The commit lock covers the LSN allocation and the append that go with
+	// it, and brings this instance up to date with the file first.
+	if err := e.beginCommit(); err != nil {
+		return 0, 0, 0, err
+	}
+	defer e.endCommit()
 	hasRecords := false
 	for i := range batches {
 		if batches[i].count() > 0 {
@@ -5711,6 +5793,13 @@ func (e *Engine) commitTx(ctx context.Context, ops []storage.TxOperation, receip
 	if e.closed.Load() {
 		return fmt.Errorf("database is closed")
 	}
+
+	// The commit lock covers the LSN allocation and the append that go
+	// with it. The transaction's work is outside it.
+	if err := e.beginCommit(); err != nil {
+		return err
+	}
+	defer e.endCommit()
 
 	txID := e.nextTxID()
 	beginLSN := e.nextLSN()
@@ -6226,6 +6315,10 @@ func (e *Engine) Close() error {
 
 	// Free all off-heap vector storage. Individual slot deallocation is
 	// unnecessary: Free() releases all mmap'd slabs at once.
+	// Give the users lock back: nobody else has the store open because of
+	// this process any more, so a compaction may now replace the file.
+	e.releaseUsersFile()
+
 	for _, collection := range e.state.Collections {
 		collection.freeVectorSFLs()
 	}
