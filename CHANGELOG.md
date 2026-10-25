@@ -4,6 +4,19 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.18 - 2026-10-25
+
+### Multi-process concurrent writers on single-file storage
+
+- Supported multiple processes concurrently reading and writing to the same `.libravdb` file without record loss or file corruption.
+- Synchronized per-collection ordinal space across processes using durable ordinal reservation frames (`recordTypeOrdinalReserve`) in the write-ahead log.
+- Enforced goroutine serialization during commit lock acquisition via mutex-guarded depth tracking.
+- Switched the commit lock to a dedicated sidecar (`.lock`) file with a stable inode, preventing lock decoupling when compaction replaces the database file.
+- Extended the shared users lock to hold an exclusive lock across the entire file replacement and compaction cycle.
+- Refreshed file header page 0, active metapage pointers, and epoch numbers when reading from disk.
+- Retained uncommitted and pending transaction frames across disk refresh passes.
+- Handled store compaction during live reading and returned an error on unexpected file truncation.
+
 ## 1.6.14 - 2026-10-22
 
 ### Concurrent history compaction and snapshot pin safety (Issue #11)
