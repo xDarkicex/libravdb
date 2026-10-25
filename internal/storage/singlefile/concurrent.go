@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"syscall"
+
+	"github.com/xDarkicex/libravdb/internal/index"
 )
 
 // The store file is shared. Two processes may hold it open and write to it,
@@ -36,75 +38,161 @@ import (
 // frames interleave at the same file offset, and one process's compaction
 // renames the file out from under the other.
 
-// holdUsersFile takes the store's shared users lock.
-//
-// Every process that has the store open holds this lock, shared. The
-// compaction needs the file to itself -- it replaces the file -- so it tries
-// to take the lock exclusively, and skips the compaction when another process
-// still has the store open. Without this, one process's compaction renames
-// the file out from under the other, and the other's writes land in an
-// orphaned inode and are lost.
-func (e *Engine) holdUsersFile() error {
-	file, err := os.OpenFile(e.usersPath(), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return fmt.Errorf("open users lock file: %w", err)
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("lock users file: %w", err)
-	}
-	e.usersFile = file
-	return nil
-}
-
-// usersPath is the path of the sidecar file that records which processes have
-// the store open.
-func (e *Engine) usersPath() string {
-	return e.path + ".users"
-}
-
-// releaseUsersFile gives the users lock back.
-func (e *Engine) releaseUsersFile() {
-	if e.usersFile == nil {
-		return
-	}
-	_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_UN)
-	_ = e.usersFile.Close()
-	e.usersFile = nil
-}
-
-// compactionAllowed reports whether the store may be compacted.
-//
-// The compaction replaces the file. That is only safe when no other process
-// has the store open: the lock is shared by everyone who has it, and the
-// compaction takes it exclusively for the length of the replacement.
-func (e *Engine) compactionAllowed() bool {
-	if e.usersFile == nil {
-		return true
-	}
-	if err := syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// A failed flock upgrade can release the previous shared lock.
-		_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_SH)
-		return false
-	}
-	return true
-}
-
-// lockFile takes the store's exclusive commit lock.
-//
-// The lock is on a stable sidecar, so it survives database replacement. It
-// is advisory: a reader never takes it, so a read keeps progressing while a
-// write is in flight.
+// lockFile locks the database inode, then verifies that it is still the inode
+// named by the database path. A waiter on an old inode retries on the replacement.
 func (e *Engine) lockFile() error {
-	if err := syscall.Flock(int(e.commitFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock store file: %w", err)
+	for {
+		if err := syscall.Flock(int(e.file.Fd()), syscall.LOCK_EX); err != nil {
+			return fmt.Errorf("lock store file: %w", err)
+		}
+		held, err := e.file.Stat()
+		if err != nil {
+			e.unlockFile()
+			return err
+		}
+		current, err := os.Stat(e.path)
+		if err != nil {
+			e.unlockFile()
+			return err
+		}
+		if os.SameFile(held, current) {
+			return nil
+		}
+		e.unlockFile()
+		replacement, err := os.OpenFile(e.path, os.O_RDWR|oNoFollow, 0)
+		if err != nil {
+			return err
+		}
+		old := e.file
+		e.file = replacement
+		_ = old.Close()
+		e.fileChanged = true
 	}
+}
+
+func (e *Engine) unlockFile() { _ = syscall.Flock(int(e.file.Fd()), syscall.LOCK_UN) }
+
+// replaceLocked hands the commit lock from the original inode to the new inode.
+// Both are locked across rename. Waiters must verify path identity after flock.
+func (e *Engine) replaceLocked(path string, replacement *os.File) error {
+	if err := syscall.Flock(int(replacement.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	if err := replaceDatabaseFile(path, e.path); err != nil {
+		_ = syscall.Flock(int(replacement.Fd()), syscall.LOCK_UN)
+		return err
+	}
+	old := e.file
+	e.file = replacement
+	_ = old.Close()
 	return nil
 }
 
-// unlockFile releases the store's commit lock.
-func (e *Engine) unlockFile() {
-	_ = syscall.Flock(int(e.commitFile.Fd()), syscall.LOCK_UN)
+func (e *Engine) reloadReplacementLocked() error {
+	old := e.state
+	pendingCatalog, catalogDirty := e.catalogData, e.catalogDirty
+	// Live recovery must not rebuild through a provider callback that re-enters
+	// engine.mu. Keep the live indexes and advance them from the snapshot diff.
+	provider := e.indexProvider
+	e.indexProvider = nil
+	err := e.openExisting()
+	e.indexProvider = provider
+	if catalogDirty {
+		e.catalogData, e.catalogDirty = pendingCatalog, true
+		e.dirty = true
+	}
+	if err != nil {
+		e.disableWrites()
+		return err
+	}
+	if err := e.refreshReplacementIndexesLocked(old); err != nil {
+		e.disableWrites()
+		return err
+	}
+	e.initReservedOrdinals()
+	for name, col := range old.Collections {
+		if next := col.reservedNextOrdinal.Load(); next > 0 {
+			advanceReservedOrdinal(e.state.Collections[name], next-1)
+		}
+		col.freeVectorSFLs()
+	}
+	e.refreshPending = nil
+	e.fileChanged = false
+	return nil
+}
+
+// refreshReplacementIndexesLocked reconciles live indexes with records folded
+// into the replacement snapshot, which are no longer present as record WAL.
+func (e *Engine) refreshReplacementIndexesLocked(old *persistedState) error {
+	if e.indexProvider == nil {
+		return nil
+	}
+	delta, ok := e.indexProvider.(IncrementalIndexRecoveryProvider)
+	canApply := func(name string, col *persistedCollection) bool {
+		if !ok {
+			return false
+		}
+		if live, supported := e.indexProvider.(interface{ CanApplyLiveIndexDeltas(string) bool }); supported {
+			return live.CanApplyLiveIndexDeltas(name)
+		}
+		return delta.CanApplyIndexDeltas(name, &col.Config)
+	}
+	for name, current := range e.state.Collections {
+		previous := old.Collections[name]
+		if current.Deleted {
+			continue
+		}
+		for id, record := range current.Records {
+			var before *recordValue
+			if previous != nil {
+				before = previous.Records[id]
+			}
+			if before != nil && before.UpdatedLSN == record.UpdatedLSN && before.Deleted == record.Deleted && before.Ordinal == record.Ordinal {
+				continue
+			}
+			if !canApply(name, current) {
+				return fmt.Errorf("index %s requires reopen after database replacement", name)
+			}
+			if record.Deleted {
+				if before != nil && !before.Deleted {
+					if err := delta.ApplyIndexDelete(name, id, before.Ordinal, &current.Config); err != nil {
+						return err
+					}
+				}
+			} else {
+				replace := before != nil && !before.Deleted
+				ordinal := record.Ordinal
+				if replace {
+					ordinal = before.Ordinal
+				}
+				entry := &index.VectorEntry{ID: id, Vector: record.Vector, Metadata: record.Metadata, Version: record.Version, Ordinal: record.Ordinal}
+				if err := delta.ApplyIndexPut(name, entry, replace, ordinal, &current.Config); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for name, previous := range old.Collections {
+		current := e.state.Collections[name]
+		if current == nil || current.Deleted {
+			if ok {
+				delta.DiscardIndex(name)
+			}
+			continue
+		}
+		for id, before := range previous.Records {
+			if _, exists := current.Records[id]; exists || before.Deleted {
+				continue
+			}
+			if !canApply(name, current) {
+				return fmt.Errorf("index %s requires reopen after database replacement", name)
+			}
+			if err := delta.ApplyIndexDelete(name, id, before.Ordinal, &current.Config); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // beginCommit takes the commit lock and brings this instance's view of the
@@ -121,6 +209,13 @@ func (e *Engine) beginCommit() error {
 	if err := e.lockFile(); err != nil {
 		e.commitDepth--
 		return err
+	}
+	if e.fileChanged {
+		if err := e.reloadReplacementLocked(); err != nil {
+			e.unlockFile()
+			e.commitDepth--
+			return err
+		}
 	}
 	if err := e.refreshFromDiskLocked(); err != nil {
 		e.unlockFile()
@@ -146,12 +241,19 @@ func (e *Engine) endCommit() {
 // written to the file.
 //
 // It is the read path's entry point. The check is a stat, which is cheap;
-// the refresh runs when the size differs. Live remote compaction is prevented
-// by the lifetime users lock; an unexpected truncation is reported as an error.
+// the refresh runs when size or inode identity differs.
 func (e *Engine) refreshIfBehind() error {
 	e.mu.RLock()
 	stat, err := e.file.Stat()
 	behind := err == nil && stat.Size() != e.walAppliedOffset
+	if err == nil {
+		current, pathErr := os.Stat(e.path)
+		if pathErr != nil {
+			err = pathErr
+		} else {
+			behind = behind || !os.SameFile(stat, current)
+		}
+	}
 	e.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("stat store file: %w", err)
@@ -288,23 +390,6 @@ func (e *Engine) refreshFromDiskLocked() error {
 		log.Printf("singlefile: refresh applied %d frames (tx %d)", refreshedFrames, e.lastLSN.Load())
 	}
 	return nil
-}
-
-// openCommitFile uses a stable inode: replacing the database must never replace
-// the object on which writers coordinate. This sidecar is never unlinked.
-func (e *Engine) openCommitFile() error {
-	f, err := os.OpenFile(e.path+".lock", os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	e.commitFile = f
-	return nil
-}
-
-func (e *Engine) finishCompaction() {
-	if e.usersFile != nil {
-		_ = syscall.Flock(int(e.usersFile.Fd()), syscall.LOCK_SH)
-	}
 }
 
 // persistOrdinalReservationsLocked publishes reservation frontiers as one WAL

@@ -4,6 +4,15 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.19 - 2026-10-25
+
+### Single-file database-level locking and compaction transfer
+
+- Restored the single-file storage contract by removing `.lock` and `.users` sidecar coordination files.
+- Implemented database-level locking directly on the database file, with atomic lock transfer across compaction/vacuum replacements via `replaceLocked`.
+- Waiters detect inode divergence (`!os.SameFile`) under flock, safely re-opening the replacement file without orphan inode leaks.
+- Reconciled live indexes (`Flat`, `HNSW`, `IVFPQ`) with replacement snapshots on remote vacuum/compaction.
+
 ## 1.6.18 - 2026-10-25
 
 ### Multi-process concurrent writers on single-file storage

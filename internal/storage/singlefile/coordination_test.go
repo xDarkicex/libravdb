@@ -62,47 +62,26 @@ func TestOrdinalReservationsAreSharedBeforeInsert(t *testing.T) {
 	}
 }
 
-func TestCompactionKeepsUsersExclusiveAndCommitInodeStable(t *testing.T) {
+func TestCompactionLocksBothInodesAcrossReplacement(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "compact.db")
 	e := coordinationEngine(t, path)
-	if err := e.createCollection("rows", storage.CollectionConfig{Dimension: 1}); err != nil {
-		t.Fatal(err)
-	}
-	before, err := e.commitFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	observer, err := os.OpenFile(e.usersPath(), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer observer.Close()
 	original := replaceDatabaseFile
 	t.Cleanup(func() { replaceDatabaseFile = original })
-	called := false
 	replaceDatabaseFile = func(src, dst string) error {
-		called = true
-		if err := syscall.Flock(int(observer.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err == nil {
-			_ = syscall.Flock(int(observer.Fd()), syscall.LOCK_UN)
-			t.Error("opener acquired users lock during replacement")
+		for _, path := range []string{src, dst} {
+			observer, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			err = syscall.Flock(int(observer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			observer.Close()
+			if err == nil {
+				t.Errorf("inode %s was not locked during replacement", path)
+			}
 		}
 		return original(src, dst)
 	}
 	if err := e.Compact(); err != nil {
-		t.Fatal(err)
-	}
-	if !called {
-		t.Fatal("compaction did not replace file")
-	}
-	after, err := e.commitFile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(before, after) {
-		t.Fatal("compaction changed commit lock inode")
-	}
-	collection, _ := e.GetCollection("rows")
-	if err := collection.Insert(context.Background(), &index.VectorEntry{ID: "after", Vector: []float32{1}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -273,5 +252,88 @@ func TestGraphIDReservationsAreSharedAndRecovered(t *testing.T) {
 	}
 	if third < second+5 {
 		t.Fatalf("recovery reused graph IDs: second=%d third=%d", second, third)
+	}
+}
+
+func TestDatabaseCreatesNoCoordinationFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "single.db")
+	e := coordinationEngine(t, path)
+	if err := e.createCollection("rows", storage.CollectionConfig{Dimension: 1}); err != nil {
+		t.Fatal(err)
+	}
+	col, _ := e.GetCollection("rows")
+	if err := col.Insert(context.Background(), &index.VectorEntry{ID: "one", Vector: []float32{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Vacuum(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "single.db" {
+		t.Fatalf("single-file database created extra files: %v", entries)
+	}
+}
+
+func TestConsumerLockFileDoesNotBlockDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "consumer.db")
+	consumer, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	if err := syscall.Flock(int(consumer.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	e := coordinationEngine(t, path)
+	if err := e.createCollection("rows", storage.CollectionConfig{Dimension: 1}); err != nil {
+		t.Fatal(err)
+	}
+	col, _ := e.GetCollection("rows")
+	if err := col.Insert(context.Background(), &index.VectorEntry{ID: "one", Vector: []float32{1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenEngineFollowsCompactionReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replacement.db")
+	a := coordinationEngine(t, path)
+	if err := a.createCollection("rows", storage.CollectionConfig{Dimension: 1}); err != nil {
+		t.Fatal(err)
+	}
+	b := coordinationEngine(t, path)
+	ca, _ := a.GetCollection("rows")
+	cb, _ := b.GetCollection("rows")
+	ctx := context.Background()
+	// b is behind when a replaces the inode. Recovery must load the new snapshot,
+	// including records that no longer have record-put WAL in the compacted file.
+	if err := ca.Insert(ctx, &index.VectorEntry{ID: "before", Vector: []float32{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Insert(ctx, &index.VectorEntry{ID: "after", Vector: []float32{2}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.refreshIfBehind(); err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range []storage.Collection{ca, cb} {
+		for _, id := range []string{"before", "after"} {
+			exists, err := col.Exists(ctx, id)
+			if err != nil || !exists {
+				t.Fatalf("lost %s after replacement: exists=%v err=%v", id, exists, err)
+			}
+		}
 	}
 }

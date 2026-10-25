@@ -427,12 +427,8 @@ type Engine struct {
 	refreshPending   map[uint64][]walRecord
 	// commitDepth counts nested commit sections, so an inner one does not
 	// release the lock the outer one holds. All access is protected by e.mu.
-	commitDepth int
-	commitFile  *os.File
-	// usersFile is the sidecar lock that records which processes have the
-	// store open. The compaction replaces the file, so it may only do that
-	// when nobody else has it open.
-	usersFile       *os.File
+	commitDepth     int
+	fileChanged     bool
 	nextGraphNodeID atomic.Uint64
 	reverseDir      *reverseDirectory
 	mu              sync.RWMutex
@@ -780,37 +776,7 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	}
 
 	engine := &Engine{path: resolved}
-	if err := engine.holdUsersFile(); err != nil {
-		return nil, err
-	}
 	opened := false
-	defer func() {
-		if !opened {
-			engine.releaseUsersFile()
-		}
-	}()
-	if err := engine.openCommitFile(); err != nil {
-		return nil, err
-	}
-	defer func() {
-		if !opened {
-			engine.commitFile.Close()
-		}
-	}()
-	if err := engine.lockFile(); err != nil {
-		return nil, err
-	}
-	// The engine is not published yet. Index recovery callbacks may take mu.
-	engine.commitDepth = 1
-	openingLocked := true
-	defer func() {
-		if openingLocked {
-			engine.commitDepth = 0
-			engine.unlockFile()
-		}
-	}()
-	finishOpen := func() { engine.commitDepth = 0; engine.unlockFile(); openingLocked = false }
-
 	// Not O_APPEND: the engine writes its fixed pages with WriteAt, which the
 	// runtime refuses on an append-mode file. The append stream is serialised
 	// by the commit lock instead, which also allocates the LSNs.
@@ -818,6 +784,26 @@ func New(path string, opts ...Option) (storage.Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database file: %w", err)
 	}
+
+	engine.file = file
+	if err := engine.lockFile(); err != nil {
+		engine.file.Close()
+		return nil, err
+	}
+	file = engine.file
+	engine.fileChanged = false
+	engine.commitDepth = 1
+	openingLocked := true
+	defer func() {
+		if openingLocked {
+			engine.commitDepth = 0
+			engine.unlockFile()
+		}
+		if !opened {
+			_ = engine.file.Close()
+		}
+	}()
+	finishOpen := func() { engine.commitDepth = 0; engine.unlockFile(); openingLocked = false }
 
 	// Check format version early before applying options or starting goroutines
 	stat, err := file.Stat()
@@ -3916,263 +3902,17 @@ func captureState(e *Engine) *persistedState {
 }
 
 // Vacuum reclaims disk space by writing a compacted database to a temporary file
-// and atomically replacing the active file. It minimizes lock contention by
-// performing heavy serialization unlocked, then copying only the appended WAL
-// deltas during a brief final lock.
+// and atomically replacing the active file under the database commit lock.
+// It shares Compact's inode handoff so concurrent writers follow the replacement.
 func (e *Engine) Vacuum(ctx context.Context) error {
-	// Phase 1: flush + snapshot (brief lock)
-	e.mu.Lock()
-	if e.closed.Load() {
-		e.mu.Unlock()
-		return fmt.Errorf("engine closed")
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if err := e.checkpointLocked(); err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("vacuum pre-checkpoint: %w", err)
-	}
-
-	// Snapshot vectors for indexes safely
-	if e.indexProvider != nil {
-		if err := e.indexProvider.SnapshotVectors(ctx); err != nil {
-			e.mu.Unlock()
-			return fmt.Errorf("vacuum snapshot vectors: %w", err)
-		}
-	}
-
-	stat, err := e.file.Stat()
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("vacuum stat: %w", err)
-	}
-	phase1Size := stat.Size()
-	snapshotState := captureState(e)
-	origHeader, err := e.readHeader()
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("vacuum read header: %w", err)
-	}
-	phase1LSN := e.lastLSN.Load()
-	e.mu.Unlock()
-
-	// Phase 2: Serialization and writing temp file (Unlocked)
-	snapshotBytes, err := encodeStateBinary(snapshotState)
-	if err != nil {
-		return fmt.Errorf("vacuum encode state: %w", err)
-	}
-	if len(snapshotBytes) > maxChunkSize {
-		return fmt.Errorf("vacuum snapshot size %d exceeds limit %d", len(snapshotBytes), maxChunkSize)
-	}
-
-	var indexBlock []byte
-	var indexChecksum uint32
-	if e.indexProvider != nil {
-		names := make([]string, 0, len(snapshotState.Collections))
-		for name := range snapshotState.Collections {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		entries := make([]indexBlockEntry, 0, len(names))
-		for _, name := range names {
-			entry, present, err := e.serializeIndexEntry(name, phase1LSN)
-			if err != nil {
-				return fmt.Errorf("vacuum serialize index %s: %w", name, err)
-			}
-			if !present {
-				continue
-			}
-			entries = append(entries, entry)
-		}
-		if len(entries) > 0 {
-			indexBlock = encodeIndexBlock(entries)
-			indexChecksum = crc32.Checksum(indexBlock, castagnoli)
-		}
-	}
-
-	tmpPath := e.path + ".vacuum"
-	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("vacuum create temp file: %w", err)
-	}
-
-	cleanup := true
-	defer func() {
-		if cleanup {
-			tmpFile.Close()
-			os.Remove(tmpPath)
-		}
-	}()
-
-	const snapshotOffset = uint64(3 * pageSize)
-	indexOffset := snapshotOffset + 16 + uint64(len(snapshotBytes))
-	indexLength := uint64(len(indexBlock))
-	totalSize := int64(indexOffset)
-	if len(indexBlock) > 0 {
-		totalSize += 16 + int64(indexLength)
-	}
-	pageCount := uint64((totalSize + pageSize - 1) / pageSize)
-
-	fh := &fileHeader{
-		FormatVersion:     origHeader.FormatVersion,
-		PageSize:          origHeader.PageSize,
-		FeatureFlags:      origHeader.FeatureFlags,
-		FileID:            origHeader.FileID,
-		CreatedUnixNano:   origHeader.CreatedUnixNano,
-		Creator:           origHeader.Creator,
-		LastCheckpointLSN: phase1LSN,
-		ActiveMetaPage:    1,
-		WALStartPage:      pageCount,
-		WALHeadPage:       pageCount,
-		WALTailPage:       pageCount,
-	}
-	copy(fh.Magic[:], origHeader.Magic[:])
-
-	bufPtr := pagePool.Get().(*[]byte)
-	buf := *bufPtr
-	for i := range buf {
-		buf[i] = 0
-	}
-	if err := writeFixedPage(tmpFile, 0, encodeHeader(fh, buf)); err != nil {
-		pagePool.Put(bufPtr)
-		return fmt.Errorf("vacuum write header: %w", err)
-	}
-
-	meta := &metaPage{
-		Magic:           metaMagicV2,
-		MetaEpoch:       1,
-		RootCatalog:     3,
-		RootFreelist:    0,
-		LastAppliedLSN:  phase1LSN,
-		PageCount:       pageCount,
-		CollectionCount: uint64(len(snapshotState.Collections)),
-		SnapshotOffset:  snapshotOffset,
-		SnapshotLength:  uint64(len(snapshotBytes)),
-		IndexOffset:     indexOffset,
-		IndexLength:     indexLength,
-		IndexChecksum:   indexChecksum,
-	}
-	for i := range buf {
-		buf[i] = 0
-	}
-	if err := writeFixedPage(tmpFile, 1, encodeMeta(meta, buf)); err != nil {
-		pagePool.Put(bufPtr)
-		return fmt.Errorf("vacuum write meta A: %w", err)
-	}
-
-	meta.RootFreelist = math.MaxUint64
-	for i := range buf {
-		buf[i] = 0
-	}
-	if err := writeFixedPage(tmpFile, 2, encodeMeta(meta, buf)); err != nil {
-		pagePool.Put(bufPtr)
-		return fmt.Errorf("vacuum write meta B: %w", err)
-	}
-	pagePool.Put(bufPtr)
-
-	var chunkHdr [16]byte
-	binary.LittleEndian.PutUint32(chunkHdr[0:4], chunkMagic)
-	binary.LittleEndian.PutUint16(chunkHdr[4:6], chunkTypeSnapshot)
-	binary.LittleEndian.PutUint16(chunkHdr[6:8], formatVersion)
-	binary.LittleEndian.PutUint32(chunkHdr[8:12], uint32(len(snapshotBytes)))
-	binary.LittleEndian.PutUint32(chunkHdr[12:16], crc32.Checksum(snapshotBytes, castagnoli))
-	if err := writeFullAt(tmpFile, chunkHdr[:], int64(snapshotOffset)); err != nil {
-		return fmt.Errorf("vacuum write chunk header: %w", err)
-	}
-	if err := writeFullAt(tmpFile, snapshotBytes, int64(snapshotOffset)+16); err != nil {
-		return fmt.Errorf("vacuum write snapshot payload: %w", err)
-	}
-
-	if len(indexBlock) > 0 {
-		var idxHdr [16]byte
-		binary.LittleEndian.PutUint32(idxHdr[0:4], chunkMagic)
-		binary.LittleEndian.PutUint16(idxHdr[4:6], chunkTypeIndex)
-		binary.LittleEndian.PutUint16(idxHdr[6:8], formatVersion)
-		binary.LittleEndian.PutUint32(idxHdr[8:12], uint32(len(indexBlock)))
-		binary.LittleEndian.PutUint32(idxHdr[12:16], indexChecksum)
-		if err := writeFullAt(tmpFile, idxHdr[:], int64(indexOffset)); err != nil {
-			return fmt.Errorf("vacuum write index chunk header: %w", err)
-		}
-		if err := writeFullAt(tmpFile, indexBlock, int64(indexOffset)+16); err != nil {
-			return fmt.Errorf("vacuum write index payload: %w", err)
-		}
-	}
-
-	// Phase 3: Catch-up & Swap (Brief Lock)
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed.Load() {
-		return fmt.Errorf("engine closed during vacuum")
-	}
-
-	// Flush any in-flight writes
-	if err := e.checkpointLocked(); err != nil {
-		return fmt.Errorf("vacuum final checkpoint: %w", err)
-	}
-
-	stat, err = e.file.Stat()
-	if err != nil {
-		return fmt.Errorf("vacuum final stat: %w", err)
-	}
-	currentSize := stat.Size()
-
-	if currentSize > phase1Size {
-		// Copy WAL bytes that landed during Phase 2
-		// Seek temp file to end (should be at totalSize)
-		if _, err := tmpFile.Seek(0, io.SeekEnd); err != nil {
-			return fmt.Errorf("vacuum seek temp file: %w", err)
-		}
-
-		// Create section reader for the delta
-		deltaReader := io.NewSectionReader(e.file, phase1Size, currentSize-phase1Size)
-		if _, err := io.Copy(tmpFile, deltaReader); err != nil {
-			return fmt.Errorf("vacuum copy WAL deltas: %w", err)
-		}
-	}
-
-	if err := tmpFile.Sync(); err != nil {
-		return fmt.Errorf("vacuum final sync: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("vacuum close temp: %w", err)
-	}
-
-	if err := e.file.Close(); err != nil {
-		// reopen guard
-		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
-			e.status.Store(int32(storage.StatusFailed))
-			return fmt.Errorf("vacuum close original: %w; reopen: %w", err, ferr)
-		} else {
-			e.file = f
-		}
-		return fmt.Errorf("vacuum close original: %w", err)
-	}
-
-	e.file = nil // Safety before rename
-	if err := replaceDatabaseFile(tmpPath, e.path); err != nil {
-		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
-			e.status.Store(int32(storage.StatusFailed))
-			return fmt.Errorf("vacuum rename: %w; reopen: %w", err, ferr)
-		} else {
-			e.file = f
-		}
-		return fmt.Errorf("vacuum rename: %w", err)
-	}
-
-	f, err := os.OpenFile(e.path, os.O_RDWR, 0644)
-	if err != nil {
-		e.status.Store(int32(storage.StatusFailed))
-		return fmt.Errorf("vacuum open new file: %w", err)
-	}
-	e.file = f
-	e.dirty = false
-	cleanup = false // Successfully swapped, defer won't remove it
-	if err := syncDatabaseParent(e.path); err != nil {
-		return fmt.Errorf("vacuum sync parent directory: %w", err)
-	}
-	return nil
+	return e.Compact()
 }
 
 // Backup creates a point-in-time copy of the active database to destPath.
-// It uses the same non-blocking fast-forward logic as Vacuum.
+// It copies a checkpoint and catches up with appended WAL.
 func (e *Engine) Backup(ctx context.Context, destPath string) error {
 	// Phase 1: flush + snapshot (brief lock)
 	e.mu.Lock()
@@ -4421,10 +4161,6 @@ func (e *Engine) compactFile() error {
 		return err
 	}
 	defer e.endCommit()
-	if !e.compactionAllowed() {
-		return nil
-	}
-	defer e.finishCompaction()
 	err := e.compactFileLocked()
 	if err != nil {
 		e.compactionErrors++
@@ -4700,38 +4436,12 @@ func (e *Engine) compactFileLocked() error {
 	if err := tmpFile.Sync(); err != nil {
 		return fmt.Errorf("compact: sync: %w", err)
 	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("compact: close temp: %w", err)
+	// Keep both inodes locked through publication. Never close the original
+	// before rename: waiters could otherwise append to the orphaned inode.
+	if err := e.replaceLocked(tmpPath, tmpFile); err != nil {
+		return fmt.Errorf("compact: replace: %w", err)
 	}
-
-	// ── Atomic rename ─────────────────────────────────────────────────────
-	// Close original before rename; if anything fails, reopen original.
-	if err := e.file.Close(); err != nil {
-		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
-			e.status.Store(int32(storage.StatusFailed))
-			return fmt.Errorf("compact: close original: %w; reopen: %w", err, ferr)
-		} else {
-			e.file = f
-		}
-		return fmt.Errorf("compact: close original: %w", err)
-	}
-	e.file = nil
-
-	if err := replaceDatabaseFile(tmpPath, e.path); err != nil {
-		if f, ferr := os.OpenFile(e.path, os.O_RDWR, 0644); ferr != nil {
-			e.status.Store(int32(storage.StatusFailed))
-			return fmt.Errorf("compact: rename: %w; reopen: %w", err, ferr)
-		} else {
-			e.file = f
-		}
-		return fmt.Errorf("compact: rename: %w", err)
-	}
-
-	newFile, err := os.OpenFile(e.path, os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("compact: reopen: %w", err)
-	}
-	e.file = newFile
+	newFile := tmpFile
 
 	// ── Reset bookkeeping to match the compacted file ─────────────────────
 	e.activeMetaPage = 1
@@ -6528,8 +6238,6 @@ func (e *Engine) Close() error {
 	// unnecessary: Free() releases all mmap'd slabs at once.
 	// Give the users lock back: nobody else has the store open because of
 	// this process any more, so a compaction may now replace the file.
-	defer e.releaseUsersFile()
-	defer e.commitFile.Close()
 
 	for _, collection := range e.state.Collections {
 		collection.freeVectorSFLs()

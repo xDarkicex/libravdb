@@ -104,9 +104,72 @@ func concurrentHelper(t *testing.T) {
 	}
 	who := os.Getenv("LIBRAVDB_CONCURRENT_WHO")
 	for i := range concurrentRecords {
+		if i == concurrentRecords/2 {
+			if err := db.Vacuum(ctx); err != nil {
+				t.Fatalf("mid-write vacuum: %v", err)
+			}
+		}
 		id := fmt.Sprintf("%s-%06d", who, i)
 		if err := col.Insert(ctx, id, nil, map[string]interface{}{"k": "v"}); err != nil {
 			t.Fatalf("insert %s: %v", id, err)
 		}
+	}
+}
+
+func TestLiveIndexFollowsRemoteVacuum(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		option CollectionOption
+	}{
+		{"flat", WithFlat()}, {"hnsw", WithHNSW(16, 100, 50)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "live.db")
+			a, err := Open(WithStoragePath(path), WithMetrics(false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
+			ca, err := a.CreateCollection(ctx, "rows", WithDimension(2), tc.option)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ca.Insert(ctx, "original", []float32{1, 0}, nil); err != nil {
+				t.Fatal(err)
+			}
+			b, err := Open(WithStoragePath(path), WithMetrics(false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.Close()
+			cb, err := b.GetCollection("rows")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ca.Insert(ctx, "remote", []float32{0, 1}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Vacuum(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// The next write refreshes b's storage and its existing live vector index.
+			if err := cb.Insert(ctx, "local", []float32{1, 1}, nil); err != nil {
+				t.Fatal(err)
+			}
+			results, err := cb.Search(ctx, []float32{0, 1}, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, result := range results.Results {
+				if result.ID == "remote" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("remote record missing from live index after vacuum: %v", results.Results)
+			}
+		})
 	}
 }

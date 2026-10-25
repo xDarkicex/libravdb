@@ -164,6 +164,13 @@ func (b *indexPersistenceBridge) CanApplyIndexDeltas(_ string, config *storage.C
 	return config != nil && IndexType(config.IndexType) != IVFPQ
 }
 
+// CanApplyLiveIndexDeltas permits reconciliation after another process compacts
+// the store. Unlike cold recovery, a live IVFPQ index is already trained.
+func (b *indexPersistenceBridge) CanApplyLiveIndexDeltas(name string) bool {
+	_, err := b.cachedRecoveryIndex(name)
+	return err == nil
+}
+
 // ApplyIndexPut advances a recovered index by one committed WAL put. Replaced
 // ordinals are removed first, matching the normal update/upsert path.
 func (b *indexPersistenceBridge) ApplyIndexPut(
@@ -218,8 +225,20 @@ func (b *indexPersistenceBridge) ApplyIndexDelete(
 
 func (b *indexPersistenceBridge) cachedRecoveryIndex(collectionName string) (index.Index, error) {
 	b.mu.Lock()
-	idx := b.cache[collectionName]
+	idx, db := b.cache[collectionName], b.db
 	b.mu.Unlock()
+	// Recovery transfers ownership out of cache when a collection opens. Later
+	// inode replacements must update that live index rather than a detached copy.
+	if idx == nil && db != nil {
+		db.mu.RLock()
+		col := db.collections[collectionName]
+		db.mu.RUnlock()
+		if col != nil {
+			col.mu.RLock()
+			idx = col.index
+			col.mu.RUnlock()
+		}
+	}
 	if idx == nil {
 		return nil, fmt.Errorf("recovery index %s is not initialized", collectionName)
 	}
