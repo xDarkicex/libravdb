@@ -366,6 +366,9 @@ func (e *Engine) refreshFromDiskLocked() error {
 			if err := e.applyCommittedFrames(frames, touched, deltaProvider); err != nil {
 				return err
 			}
+			if payload, ok := decodeTxCommitPayload(record.Payload); ok {
+				e.recordCommitLocked(record.Header.LSN, payload.Timestamp)
+			}
 			refreshedFrames += len(frames)
 			delete(pending, record.Header.TxID)
 			// The counters follow the file, but only as far as a

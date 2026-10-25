@@ -4,6 +4,15 @@ All releases follow [Go module versioning](https://go.dev/doc/modules/version-nu
 
 ## Unreleased
 
+## 1.6.20 - 2026-10-25
+
+### Ordered commit catalog recovery and remote commit refresh
+
+- Fixed an issue where recovery appended older WAL commits after newer checkpoint entries, causing the catalog's latest LSN to regress.
+- Kept commit catalog entries ordered and unique during live publication and WAL recovery.
+- Added `normalizeCommitCatalogLocked` to repair previously misordered catalogs upon loading.
+- Recorded remote commits during disk refresh (`refreshFromDiskLocked`).
+
 ## 1.6.19 - 2026-10-25
 
 ### Single-file database-level locking and compaction transfer

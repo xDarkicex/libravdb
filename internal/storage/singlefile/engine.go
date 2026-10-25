@@ -972,6 +972,7 @@ func (e *Engine) openExisting() error {
 		e.state.UndirectedEdgeKinds = make(map[string]bool)
 	}
 	e.commitCatalog = append([]commitEntry(nil), e.state.CommitCatalog...)
+	e.normalizeCommitCatalogLocked()
 	e.oldestRetainedLSN = e.state.OldestRetainedLSN
 
 	// A pre-catalog writer could relocate the legacy chunk tail more than
@@ -4744,19 +4745,47 @@ func (e *Engine) makeTxCommitFrame(commitLSN, txID, prevLSN uint64) walRecord {
 // in-memory catalog. Must be called after syncWALLocked succeeds.
 func (e *Engine) recordPendingCommitLocked() {
 	if e.pendingCommitLSN != 0 {
-		e.commitCatalog = append(e.commitCatalog, commitEntry{
-			LSN: e.pendingCommitLSN, Timestamp: e.pendingCommitTS,
-		})
+		e.recordCommitLocked(e.pendingCommitLSN, e.pendingCommitTS)
 		e.pendingCommitLSN = 0
 		e.pendingCommitTS = 0
 	}
 }
 
-// recordCommitLocked appends a pre-resolved commit entry to the in-memory
-// catalog. Used during WAL replay where the timestamp is decoded from the
-// frame rather than captured live.
+// recordCommitLocked merges a commit from live publication or WAL recovery.
+// Checkpoints already contain their commit catalog, while retained graph WAL
+// may replay older commits. Replaying those must not regress the catalog tail
+// or duplicate entries used by timestamp-to-LSN resolution.
 func (e *Engine) recordCommitLocked(lsn uint64, ts int64) {
-	e.commitCatalog = append(e.commitCatalog, commitEntry{LSN: lsn, Timestamp: ts})
+	if lsn < e.oldestRetainedLSN {
+		return
+	}
+	n := len(e.commitCatalog)
+	if n == 0 || e.commitCatalog[n-1].LSN < lsn {
+		e.commitCatalog = append(e.commitCatalog, commitEntry{LSN: lsn, Timestamp: ts})
+		return
+	}
+	pos := sort.Search(n, func(i int) bool { return e.commitCatalog[i].LSN >= lsn })
+	if pos < n && e.commitCatalog[pos].LSN == lsn {
+		return
+	}
+	e.commitCatalog = append(e.commitCatalog, commitEntry{})
+	copy(e.commitCatalog[pos+1:], e.commitCatalog[pos:n])
+	e.commitCatalog[pos] = commitEntry{LSN: lsn, Timestamp: ts}
+}
+
+// normalizeCommitCatalogLocked repairs snapshots written by earlier versions
+// that appended already-checkpointed WAL commits after the catalog's true tail.
+func (e *Engine) normalizeCommitCatalogLocked() {
+	sort.SliceStable(e.commitCatalog, func(i, j int) bool { return e.commitCatalog[i].LSN < e.commitCatalog[j].LSN })
+	count := 0
+	for _, entry := range e.commitCatalog {
+		if count > 0 && e.commitCatalog[count-1].LSN == entry.LSN {
+			continue
+		}
+		e.commitCatalog[count] = entry
+		count++
+	}
+	e.commitCatalog = e.commitCatalog[:count]
 }
 
 // commitTimestampForLSN returns the UTC timestamp for a committed LSN by
