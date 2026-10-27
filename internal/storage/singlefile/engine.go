@@ -229,6 +229,9 @@ type walRecord struct {
 }
 
 type persistedState struct {
+	ChangeFeedVersion      uint32                          `json:"change_feed_version,omitempty"`
+	ChangeStartLSN         uint64                          `json:"change_start_lsn,omitempty"`
+	ChangeCommits          []changeCommit                  `json:"change_commits,omitempty"`
 	Collections            map[string]*persistedCollection `json:"collections"`
 	NextCollectionID       uint64                          `json:"next_collection_id"`
 	NextGraphNodeID        uint64                          `json:"next_graph_node_id"`
@@ -491,6 +494,7 @@ type Engine struct {
 
 	// Pending commit timestamp buffers set by makeTxCommitFrame and consumed
 	// by recordPendingCommitLocked after WAL sync succeeds.
+	pendingChanges   []changeCommit
 	pendingCommitLSN uint64
 	pendingCommitTS  int64
 
@@ -965,6 +969,10 @@ func (e *Engine) openExisting() error {
 	e.activeMetaPage = metaPageNumber(chosen.meta)
 	e.lastLSN.Store(chosen.meta.LastAppliedLSN)
 	e.state = chosen.state
+	if e.state.ChangeFeedVersion == 0 {
+		e.state.ChangeFeedVersion = 1
+		e.state.ChangeStartLSN = chosen.meta.LastAppliedLSN
+	}
 	if e.state.EdgeKinds == nil {
 		e.state.EdgeKinds = make(map[string]uint8)
 	}
@@ -2133,6 +2141,9 @@ func (e *Engine) applyCommittedFrames(
 	deltaProvider IncrementalIndexRecoveryProvider,
 ) error {
 	commitLSN := frames[len(frames)-1].Header.LSN
+	if err := e.replayChanges(frames); err != nil {
+		return err
+	}
 	for _, record := range frames {
 		switch record.Header.RecordType {
 		case recordTypeGraphIDReserve:
@@ -3851,6 +3862,9 @@ func (e *Engine) checkpointLocked() error {
 
 func captureState(e *Engine) *persistedState {
 	cloned := &persistedState{
+		ChangeFeedVersion:      e.state.ChangeFeedVersion,
+		ChangeStartLSN:         e.state.ChangeStartLSN,
+		ChangeCommits:          append([]changeCommit(nil), e.state.ChangeCommits...),
 		NextCollectionID:       e.state.NextCollectionID,
 		NextGraphNodeID:        e.state.NextGraphNodeID,
 		TombstonedGraphNodeIDs: append([]uint64(nil), e.state.TombstonedGraphNodeIDs...),
@@ -4601,6 +4615,10 @@ func (e *Engine) appendTransactionLocked(records []walRecord) (uint64, error) {
 	if n != len(buf) {
 		return written, &ambiguousWriteError{n: n, err: fmt.Errorf("short write: wrote %d of %d bytes", n, len(buf))}
 	}
+	if err := e.stageChanges(records); err != nil {
+		e.disableWrites()
+		return written, err
+	}
 	e.walTransactions++
 	e.walBytes += written
 	// The append lock is held, so the bytes just written are ours and the
@@ -4737,13 +4755,18 @@ func (e *Engine) makeTxCommitFrame(commitLSN, txID, prevLSN uint64) walRecord {
 	}
 	e.pendingCommitTS = now
 	e.pendingCommitLSN = commitLSN
-	payload := encodeTxCommitPayload(txCommitPayload{Timestamp: now})
+	payload := encodeTxCommitPayload(txCommitPayload{Timestamp: now, Nonce: changeNonce()})
 	return newFrame(recordTypeTxCommit, commitLSN, txID, prevLSN, payload)
 }
 
 // recordPendingCommitLocked publishes the buffered commit timestamp to the
 // in-memory catalog. Must be called after syncWALLocked succeeds.
 func (e *Engine) recordPendingCommitLocked() {
+	for _, commit := range e.pendingChanges {
+		e.publishChanges(commit)
+		e.recordCommitLocked(commit.LSN, commit.Timestamp)
+	}
+	e.pendingChanges = nil
 	if e.pendingCommitLSN != 0 {
 		e.recordCommitLocked(e.pendingCommitLSN, e.pendingCommitTS)
 		e.pendingCommitLSN = 0

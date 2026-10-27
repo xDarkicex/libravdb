@@ -1598,3 +1598,11 @@ Migrates a v1-format database at `path` to the current format. Returns an error
 if the path does not contain a valid v1 database or migration fails.
 `Open` handles this automatically; call `Migrate` directly only for pre-flight
 migration or offline maintenance.
+
+## Committed change feed
+
+`Database.ChangeCheckpoint(ctx)` captures an opaque consumer checkpoint.
+`Database.ReadChanges(ctx, after, limit)` returns compact record/graph mutation
+references with bounded pagination and transaction positions. See
+[the change-feed contract](CHANGE_FEED.md) for bootstrap, history lineage, split
+transactions, upgrade boundaries and retention semantics.

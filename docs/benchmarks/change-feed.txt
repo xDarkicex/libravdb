@@ -1,0 +1,114 @@
+Apple M2 / darwin arm64. Three short 100-operation samples; concurrent race-test activity adds noise.
+These samples do not establish a write-latency improvement or regression.
+
+Baseline: 8fab402, existing BenchmarkWALInsertConcurrent
+goos: darwin
+goarch: arm64
+pkg: github.com/xDarkicex/libravdb/internal/storage/singlefile
+cpu: Apple M2
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	   1227158 ns/op	   2.50 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1470 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	   1270580 ns/op	   2.42 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1381 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	    998811 ns/op	   3.08 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1426 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    351561 ns/op	   8.74 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2427 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    451092 ns/op	   6.81 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2466 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    389359 ns/op	   7.89 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2313 B/op	       6 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    509680 ns/op	   6.03 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1360 B/op	       5 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    350735 ns/op	   8.76 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1320 B/op	       5 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    540142 ns/op	   5.69 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1400 B/op	       5 allocs/op
+PASS
+ok  	github.com/xDarkicex/libravdb/internal/storage/singlefile	1.762s
+
+Native change feed (final):
+goos: darwin
+goarch: arm64
+pkg: github.com/xDarkicex/libravdb/internal/storage/singlefile
+cpu: Apple M2
+BenchmarkReadChangesTail-8       	     100	      3165 ns/op	     816 B/op	       8 allocs/op
+BenchmarkReadChangesTail-8       	     100	      3155 ns/op	     816 B/op	       8 allocs/op
+BenchmarkReadChangesTail-8       	     100	      7341 ns/op	     816 B/op	       8 allocs/op
+BenchmarkReadChangesPage-8       	     100	      9535 ns/op	    2760 B/op	      19 allocs/op
+BenchmarkReadChangesPage-8       	     100	      4872 ns/op	    2760 B/op	      19 allocs/op
+BenchmarkReadChangesPage-8       	     100	      8740 ns/op	    2760 B/op	      19 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	   1099545 ns/op	   2.79 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1619 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	   1061295 ns/op	   2.89 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1507 B/op	      10 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_8-8         	     100	   1099013 ns/op	   2.80 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1651 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    358285 ns/op	   8.57 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2576 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    398672 ns/op	   7.71 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2704 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/durable_writers_32-8        	     100	    350546 ns/op	   8.76 MB/s	        25.00 entries/wal_tx	         4.000 flushes	         4.000 wal_tx	    2490 B/op	      10 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    372249 ns/op	   8.25 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1641 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    581056 ns/op	   5.29 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1645 B/op	      11 allocs/op
+BenchmarkWALInsertConcurrent/unsafe_no_sync_writers_8-8  	     100	    483420 ns/op	   6.35 MB/s	         7.692 entries/wal_tx	        13.00 flushes	        13.00 wal_tx	    1643 B/op	      11 allocs/op
+PASS
+ok  	github.com/xDarkicex/libravdb/internal/storage/singlefile	33.701s
+goos: darwin
+goarch: arm64
+pkg: github.com/xDarkicex/libravdb/internal/storage/singlefile
+cpu: Apple M2
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                    sec/op                    │      sec/op        vs base                │
+WALInsertConcurrent/durable_writers_8-8                                          1.227m ± ∞ ¹        1.099m ± ∞ ¹       ~ (p=0.700 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                         389.4µ ± ∞ ¹        358.3µ ± ∞ ¹       ~ (p=0.700 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                   509.7µ ± ∞ ¹        483.4µ ± ∞ ¹       ~ (p=1.000 n=3) ²
+ReadChangesTail-8                                                                                    3.165µ ± ∞ ¹
+ReadChangesPage-8                                                                                    8.740µ ± ∞ ¹
+geomean                                                                          624.5µ              87.96µ        -7.88%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                     B/s                      │        B/s         vs base                │
+WALInsertConcurrent/durable_writers_8-8                                         2.384Mi ± ∞ ¹       2.670Mi ± ∞ ¹       ~ (p=0.700 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                        7.524Mi ± ∞ ¹       8.173Mi ± ∞ ¹       ~ (p=0.700 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                  5.751Mi ± ∞ ¹       6.056Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                         4.690Mi             5.094Mi        +8.61%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                entries/wal_tx                │  entries/wal_tx    vs base                │
+WALInsertConcurrent/durable_writers_8-8                                           7.692 ± ∞ ¹         7.692 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                          25.00 ± ∞ ¹         25.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                    7.692 ± ∞ ¹         7.692 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                           11.39               11.39        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                   flushes                    │      flushes       vs base                │
+WALInsertConcurrent/durable_writers_8-8                                           13.00 ± ∞ ¹         13.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                          4.000 ± ∞ ¹         4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                    13.00 ± ∞ ¹         13.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                           8.776               8.776        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                    wal_tx                    │      wal_tx        vs base                │
+WALInsertConcurrent/durable_writers_8-8                                           13.00 ± ∞ ¹         13.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                          4.000 ± ∞ ¹         4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                    13.00 ± ∞ ¹         13.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                           8.776               8.776        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                     B/op                     │       B/op        vs base                 │
+WALInsertConcurrent/durable_writers_8-8                                         1.393Ki ± ∞ ¹      1.581Ki ± ∞ ¹        ~ (p=0.100 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                        2.370Ki ± ∞ ¹      2.516Ki ± ∞ ¹        ~ (p=0.100 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                  1.328Ki ± ∞ ¹      1.604Ki ± ∞ ¹        ~ (p=0.100 n=3) ²
+ReadChangesTail-8                                                                                    816.0 ± ∞ ¹
+ReadChangesPage-8                                                                                  2.695Ki ± ∞ ¹
+geomean                                                                         1.637Ki            1.688Ki        +13.34%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                               │ /tmp/libravdb-change-feed-baseline-bench.txt │ /tmp/libravdb-change-feed-final-bench.txt │
+                                               │                  allocs/op                   │    allocs/op      vs base                 │
+WALInsertConcurrent/durable_writers_8-8                                           6.000 ± ∞ ¹       11.000 ± ∞ ¹        ~ (p=0.100 n=3) ²
+WALInsertConcurrent/durable_writers_32-8                                          6.000 ± ∞ ¹       11.000 ± ∞ ¹        ~ (p=0.100 n=3) ²
+WALInsertConcurrent/unsafe_no_sync_writers_8-8                                    5.000 ± ∞ ¹       11.000 ± ∞ ¹        ~ (p=0.100 n=3) ²
+ReadChangesTail-8                                                                                    8.000 ± ∞ ¹
+ReadChangesPage-8                                                                                    19.00 ± ∞ ¹
+geomean                                                                           5.646              11.51        +94.82%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05

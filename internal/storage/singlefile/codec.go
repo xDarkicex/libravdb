@@ -15,7 +15,7 @@ const (
 	codecVersion byte = 3 // Binary payload encoding (snapshot state, WAL frames, collection records)
 )
 
-const snapshotCodecVersion byte = 8 // v4: historical versions; v5: graph tombstones; v6: temporal catalog; v7: edge kinds; v8: edge directionality
+const snapshotCodecVersion byte = 9 // v4: historical versions; v5: graph tombstones; v6: temporal catalog; v7: edge kinds; v8: edge directionality; v9: change feed
 
 var graphConfigFieldMagic = []byte{'G', 'R', 'P', 'H', 1}
 
@@ -90,6 +90,9 @@ func encodeStateBinary(state *persistedState) ([]byte, error) {
 		if err := writeCollection(enc, collection); err != nil {
 			return nil, err
 		}
+	}
+	if err := encodeChanges(state, enc); err != nil {
+		return nil, err
 	}
 	return enc.DetachBytes(), nil
 }
@@ -211,6 +214,11 @@ func decodeStateBinary(data []byte) (*persistedState, error) {
 			return nil, err
 		}
 		state.Collections[name] = collection
+	}
+	if version >= 9 {
+		if err := decodeChanges(state, dec); err != nil {
+			return nil, err
+		}
 	}
 	return state, nil
 }
@@ -580,13 +588,17 @@ func decodeGraphNodeDropPayload(data []byte) (graphNodeDropPayload, error) {
 // unix nano; 0 means pre-temporal (replayed from a database written before
 // the commit catalog existed).
 type txCommitPayload struct {
+	Nonce     [16]byte
 	Timestamp int64
 }
 
 func encodeTxCommitPayload(p txCommitPayload) encodedPayload {
-	enc := util.AcquireBinaryEncoder(1 + 8)
+	enc := util.AcquireBinaryEncoder(1 + 8 + 16)
 	enc.WriteByte(codecVersion)
 	enc.WriteUint64(uint64(p.Timestamp))
+	for _, value := range p.Nonce {
+		enc.WriteByte(value)
+	}
 	return detachPayload(enc)
 }
 
@@ -606,7 +618,11 @@ func decodeTxCommitPayload(data []byte) (txCommitPayload, bool) {
 	if err != nil {
 		return txCommitPayload{}, false
 	}
-	return txCommitPayload{Timestamp: int64(ts)}, true
+	result := txCommitPayload{Timestamp: int64(ts)}
+	if len(data)-dec.Off >= 16 {
+		copy(result.Nonce[:], data[dec.Off:dec.Off+16])
+	}
+	return result, true
 }
 
 func writeCollectionConfig(enc *util.BinaryEncoder, config storage.CollectionConfig) error {

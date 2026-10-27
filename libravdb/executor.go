@@ -2628,22 +2628,21 @@ func (e *Executor) buildSelectResult(ctx context.Context, col *Collection, sr *S
 // buildSelectResults enriches a batch of search results with record metadata
 // projected to the plan's column list, then applies ORDER BY if requested.
 func (e *Executor) buildSelectResults(ctx context.Context, col *Collection, results []*SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
-	out := &SearchResults{}
+	for i, sr := range results {
+		results[i] = e.attachMetadata(ctx, col, sr, plan)
+	}
+	return e.finishSelectResults(col, results, plan)
+}
+func (e *Executor) finishSelectResults(col *Collection, results []*SearchResult, plan *optimizer.PhysicalPlan) *SearchResults {
 	columns := plan.Projections
 	if len(columns) == 0 {
-		// A bare SELECT * must expose the collection's actual relational
-		// columns over pgwire. The legacy empty projection shape (id/score)
-		// loses metadata fields and causes database/sql ORMs such as GORM to
-		// scan every non-key field as NULL/default values.
 		columns = collectionColumns(col)
 	}
+	out := &SearchResults{Columns: columns}
 	if len(results) == 0 {
-		out.Columns = columns
 		return out
 	}
-	for _, sr := range results {
-		out.Results = append(out.Results, e.attachMetadata(ctx, col, sr, plan))
-	}
+	out.Results = results
 	if plan.Distinct {
 		out.Results = distinctSearchResults(out.Results, plan.Projections)
 	}
@@ -2698,44 +2697,11 @@ func distinctSearchResults(rows []*SearchResult, columns []string) []*SearchResu
 // metadata. Numeric-looking values sort numerically; everything else sorts
 // lexically. IsDesc reverses the order.
 func (e *Executor) applyOrderBy(out *SearchResults, plan *optimizer.PhysicalPlan) {
-	colName := plan.OrderBy
-	less := func(a, b *SearchResult) bool {
-		av, aok := a.Metadata[colName]
-		bv, bok := b.Metadata[colName]
-		if !aok && !bok {
-			return a.ID < b.ID
-		}
-		if !aok {
-			return true
-		}
-		if !bok {
-			return false
-		}
-		// Numeric comparison when both parse as float64.
-		af, aIsNum := toFloat(av)
-		bf, bIsNum := toFloat(bv)
-		if aIsNum && bIsNum {
-			if af != bf {
-				return af < bf
-			}
-			// Tie: break deterministically by ID.
-			return a.ID < b.ID
-		}
-		as, bs := fmt.Sprint(av), fmt.Sprint(bv)
-		if as != bs {
-			return as < bs
-		}
-		return a.ID < b.ID
-	}
-	if plan.IsDesc {
-		// Reverse via sort.Slice with inverted comparator.
-		sort.Slice(out.Results, func(i, j int) bool {
-			return less(out.Results[j], out.Results[i])
-		})
-		return
-	}
 	sort.Slice(out.Results, func(i, j int) bool {
-		return less(out.Results[i], out.Results[j])
+		if plan.IsDesc {
+			return orderedRowsLess(out.Results[j], out.Results[i], plan.OrderBy)
+		}
+		return orderedRowsLess(out.Results[i], out.Results[j], plan.OrderBy)
 	})
 }
 
@@ -2751,7 +2717,11 @@ func toFloat(v interface{}) (float64, bool) {
 	case int64:
 		return float64(n), true
 	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		n = strings.TrimSpace(n)
+		if !numericStringCandidate(n) {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(n, 64)
 		if err != nil {
 			return 0, false
 		}
@@ -2785,103 +2755,7 @@ func (e *Executor) attachMetadata(ctx context.Context, col *Collection, sr *Sear
 	if err != nil {
 		return sr
 	}
-	// Vector-func projections need the record's stored vector. Compute them
-	// before projecting so they land in the output metadata.
-	if len(plan.VectorFuncProjections) > 0 && len(rec.Vector) > 0 {
-		for _, vfp := range plan.VectorFuncProjections {
-			if len(vfp.QueryVector) == 0 || len(vfp.QueryVector) != len(rec.Vector) {
-				continue
-			}
-			score := computeVectorScore(col, vfp, rec.Vector)
-			if sr.Metadata == nil {
-				sr.Metadata = make(map[string]interface{}, len(plan.VectorFuncProjections))
-			}
-			sr.Metadata[vfp.Name] = score
-		}
-	}
-	if len(plan.VectorOperatorProjections) > 0 && len(rec.Vector) > 0 {
-		for _, vop := range plan.VectorOperatorProjections {
-			if score, ok := vectorOperatorScore(vop.Operator, vop.QueryVector, rec.Vector); ok {
-				if sr.Metadata == nil {
-					sr.Metadata = make(map[string]interface{}, len(plan.VectorOperatorProjections))
-				}
-				sr.Metadata[vop.Name] = score
-			}
-		}
-	}
-	if len(plan.FTSRankProjections) > 0 {
-		if sr.Metadata == nil {
-			sr.Metadata = make(map[string]interface{}, len(plan.FTSRankProjections))
-		}
-		for _, fts := range plan.FTSRankProjections {
-			if value, ok := recordMetadataValue(rec.Metadata, fts.TextColumn); ok && value != nil {
-				sr.Metadata[fts.Name] = ftsRankText(recordMetaToString(value), fts.TextQuery, "plain")
-			} else {
-				sr.Metadata[fts.Name] = float64(0)
-			}
-		}
-	}
-	if len(plan.FTSProjections) > 0 {
-		if sr.Metadata == nil {
-			sr.Metadata = make(map[string]interface{}, len(plan.FTSProjections))
-		}
-		for _, fts := range plan.FTSProjections {
-			text := fts.Query
-			if fts.Column != "" {
-				if value, ok := recordMetadataValue(rec.Metadata, fts.Column); ok && value != nil {
-					text = recordMetaToString(value)
-				} else {
-					text = ""
-				}
-			}
-			switch fts.Kind {
-			case optimizer.FTSProjectionVector:
-				sr.Metadata[fts.Name] = ftsVectorStringConfig(text, fts.Config)
-			case optimizer.FTSProjectionQuery:
-				sr.Metadata[fts.Name] = ftsQueryStringConfig(text, fts.QueryMode, fts.Config)
-			case optimizer.FTSProjectionRank:
-				sr.Metadata[fts.Name] = ftsRankTextConfigNorm(text, fts.Query, fts.QueryMode, fts.Config, fts.Normalization)
-			}
-		}
-	}
-	if len(plan.Projections) == 0 {
-		// All columns: expose every metadata field.
-		sr.Metadata = rec.Metadata
-		return sr
-	}
-	// Projected columns: keep only what was selected, in order.
-	proj := make(map[string]interface{}, len(plan.Projections))
-	for _, colName := range plan.Projections {
-		if colName == "id" || colName == "ID" {
-			proj[colName] = sr.ID
-			continue
-		}
-		sourceName := colName
-		for _, ref := range plan.ProjectionRefs {
-			if strings.EqualFold(ref.OutputName, colName) {
-				sourceName = ref.SourceName
-				break
-			}
-		}
-		// The vector is stored on the record itself, not in the metadata map.
-		// Vector-operator searches used to project `embedding` by looking only
-		// in metadata, which silently emitted SQL NULL for a valid stored vector.
-		// Keep the physical vector in the established wire representation used by
-		// INSERT ... RETURNING and ordinary vector projections.
-		if e.isVectorColumn(plan.CollectionName, sourceName) && len(rec.Vector) > 0 {
-			proj[colName] = formatConflictVector(rec.Vector)
-			continue
-		}
-		if value, ok := recordMetadataValue(sr.Metadata, sourceName); ok {
-			proj[colName] = value
-			continue
-		}
-		if v, ok := recordMetadataValue(rec.Metadata, sourceName); ok {
-			proj[colName] = v
-		}
-	}
-	sr.Metadata = proj
-	return sr
+	return e.attachRecordMetadata(col, sr, plan, rec)
 }
 
 // computeVectorScore computes the SIMILARITY or VECTOR_DISTANCE score for a
@@ -5817,6 +5691,9 @@ func graphEdgeMatchesPredicates(sourceID, targetID string, edge graph.Edge, pred
 // executeRelationalFullScan handles relational queries when the index doesn't
 // support B-tree access (HNSW, Flat, IVFPQ). Iterates all records via ListAll.
 func (e *Executor) executeRelationalFullScan(ctx context.Context, col *Collection, plan *optimizer.PhysicalPlan) (*SearchResults, error) {
+	if liveRelationalScan(ctx, plan) {
+		return e.executeLiveRelationalScan(ctx, col, plan)
+	}
 	records, err := recordsVisibleInContext(ctx, col)
 	if err != nil {
 		return nil, err
